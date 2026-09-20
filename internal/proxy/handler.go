@@ -302,16 +302,22 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		stats, err := CopySSE(sw, resp.Body, m.Public, flusher(sw))
 		if err != nil {
 			phase := "upstream_read"
+			outcome = "stream_truncated"
 			var swe *streamWriteError
 			if errors.As(err, &swe) {
 				// The client connection broke mid-stream; the upstream may
 				// have been fine. An operational warning, not an error.
 				phase = "client_write"
+			} else if errors.Is(err, ErrSSELineTooLong) || errors.Is(err, ErrSSEEventTooLarge) {
+				// The upstream crossed a bounded-relay cap: a hostile or
+				// broken peer, stopped cleanly at the wall. The logged
+				// error carries counts only, never the bytes themselves.
+				phase = "upstream_limit"
+				outcome = "stream_limit_exceeded"
 			}
 			log.Warn().Err(err).Str("public_model", model).Str("phase", phase).
 				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
 				Msg("stream_truncated")
-			outcome = "stream_truncated"
 		} else {
 			log.Debug().Str("public_model", model).
 				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).

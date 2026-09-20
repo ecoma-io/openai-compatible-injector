@@ -53,7 +53,9 @@ Owned decomposition:
 - **Streaming branches on the URL path**, not the body: chat = `data:`
   lines + `data: [DONE]`; responses = `event:`+`data:` pairs, no `[DONE]`
   (Responses termination events pass through untouched). `CopySSE` flushes
-  per event boundary (blank line), grows its buffer without a cap, and
+  per event boundary (blank line), is bounded (1 MiB per line, 2 MiB per
+  in-flight event — breach stops the relay with outcome
+  `stream_limit_exceeded`, the offending line never forwarded), and
   rewrites only `data:` lines containing a model string, with the same
   acceptance rule as the buffered path.
 - **Verbose verbatim, loud local.** 4xx/5xx upstream responses forward byte

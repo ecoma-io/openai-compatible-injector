@@ -240,8 +240,13 @@ live stream with correct per-chunk latency. Behavior:
 
 - Lines are written out as they are read, and flushed to the client at
   every event boundary — the blank line that terminates an event, which is
-  what SSE clients dispatch on. The internal line buffer grows without a
-  cap: providers pad chunks and there is no line length ceiling to impose.
+  what SSE clients dispatch on. Input is **bounded**: a single line is
+  capped at 1 MiB and an in-flight event (the lines since the last blank
+  separator, the dispatching blank line excluded) at 2 MiB. Real provider
+  events are far below both; the caps exist so a hostile or broken upstream
+  cannot pin unbounded memory. Crossing a cap stops the relay cleanly — the
+  offending line is never forwarded, and the request is logged with the
+  `stream_limit_exceeded` outcome.
 - The streaming _shape_ is decided by the **URL path**, not the body:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses
@@ -461,10 +466,12 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
   drain finishes, duplicate signals are ignored: the process keeps the exit
   code it earned.
 - Connection hygiene is bounded: request bodies are capped at 64 MiB,
-  request headers must arrive within 10s, and idle keep-alive connections
-  are closed after 120s — a quiet client cannot pin a goroutine and a file
-  descriptor forever. An active response (including a long SSE stream) is
-  never touched by the idle timeout.
+  request headers must arrive within 10s, idle keep-alive connections
+  are closed after 120s, and SSE relay input is capped per line and per
+  event (see [Streaming](#streaming)) — a quiet client cannot pin a
+  goroutine and a file descriptor forever, and a hostile upstream cannot
+  pin unbounded memory. An active response (including a long SSE stream)
+  is never touched by the idle timeout.
 
 ## Out of scope
 
