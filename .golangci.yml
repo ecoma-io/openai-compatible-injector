@@ -1,0 +1,12 @@
+# Formatting is deliberately not delegated here — `gofmt` is its own gate in
+# ci.yml, because `gofmt -l` exits 0 over findings and only emptiness means
+# clean. `go vet ./...` remains a separate explicit CI command too: keeping
+# it visible makes the Go baseline readable without knowing golangci-lint's
+# config syntax.
+#
+# The standard v2 baseline catches unchecked errors and static-analysis
+# regressions across production code and tests. It is enabled without blanket
+# exclusions; any finding must be fixed in code, not silenced in config.
+version: "2"
+linters:
+  default: standard

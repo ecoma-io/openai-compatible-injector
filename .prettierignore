@@ -1,0 +1,7 @@
+# Semgrep fixtures are load-bearing bytes: their whole job is to match (or
+# not match) rules, and prettier reformatting them would invalidate
+# `semgrep --test` in analysis.yml.
+.github/semgrep/
+bin/
+pnpm-lock.yaml
+node_modules/

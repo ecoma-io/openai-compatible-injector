@@ -1,0 +1,47 @@
+# Runtime configuration for openai-compatible-injector.
+# The process polls this file every second and hot-reloads validated changes
+# when its content hash changes. Copy it to config.yaml, replace the example
+# models and injection prompts, then start the service. config.yaml is
+# intentionally ignored because it may carry endpoint URLs the operator does
+# not want in the tree (and, if the upstream ever requires credentials, they
+# belong in the Authorization header the client sends, never here).
+#
+# Bootstrap settings (LISTEN, CONFIG_FILE, CONFIG_POLL_INTERVAL,
+# SHUTDOWN_GRACE) come from the environment and do NOT belong in this file.
+# A runtime file that tries to define them is rejected by strict decoding —
+# when a bad reload is writing, the last-known-good config keeps serving;
+# when first boot is reading, the process refuses to start.
+
+models:
+  # Every public model name a client may request. The request's `model`
+  # field is matched against these keys and sent upstream as
+  # `upstream-model`; the upstream endpoint receives the request at
+  # `<endpoint>/chat/completions` or `<endpoint>/responses` (the endpoint
+  # base must not include the /chat/completions or /responses suffix).
+  gpt-reviewer:
+    # Required. Base http(s) URL of the upstream provider. No credentials in
+    # the URL (userinfo is rejected); port allowed, path allowed (trailing
+    # slashes are ignored).
+    endpoint: https://api.provider.example/v1
+    # Required. The model name actually sent to the upstream provider.
+    upstream-model: gpt-5-pro
+    # Optional. A system-level instruction injected into EVERY request for
+    # this model. Empty (or omitted) disables injection.
+    #
+    # Chat Completions: prepended as a {"role":"system","content":...}
+    # message at index 0 of `messages`. If `messages` is absent or not a
+    # JSON array the request passes through untouched — we never corrupt a
+    # request to inject.
+    #
+    # Responses API: merged into `instructions` as a developer message. If
+    # `instructions` is a string it is prefixed (prompt + "\n\n" + text); an
+    # array gets a developer message item prepended; any other type is left
+    # untouched.
+    injection-prompt: |
+      Review the following code rigorously. Report every bug you can find,
+      ordered by severity, and suggest a fix for each.
+
+  # A second example, without injection — pure model renaming.
+  echo-model:
+    endpoint: https://api.provider.example/v1
+    upstream-model: gpt-4o-mini

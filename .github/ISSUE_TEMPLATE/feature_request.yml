@@ -1,0 +1,72 @@
+name: Feature request
+description: Propose a capability — API coverage, configuration, observability.
+title: "feat: "
+labels: ["needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        [`README.md`](../../blob/main/README.md) is the behavior contract. A
+        proposal that moves documented behavior must say which sections
+        change, and the pull request that lands it updates those sections in
+        the same pass.
+
+        Already-decided out of scope (a proposal here should argue the
+        decision, not restate the wish):
+
+        - Additional OpenAI API surfaces beyond Chat Completions
+          (`/v1/chat/completions`) and Responses (`/v1/responses`) — e.g.
+          embeddings or batch endpoints. The injector is a request/response
+          injector for the two model-serving protocols; a new surface starts
+          with its own design discussion.
+        - Manual reload triggers (SIGHUP, filesystem events) — the content
+          polling is a design, not a gap; see README "Hot reload" for the
+          blind spot no watcher fixes.
+        - Per-request overrides of the injection prompt or upstream model via
+          request fields. The mapping is static per public model name; a
+          request field that could change forwarding behavior is a footgun.
+        - Non-HTTP(S) upstream endpoints. Certificates verify chain and host.
+  - type: checkboxes
+    id: before-filing
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues for a duplicate.
+          required: true
+        - label: This does not conflict with a decision listed out of scope above.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What are you proposing?
+    validations:
+      required: true
+  - type: textarea
+    id: quiet-direction
+    attributes:
+      label: What happens to in-flight requests and config reloads if this change is wrong in the quiet direction?
+      description: >
+        The dangerous failure here is the silent one — an injection prompt
+        that stops being applied, a model that routes to the wrong upstream
+        after a reload, a stream that is buffered instead of passed through.
+        "No quiet direction" is a valid answer when it is true.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Would you like to open the pull request for this?
+      options:
+        - label: I am willing to open a pull request for this.
