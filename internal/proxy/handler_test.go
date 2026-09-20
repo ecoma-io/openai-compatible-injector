@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,6 +69,40 @@ func (c *countingRecorder) Flush() {
 	c.flushes++
 	c.mu.Unlock()
 	c.ResponseRecorder.Flush()
+}
+
+// TestUpstreamFailureLogsRedactEndpoint pins the credential rule: a dial
+// failure against an endpoint whose query string carries a secret must not
+// put that secret — or the full URL — into logs, in any field. Only the
+// scheme+host origin may appear.
+func TestUpstreamFailureLogsRedactEndpoint(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close() // refuses connections
+
+	endpoint := "http://" + addr + "/v1?api-key=SECRET_ENDPOINT_TOKEN&deployment=x"
+	store := newTestStore(t, endpoint)
+	var logs bytes.Buffer
+	log := zerolog.New(&logs)
+	h := NewHandler(store, NewSharedClient(), log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+
+	out := logs.String()
+	for _, banned := range []string{"SECRET_ENDPOINT_TOKEN", "api-key", "deployment", "/v1/chat/completions?"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("log line contains %q:\n%s", banned, out)
+		}
+	}
+	if !strings.Contains(out, "http://"+addr) {
+		t.Errorf("log line lost the scheme+host origin:\n%s", out)
+	}
 }
 
 func TestHealthz(t *testing.T) {

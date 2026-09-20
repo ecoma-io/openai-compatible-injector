@@ -88,8 +88,8 @@ func TestLoadRuntimeModelValidation(t *testing.T) {
 		want string
 	}{
 		{"missing endpoint", "models:\n  a:\n    upstream-model: m\n", "endpoint is required"},
-		{"non-http endpoint", "models:\n  a:\n    endpoint: ftp://h\n    upstream-model: m\n", "http(s) URL"},
-		{"hostless endpoint", "models:\n  a:\n    endpoint: https://\n    upstream-model: m\n", "http(s) URL"},
+		{"non-http endpoint", "models:\n  a:\n    endpoint: ftp://h\n    upstream-model: m\n", "http(s) with a host"},
+		{"hostless endpoint", "models:\n  a:\n    endpoint: https://\n    upstream-model: m\n", "http(s) with a host"},
 		{"credentials in endpoint", "models:\n  a:\n    endpoint: https://user:pass@h/v1\n    upstream-model: m\n", "credentials"},
 		{"fragment in endpoint", "models:\n  a:\n    endpoint: https://h/v1#page\n    upstream-model: m\n", "fragment"},
 		{"missing upstream model", "models:\n  a:\n    endpoint: https://h/v1\n", "upstream-model is required"},
@@ -101,6 +101,32 @@ func TestLoadRuntimeModelValidation(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want containing %q", err, tc.want)
 			}
+		})
+	}
+}
+
+// TestConfigErrorsDoNotEmbedRawEndpoint pins the credential rule on the
+// config plane: validation error text reaches logs verbatim, so it must
+// never quote an endpoint's query string or other secret-bearing parts.
+func TestConfigErrorsDoNotEmbedRawEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"bad scheme with secret query", "models:\n  a:\n    endpoint: ftp://h/v1?api-key=SECRET_ENDPOINT_TOKEN\n    upstream-model: m\n"},
+		{"unparseable URL with secret query", "models:\n  a:\n    endpoint: \"ht tp://h/v1?api-key=SECRET_ENDPOINT_TOKEN\"\n    upstream-model: m\n"},
+		{"missing host with secret query", "models:\n  a:\n    endpoint: \"/v1?api-key=SECRET_ENDPOINT_TOKEN\"\n    upstream-model: m\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if strings.Contains(err.Error(), "SECRET_ENDPOINT_TOKEN") {
+				t.Errorf("error text embeds the endpoint query (secret leak): %v", err)
+			}
+			t.Logf("error text: %v", err)
 		})
 	}
 }

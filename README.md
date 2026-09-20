@@ -274,8 +274,10 @@ them would make a 429 indistinguishable from any other upstream failure.
   untouched.
 - **Credentials never reach logs or error text** — no `Authorization`
   values, request bodies, or injection prompts in log lines, and no
-  upstream URL details beyond the endpoint's scheme+host in startup logs.
-  A quote of any of these is a security defect, not a typo (SECURITY.md).
+  upstream URL details beyond the endpoint's scheme+host in **any** log
+  line or error text (a query-parameter API key survives even a dial
+  failure). A quote of any of these is a security defect, not a typo
+  (SECURITY.md).
 - `endpoint` URLs with userinfo are rejected at config load; fragments are
   rejected too (a fragment is never sent to a server, so accepting one would
   silently ignore part of the configured endpoint). An endpoint's query

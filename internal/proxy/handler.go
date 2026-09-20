@@ -2,11 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"syscall"
 
 	"github.com/rs/zerolog"
 
@@ -173,7 +178,13 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String(), bytes.NewReader(out))
 	if err != nil {
-		h.log.Error().Err(err).Str("model", model).Msg("proxy: building upstream request failed")
+		// Unreachable by construction (the endpoint was validated to a
+		// *url.URL at config load), but if it ever fires the raw error text
+		// must still not reach logs — it would embed the full URL.
+		h.log.Error().Str("model", model).
+			Str("upstream", origin(&upstream)).
+			Str("error_class", "request_build").
+			Msg("proxy: building upstream request failed")
 		writeEnvelope(w, http.StatusBadGateway, envelopeUpUnreach)
 		return
 	}
@@ -181,7 +192,21 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.log.Error().Err(err).Str("model", model).Str("upstream", upstream.String()).Msg("proxy: upstream request failed")
+		// The *url.Error from client.Do embeds the full request URL —
+		// query string included, which is how query-authenticated
+		// providers leak credentials. Log the sanitized error and the
+		// scheme+host origin only, per the credential rule.
+		event := h.log.Error()
+		if errors.Is(err, context.Canceled) {
+			// The client went away mid-request; that is an operational
+			// warning, not an upstream failure.
+			event = h.log.Warn()
+		}
+		event.Err(sanitizeUpstreamError(err, &upstream)).
+			Str("model", model).
+			Str("upstream", origin(&upstream)).
+			Str("error_class", upstreamErrorClass(err)).
+			Msg("proxy: upstream request failed")
 		writeEnvelope(w, http.StatusBadGateway, envelopeUpUnreach)
 		return
 	}
@@ -235,6 +260,44 @@ func (h *injectorHandler) writeModelNotFound(w http.ResponseWriter, model string
 	}}
 	body, err := json.Marshal(env)
 	writeEnvelopeErr(w, http.StatusNotFound, body, err)
+}
+
+// origin renders the endpoint's scheme+host — the only upstream URL detail
+// that may ever reach logs. Query strings, paths, and userinfo are
+// credential- or traffic-bearing and stay out.
+func origin(u *url.URL) string {
+	return u.Scheme + "://" + u.Host
+}
+
+// sanitizeUpstreamError rebuilds a client.Do error without the full request
+// URL: *url.Error.Error() quotes it verbatim, query string included.
+func sanitizeUpstreamError(err error, endpoint *url.URL) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return &url.Error{Op: ue.Op, URL: origin(endpoint), Err: ue.Err}
+	}
+	return err
+}
+
+// upstreamErrorClass buckets a client.Do error for logging. The error is
+// classified in its raw form — sanitization only strips the URL text.
+func upstreamErrorClass(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "client_canceled"
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return "timeout"
+	}
+	var te *tls.CertificateVerificationError
+	if errors.As(err, &te) {
+		return "tls"
+	}
+	var oe *net.OpError
+	if errors.As(err, &oe) && errors.Is(oe.Err, syscall.ECONNREFUSED) {
+		return "connection_refused"
+	}
+	return "dial"
 }
 
 func writeEnvelope(w http.ResponseWriter, status int, body string) {

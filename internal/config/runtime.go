@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -117,10 +118,13 @@ func buildModel(name string, rm runtimeModel) (Model, error) {
 	}
 	u, err := url.Parse(rm.Endpoint)
 	if err != nil {
-		return Model{}, fmt.Errorf("endpoint: %w", err)
+		// url.Parse errors quote the raw input, query string included; error
+		// text reaches logs verbatim, so the raw endpoint must not. The
+		// cause's own text survives — only the input echo is cut.
+		return Model{}, fmt.Errorf("endpoint: %s", strings.TrimPrefix(err.Error(), "parse "+strconv.Quote(rm.Endpoint)+": "))
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return Model{}, fmt.Errorf("endpoint %q must be an http(s) URL with a host", rm.Endpoint)
+		return Model{}, fmt.Errorf("endpoint scheme %q (host %q) must be http(s) with a host", u.Scheme, u.Host)
 	}
 	if u.User != nil {
 		return Model{}, errors.New("endpoint must not contain credentials")
