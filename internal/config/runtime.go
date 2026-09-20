@@ -6,11 +6,55 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// typeErrorLine matches the "line N:" prefix of each problem a yaml
+// TypeError reports — the only part of that error that is safe to surface.
+var typeErrorLine = regexp.MustCompile(`line (\d+)`)
+
+// decodeConfigError rewrites a YAML decode failure into log-safe text.
+// yaml.TypeError quotes the offending key or scalar value — and a botched
+// paste into any YAML position can carry credentials — so the error is
+// reduced to the line numbers that failed and a generic description.
+// Scanner/syntax errors quote only positions and pass through unchanged.
+func decodeConfigError(err error) error {
+	var te *yaml.TypeError
+	if !errors.As(err, &te) {
+		return err
+	}
+	matches := typeErrorLine.FindAllStringSubmatch(te.Error(), -1)
+	if len(matches) == 0 {
+		return errors.New("yaml: unmarshal errors (input redacted)")
+	}
+	seen := make(map[int]struct{}, len(matches))
+	lines := make([]int, 0, len(matches))
+	for _, m := range matches {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		lines = append(lines, n)
+	}
+	if len(lines) == 0 {
+		return errors.New("yaml: unmarshal errors (input redacted)")
+	}
+	sort.Ints(lines)
+	parts := make([]string, len(lines))
+	for i, n := range lines {
+		parts[i] = strconv.Itoa(n)
+	}
+	return fmt.Errorf("yaml: unmarshal errors at line(s) %s (input redacted)", strings.Join(parts, ", "))
+}
 
 // runtime file schema. Strictness has two layers: top-level keys are
 // validated against the raw YAML (only "models" and "logging" are legal —
@@ -50,18 +94,24 @@ type runtimeModel struct {
 // entry — rejects the whole file; callers must keep serving the previous
 // snapshot in that case.
 func LoadRuntime(data []byte) (*Snapshot, error) {
-	// Top-level keys are validated against the raw YAML first: a strict
-	// struct decode alone would report an unknown key without naming it, and
-	// the bootstrap-plane rule is absolute — a runtime file must reject any
-	// bootstrap key, regardless of its value's shape.
+	// Top-level keys are validated against the raw YAML first — a reject
+	// with a fixed message independent of the key's text (which error text
+	// must never echo). The strict struct decode below would also reject
+	// these keys, but only after YAML-level type resolution; this pass keeps
+	// the bootstrap-plane rule absolute regardless of a stray key's value
+	// shape.
 	var raw map[string]any
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	for k := range raw {
-		if k != "models" && k != "logging" {
-			return nil, fmt.Errorf("decode config: unknown top-level key %q", k)
+		if k == "models" || k == "logging" {
+			continue
 		}
+		// The key itself is not named: error text reaches logs verbatim, and
+		// a pasted credential can land in a key position just as well as a
+		// value position.
+		return nil, errors.New("unknown top-level key (only models and logging are legal)")
 	}
 	var rf runtimeFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -70,7 +120,21 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	// an empty models table, which the emptiness check below rejects with
 	// the honest message.
 	if err := dec.Decode(&rf); err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("decode config: %w", err)
+		return nil, fmt.Errorf("decode config: %w", decodeConfigError(err))
+	}
+	// yaml.v3's Decode consumes only the first document in a stream; a file
+	// with more silently hides the rest — including any bootstrap-plane key
+	// an operator (or a careless merge tool) appended after a `---`. That
+	// would break the two-plane rule without any visible rejection, so a
+	// multi-document file is a reject, full stop.
+	var extra map[string]any
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+		// Exactly one document: the only accepted shape.
+	case err != nil:
+		return nil, fmt.Errorf("decode config: %w", decodeConfigError(err))
+	default:
+		return nil, errors.New("config file must contain exactly one YAML document")
 	}
 
 	models := make(map[string]Model, len(rf.Models))
@@ -119,9 +183,21 @@ func buildModel(name string, rm runtimeModel) (Model, error) {
 	u, err := url.Parse(rm.Endpoint)
 	if err != nil {
 		// url.Parse errors quote the raw input, query string included; error
-		// text reaches logs verbatim, so the raw endpoint must not. The
-		// cause's own text survives — only the input echo is cut.
-		return Model{}, fmt.Errorf("endpoint: %s", strings.TrimPrefix(err.Error(), "parse "+strconv.Quote(rm.Endpoint)+": "))
+		// text reaches logs verbatim, so the raw endpoint must not. A
+		// *url.Error is unwrapped to its cause, which never carries the
+		// input; a bare stdlib message (e.g. control-character rejection)
+		// has no echo and passes through. If the text ever does contain the
+		// input's quoted form, it is dropped entirely — the sanitizer fails
+		// closed, never open.
+		var ue *url.Error
+		switch {
+		case errors.As(err, &ue):
+			return Model{}, fmt.Errorf("endpoint: %s", ue.Err)
+		case strings.Contains(err.Error(), strconv.Quote(rm.Endpoint)):
+			return Model{}, errors.New("endpoint: invalid URL (input redacted)")
+		default:
+			return Model{}, fmt.Errorf("endpoint: %s", err)
+		}
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return Model{}, fmt.Errorf("endpoint scheme %q (host %q) must be http(s) with a host", u.Scheme, u.Host)
