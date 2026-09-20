@@ -23,9 +23,12 @@ import (
 // 86,400 lines a day at the default interval. The failure is tracked by
 // kind (unreadable vs rejected), so a file that starts failing in a new way
 // warns again; while one kind persists, a debug-level line documents each
-// retry, and recovery is logged again. onPublish, when non-nil, runs after
-// every successful publish — the hook that applies the snapshot's
-// hot-reloadable log level.
+// retry, and recovery is logged again. The healthy-unchanged state logs
+// nothing at all: it is the norm, every tick of it is already visible as an
+// unchanged generation, and a healthy heartbeat would be the same perpetual
+// line-per-tick volume the failure model exists to avoid. onPublish, when
+// non-nil, runs after every successful publish — the hook that applies the
+// snapshot's hot-reloadable log level.
 type Poller struct {
 	store     *Store
 	path      string
@@ -76,9 +79,10 @@ func (p *Poller) Run(ctx context.Context) {
 				// The file is back — and byte-identical to the last-known-good
 				// content, so there is nothing to republish.
 				p.log.Info().Str("file", p.path).Msg("config_file_recovered")
-			} else {
-				p.log.Debug().Msg("config_unchanged")
 			}
+			// A healthy unchanged tick is silent: the healthy state is the
+			// norm, and a per-tick heartbeat there would be the same
+			// perpetual line-per-interval volume the failure model avoids.
 			failingKind = ""
 			continue
 		}

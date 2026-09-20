@@ -341,10 +341,10 @@ func TestPollerUnreadableTransitionLogging(t *testing.T) {
 	waitGenStable(t, store, store.Gen(), 120*time.Millisecond)
 }
 
-// TestPollerDebugHeartbeat pins the debug-level heartbeat contract: with the
-// level raised to debug, unchanged ticks and persistent failures each emit
-// their documented debug event, so an operator debugging a stuck reload can
-// see every poll outcome without recompiling.
+// TestPollerDebugHeartbeat pins the debug-level persistence contract: with
+// the level raised to debug, a failure that persists across ticks emits its
+// documented debug event, so an operator debugging a stuck reload can see
+// every failing poll outcome without recompiling.
 func TestPollerDebugHeartbeat(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -365,6 +365,56 @@ func TestPollerDebugHeartbeat(t *testing.T) {
 	writeFile(t, path, "models: [unclosed\n")
 	waitUntil(t, 2*time.Second, func() bool { return buf.countEvents("config_reload_still_rejected") >= 1 },
 		"no config_reload_still_rejected DEBUG while the failure persists")
+}
+
+// TestPollerHealthyTicksAreSilent pins the healthy-state logging contract:
+// an unchanged file produces no event per tick — not even at debug level —
+// so a process serving one static config emits no perpetual heartbeat
+// (86,400 lines a day at the default interval) on top of an unchanged
+// generation. The reload path keeps its own events; only the quiet state is
+// quiet.
+func TestPollerHealthyTicksAreSilent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, validRuntime())
+
+	store := NewStore(mustSnapshot(t, validRuntime()))
+	var buf syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.DebugLevel), nil)
+	go p.Run(ctx)
+
+	// Enough unchanged ticks that the old per-tick DEBUG event would have
+	// fired many times over.
+	waitGenStable(t, store, store.Gen(), 300*time.Millisecond)
+	if got := buf.countEvents("config_unchanged"); got != 0 {
+		t.Errorf("config_unchanged logged %d times on healthy ticks, want 0 (no perpetual heartbeat)", got)
+	}
+	if lines := buf.lines(); lines != 0 {
+		t.Errorf("healthy ticks emitted %d log lines, want 0:\n%s", lines, buf.String())
+	}
+
+	// The silence is scoped to the unchanged state: a change still logs.
+	changed := strings.Replace(validRuntime(), "gpt-5-pro", "gpt-9", 1)
+	writeFile(t, path, changed)
+	waitGen(t, store, 1)
+	waitUntil(t, 2*time.Second, func() bool { return buf.countEvents("config_reloaded") >= 1 },
+		"no config_reloaded INFO for the changed file")
+}
+
+// lines counts captured log lines (every line is one JSON event).
+func (b *syncBuffer) lines() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, line := range strings.Split(b.buf.String(), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // TestPollerSeedsHashFromBootContent pins the boot-content seed: Run must
