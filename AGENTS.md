@@ -124,8 +124,10 @@ Owned decomposition:
 - Conventional Commits via lefthook + commitlint (scopes: inject, proxy,
   server, config, cmd, e2e, docs, deps, ci, workspace, release). Signed
   commits everywhere. Squash merges into main only.
-- release-please (go type, 0.0.0 baseline in the manifest; the first release
-  derives from commits — 0.1.0) owns CHANGELOG.md/tags; Docker
+- release-please (go type) owns CHANGELOG.md/tags. The manifest baseline is
+  0.0.0 until the first release lands — 0.0.0 disables the last-release
+  backfill, so the first proposal comes straight from `initial-version`
+  (0.1.0); afterwards the manifest tracks the landed version. Docker
   publishes ghcr.io/ecoma-io/openai-compatible-injector on release.
 - AI-assisted commits carry `Assisted-by:`/`Generated-by:` trailers on the
   last commit of the PR, per CONTRIBUTING.md.
