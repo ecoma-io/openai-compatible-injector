@@ -13,12 +13,18 @@ name: CI
 
 on:
   pull_request:
+  # The merge queue re-runs the required checks on each group's
+  # gh-readonly-queue merge commit through this event; without it a queued
+  # entry waits for checks that never start and stalls the queue.
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
 
 # A push to main gets a run of its own per commit; a new push to a pull
-# request supersedes the in-flight run for it.
+# request supersedes the in-flight run for it. Queue groups fall through to
+# the sha arm — one group, one run, nothing cancelled: the queue owns its
+# build concurrency.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
