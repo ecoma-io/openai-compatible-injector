@@ -79,7 +79,9 @@ Owned decomposition:
   `warning` is an alias, absent = `info`); there is no `LOG_LEVEL` env var.
   A valid reload applies the level process-wide via the poller's
   `onPublish` hook calling `zerolog.SetGlobalLevel` (atomic store, no locks,
-  no signal, no restart). Events are JSON lines on stderr with stable
+  no signal, no restart) and acknowledges it with `log_level_applied`
+  emitted at the new level — the only severity visible under the level it
+  announces — so no transition, even `error→warn`, is ever silent. Events are JSON lines on stderr with stable
   snake_case message slugs (`request_completed`, `config_reloaded`,
   `stream_truncated`, ...); one INFO `request_completed` per request binds
   `request_id`, outcome, byte counts, duration and `config_generation`. The

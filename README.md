@@ -164,9 +164,13 @@ Semantics that hold:
   signal; an invalid `level` value rejects the whole file onto the
   last-known-good path. The level swap is an atomic store zerolog consults
   per event, so in-flight requests race only the old/new boundary and never
-  block. The reload acknowledgment itself is logged under the level in
-  effect _before_ the swap: at `error` level a successful reload is silent
-  in the logs and visible only through behavior (the next event's level).
+  block. Every successful swap is acknowledged by `log_level_applied`,
+  emitted _after_ the swap and _at the new level_ — the only severity
+  guaranteed visible under the level it announces — carrying `generation`,
+  `previous_level`, and `log_level`. (The companion `config_reloaded` INFO
+  line is written before the swap, so it disappears on transitions out of
+  `warn`/`error`; the ack exists so no transition is ever silent.) A
+  rejected file acknowledges nothing and leaves the level in force.
 - **Atomic replace caveat.** The poller watches the file's content, and reads
   it by path; tools that replace a file by `mv`/rename (editor safe-save)
   swap in a new inode the read still follows — but if the process opened the
@@ -335,10 +339,10 @@ What each level carries:
 
 - **DEBUG** — request lifecycle detail: `request_received`
   (method/path/remote address), `stream_started`, `stream_completed`,
-  `log_level_applied` after each reload, `config_unchanged` and the
-  poller's per-tick heartbeat while a failure persists. Detailed but never
-  payload-bearing: request bodies, SSE `data:` payloads, and injection
-  prompts do not exist at this level — or at any level.
+  `config_unchanged` and the poller's per-tick heartbeat while a failure
+  persists. Detailed but never payload-bearing: request bodies, SSE `data:`
+  payloads, and injection prompts do not exist at this level — or at any
+  level.
 - **INFO** — one `request_completed` per proxied request with the wire
   facts: `request_id` (16 hex chars, generated per request), `api`
   (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,

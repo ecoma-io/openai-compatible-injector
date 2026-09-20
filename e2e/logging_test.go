@@ -186,8 +186,10 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 		t.Fatalf("request_completed events = %d, want still 2 (INFO suppressed at error level)", got)
 	}
 
-	// error -> debug: no INFO ack can appear at error level, so wait on the
-	// behavior itself — the next debug event proves the new level applied.
+	// error -> debug: config_reloaded is invisible (INFO under the old error
+	// level), so wait on the behavior itself — the next debug event proves
+	// the new level applied. (The DEBUG log_level_applied ack is asserted
+	// per-transition by TestLogLevelTransitionMatrix.)
 	before := received()
 	rewriteConfig(t, p.cfgPath, loggingYAML(upstream.url(), upstream.url(), "debug"))
 	deadline := time.Now().Add(5 * time.Second)
@@ -215,6 +217,95 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 	if got := len(completions(4)); got < 4 {
 		t.Fatalf("request_completed events = %d, want >= 4 (every request answered)", got)
 	}
+}
+
+// TestLogLevelTransitionMatrix walks the level through every ordered pair of
+// the four documented levels plus the `warning` alias, requiring an
+// observable acknowledgement per transition: log_level_applied is emitted
+// at the level it announces, so it is visible on every transition —
+// including error->warn and anything->error, where the INFO config_reloaded
+// line is suppressed by the level still in force when it is written. Each
+// ack must also carry the generation the reload produced, incremented by
+// exactly one per successful publish. A rejected file afterwards must
+// neither bump the generation nor disturb the level in force.
+func TestLogLevelTransitionMatrix(t *testing.T) {
+	upstream := newFakeUpstream(t)
+	upstream.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","model":"up-live","choices":[]}`))
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     loggingYAML(upstream.url(), upstream.url(), "info"),
+		logLevel: "",
+	})
+
+	rewrite := func(level string) {
+		t.Helper()
+		rewriteConfig(t, p.cfgPath, loggingYAML(upstream.url(), upstream.url(), level))
+	}
+	generation := 0
+	expectAck := func(previous, level string) {
+		t.Helper()
+		generation++
+		waitForLogEvent(t, p, func(ev logEvent) bool {
+			return ev["message"] == "log_level_applied" &&
+				ev["previous_level"] == previous &&
+				ev["log_level"] == level &&
+				fmt.Sprint(ev["generation"]) == fmt.Sprint(generation)
+		}, fmt.Sprintf("log_level_applied %s->%s (generation %d)", previous, level, generation))
+	}
+
+	// Twelve rewrites, every ordered pair of the documented levels exactly
+	// once. The chain starts from the boot level (info) and returns to it.
+	for _, step := range [][2]string{
+		{"info", "debug"}, {"debug", "warn"}, {"warn", "info"},
+		{"info", "error"}, {"error", "debug"}, {"debug", "error"},
+		{"error", "warn"}, {"warn", "debug"}, {"debug", "info"},
+		{"info", "warn"}, {"warn", "error"}, {"error", "info"},
+	} {
+		rewrite(step[1])
+		expectAck(step[0], step[1])
+	}
+
+	// The alias: `warning` publishes warn and acknowledges with the
+	// canonical name.
+	rewrite("warning")
+	expectAck("info", "warn")
+
+	// A rejected file changes nothing: the ack generation the recovery
+	// produces must be exactly one past the alias reload's — no generation
+	// was consumed by the rejection — and DEBUG traffic must still flow
+	// while the file is broken, so first move to a level where the
+	// behavior is observable.
+	rewrite("debug")
+	expectAck("warn", "debug")
+	postJSON(t, p.addr, "/v1/chat/completions", secretBody, nil)
+	before := len(eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_received"))
+	if before == 0 {
+		t.Fatal("no request_received at debug level — precondition broken")
+	}
+
+	rewriteConfig(t, p.cfgPath, "models: [unclosed")
+	waitForLogEvent(t, p, func(ev logEvent) bool {
+		return ev["message"] == "config_reload_rejected"
+	}, "config_reload_rejected")
+	postJSON(t, p.addr, "/v1/chat/completions", secretBody, nil)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := len(eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_received")); got > before {
+			break // debug-level events still flowing: the level survived
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("level did not survive the rejected reload — no new request_received; stderr:\n%s", p.stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Recovery with the alias spelling: generation resumes one past the
+	// last successful publish.
+	rewrite("warning")
+	expectAck("debug", "warn")
 }
 
 // TestLoggingNeverLeaksSecrets drives every log-producing path at maximum

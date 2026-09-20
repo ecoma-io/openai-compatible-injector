@@ -168,17 +168,14 @@ func run() int {
 		}
 	}()
 
-	// onPublish applies the reloaded snapshot's log level process-wide: the
-	// global level is an atomic int32 that zerolog consults per event, so a
-	// reload swaps it without locks and in-flight events race only to the
-	// old/new boundary, never around a mutex. The poller is seeded with the
-	// exact bytes loaded above: its hash baseline is the boot content, not a
-	// fresh read of a file that may have changed in between.
-	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, func(next *config.Snapshot) {
-		zerolog.SetGlobalLevel(next.LogLevel())
-		log.Debug().Uint64("generation", next.Gen()).
-			Str("log_level", next.LogLevel().String()).Msg("log_level_applied")
-	}).Run(ctx)
+	// onPublish applies the reloaded snapshot's log level process-wide and
+	// acknowledges it at the new level (config.LogLevelHook): the global
+	// level is an atomic int32 that zerolog consults per event, so a reload
+	// swaps it without locks and in-flight events race only to the old/new
+	// boundary, never around a mutex. The poller is seeded with the exact
+	// bytes loaded above: its hash baseline is the boot content, not a fresh
+	// read of a file that may have changed in between.
+	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, config.LogLevelHook(log)).Run(ctx)
 
 	err = server.New(store, b.Listen, b.ShutdownGrace, log).Run(ctx)
 	// Ignore before announcing the drain done: from the instant Run returns

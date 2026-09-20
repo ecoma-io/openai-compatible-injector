@@ -11,6 +11,31 @@ import (
 // logging section.
 const DefaultLogLevel = zerolog.InfoLevel
 
+// LogLevelHook returns the poller's onPublish hook that applies each
+// published snapshot's log level process-wide and acknowledges the change.
+//
+// The ack is emitted after the global level swaps, at the new level — the
+// only severity guaranteed visible under the level it announces. zerolog
+// drops events below the global level, so an ack emitted at a fixed
+// severity would vanish on exactly the transitions an operator needs
+// confirmed: anything->error drops an info or warn ack, warn->info drops a
+// debug ack. config_reloaded (logged before the swap, at info) is likewise
+// suppressed while the old level is warn or above — with the ack at the new
+// level, every successful transition still yields at least one visible
+// confirmation. previous_level names what the swap replaced, so the full
+// transition reads from one line.
+func LogLevelHook(log zerolog.Logger) func(*Snapshot) {
+	return func(next *Snapshot) {
+		prev := zerolog.GlobalLevel()
+		zerolog.SetGlobalLevel(next.LogLevel())
+		log.WithLevel(next.LogLevel()).
+			Uint64("generation", next.Gen()).
+			Str("previous_level", prev.String()).
+			Str("log_level", next.LogLevel().String()).
+			Msg("log_level_applied")
+	}
+}
+
 // ParseLogLevel maps the runtime file's logging.level value onto a zerolog
 // level. Accepted (case-insensitive, surrounding whitespace ignored):
 // debug, info, warn, warning (alias for warn), error; empty selects the
