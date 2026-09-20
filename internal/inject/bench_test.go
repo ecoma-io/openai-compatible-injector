@@ -58,7 +58,7 @@ func BenchmarkProbe(b *testing.B) {
 			b.ResetTimer()
 			b.SetBytes(int64(len(body)))
 			for i := 0; i < b.N; i++ {
-				Probe(body)
+				_, _, _ = Probe(body)
 			}
 		})
 	}
@@ -67,7 +67,7 @@ func BenchmarkProbe(b *testing.B) {
 		b.ResetTimer()
 		b.SetBytes(int64(len(invalid)))
 		for i := 0; i < b.N; i++ {
-			Probe(invalid)
+			_, _, _ = Probe(invalid)
 		}
 	})
 }
@@ -81,7 +81,7 @@ func BenchmarkChat(b *testing.B) {
 			b.ResetTimer()
 			b.SetBytes(int64(len(body)))
 			for i := 0; i < b.N; i++ {
-				Chat(body, m)
+				_, _ = Chat(body, m)
 			}
 		})
 	}
@@ -96,7 +96,7 @@ func BenchmarkResponses(b *testing.B) {
 			b.ResetTimer()
 			b.SetBytes(int64(len(body)))
 			for i := 0; i < b.N; i++ {
-				Responses(body, m)
+				_, _ = Responses(body, m)
 			}
 		})
 	}
@@ -197,7 +197,7 @@ func TestRewriteModelAllocBudget(t *testing.T) {
 		singleAllocs = 7
 	)
 
-	if got := testing.AllocsPerRun(5000, func() { Probe(small) }); got > probeAllocs {
+	if got := testing.AllocsPerRun(5000, func() { _, _, _ = Probe(small) }); got > probeAllocs {
 		t.Errorf("Probe allocations = %.2f/op, want <= %d", got, probeAllocs)
 	}
 	if got := testing.AllocsPerRun(5000, func() { RewriteModel(noModel, "public-name") }); got > noModelAllocs {
