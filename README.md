@@ -259,7 +259,10 @@ live stream with correct per-chunk latency. Behavior:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses
     termination events are part of the protocol and pass through untouched.
-- Only `data:` lines whose JSON contains a model string are rewritten.
+- Only `data:` lines whose JSON carries an in-scope `model` string value are
+  rewritten — the top-level key (and, for responses, the envelope's
+  `response.model`). Model text appearing anywhere else in the payload — a
+  substring of a message, another field's value — never matches.
   `event:`, comments, and non-model `data:` lines pass through verbatim.
 - Malformed lines are forwarded verbatim. We are a passthrough, not an SSE
   validator.
@@ -466,7 +469,7 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
   copying, and server shutdown ordering.
 - **E2E suite** (`e2e/`) drives the real binary as a subprocess against
   in-process fake upstreams: forwarding, injection, streaming, hot reload,
-  drain, startup failures, plane violations. Everything needs is Go —
+  drain, startup failures, plane violations. Everything it needs is Go —
   no Docker required:
 
   ```sh
@@ -511,8 +514,11 @@ Decided, and not coming back without a design discussion:
 - **Per-request overrides** of prompt or upstream model — the mapping is
   static per public name; a request field that changes forwarding is a
   footgun.
-- **Non-HTTPS(S) upstreams, proxies, TLS config** — endpoints verify chain
-  and host with system roots; no `insecure-skip-verify`.
+- **Proxy and TLS configuration** — upstream connections follow the standard
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables (inherited
+  from `net/http`'s default transport) and verify chain and host with
+  system roots; custom TLS setup (client certificates, custom CA pools,
+  `insecure-skip-verify`) is not coming.
 - **Authz on the inbound side** — requests are forwarded as received; the
   service is not an identity boundary.
 
