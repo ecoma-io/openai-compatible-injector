@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"syscall"
 	"testing"
@@ -24,11 +25,12 @@ func shutdownEvent(t *testing.T, p *proc, msg string) map[string]any {
 	return nil
 }
 
-// TestSecondSignalForcesExitOne: a request is in flight (upstream blocked) so
-// the drain cannot finish; a second SIGTERM must force an immediate exit 1
-// with the second_signal_forced_exit event — before the grace deadline, not
-// after it.
-func TestSecondSignalForcesExitOne(t *testing.T) {
+// secondSignalForcesExitOne is the shared body of the force-exit pins: a
+// request is in flight (upstream blocked) so the drain cannot finish; a
+// second delivery of sig must force an immediate exit 1 with the
+// second_signal_forced_exit event — before the grace deadline, not after it.
+func secondSignalForcesExitOne(t *testing.T, sig os.Signal) {
+	t.Helper()
 	up := newFakeUpstream(t)
 	received := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -59,9 +61,9 @@ func TestSecondSignalForcesExitOne(t *testing.T) {
 	}()
 	<-received
 
-	p.signal(syscall.SIGTERM)
+	p.signal(sig)
 	time.Sleep(200 * time.Millisecond)
-	p.signal(syscall.SIGTERM) // second signal: force exit
+	p.signal(sig) // second signal: force exit
 
 	start := time.Now()
 	code, err := p.waitExit(t, 4*time.Second)
@@ -80,6 +82,39 @@ func TestSecondSignalForcesExitOne(t *testing.T) {
 		t.Fatalf("second_signal_forced_exit event missing; stderr:\n%s", p.stderr.String())
 	}
 	<-done
+}
+
+// TestSecondSignalForcesExitOne pins the force exit on the SIGTERM half of
+// the registration.
+func TestSecondSignalForcesExitOne(t *testing.T) {
+	secondSignalForcesExitOne(t, syscall.SIGTERM)
+}
+
+// TestSecondInterruptForcesExitOne pins the SIGINT half. Every other
+// shutdown test drives SIGTERM; without this, dropping os.Interrupt from the
+// Notify registration would ship green.
+func TestSecondInterruptForcesExitOne(t *testing.T) {
+	secondSignalForcesExitOne(t, syscall.SIGINT)
+}
+
+// TestInterruptWhileIdleExitsZero: SIGINT with nothing in flight is a plain
+// clean stop — same exit code, same shutdown_complete trail as SIGTERM.
+func TestInterruptWhileIdleExitsZero(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(jsonChatHandler(chatUpstream))
+	p := startSubprocess(t, startOpts{
+		yaml:     runtimeYAML(chatPublic, up.url()+"/v1", chatUpstream, ""),
+		logLevel: "info",
+		grace:    "3s",
+	})
+
+	p.signal(syscall.SIGINT)
+	if code, err := p.waitExit(t, 8*time.Second); err != nil || code != 0 {
+		t.Fatalf("SIGINT while idle: code=%d err=%v", code, err)
+	}
+	if shutdownEvent(t, p, "shutdown_complete") == nil {
+		t.Errorf("shutdown_complete missing after SIGINT; stderr:\n%s", p.stderr.String())
+	}
 }
 
 // TestShutdownLifecycleEvents pins the event trail of a clean stop at a level

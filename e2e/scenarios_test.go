@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -554,6 +555,27 @@ func TestMissingConfigFileStartup(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "config") {
 		t.Fatalf("startup error should mention the config file:\n%s", stderr)
+	}
+}
+
+// Scenario 26: listen failure — a listen address that is already bound fails
+// the startup with exit 1 and a server_failed event; the process never sits
+// silently half-started.
+func TestListenFailureExitsOne(t *testing.T) {
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind blocker listener: %v", err)
+	}
+	defer func() { _ = blocker.Close() }()
+	code, stderr := startSubprocessExpectExit(t, startOpts{
+		yaml:   runtimeYAML(chatPublic, "http://127.0.0.1:1/v1", chatUpstream, ""),
+		listen: blocker.Addr().String(),
+	})
+	if code != 1 {
+		t.Fatalf("startup with an occupied listen address exited %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "server_failed") {
+		t.Fatalf("server_failed event missing from listen failure:\n%s", stderr)
 	}
 }
 
