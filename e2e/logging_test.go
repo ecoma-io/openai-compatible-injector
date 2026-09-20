@@ -209,8 +209,11 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 	if p.cmd.Process.Pid != pid {
 		t.Fatal("process PID changed — the level was not hot-reloaded but restarted")
 	}
-	if got := len(completions(4)); got != 4 {
-		t.Fatalf("request_completed events = %d, want 4 (every request answered)", got)
+	// The debug-wait loop above may post one extra request while stderr lags,
+	// so the bound is "at least one completion per request" — never an exact
+	// count. Fewer than four means a request was dropped.
+	if got := len(completions(4)); got < 4 {
+		t.Fatalf("request_completed events = %d, want >= 4 (every request answered)", got)
 	}
 }
 

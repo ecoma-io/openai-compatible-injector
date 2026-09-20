@@ -537,9 +537,12 @@ func TestPlaneViolationListenKey(t *testing.T) {
 	if code == 0 {
 		t.Fatal("startup with plane-violating config exited 0, want nonzero")
 	}
-	if !strings.Contains(stderr, "listen") {
-		t.Fatalf("startup error must mention the offending key 'listen':\n%s", stderr)
+	if !strings.Contains(stderr, "unknown top-level key") {
+		t.Fatalf("startup error must name the violation class:\n%s", stderr)
 	}
+	// The key itself is never echoed: a paste into a key position can carry
+	// credentials just as well as a value, and the fatal reaches logs
+	// verbatim.
 }
 
 // Scenario 25: missing config file at startup -> nonzero exit.
