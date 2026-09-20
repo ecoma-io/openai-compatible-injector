@@ -12,11 +12,12 @@ import (
 )
 
 // runtime file schema. Strictness has two layers: top-level keys are
-// validated against the raw YAML (only "models" is legal — this is what
-// keeps the bootstrap plane out of the runtime file: listen, config file,
-// poll interval, ... any file that tries to define them fails validation,
-// whatever their value's shape), and a KnownFields strict decode rejects
-// unknown keys inside each model entry.
+// validated against the raw YAML (only "models" and "logging" are legal —
+// this is what keeps the bootstrap plane out of the runtime file: listen,
+// config file, poll interval, ... any file that tries to define them fails
+// validation, whatever their value's shape), and a KnownFields strict decode
+// rejects unknown keys inside each model entry and inside the logging
+// section.
 //
 // The models table is decoded with yaml.v3 directly, never through viper:
 // viper's map normalization lowercases every key and flattens dotted names,
@@ -26,7 +27,15 @@ import (
 // written and matches entry fields case-sensitively.
 
 type runtimeFile struct {
-	Models map[string]runtimeModel `yaml:"models"`
+	Models  map[string]runtimeModel `yaml:"models"`
+	Logging runtimeLogging          `yaml:"logging"`
+}
+
+// runtimeLogging mirrors the optional logging section. Absent or null
+// selects the default level; the level string itself is validated by
+// ParseLogLevel.
+type runtimeLogging struct {
+	Level string `yaml:"level"`
 }
 
 type runtimeModel struct {
@@ -49,7 +58,7 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	for k := range raw {
-		if k != "models" {
+		if k != "models" && k != "logging" {
 			return nil, fmt.Errorf("decode config: unknown top-level key %q", k)
 		}
 	}
@@ -94,7 +103,12 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, errors.New("models: at least one model is required")
 	}
 
-	return &Snapshot{models: models}, nil
+	level, err := ParseLogLevel(rf.Logging.Level)
+	if err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+
+	return &Snapshot{models: models, logLevel: level}, nil
 }
 
 func buildModel(name string, rm runtimeModel) (Model, error) {

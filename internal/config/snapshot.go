@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/url"
 	"sync/atomic"
+
+	"github.com/rs/zerolog"
 )
 
 // Model is one validated public-model mapping. It is immutable after the
@@ -25,13 +27,19 @@ type Model struct {
 // Snapshot for its whole lifetime, so a reload mid-request cannot change the
 // endpoint, model, or prompt that request is using.
 type Snapshot struct {
-	gen    uint64
-	models map[string]Model
+	gen      uint64
+	models   map[string]Model
+	logLevel zerolog.Level
 }
 
 // Gen returns the snapshot's generation number (0 for the initial snapshot,
 // incremented on every successful reload).
 func (s *Snapshot) Gen() uint64 { return s.gen }
+
+// LogLevel returns the log level this snapshot carries. It is applied to the
+// process-wide logger when the snapshot is published, making the level
+// hot-reloadable through the same content-hash poll as everything else.
+func (s *Snapshot) LogLevel() zerolog.Level { return s.logLevel }
 
 // Model resolves a public model name. The second return value reports
 // whether the model exists.
@@ -48,6 +56,10 @@ func (s *Snapshot) Models() map[string]Model {
 	}
 	return out
 }
+
+// Len returns the number of models in the table without copying it —
+// the cheap form used by reload logging.
+func (s *Snapshot) Len() int { return len(s.models) }
 
 // Store holds the currently active Snapshot behind an atomic pointer. The
 // reload loop is the only publisher; every request is a reader.
