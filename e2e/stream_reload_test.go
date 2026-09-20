@@ -65,6 +65,16 @@ func chatStreamRequest(model string) string {
 func TestChatStreamIncremental(t *testing.T) {
 	up := newFakeUpstream(t)
 	gate := make(chan struct{})
+	// A failed assertion must not leave the upstream handler blocked on the
+	// gate forever: httptest.Server.Close waits for it, and with it the
+	// whole test binary.
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
 	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -308,6 +318,16 @@ func TestActiveStreamSurvivesReload(t *testing.T) {
 	upB := newFakeUpstream(t)
 	chunk1Sent := make(chan struct{})
 	gate := make(chan struct{})
+	// A failed assertion must not leave the upstream handler blocked on the
+	// gate forever: httptest.Server.Close waits for it, and with it the
+	// whole test binary.
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
 	var once sync.Once
 	upA.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -618,5 +638,99 @@ func TestActiveStreamPromptBoundToOldSnapshot(t *testing.T) {
 	}
 	if n := upB.count(); n != 0 {
 		t.Fatalf("B saw %d requests after completion, want 0", n)
+	}
+}
+
+// TestResponsesStreamIncremental pins the pass-through contract on the
+// Responses surface — the deterministic protocol regression for stream
+// buffering, mirroring TestChatStreamIncremental. The upstream writes one
+// envelope event, flushes it, and then holds the stream open on a gate; the
+// test only opens the gate after the client has read that first event. A
+// pass-through relay (CopySSE writing and flushing at the event boundary)
+// delivers the event while the upstream is still holding; an accidentally
+// buffering relay can deliver nothing until the stream completes — which
+// never happens — so the read times out and fails. The 3s deadline is not a
+// timing threshold: under the buffering failure mode the event arrives at
+// never, so any nonzero deadline detects it with certainty, and under
+// pass-through the event is already in the client's buffer microseconds
+// after the flush. The gate's cleanup close keeps a failed assertion from
+// wedging the whole binary inside httptest.Server.Close.
+func TestResponsesStreamIncremental(t *testing.T) {
+	up := newFakeUpstream(t)
+	gate := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
+	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		for i := 0; i < 3; i++ {
+			_, _ = fmt.Fprintf(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"response\":{\"model\":\"%s\"},\"delta\":\"d%d\"}\n\n", respUpstream, i)
+			fl.Flush()
+			if i == 0 {
+				<-gate // hold the remaining events until the client has read event 1
+			}
+		}
+	})
+	p := startSubprocess(t, startOpts{
+		yaml: runtimeYAML(respPublic, up.url()+"/v1", respUpstream, ""),
+	})
+
+	resp := openJSON(t, p.addr, "/v1/responses",
+		`{"model":"resp-public","input":"hi","stream":true}`,
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	// Event 1 must arrive while the upstream is still blocked on the gate.
+	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	if eof {
+		t.Fatal("stream ended before the first response event")
+	}
+	assertResponsesEnvelopeModel(t, lines, respPublic)
+
+	close(gate)
+	for i := 1; i < 3; i++ {
+		lines, eof = nextSSEEvent(t, br, 3*time.Second)
+		if eof {
+			t.Fatalf("stream ended before event %d", i+1)
+		}
+		assertResponsesEnvelopeModel(t, lines, respPublic)
+	}
+}
+
+// assertResponsesEnvelopeModel checks that a Responses envelope event's data
+// line rewrites response.model to the public name.
+func assertResponsesEnvelopeModel(t *testing.T, lines []string, wantModel string) {
+	t.Helper()
+	type envelope struct {
+		Response *struct {
+			Model string `json:"model"`
+		} `json:"response"`
+	}
+	found := false
+	for _, ln := range lines {
+		if !strings.HasPrefix(ln, "data:") {
+			continue
+		}
+		var ev envelope
+		if err := json.Unmarshal([]byte(sseDataContent(t, ln)), &ev); err != nil {
+			t.Fatalf("envelope %q not JSON: %v", ln, err)
+		}
+		if ev.Response == nil {
+			continue
+		}
+		if ev.Response.Model != wantModel {
+			t.Fatalf("response.model = %q, want %q (line %q)", ev.Response.Model, wantModel, ln)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("no data line with a response object in event %q", lines)
 	}
 }
