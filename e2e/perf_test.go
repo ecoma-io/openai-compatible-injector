@@ -53,7 +53,7 @@ func newPerfUpstream(b *testing.B, bodySize, streamEvents int) *perfUpstream {
 		u.hits.Add(1)
 		if u.streamEvents == 0 {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"id":"p","model":"up-name","choices":[{"message":{"role":"assistant","content":"%s"}}]}`, pad)
+			_, _ = fmt.Fprintf(w, `{"id":"p","model":"up-name","choices":[{"message":{"role":"assistant","content":"%s"}}]}`, pad)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -97,31 +97,6 @@ func benchmarkArm(b *testing.B, u *perfUpstream, arm string) string {
 	default:
 		b.Fatalf("unknown arm %q", arm)
 		return ""
-	}
-}
-
-// waitHealthB polls /healthz for the benchmark-started process.
-func waitHealthB(b *testing.B, p *proc, timeout time.Duration) {
-	b.Helper()
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	deadline := time.Now().Add(timeout)
-	for {
-		resp, err := client.Get("http://" + p.addr + "/healthz")
-		if err == nil {
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && string(body) == "ok\n" {
-				return
-			}
-		}
-		select {
-		case <-p.done:
-			b.Fatalf("subprocess exited before healthz ready; stderr:\n%s", p.stderr.String())
-		case <-time.After(50 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			b.Fatalf("healthz not ready within %v", timeout)
-		}
 	}
 }
 
