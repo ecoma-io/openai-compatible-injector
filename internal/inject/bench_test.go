@@ -2,6 +2,7 @@ package inject
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -72,6 +73,14 @@ func BenchmarkProbe(b *testing.B) {
 	})
 }
 
+// BenchmarkChat measures the buffered chat transform. A reconciliation
+// trap for anyone reading the recorded numbers: BenchmarkChat/large_64KB
+// (~1.2ms, ~283KB allocated per op) exceeds the ENTIRE measured e2e
+// injector-vs-direct delta at that size (~0.5ms) — a tight-loop artifact
+// where every iteration allocates before the GC can keep up. The e2e
+// harness (e2e/perf_test.go) varies the upstream RESPONSE size, not the
+// request, and runs an empty injection prompt, so its arms measure a
+// different path; the two numbers are not expected to agree.
 func BenchmarkChat(b *testing.B) {
 	m := benchModel()
 	for _, tc := range benchSizes() {
@@ -208,4 +217,38 @@ func TestRewriteModelAllocBudget(t *testing.T) {
 	if got := testing.AllocsPerRun(5000, func() { RewriteModel(single, "public-name") }); got > singleAllocs {
 		t.Errorf("RewriteModel single-span allocations = %.2f/op, want <= %d", got, singleAllocs)
 	}
+
+	// Count-only budgets cannot see size amplification: the alloc count is
+	// constant while bytes scale with the body, so a per-byte allocation
+	// factory with a constant count would pass the checks above. The
+	// ceilings pin bytes/op at the 4KB fixture (measured 2026-09-20:
+	// Probe 4,955 B/op — roughly the decode copy; Chat 19,250 B/op — decode,
+	// re-marshal, and raw-value copies).
+	const (
+		probe4KiBBytes = 6000
+		chat4KiBBytes  = 24000
+	)
+	body4k := chatBody(4 << 10)
+	if got := bytesPerRun(2000, func() { _, _, _ = Probe(body4k) }); got > probe4KiBBytes {
+		t.Errorf("Probe bytes at 4KB = %d/op, want <= %d", got, probe4KiBBytes)
+	}
+	m := benchModel()
+	if got := bytesPerRun(1000, func() { _, _ = Chat(body4k, m) }); got > chat4KiBBytes {
+		t.Errorf("Chat bytes at 4KB = %d/op, want <= %d", got, chat4KiBBytes)
+	}
+}
+
+// bytesPerRun returns bytes allocated per op, measured as the TotalAlloc
+// delta over n runs after a warmup op. TotalAlloc is cumulative and exact
+// for a deterministic allocation pattern — GC activity never reduces it —
+// so the quotient is stable where wall-clock timings are not.
+func bytesPerRun(n int, op func()) uint64 {
+	op()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < n; i++ {
+		op()
+	}
+	runtime.ReadMemStats(&after)
+	return (after.TotalAlloc - before.TotalAlloc) / uint64(n)
 }
