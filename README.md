@@ -69,6 +69,7 @@ Division of responsibility:
 | ----------------------------------------------------------------- | ----------------------- |
 | `LISTEN`, `CONFIG_FILE`, `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE` | Environment (bootstrap) |
 | `models.<name>.{endpoint,upstream-model,injection-prompt}`        | YAML file (runtime)     |
+| `logging.level`                                                   | YAML file (runtime)     |
 
 ### Bootstrap environment
 
@@ -78,7 +79,12 @@ Division of responsibility:
 | `CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled            |
 | `CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                    |
 | `SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed |
-| `LOG_LEVEL`            | `info`                | `debug`, `info`, `warn`, `error` (JSON logs to stderr)             |
+
+There is no `LOG_LEVEL` environment variable — it was removed together with
+the introduction of `logging.level` in the runtime file, which hot-reloads.
+The runtime file is mandatory at boot, so an environment override had no
+window in which it could take effect; one setting has exactly one source of
+truth.
 
 ### Runtime YAML
 
@@ -93,6 +99,9 @@ models:
   echo-model:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
+
+logging:
+  level: info # optional; debug | info | warn | warning | error (absent = info)
 ```
 
 - `endpoint` — base URL of the upstream provider. Scheme `http` or `https`
@@ -105,14 +114,15 @@ models:
 
 The file is validated strictly, in two layers:
 
-- **Top-level keys** are checked against the raw YAML: only `models` is
-  legal. This is the bootstrap-plane rule — a file that tries to define
-  `listen`, `config-file`, `config-poll-interval` or `shutdown-grace` is
-  rejected whatever its value's shape (a strict struct decode alone misses
-  a bootstrap key whose value is an empty map).
-- **Model entries** are decoded strictly (`yaml.v3` with known fields):
-  any key outside `endpoint`, `upstream-model`, `injection-prompt` —
-  including a nested bootstrap key — is a rejection, not a warning.
+- **Top-level keys** are checked against the raw YAML: only `models` and
+  `logging` are legal. This is the bootstrap-plane rule — a file that tries
+  to define `listen`, `config-file`, `config-poll-interval` or
+  `shutdown-grace` is rejected whatever its value's shape (a strict struct
+  decode alone misses a bootstrap key whose value is an empty map).
+- **Model entries and the logging section** are decoded strictly (`yaml.v3`
+  with known fields): any key outside `endpoint`, `upstream-model`,
+  `injection-prompt` — including a nested bootstrap key — is a rejection,
+  not a warning, and so is any key inside `logging` other than `level`.
 
 The `models` table itself must contain at least one model. An empty table is
 rejected — an empty file is what a truncate-then-write config edit looks
@@ -140,6 +150,13 @@ Semantics that hold:
   applies to reloads, because at boot there is no last-known-good.
 - **Unchanged file, no churn.** If the content hash is stable, nothing is
   republished; the generation number is stable too.
+- **The log level hot-reloads with everything else.** `logging.level` rides
+  the same validate-then-publish path as the model mappings: a valid reload
+  applies the new level process-wide without a restart, a restart, or any
+  signal; an invalid `level` value rejects the whole file onto the
+  last-known-good path. The level swap is an atomic store zerolog consults
+  per event, so in-flight requests race only the old/new boundary and never
+  block.
 - **Atomic replace caveat.** The poller watches the file's content, and reads
   it by path; tools that replace a file by `mv`/rename (editor safe-save)
   swap in a new inode the read still follows — but if the process opened the
@@ -283,6 +300,47 @@ them would make a 429 indistinguishable from any other upstream failure.
   silently ignore part of the configured endpoint). An endpoint's query
   string is preserved and sent with every request — that is how providers
   that authenticate via query parameter (e.g. `api-version`) work.
+
+## Logging
+
+JSON lines on stderr only (zerolog; stdout is never written). Every line is
+machine-parseable and carries `level`, `time`, and a stable snake_case
+`message` slug. Levels are `debug`, `info`, `warn` (the runtime file also
+accepts the spelling `warning`), and `error`, defaulting to `info`; the
+level is hot-reloadable through `logging.level` (see Hot reload).
+
+What each level carries:
+
+- **DEBUG** — request lifecycle detail: `request_received`
+  (method/path/remote address), `stream_started`, `stream_completed`,
+  `config_unchanged` and the poller's per-tick heartbeat while a failure
+  persists. Detailed but never payload-bearing: request bodies, SSE
+  `data:` payloads, and injection prompts do not exist at this level — or
+  at any level.
+- **INFO** — one `request_completed` per proxied request with the wire
+  facts: `request_id` (16 hex chars, generated per request), `api`
+  (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,
+  `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
+  snapshot generation the request bound to — correlating reloads with
+  behavior). Also `config_reloaded` (`generation`, `model_count`,
+  `log_level`), reload acknowledgments, `service_started`, and
+  `drain_started`.
+- **WARN** — client disconnects and truncations (`stream_truncated` with a
+  `phase` field separating `client_write` from `upstream_read`), a client
+  that cancels mid-request, one warning per transition into a failed config
+  state (`config_file_unreadable`, `config_reload_rejected`) — never one
+  per poll tick — plus `second_signal_forced_exit` and drain overflow.
+- **ERROR** — upstream connection failures (`upstream_request_failed` with
+  an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial`),
+  unparseable upstream responses, and anything fatal at startup.
+
+The credential rule is absolute: no log line, at any level, ever contains
+an `Authorization` value, a request or response body, an injection prompt,
+or upstream URL detail beyond scheme+host. Endpoint query strings (which
+providers use for API keys) survive even a dial failure's error text —
+errors are sanitized before logging. The planted-secret E2E suite
+(`TestLoggingNeverLeaksSecrets`) holds this rule under success, streaming,
+rejection, dial-failure, and verbatim-echo traffic at maximum verbosity.
 
 ## Healthcheck
 

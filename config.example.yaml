@@ -45,3 +45,12 @@ models:
   echo-model:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
+
+# Optional. The log level, hot-reloadable like everything else in this
+# file: change it here and the running process picks it up on the next
+# poll, no restart and no signal. One of debug | info | warn | warning |
+# error (warning is an alias for warn); absent selects info. There is no
+# LOG_LEVEL environment variable — this section is the single source of
+# truth.
+logging:
+  level: info

@@ -37,6 +37,10 @@ pull request. A document that lags the code is a defect, not a follow-up.
 | `go test -race ./...`                                                                                              | The full suite, including the black-box E2E tests                                                              |
 | `go test -short -race ./...`                                                                                       | Unit only — the E2E suite skips itself under `-short`                                                          |
 | `go test ./e2e/`                                                                                                   | Just the black-box suite: the real binary as a subprocess against in-process fake upstreams (no Docker needed) |
+| `go test ./e2e/ -run '^$' -bench BenchmarkThroughput -benchtime 2s`                                                | End-to-end throughput: injector vs the direct-upstream baseline, sizes, levels, stream lengths                 |
+| `go test ./e2e/ -run '^$' -bench BenchmarkLatencyPercentiles -benchtime 1x`                                        | p50/p95/p99 over a fixed 1000-request sample through the running binary                                        |
+| `go test ./internal/... -run '^$' -bench . -benchtime 1s`                                                          | Micro-benchmarks (Probe, transforms, rewrite, SSE) with ns/op, B/op and allocs/op                              |
+| `go test -fuzz FuzzRewriteModel -fuzztime 30s ./internal/inject/`                                                  | A 30-second fuzz run (also: `FuzzProbe`, `FuzzRewriteSSELine`, `FuzzLoadRuntime`)                              |
 | `go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector ./cmd/openai-compatible-injector` | Build the binary                                                                                               |
 | `pnpm format` / `pnpm format:check`                                                                                | Prettier over the docs, workflows, and config files                                                            |
 
