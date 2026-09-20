@@ -73,12 +73,12 @@ Division of responsibility:
 
 ### Bootstrap environment
 
-| Variable               | Default               | Meaning                                                            |
-| ---------------------- | --------------------- | ------------------------------------------------------------------ |
-| `LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)   |
-| `CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled            |
-| `CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                    |
-| `SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed |
+| Variable               | Default               | Meaning                                                                                                                                                                 |
+| ---------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                        |
+| `CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled                                                                                                                 |
+| `CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                                                                                                                         |
+| `SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain) |
 
 There is no `LOG_LEVEL` environment variable — it was removed together with
 the introduction of `logging.level` in the runtime file, which hot-reloads.
@@ -360,16 +360,18 @@ What each level carries:
   upstream model, upstream scheme+host origin), `request_transform_started`/
   `request_transform_completed` (byte counts around prompt injection),
   `upstream_request_started` (origin + forwarded byte count),
-  `upstream_response_received` (upstream status + content type),
+  `upstream_response_received` (upstream status + content type). From there
+  the lifecycle forks: a buffered response continues with
   `response_transform_started`/`response_transform_completed` (byte counts
-  around the model rewrite), `client_write_completed`; streamed responses
-  add `stream_started`, periodic `stream_event_progress` heartbeats
-  (running event/byte counts, one every 256 dispatched events — a stuck
-  stream shows up as a heartbeat that stops advancing), and
-  `stream_completed`. Plus `config_unchanged` and the poller's per-tick
-  heartbeat while a failure persists. Detailed but never payload-bearing:
-  request bodies, SSE `data:` payloads, and injection prompts do not exist
-  at this level — or at any level.
+  around the model rewrite) and `client_write_completed`; a streamed
+  response instead emits `stream_started`, periodic
+  `stream_event_progress` heartbeats (running event/byte counts, one every
+  256 dispatched events — a stuck stream shows up as a heartbeat that
+  stops advancing), and `stream_completed`. Plus the poller's per-tick
+  debug heartbeat while a config failure persists (the healthy unchanged
+  state logs nothing at all). Detailed but never payload-bearing: request
+  bodies, SSE `data:` payloads, and injection prompts do not exist at this
+  level — or at any level.
 - **INFO** — one `request_completed` per proxied request with the wire
   facts: `request_id` (16 hex chars, generated per request), `api`
   (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,
@@ -384,9 +386,13 @@ What each level carries:
   `listener_ready`), and `drain_started`.
 - **WARN** — client disconnects and truncations (`stream_truncated` with a
   `phase` field separating `client_write` from `upstream_read` and
-  `upstream_limit`, and `relay_copy_failed` with the same `phase` values on
-  the verbatim path), a buffered body that never landed
-  (`client_write_failed`, outcome `client_disconnected`), an upstream that
+  `upstream_limit`, and `relay_copy_failed` with phase `client_write` on
+  the verbatim and buffered paths — the buffered case covers a client whose
+  cancel surfaces through the upstream body read, with no envelope written
+  to the connection that is already gone), a response that never landed because the client was
+  already gone — a buffered body or any locally generated error envelope
+  (`client_write_failed`, outcome `client_disconnected`, superseding the
+  envelope's own classification), an upstream that
   died mid-body before the answer could be parsed
   (`upstream_body_read_failed`, outcome `upstream_read_failed`), a client
   that cancels mid-request — including while the upstream request is in
@@ -398,8 +404,13 @@ What each level carries:
   plus `second_signal_forced_exit` and drain overflow.
 - **ERROR** — upstream connection failures (`upstream_request_failed` with
   an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial` —
-  never `client_canceled`, which is the WARN disconnect above),
-  unparseable upstream responses, and anything fatal at startup.
+  never `client_canceled`, which is the WARN disconnect above) and an
+  upstream that died mid-relay on the verbatim path (`relay_copy_failed`
+  with phase `upstream_read` — the one relay failure that is not a
+  disconnect), plus anything fatal at startup. A 200 that is not
+  parseable JSON is not an event of its own: it surfaces only as the
+  `upstream_invalid_response` outcome on the INFO completion line, with
+  the 502 envelope on the wire.
 
 The credential rule is absolute: no log line, at any level, ever contains
 an `Authorization` value, a request or response body, an injection prompt,
