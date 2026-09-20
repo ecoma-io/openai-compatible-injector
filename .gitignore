@@ -1,5 +1,8 @@
-/injector
-/dist/
+# Deployment runtime file — credentials and endpoint URLs; never committed.
+config.yaml
+bin/
+node_modules/
+.claude/
 *.test
 *.out
 coverage*

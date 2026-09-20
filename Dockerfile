@@ -1,0 +1,19 @@
+# Multi-stage build. Runtime stage is `scratch`: exactly one static binary
+# plus the CA bundle used to verify HTTPS upstream endpoints. No shell — the
+# Docker HEALTHCHECK works because `openai-compatible-injector healthcheck`
+# is a binary subcommand of the entrypoint itself.
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+COPY . .
+ARG VERSION=0.1.0-dev
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
+    -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /out/openai-compatible-injector ./cmd/openai-compatible-injector
+
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/openai-compatible-injector /app/openai-compatible-injector
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/app/openai-compatible-injector"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["/app/openai-compatible-injector", "healthcheck"]

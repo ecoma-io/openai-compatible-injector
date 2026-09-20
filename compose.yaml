@@ -1,0 +1,42 @@
+# Homelab deployment for openai-compatible-injector.
+# config.yaml is the Git-ignored runtime file at the repo root; copy
+# config.example.yaml to config.yaml first. Hot reload polls file content, so
+# editing config.yaml in place on the host applies without a restart. One
+# caveat of the single-file bind mount: replacing the file atomically (mv,
+# editor safe-save) splices in a new inode that the mount never follows —
+# edit in place, or restart the container after a replace.
+services:
+  injector:
+    build:
+      context: .
+      args:
+        VERSION: 0.1.0-dev
+    container_name: injector
+    ports:
+      - "8080:8080"
+    environment:
+      # Bootstrap-only settings: changes require a container restart.
+      LISTEN: :8080
+      CONFIG_FILE: /app/config.yaml
+      # Optional. The drain budget must stay below stop_grace_period so
+      # docker's SIGKILL never cuts it short.
+      # SHUTDOWN_GRACE: 45s
+      # CONFIG_POLL_INTERVAL: 1s
+    # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
+    # above the service's SHUTDOWN_GRACE (default 55s) plus a little margin
+    # so an active SSE stream gets its full drain before the kill.
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "/app/openai-compatible-injector", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
