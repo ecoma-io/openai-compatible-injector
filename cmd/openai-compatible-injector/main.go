@@ -123,15 +123,20 @@ func run() int {
 	defer stop()
 
 	// A second signal forces an immediate exit regardless of in-flight work.
-	// Wait for the first signal (ctx.Done) before arming: signal.Notify
-	// delivers every occurrence to every registered channel, so a channel
-	// registered up front would also catch the first signal and race the
-	// graceful shutdown.
+	// The watcher channel is registered NOW rather than after ctx.Done:
+	// between the first signal's cancel and a later registration, a second
+	// signal would reach only NotifyContext's channel, whose goroutine has
+	// already returned — swallowed, and the drain would run its full grace
+	// budget. Registered up front, every signal lands in this channel too;
+	// the first read (the signal that started the drain) is discarded and
+	// the second read forces the exit.
+	sig := make(chan os.Signal, 2)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
 	go func() {
 		<-ctx.Done()
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
+		<-sig // the signal that started the drain — discarded
+		<-sig // any second signal — force exit
 		log.Warn().Msg("second signal received; forcing exit")
 		os.Exit(1)
 	}()
