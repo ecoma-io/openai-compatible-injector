@@ -78,6 +78,38 @@ func TestCopySSERewritesModelOnlyInsideDataLines(t *testing.T) {
 	}
 }
 
+// TestCopySSERewriteSparesAdjacentNonDataLines pins the mix the other
+// rewrite tests keep apart: comment and event/id lines sandwiching data lines
+// that DO need rewriting. A rewrite that swallowed its surrounding lines —
+// dropping keep-alives or field lines — would corrupt exactly the streams
+// this proxy exists to relay.
+func TestCopySSERewriteSparesAdjacentNonDataLines(t *testing.T) {
+	input := ": keep-alive\n" +
+		"event: response.created\n" +
+		"data: {\"model\":\"upstream-name\"}\n" +
+		"id: 7\n" +
+		": ping\n" +
+		"data: {\"model\":\"upstream-name\"}\n" +
+		"event: response.done\n"
+	out, _ := copySSEOnce(t, input, "public-name")
+	want := strings.ReplaceAll(input, "upstream-name", "public-name")
+	if out != want {
+		t.Errorf("mixed-line event corrupted:\n got %q\nwant %q", out, want)
+	}
+}
+
+// TestCopySSESubstringModelNotRewritten pins the SSE half of the acceptance
+// rule: a parseable data line whose JSON merely CONTAINS the model text
+// inside a longer string value is not rewritten — only an exact top-level (or
+// Responses envelope) "model" string value matches.
+func TestCopySSESubstringModelNotRewritten(t *testing.T) {
+	input := "data: {\"messages\":[{\"content\":\"try upstream-name today\"}]}\n\n"
+	out, _ := copySSEOnce(t, input, "public-name")
+	if out != input {
+		t.Errorf("substring occurrence rewritten:\n got %q\nwant %q", out, input)
+	}
+}
+
 func TestCopySSEPreservesMissingSpaceSeparator(t *testing.T) {
 	input := "data:{\"model\":\"upstream-name\",\"a\":2}\n"
 	out, _ := copySSEOnce(t, input, "public-name")

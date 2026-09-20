@@ -71,6 +71,60 @@ func (c *countingRecorder) Flush() {
 	c.ResponseRecorder.Flush()
 }
 
+// TestQueryStringEncoding pins both halves of the query contract. The
+// client's query string is dropped: only the operator-configured endpoint
+// defines where the request goes, and a client-supplied `?api-key=` must
+// never travel — not to the configured upstream, and not into a URL this
+// proxy might otherwise log. The endpoint's OWN query is preserved verbatim:
+// query-authenticated providers configure their key there, on purpose.
+func TestQueryStringEncoding(t *testing.T) {
+	var gotQuery muquery
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery.set(r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"upstream-name","choices":[]}`))
+	}))
+	defer up.Close()
+
+	t.Run("client query dropped", func(t *testing.T) {
+		gotQuery.set("")
+		h := newTestHandler(t, newTestStore(t, up.URL+"/v1"))
+		rec := doRequest(t, h, http.MethodPost,
+			"/v1/chat/completions?api-key=CLIENT_SECRET&x=1",
+			`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if q := gotQuery.get(); q != "" {
+			t.Fatalf("upstream RawQuery = %q, want empty (client query must not travel)", q)
+		}
+	})
+
+	t.Run("endpoint query preserved", func(t *testing.T) {
+		gotQuery.set("")
+		h := newTestHandler(t, newTestStore(t, up.URL+"/v1?api-version=2024-02-01"))
+		rec := doRequest(t, h, http.MethodPost,
+			"/v1/chat/completions",
+			`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if q := gotQuery.get(); q != "api-version=2024-02-01" {
+			t.Fatalf("upstream RawQuery = %q, want the endpoint's configured query", q)
+		}
+	})
+}
+
+// muquery is a mutex-guarded string cell for the single-variable capture the
+// test above needs.
+type muquery struct {
+	mu sync.Mutex
+	v  string
+}
+
+func (q *muquery) set(v string) { q.mu.Lock(); q.v = v; q.mu.Unlock() }
+func (q *muquery) get() string  { q.mu.Lock(); defer q.mu.Unlock(); return q.v }
+
 // TestUpstreamFailureLogsRedactEndpoint pins the credential rule: a dial
 // failure against an endpoint whose query string carries a secret must not
 // put that secret — or the full URL — into logs, in any field. Only the

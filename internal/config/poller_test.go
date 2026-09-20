@@ -427,6 +427,74 @@ func TestPollerBootReadFailureDoesNotSpuriouslyRepublish(t *testing.T) {
 	}
 }
 
+// TestPollerRapidEditsConvergeToFinalContent pins the rapid-edit contract: a
+// content-hash poller observes file STATE at each tick, not write events, so
+// edits landing between two reads are collapsed. Whatever the interleaving,
+// once the writes have settled the poller must converge to the final content
+// and never wedge on an intermediate invalid file it may never see.
+func TestPollerRapidEditsConvergeToFinalContent(t *testing.T) {
+	valid := func(model string) string {
+		return `
+models:
+  gpt-reviewer:
+    endpoint: https://api.provider.example/v2
+    upstream-model: ` + model + `
+    injection-prompt: p
+`
+	}
+	t.Run("two valid edits collapse to the last", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		writeFile(t, path, valid("first"))
+
+		store := NewStore(mustSnapshot(t, valid("first")))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		p := NewPoller(store, path, []byte(valid("first")), 50*time.Millisecond, testLog(t), nil)
+		go p.Run(ctx)
+
+		time.Sleep(3 * 50 * time.Millisecond)
+		// Both writes land well inside one interval: the middle state
+		// ("second") may or may not ever be read.
+		writeFile(t, path, valid("second"))
+		writeFile(t, path, valid("third"))
+
+		waitUntil(t, 2*time.Second, func() bool {
+			m, _ := store.Load().Model("gpt-reviewer")
+			return m.UpstreamModel == "third"
+		}, "poller did not converge to the final content")
+		// Convergence is monotone: the generation only ever moved forward,
+		// and no further reload happens after the content has settled.
+		gen := store.Gen()
+		waitGenStable(t, store, gen, 200*time.Millisecond)
+	})
+
+	t.Run("invalid intermediate never wedges the poller", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		writeFile(t, path, valid("first"))
+
+		store := NewStore(mustSnapshot(t, valid("first")))
+		var buf syncBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		p := NewPoller(store, path, []byte(valid("first")), 50*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
+		go p.Run(ctx)
+
+		time.Sleep(3 * 50 * time.Millisecond)
+		// valid -> invalid -> valid: the broken state exists only inside one
+		// interval, so the poller may legitimately never observe it. Whether
+		// it does or not, the final valid content must win.
+		writeFile(t, path, "models: [unclosed\n")
+		writeFile(t, path, valid("final"))
+
+		waitUntil(t, 2*time.Second, func() bool {
+			m, _ := store.Load().Model("gpt-reviewer")
+			return m.UpstreamModel == "final"
+		}, "poller did not converge past a transient invalid file")
+	})
+}
+
 // TestPollerFailureKindSwitchWarns pins the failure-kind tracking: a file
 // that fails as invalid content and then fails as unreadable has produced a
 // NEW failure condition, which must warn again — a single failing bit would

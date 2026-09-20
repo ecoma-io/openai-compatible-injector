@@ -325,7 +325,10 @@ them would make a 429 indistinguishable from any other upstream failure.
   rejected too (a fragment is never sent to a server, so accepting one would
   silently ignore part of the configured endpoint). An endpoint's query
   string is preserved and sent with every request — that is how providers
-  that authenticate via query parameter (e.g. `api-version`) work.
+  that authenticate via query parameter (e.g. `api-version`) work. The
+  client's own query string, by contrast, is dropped: only the configured
+  endpoint defines where a request goes, and a client-supplied
+  `?api-key=` must never travel.
 
 ## Logging
 
