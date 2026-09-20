@@ -142,7 +142,6 @@ func run() int {
 	// a late duplicate into the shell's 143.
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sig)
 
 	drainDone := make(chan struct{})
 	go func() {
@@ -153,7 +152,16 @@ func run() int {
 			return
 		}
 		select {
-		case <-sig: // second signal: force exit before the grace budget
+		case <-sig:
+			// A duplicate forces exit only while the drain is still running.
+			// A select with two ready cases picks at random, so once the
+			// drain has finished, a buffered latecomer must lose
+			// deterministically instead of racing the exit code.
+			select {
+			case <-drainDone:
+				return
+			default:
+			}
 			log.Warn().Msg("second_signal_forced_exit")
 			os.Exit(1)
 		case <-drainDone: // the drain finished within grace
@@ -173,10 +181,15 @@ func run() int {
 	}).Run(ctx)
 
 	err = server.New(store, b.Listen, b.ShutdownGrace, log).Run(ctx)
-	close(drainDone)
-	// From here the process is committed to its exit code; a duplicate
-	// signal during teardown must not overwrite it.
+	// Ignore before announcing the drain done: from the instant Run returns
+	// the process is committed to its exit code, and a duplicate signal must
+	// fall on the ignored disposition, not the default handler's 143.
+	// Already-buffered signals stay readable in the channel, and the
+	// drain-wins check in the watcher makes them deterministic no-ops.
+	// signal.Stop is deliberately not deferred — it would re-arm the default
+	// disposition at return, briefly reopening exactly this window.
 	signal.Ignore(os.Interrupt, syscall.SIGTERM)
+	close(drainDone)
 	if err != nil {
 		log.Error().Err(err).Msg("server_failed")
 		return 1
