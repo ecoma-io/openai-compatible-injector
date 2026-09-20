@@ -57,7 +57,9 @@ func LoadBootstrap(env func(string) string) (Bootstrap, error) {
 	if v := env("CONFIG_POLL_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("CONFIG_POLL_INTERVAL: %w", err))
+			// time.ParseDuration quotes the raw input; error text reaches
+			// logs verbatim, so the value is not echoed (length only).
+			errs = append(errs, fmt.Errorf("CONFIG_POLL_INTERVAL is not a duration (%d characters; e.g. 500ms, 5s)", len(v)))
 		} else if d <= 0 {
 			errs = append(errs, errors.New("CONFIG_POLL_INTERVAL must be a positive duration"))
 		} else {
@@ -70,7 +72,7 @@ func LoadBootstrap(env func(string) string) (Bootstrap, error) {
 	if v := env("SHUTDOWN_GRACE"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE: %w", err))
+			errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE is not a duration (%d characters; e.g. 55s)", len(v)))
 		} else if d < 0 {
 			errs = append(errs, errors.New("SHUTDOWN_GRACE must not be negative"))
 		} else {

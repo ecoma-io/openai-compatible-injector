@@ -83,3 +83,24 @@ func TestLoadBootstrapErrors(t *testing.T) {
 		t.Errorf("joined error missing a field diagnosis: %s", joined)
 	}
 }
+
+// TestLoadBootstrapErrorsDoNotEchoValues pins the credential rule on the
+// bootstrap plane: env values are operator input too, and time.ParseDuration
+// quotes its raw input — which would carry a botched paste into the fatal
+// bootstrap_load_failed log. Only the value's length is reported.
+func TestLoadBootstrapErrorsDoNotEchoValues(t *testing.T) {
+	const marker = "SECRET_DURATION_PASTE"
+	_, err := LoadBootstrap(envOf(map[string]string{
+		"CONFIG_POLL_INTERVAL": marker,
+		"SHUTDOWN_GRACE":       "https://h/v1?" + marker + "=x",
+	}))
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("bootstrap error echoes the raw value: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "time:") {
+		t.Errorf("bootstrap error leaked the stdlib message (it quotes input): %q", err.Error())
+	}
+}
