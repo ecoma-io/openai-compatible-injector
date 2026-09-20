@@ -96,8 +96,14 @@ Owned decomposition:
 - 400 `invalid_request_error` — body not JSON, or missing `model`.
 - 404 `model_not_found` — exact shape
   `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`.
+  Interpolated names land byte-exact (no HTML escaping).
+- 404 `invalid_request_error` — unknown path (no route matched):
+  `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`.
+  OpenAI SDK clients always get parseable JSON, never the mux's plain text.
 - 502 `upstream_error` — `code: "upstream_unreachable"` on dial failure;
-  `code: "upstream_invalid_response"` on 200 + unparseable JSON.
+  `code: "upstream_invalid_response"` on 200 + unparseable JSON. A client
+  cancel while the upstream request is in flight is the WARN
+  `client_disconnected` outcome, never this 502.
 - Anything else from upstream (any 4xx/5xx) forwards verbatim.
 - No overall request timeout; upstream timeouts surface as 502.
 

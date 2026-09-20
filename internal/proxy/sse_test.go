@@ -350,3 +350,29 @@ func TestCopySSERejectsShortWrite(t *testing.T) {
 		t.Errorf("stats.Bytes = %d exceeds the accepted input", stats.Bytes)
 	}
 }
+
+// TestCopySSENilFlushStillCountsEvents pins that event accounting and the
+// per-event budget reset are boundary-driven, not flush-driven: a caller
+// that passes no flush still gets dispatched-event counts, and a second
+// large event after a boundary does not inherit the first event's budget —
+// a regression here would false-trip MaxEventBytes on healthy multi-event
+// streams for any future caller that relays without explicit flushing.
+func TestCopySSENilFlushStillCountsEvents(t *testing.T) {
+	// Two events of two ~900KiB lines each: every line under MaxLineBytes,
+	// every event under MaxEventBytes, but the two events TOGETHER over the
+	// event cap — so only a per-boundary reset relays the whole stream.
+	big := strings.Repeat("a", 900<<10)
+	line := "data: {\"x\":\"" + big + "\"}\n"
+	input := line + line + "\n" + line + line + "\n"
+	var buf bytes.Buffer
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), nil)
+	if err != nil {
+		t.Fatalf("CopySSE: %v (the per-event budget must reset at the boundary even without a flush)", err)
+	}
+	if stats.Events != 2 {
+		t.Errorf("stats.Events = %d, want 2 (boundary-driven, flush or no flush)", stats.Events)
+	}
+	if stats.Bytes != int64(buf.Len()) {
+		t.Errorf("stats.Bytes = %d, want %d", stats.Bytes, buf.Len())
+	}
+}

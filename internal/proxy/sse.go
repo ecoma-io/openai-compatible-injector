@@ -119,8 +119,14 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 			if n < len(out) {
 				return stats, &streamWriteError{err: io.ErrShortWrite}
 			}
-			if flush != nil && boundary {
-				flush()
+			if boundary {
+				// Accounting and budget reset belong to the boundary, not to
+				// the flush: stats.Events counts dispatched events and the
+				// in-flight budget restarts per event whether or not this
+				// caller asked for explicit flushes.
+				if flush != nil {
+					flush()
+				}
 				stats.Events++
 				pending = 0
 			}

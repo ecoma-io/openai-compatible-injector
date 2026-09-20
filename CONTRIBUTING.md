@@ -40,6 +40,7 @@ pull request. A document that lags the code is a defect, not a follow-up.
 | `go test ./e2e/ -run '^$' -bench BenchmarkThroughput -benchtime 2s`                                                | End-to-end throughput: injector vs the direct-upstream baseline, sizes, levels, stream lengths                 |
 | `go test ./e2e/ -run '^$' -bench BenchmarkLatencyPercentiles -benchtime 1x`                                        | p50/p95/p99 over a fixed 1000-request sample through the running binary                                        |
 | `go test ./e2e/ -run '^$' -bench BenchmarkStreamFirstBytePercentiles -benchtime 1x`                                | Streaming first-event (TTFB) p50/p95/p99, injector vs direct                                                   |
+| `go test ./e2e/ -run '^$' -bench BenchmarkStreamFirstBytePaced -benchtime 1x`                                      | TTFB against an upstream that spaces its events 25ms apart — the instrument that exposes a buffering relay     |
 | `go test ./e2e/ -run '^$' -bench BenchmarkThroughputResponsesStream -benchtime 2s`                                 | Responses SSE throughput: injector vs direct, event counts, log levels                                         |
 | `go test ./internal/... -run '^$' -bench . -benchtime 1s`                                                          | Micro-benchmarks (Probe, transforms, rewrite, SSE) with ns/op, B/op and allocs/op                              |
 | `go test -fuzz FuzzRewriteModel -fuzztime 30s ./internal/inject/`                                                  | A 30-second fuzz run (also: `FuzzProbe`, `FuzzRewriteSSELine`, `FuzzLoadRuntime`)                              |
@@ -49,8 +50,13 @@ pull request. A document that lags the code is a defect, not a follow-up.
 Benchmarks never run in CI: every CI `go test` invocation omits `-bench`,
 and `go test` executes benchmark functions only under that flag. The one
 perf assertion CI does carry is `TestProxyOverheadGuard` in the E2E suite —
-a relative (ratio-based, median-of-400) tripwire that skips under `-short`
-and `-race`, so it never gates on absolute wall clock.
+a median-of-400 tripwire bounded by `8x direct median + 5ms`. On loopback
+the direct median is microseconds, so the floor dominates and the guard
+behaves as an absolute ~5ms ceiling: it catches structural catastrophes
+(per-request dials, per-request config work), not microsecond deltas, and
+it cannot detect buffering of an unpaced stream (an unpaced stream arrives
+nearly instantly either way — `BenchmarkStreamFirstBytePaced` is the
+instrument for that). It skips under `-short` and `-race`.
 
 ## What the hooks do
 

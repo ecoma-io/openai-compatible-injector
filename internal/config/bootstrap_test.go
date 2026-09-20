@@ -60,7 +60,9 @@ func TestLoadBootstrapErrors(t *testing.T) {
 		{"zero interval", map[string]string{"CONFIG_POLL_INTERVAL": "0s"}, "positive"},
 		{"negative interval", map[string]string{"CONFIG_POLL_INTERVAL": "-1s"}, "positive"},
 		{"bad grace", map[string]string{"SHUTDOWN_GRACE": "abc"}, "SHUTDOWN_GRACE"},
-		{"negative grace", map[string]string{"SHUTDOWN_GRACE": "-2s"}, "not be negative"},
+		{"negative grace", map[string]string{"SHUTDOWN_GRACE": "-2s"}, "positive"},
+		// Zero disables the graceful drain entirely — rejected, not honored.
+		{"zero grace", map[string]string{"SHUTDOWN_GRACE": "0s"}, "positive"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

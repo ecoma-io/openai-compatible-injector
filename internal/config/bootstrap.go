@@ -73,8 +73,11 @@ func LoadBootstrap(env func(string) string) (Bootstrap, error) {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE is not a duration (%d characters; e.g. 55s)", len(v)))
-		} else if d < 0 {
-			errs = append(errs, errors.New("SHUTDOWN_GRACE must not be negative"))
+		} else if d <= 0 {
+			// Zero silently disables the graceful drain — in-flight streams
+			// would be force-closed the moment shutdown starts. That must be
+			// a startup error, not a surprise.
+			errs = append(errs, errors.New("SHUTDOWN_GRACE must be a positive duration"))
 		} else {
 			b.ShutdownGrace = d
 		}

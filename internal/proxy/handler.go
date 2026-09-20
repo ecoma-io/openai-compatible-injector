@@ -99,6 +99,10 @@ func NewHandler(store *config.Store, client *http.Client, log zerolog.Logger) ht
 	// plain-text default.
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 	mux.HandleFunc("/v1/responses", h.responses)
+	// The catch-all keeps the same promise for unknown paths — trailing
+	// slashes, wrong case, anything unmatched: an OpenAI SDK client always
+	// gets a parseable JSON error body, never the mux's plain text.
+	mux.HandleFunc("/", h.notFound)
 	return mux
 }
 
@@ -124,6 +128,18 @@ func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
 	h.serve(w, r, "responses", inject.Responses, inject.RewriteResponsesModel, "/responses")
+}
+
+// notFound is the catch-all for paths no route matched. The interpolated
+// method and path are client-supplied and go to the client only — they never
+// reach logs, so the no-echo rule is not at stake here.
+func (h *injectorHandler) notFound(w http.ResponseWriter, r *http.Request) {
+	env := openAIError{Error: openAIErrorBody{
+		Message: "Invalid URL (" + r.Method + " " + r.URL.Path + ")",
+		Type:    "invalid_request_error",
+	}}
+	body, err := marshalEnvelopeJSON(env)
+	writeEnvelopeErr(w, http.StatusNotFound, body, err)
 }
 
 type transformFunc func(body []byte, m config.Model) ([]byte, error)
@@ -281,9 +297,19 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// scheme+host origin only, per the credential rule.
 		event := log.Error()
 		if errors.Is(err, context.Canceled) {
-			// The client went away mid-request; that is an operational
-			// warning, not an upstream failure.
+			// The client went away before the upstream answered. The
+			// outcome is the disconnect — an upstream_unreachable 502
+			// would misreport a client-side event as an upstream
+			// failure — and there is no response left to write.
 			event = log.Warn()
+			outcome = "client_disconnected"
+			event.Err(sanitizeUpstreamError(err, &upstream)).
+				Str("public_model", model).
+				Str("upstream", origin(&upstream)).
+				Str("error_class", upstreamErrorClass(err)).
+				Msg("upstream_request_failed")
+			complete()
+			return
 		}
 		event.Err(sanitizeUpstreamError(err, &upstream)).
 			Str("public_model", model).
@@ -424,8 +450,24 @@ func (h *injectorHandler) writeModelNotFound(w http.ResponseWriter, model string
 		Type:    "invalid_request_error",
 		Code:    "model_not_found",
 	}}
-	body, err := json.Marshal(env)
+	body, err := marshalEnvelopeJSON(env)
 	writeEnvelopeErr(w, http.StatusNotFound, body, err)
+}
+
+// marshalEnvelopeJSON marshals an error envelope without HTML escaping:
+// json.Marshal would turn the < > & characters in interpolated values (the
+// requested model, the request path) into their unicode escape sequences
+// (e.g. "<" becomes six bytes, not one), breaking the byte-exact envelope
+// contract for names the configuration is free to use.
+func marshalEnvelopeJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	// json.Encoder appends a newline json.Marshal would not have written.
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 // origin renders the endpoint's scheme+host — the only upstream URL detail
@@ -436,11 +478,23 @@ func origin(u *url.URL) string {
 }
 
 // sanitizeUpstreamError rebuilds a client.Do error without the full request
-// URL: *url.Error.Error() quotes it verbatim, query string included.
+// URL: *url.Error.Error() quotes it verbatim, query string included. The
+// nested url parse/escape errors quote raw bytes too (the offending escape
+// sequence, the rejected host), so they are replaced with static text under
+// the same no-echo rule.
 func sanitizeUpstreamError(err error, endpoint *url.URL) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
-		return &url.Error{Op: ue.Op, URL: origin(endpoint), Err: ue.Err}
+		inner := ue.Err
+		var ee url.EscapeError
+		if errors.As(inner, &ee) {
+			inner = errors.New("invalid URL escape")
+		}
+		var he url.InvalidHostError
+		if errors.As(inner, &he) {
+			inner = errors.New("invalid host")
+		}
+		return &url.Error{Op: ue.Op, URL: origin(endpoint), Err: inner}
 	}
 	return err
 }

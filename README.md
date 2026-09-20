@@ -272,6 +272,16 @@ live stream with correct per-chunk latency. Behavior:
 - A request with `"stream": true` against an upstream that answers with a
   normal JSON body is handled as a plain 200 (the body is model-rewritten,
   not wrapped, not streamed).
+- Known limitation: which 2xx handling applies is decided by the upstream's
+  `Content-Type` alone. A 200 under `text/event-stream` is relayed line by
+  line even if the body is not actually SSE — such a body carries no
+  rewriteable `data:` lines, so a non-conforming upstream that mislabels a
+  JSON body as `text/event-stream` would pass its upstream model alias
+  through unrewritten (conforming providers never do this). Symmetrically,
+  an upstream that streams SSE at a `"stream": false` request gets its body
+  buffered, fails the JSON validation, and surfaces as the documented 502
+  `upstream_invalid_response` — the fog belongs to the upstream, and the
+  access log's outcome says so.
 - Reloads never interrupt a stream: it is bound to its request's snapshot.
 
 ## Errors
@@ -284,6 +294,7 @@ Upstream and client failures are classified, never fogged:
 | Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
 | Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
 | Request names an unmapped model                                                                                 | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
+| Request path matches no route (unknown path, trailing slash, wrong case)                                        | 404                    | `invalid_request_error` — exact body: `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`                                          |
 | Upstream unreachable (dial/network)                                                                             | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
 | Upstream 200 with unparseable body (or body over the 64 MiB buffered cap, or a body read that fails mid-answer) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
 | Upstream answers 3xx/4xx/5xx                                                                                    | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
@@ -378,12 +389,16 @@ What each level carries:
   (`client_write_failed`, outcome `client_disconnected`), an upstream that
   died mid-body before the answer could be parsed
   (`upstream_body_read_failed`, outcome `upstream_read_failed`), a client
-  that cancels mid-request, one warning per transition into a failed config
+  that cancels mid-request — including while the upstream request is in
+  flight (`upstream_request_failed` with `error_class` `client_canceled`,
+  outcome `client_disconnected`, and no error envelope, since the client is
+  gone) — one warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —
   plus `second_signal_forced_exit` and drain overflow.
 - **ERROR** — upstream connection failures (`upstream_request_failed` with
-  an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial`),
+  an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial` —
+  never `client_canceled`, which is the WARN disconnect above),
   unparseable upstream responses, and anything fatal at startup.
 
 The credential rule is absolute: no log line, at any level, ever contains

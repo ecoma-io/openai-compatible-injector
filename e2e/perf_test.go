@@ -36,8 +36,9 @@ func perfMax(a, b int) int {
 
 // perfUpstream is a fake upstream tuned for benchmarking: it answers every
 // request with a JSON body padded to bodySize bytes, or — when
-// streamEvents > 0 — with that many ~200B SSE events, flushed per event and
-// never paced (the benchmark measures proxy overhead, not upstream timing).
+// streamEvents > 0 — with that many SSE events (perfEvent(shape, 200)),
+// flushed per event and unpaced unless eventInterval is set (the benchmarks
+// measure proxy overhead, not upstream timing).
 type perfUpstream struct {
 	srv          *httptest.Server
 	hits         atomic.Int64
@@ -47,6 +48,9 @@ type perfUpstream struct {
 	// (default) emits bare data: lines; "responses" emits the
 	// event:+data: pairs the Responses surface branches on.
 	shape string
+	// eventInterval, when set, spaces the stream's events that far apart —
+	// the pacing a buffering relay would hide (BenchmarkStreamFirstBytePaced).
+	eventInterval time.Duration
 }
 
 func newPerfUpstream(b *testing.B, bodySize, streamEvents int) *perfUpstream {
@@ -68,6 +72,9 @@ func newPerfUpstream(b *testing.B, bodySize, streamEvents int) *perfUpstream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
 		for i := 0; i < u.streamEvents; i++ {
+			if u.eventInterval > 0 && i > 0 {
+				time.Sleep(u.eventInterval)
+			}
 			_, _ = io.WriteString(w, event)
 			if fl != nil {
 				fl.Flush()
@@ -199,7 +206,6 @@ func BenchmarkThroughputChat(b *testing.B) {
 				for i := 0; i < 100; i++ {
 					perfPost(b, addr, body)
 				}
-				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					perfPost(b, addr, body)
@@ -219,7 +225,6 @@ func BenchmarkThroughputResponses(b *testing.B) {
 			for i := 0; i < 100; i++ {
 				perfPostAt(b, addr, "/v1/responses", body)
 			}
-			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				perfPostAt(b, addr, "/v1/responses", body)
@@ -229,7 +234,9 @@ func BenchmarkThroughputResponses(b *testing.B) {
 }
 
 // BenchmarkThroughputStream measures streaming overhead at 10/100/1000
-// events (~200B each, unpaced): read-to-EOF round trip.
+// events (perfEvent's exact byte count feeds SetBytes; unpaced):
+// read-to-EOF round trip. No ReportAllocs: these measure the benchmark
+// client's heap, not the binary under test.
 func BenchmarkThroughputStream(b *testing.B) {
 	for _, events := range []int{10, 100, 1000} {
 		for _, arm := range []string{"direct", "injector_error"} {
@@ -240,8 +247,7 @@ func BenchmarkThroughputStream(b *testing.B) {
 				for i := 0; i < 100; i++ {
 					perfStream(b, addr, body)
 				}
-				b.ReportAllocs()
-				b.SetBytes(int64(events * 200))
+				b.SetBytes(int64(len(perfEvent("chat", 200))) * int64(events))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					perfStream(b, addr, body)
@@ -348,8 +354,7 @@ func BenchmarkThroughputResponsesStream(b *testing.B) {
 				for i := 0; i < 100; i++ {
 					_, _ = perfStreamRead(b, addr, "/v1/responses", body)
 				}
-				b.ReportAllocs()
-				b.SetBytes(int64(events * 200))
+				b.SetBytes(int64(len(perfEvent("responses", 200))) * int64(events))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					_, _ = perfStreamRead(b, addr, "/v1/responses", body)
@@ -397,15 +402,59 @@ func BenchmarkStreamFirstBytePercentiles(b *testing.B) {
 	}
 }
 
-// TestProxyOverheadGuard is the relative regression guard for the whole
-// proxy path: the injector's median round trip must stay within a generous
-// multiple of the direct-upstream median — for a buffered request and for a
-// stream's first event. The bounds are order-of-magnitude tripwires: they
-// catch a proxy that started buffering whole streams, re-dialing per request,
-// or paying per-request config work, while never asserting an absolute wall
-// clock, so a slow CI machine passes as long as the RATIO holds. Skipped
-// under -short (keeps the suite quick) and -race (timings are meaningless
-// with the detector on).
+// BenchmarkStreamFirstBytePaced makes buffering measurable where the
+// unpaced benchmarks cannot see it: the upstream spaces its events 25ms
+// apart, so a pass-through relay delivers the first event at roughly one
+// interval while a buffering relay cannot deliver anything until the
+// upstream finishes. The reported ttfb-p50 per arm is the instrument — the
+// direct-to-injector gap staying near zero is the pass-through evidence.
+// Report metrics, not per-iteration timings; run with -benchtime 1x.
+func BenchmarkStreamFirstBytePaced(b *testing.B) {
+	const (
+		events   = 6
+		interval = 25 * time.Millisecond
+		samples  = 20
+		warmup   = 3
+	)
+	for _, arm := range []string{"direct", "injector_error"} {
+		b.Run(arm, func(b *testing.B) {
+			u := newPerfUpstream(b, 0, events)
+			u.eventInterval = interval
+			addr := benchmarkArm(b, u, arm)
+			body := `{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+			for i := 0; i < warmup; i++ {
+				_, _ = perfStreamRead(b, addr, "/v1/chat/completions", body)
+			}
+			sample := make([]time.Duration, 0, samples)
+			b.ResetTimer()
+			for i := 0; i < samples; i++ {
+				ttfb, _ := perfStreamRead(b, addr, "/v1/chat/completions", body)
+				sample = append(sample, ttfb)
+			}
+			b.StopTimer()
+
+			sort.Slice(sample, func(i, j int) bool { return sample[i] < sample[j] })
+			p50 := float64(sample[len(sample)/2].Microseconds()) / 1000.0
+			b.ReportMetric(p50, "ttfb-p50-ms")
+			b.Logf("paced ttfb over %d requests (%s): p50=%.3fms (pass-through lands near one %v interval)",
+				samples, arm, p50, interval)
+		})
+	}
+}
+
+// TestProxyOverheadGuard is the coarse overhead tripwire for the whole proxy
+// path: the injector's median round trip must stay within 8x the
+// direct-upstream median plus an absolute floor — for a buffered request and
+// for a stream's first event. At realistic loopback medians (tens of
+// microseconds) the floor dominates the bound, so in practice this behaves
+// like an absolute ~5ms ceiling: it catches structural catastrophes
+// (per-request config work, per-request dials, synchronous heavy logging),
+// not microsecond deltas — and it cannot detect buffering of an unpaced
+// upstream stream at all, because an unpaced stream arrives nearly instantly
+// either way; BenchmarkStreamFirstBytePaced is the instrument for buffering.
+// The multiple only binds if the upstream itself is slow, where scaling with
+// the baseline is the fairer bound. Skipped under -short (keeps the suite
+// quick) and -race (timings are meaningless with the detector on).
 func TestProxyOverheadGuard(t *testing.T) {
 	if testing.Short() {
 		t.Skip("relative wall-clock guard skipped under -short")
@@ -426,6 +475,9 @@ func TestProxyOverheadGuard(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
 		for i := 0; i < u.streamEvents; i++ {
+			if u.eventInterval > 0 && i > 0 {
+				time.Sleep(u.eventInterval)
+			}
 			_, _ = io.WriteString(w, event)
 			if fl != nil {
 				fl.Flush()
@@ -481,10 +533,10 @@ func TestProxyOverheadGuard(t *testing.T) {
 	directTTFB := median(ttfbSample(direct, n))
 	injTTFB := median(ttfbSample(p.addr, n))
 
-	// The multiple is deliberately loose: local loopback deltas for this
-	// proxy are well under 2x, so anything past 8x is a structural
-	// regression, not noise. The absolute floor keeps the guard sane if the
-	// direct median ever collapses toward zero.
+	// 8x the direct median plus a 5ms floor. On loopback the direct median
+	// is microseconds, so the floor is what binds and the guard is an
+	// order-of-magnitude tripwire; the multiple takes over only when the
+	// upstream itself is slow, where a scaled bound stays fair.
 	const multiple = 8.0
 	const floor = 5 * time.Millisecond
 	limit := func(direct time.Duration) time.Duration {
