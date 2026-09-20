@@ -71,17 +71,20 @@ func healthcheck() int {
 	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{}}
 	resp, err := client.Get(url)
 	if err != nil {
-		log.Error().Err(err).Str("url", url).Msg("healthcheck_probe_failed")
+		log.Error().Err(err).Msg("healthcheck_probe_failed")
 		return 1
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	// Bounded read: /healthz answers "ok\n", but a probe aimed at the wrong
+	// port can hit anything, and its answer is never logged — only its
+	// status and size.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		log.Error().Err(err).Msg("healthcheck_body_read_failed")
 		return 1
 	}
 	if resp.StatusCode != http.StatusOK || string(body) != "ok\n" {
-		log.Error().Int("status", resp.StatusCode).Str("body", string(body)).Msg("healthcheck_unhealthy")
+		log.Error().Int("status", resp.StatusCode).Int("body_len", len(body)).Msg("healthcheck_unhealthy")
 		return 1
 	}
 	return 0
@@ -127,39 +130,54 @@ func run() int {
 		Str("log_level", snap.LogLevel().String()).
 		Msg("service_started")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// A second signal forces an immediate exit regardless of in-flight work.
-	// The watcher channel is registered NOW rather than after ctx.Done:
-	// between the first signal's cancel and a later registration, a second
-	// signal would reach only NotifyContext's channel, whose goroutine has
-	// already returned — swallowed, and the drain would run its full grace
-	// budget. Registered up front, every signal lands in this channel too;
-	// the first read (the signal that started the drain) is discarded and
-	// the second read forces the exit.
+	// One signal channel owns the whole lifecycle. Both signals are
+	// registered before anything can deliver one, so no window exists where
+	// a signal is swallowed: the first SIGINT/SIGTERM starts the graceful
+	// drain, a second forces an immediate exit 1 regardless of in-flight
+	// work, and once the drain has finished the signals are ignored outright
+	// — the process is committed to its exit code and must not be killed by
+	// a late duplicate into the shell's 143.
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
+
+	drainDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		<-sig // the signal that started the drain — discarded
-		<-sig // any second signal — force exit
-		log.Warn().Msg("second_signal_forced_exit")
-		os.Exit(1)
+		select {
+		case <-sig: // the signal that starts the drain
+			cancel()
+		case <-drainDone: // the server stopped without a signal
+			return
+		}
+		select {
+		case <-sig: // second signal: force exit before the grace budget
+			log.Warn().Msg("second_signal_forced_exit")
+			os.Exit(1)
+		case <-drainDone: // the drain finished within grace
+		}
 	}()
 
 	// onPublish applies the reloaded snapshot's log level process-wide: the
 	// global level is an atomic int32 that zerolog consults per event, so a
 	// reload swaps it without locks and in-flight events race only to the
-	// old/new boundary, never around a mutex.
-	go config.NewPoller(store, b.ConfigFile, b.PollInterval, log, func(next *config.Snapshot) {
+	// old/new boundary, never around a mutex. The poller is seeded with the
+	// exact bytes loaded above: its hash baseline is the boot content, not a
+	// fresh read of a file that may have changed in between.
+	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, func(next *config.Snapshot) {
 		zerolog.SetGlobalLevel(next.LogLevel())
 		log.Debug().Uint64("generation", next.Gen()).
 			Str("log_level", next.LogLevel().String()).Msg("log_level_applied")
 	}).Run(ctx)
 
-	if err := server.New(store, b.Listen, b.ShutdownGrace, log).Run(ctx); err != nil {
+	err = server.New(store, b.Listen, b.ShutdownGrace, log).Run(ctx)
+	close(drainDone)
+	// From here the process is committed to its exit code; a duplicate
+	// signal during teardown must not overwrite it.
+	signal.Ignore(os.Interrupt, syscall.SIGTERM)
+	if err != nil {
 		log.Error().Err(err).Msg("server_failed")
 		return 1
 	}
