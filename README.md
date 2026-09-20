@@ -403,6 +403,6 @@ advisory, never a public issue.
 ## License and acknowledgements
 
 Apache License 2.0 — see [LICENSE](LICENSE). Built on Go, with
-`spf13/viper` and `rs/zerolog`. This project was developed with AI
+`rs/zerolog` and `gopkg.in/yaml.v3`. This project was developed with AI
 assistance; the AI-assisted disclosure policy is described in
 [CONTRIBUTING.md](CONTRIBUTING.md).

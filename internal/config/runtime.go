@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 
-	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
 
@@ -15,17 +15,24 @@ import (
 // validated against the raw YAML (only "models" is legal — this is what
 // keeps the bootstrap plane out of the runtime file: listen, config file,
 // poll interval, ... any file that tries to define them fails validation,
-// whatever their value's shape), and viper's UnmarshalExact rejects unknown
-// keys inside each model entry.
+// whatever their value's shape), and a KnownFields strict decode rejects
+// unknown keys inside each model entry.
+//
+// The models table is decoded with yaml.v3 directly, never through viper:
+// viper's map normalization lowercases every key and flattens dotted names,
+// which would both corrupt public model names (`MyModel` reaching a client
+// as `mymodel`; `gpt-3.5-turbo` rejected as an unknown key) and silently
+// accept case variants of entry keys. yaml.v3 preserves key bytes as
+// written and matches entry fields case-sensitively.
 
 type runtimeFile struct {
-	Models map[string]runtimeModel `mapstructure:"models"`
+	Models map[string]runtimeModel `yaml:"models"`
 }
 
 type runtimeModel struct {
-	Endpoint        string `mapstructure:"endpoint"`
-	UpstreamModel   string `mapstructure:"upstream-model"`
-	InjectionPrompt string `mapstructure:"injection-prompt"`
+	Endpoint        string `yaml:"endpoint"`
+	UpstreamModel   string `yaml:"upstream-model"`
+	InjectionPrompt string `yaml:"injection-prompt"`
 }
 
 // LoadRuntime parses and validates runtime configuration bytes into an
@@ -33,16 +40,9 @@ type runtimeModel struct {
 // entry — rejects the whole file; callers must keep serving the previous
 // snapshot in that case.
 func LoadRuntime(data []byte) (*Snapshot, error) {
-	v := viper.New()
-	v.SetConfigType("yaml")
-	v.SetTypeByDefaultValue(true)
-	if err := v.ReadConfig(bytes.NewReader(data)); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	// Top-level keys are validated against the raw YAML first: viper's
-	// UnmarshalExact misses a key whose value is an empty map (an empty
-	// `config:` or `listen:` block would slip through strict decode), and the
-	// bootstrap-plane rule is absolute — a runtime file must reject any
+	// Top-level keys are validated against the raw YAML first: a strict
+	// struct decode alone would report an unknown key without naming it, and
+	// the bootstrap-plane rule is absolute — a runtime file must reject any
 	// bootstrap key, regardless of its value's shape.
 	var raw map[string]any
 	if err := yaml.Unmarshal(data, &raw); err != nil {
@@ -53,18 +53,30 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 			return nil, fmt.Errorf("decode config: unknown top-level key %q", k)
 		}
 	}
-
 	var rf runtimeFile
-	if err := v.UnmarshalExact(&rf); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	// An empty document decodes as io.EOF; that is not a malformed file but
+	// an empty models table, which the emptiness check below rejects with
+	// the honest message.
+	if err := dec.Decode(&rf); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
 	models := make(map[string]Model, len(rf.Models))
+	seen := make(map[string]struct{}, len(rf.Models))
 	for name, rm := range rf.Models {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			return nil, errors.New("model name must not be empty")
 		}
+		if _, dup := seen[name]; dup {
+			// `"  a":` and `a:` are distinct YAML keys that trim to the same
+			// model name; which one wins must not depend on map iteration
+			// order, so an ambiguous file is a reject, not a coin toss.
+			return nil, fmt.Errorf("model %q: name collides with another entry after trimming whitespace", name)
+		}
+		seen[name] = struct{}{}
 		m, err := buildModel(name, rm)
 		if err != nil {
 			return nil, fmt.Errorf("model %q: %w", name, err)

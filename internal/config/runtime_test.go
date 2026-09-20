@@ -179,3 +179,76 @@ func TestStorePublishNil(t *testing.T) {
 		t.Errorf("nil publish must not change generation, got %d", store.Gen())
 	}
 }
+
+func TestLoadRuntimePreservesModelNameCase(t *testing.T) {
+	// viper's map normalization lowercases every key; public model names
+	// must reach clients exactly as configured. A configured `MyModel` is
+	// reachable as `MyModel` and nothing else.
+	s := mustSnapshot(t, `
+models:
+  MyModel:
+    endpoint: http://localhost:9000/v1
+    upstream-model: m
+  mymodel:
+    endpoint: http://localhost:9001/v1
+    upstream-model: m2
+`)
+	if got, ok := s.Model("MyModel"); !ok {
+		t.Fatal("MyModel not reachable under its configured name")
+	} else if got.Endpoint.Host != "localhost:9000" {
+		t.Fatalf("MyModel resolved to the wrong entry: %+v", got)
+	}
+	// The lowercase twin has its own entry: a case-folding decoder (viper)
+	// would collapse both keys into one entry and both lookups would land
+	// on the same endpoint.
+	if got, ok := s.Model("mymodel"); !ok {
+		t.Fatal("mymodel not reachable under its configured name")
+	} else if got.Endpoint.Host != "localhost:9001" {
+		t.Fatalf("mymodel collapsed into MyModel's entry: %+v", got)
+	}
+}
+
+func TestLoadRuntimeAcceptsDottedModelName(t *testing.T) {
+	// viper flattens dotted keys (`gpt-3.5-turbo` -> gpt-3 -> 5-turbo) and
+	// then rejects the leftover as an unknown key; a dotted name is legal
+	// YAML and must load.
+	s := mustSnapshot(t, `
+models:
+  gpt-3.5-turbo:
+    endpoint: http://localhost:9000/v1
+    upstream-model: m
+`)
+	if m, ok := s.Model("gpt-3.5-turbo"); !ok {
+		t.Fatal("dotted model name not reachable under its configured name")
+	} else if m.Endpoint.Host != "localhost:9000" {
+		t.Fatalf("dotted model resolved to the wrong entry: %+v", m)
+	}
+}
+
+func TestLoadRuntimeRejectsUppercaseEntryKeys(t *testing.T) {
+	// Entry keys are matched case-sensitively: ENDPOINT is not endpoint.
+	if _, err := LoadRuntime([]byte(`
+models:
+  a:
+    ENDPOINT: http://localhost:9000/v1
+    upstream-model: m
+`)); err == nil {
+		t.Fatal("expected rejection of uppercase entry key")
+	}
+}
+
+func TestLoadRuntimeRejectsTrimCollision(t *testing.T) {
+	// `  a` and `a` are distinct YAML keys that trim to the same model
+	// name; which one wins must not depend on map iteration order.
+	if _, err := LoadRuntime([]byte(`
+models:
+  "  a":
+    endpoint: http://localhost:9000/v1
+    upstream-model: m
+  a:
+    endpoint: http://localhost:9001/v1
+    upstream-model: m2
+`)); err == nil {
+		t.Fatal("expected rejection of colliding trimmed model names")
+	}
+}
