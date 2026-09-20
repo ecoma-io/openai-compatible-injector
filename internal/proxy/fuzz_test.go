@@ -60,7 +60,7 @@ func FuzzRewriteSSELine(f *testing.F) {
 
 	const public = "public-name"
 	f.Fuzz(func(t *testing.T, line []byte) {
-		got := rewriteSSELine(line, public)
+		got := rewriteSSELine(line, sseRewriter(public))
 
 		content, term := splitSSELineTerminator(line)
 		rest, isData := bytes.CutPrefix(content, sseDataPrefix)

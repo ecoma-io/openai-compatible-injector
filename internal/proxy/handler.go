@@ -115,14 +115,20 @@ func (h *injectorHandler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "chat", inject.Chat, "/chat/completions")
+	h.serve(w, r, "chat", inject.Chat, inject.RewriteChatModel, "/chat/completions")
 }
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "responses", inject.Responses, "/responses")
+	h.serve(w, r, "responses", inject.Responses, inject.RewriteResponsesModel, "/responses")
 }
 
 type transformFunc func(body []byte, m config.Model) ([]byte, error)
+
+// rewriteFunc is the API-scoped response rewrite (RewriteChatModel or
+// RewriteResponsesModel): the chat surface owns only the top-level model,
+// the Responses surface also owns response.model in envelope events. Both
+// scopes obey the same byte-preserving acceptance rule.
+type rewriteFunc func(body []byte, public string) []byte
 
 // serve runs the full injector flow for one request. One snapshot is loaded
 // at entry and every later step (resolution, transformation, forwarding,
@@ -133,7 +139,7 @@ type transformFunc func(body []byte, m config.Model) ([]byte, error)
 // duration, byte counts, snapshot generation), and WARN-level stream
 // truncation split by phase. Metadata only — bodies, prompts, payloads,
 // and Authorization never enter any log event at any level.
-func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, suffix string) {
+func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, suffix string) {
 	start := time.Now()
 	if r.Method != http.MethodPost {
 		// Outside the request lifecycle: no snapshot is loaded and no
@@ -299,7 +305,9 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		copyRelayHeaders(sw.Header(), resp.Header)
 		sw.WriteHeader(resp.StatusCode)
 		log.Debug().Str("public_model", model).Msg("stream_started")
-		stats, err := CopySSE(sw, resp.Body, m.Public, flusher(sw))
+		stats, err := CopySSE(sw, resp.Body, func(payload []byte) []byte {
+			return rewrite(payload, m.Public)
+		}, flusher(sw))
 		if err != nil {
 			phase := "upstream_read"
 			outcome = "stream_truncated"
@@ -338,7 +346,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 		return
 	}
-	rewritten := inject.RewriteModel(upstreamBody, m.Public)
+	rewritten := rewrite(upstreamBody, m.Public)
 	copyRelayHeaders(sw.Header(), resp.Header)
 	sw.WriteHeader(resp.StatusCode)
 	_, _ = sw.Write(rewritten)

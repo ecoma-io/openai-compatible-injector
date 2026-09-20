@@ -7,7 +7,16 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"openai-compatible-injector/internal/inject"
 )
+
+// sseRewriter returns the payload rewriter CopySSE calls, bound to the chat
+// scope — the scope nearly all SSE fixtures use. Responses-scope tests pass
+// their own.
+func sseRewriter(public string) func([]byte) []byte {
+	return func(p []byte) []byte { return inject.RewriteChatModel(p, public) }
+}
 
 // copySSEOnce runs CopySSE over input and returns the exact output bytes and
 // the number of flush invocations. The reported stats are checked against
@@ -16,7 +25,7 @@ func copySSEOnce(t *testing.T, input, public string) (string, int) {
 	t.Helper()
 	var buf bytes.Buffer
 	flushes := 0
-	stats, err := CopySSE(&buf, strings.NewReader(input), public, func() { flushes++ })
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter(public), func() { flushes++ })
 	if err != nil {
 		t.Fatalf("CopySSE: %v", err)
 	}
@@ -151,6 +160,34 @@ func TestCopySSERewritesPayloadTheBufferedPathRewrites(t *testing.T) {
 	}
 }
 
+// TestCopySSEScopesPerAPI pins the API-scoped rewrite on the streaming
+// path: the same envelope line is rewritten in response.model only by the
+// Responses rewriter — the chat stream must leave it untouched, exactly
+// like the buffered paths.
+func TestCopySSEScopesPerAPI(t *testing.T) {
+	line := "data: {\"model\":\"upstream-name\",\"response\":{\"model\":\"upstream-name\"}}\n"
+
+	chatOut, _ := copySSEOnce(t, line, "public-name")
+	if chatOut != "data: {\"model\":\"public-name\",\"response\":{\"model\":\"upstream-name\"}}\n" {
+		t.Errorf("chat scope touched response.model: %q", chatOut)
+	}
+
+	var buf bytes.Buffer
+	flushes := 0
+	stats, err := CopySSE(&buf, strings.NewReader(line),
+		func(p []byte) []byte { return inject.RewriteResponsesModel(p, "public-name") },
+		func() { flushes++ })
+	if err != nil {
+		t.Fatalf("CopySSE: %v", err)
+	}
+	if want := "data: {\"model\":\"public-name\",\"response\":{\"model\":\"public-name\"}}\n"; buf.String() != want {
+		t.Errorf("responses scope missed response.model:\n got  %q\n want %q", buf.String(), want)
+	}
+	if stats.Events != flushes {
+		t.Errorf("stats.Events = %d, want %d", stats.Events, flushes)
+	}
+}
+
 func TestCopySSEPartialFinalLine(t *testing.T) {
 	// EOF with no trailing newline: the final partial line is still
 	// forwarded (no flush — it is not an event boundary; the response
@@ -222,7 +259,7 @@ func (failingReader) Read(p []byte) (int, error) { return 0, errors.New("read bo
 func TestCopySSEPropagatesErrors(t *testing.T) {
 	// A write failure is client-side; the caller logs it as a client
 	// disconnect via the *streamWriteError marker.
-	_, err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), "p", func() {})
+	_, err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), sseRewriter("p"), func() {})
 	if err == nil {
 		t.Fatal("write error not propagated")
 	}
@@ -233,7 +270,7 @@ func TestCopySSEPropagatesErrors(t *testing.T) {
 
 	// A read failure is upstream-side and must NOT carry the marker — the
 	// truncation phase in the access log depends on the distinction.
-	_, err = CopySSE(io.Discard, failingReader{}, "p", func() {})
+	_, err = CopySSE(io.Discard, failingReader{}, sseRewriter("p"), func() {})
 	if err == nil || err == io.EOF {
 		t.Errorf("read error not propagated as-is: %v", err)
 	}
@@ -248,7 +285,7 @@ func TestCopySSEPropagatesErrors(t *testing.T) {
 // and the write is still marked as a client-side failure.
 func TestCopySSEAccountsPartialWrite(t *testing.T) {
 	w := &limitedWriter{limit: 5}
-	stats, err := CopySSE(w, strings.NewReader("data: x\ndata: y\n"), "p", nil)
+	stats, err := CopySSE(w, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil)
 	if err == nil {
 		t.Fatal("write failure not propagated")
 	}
@@ -266,7 +303,7 @@ func TestCopySSEAccountsPartialWrite(t *testing.T) {
 // must truncate the stream as a client-side failure — continuing past it
 // would relay a torn line and overcount the bytes.
 func TestCopySSERejectsShortWrite(t *testing.T) {
-	stats, err := CopySSE(&shortWriter{}, strings.NewReader("data: x\ndata: y\n"), "p", nil)
+	stats, err := CopySSE(&shortWriter{}, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil)
 	if err == nil {
 		t.Fatal("short write not detected")
 	}

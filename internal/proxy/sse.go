@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
-	"openai-compatible-injector/internal/inject"
 )
 
 var (
@@ -51,14 +49,16 @@ var (
 )
 
 // CopySSE incrementally passes an upstream SSE stream through to dst,
-// rewriting the model field inside data lines from the upstream name to the
-// public name. It never buffers the whole stream: lines are read one at a
-// time under hard caps (MaxLineBytes per line, MaxEventBytes per in-flight
-// event), each line is written out immediately, and flush is invoked at
-// every event boundary — the blank line that terminates an event, which is
-// exactly what SSE clients dispatch on — so events reach the client promptly
-// with no aggregation or reordering. Per-line flushing spends a write round
-// trip per line without delivering anything a client can act on earlier.
+// rewriting the model field inside data lines via the API-scoped rewriter
+// the caller supplies (RewriteChatModel or RewriteResponsesModel — the
+// stream must obey its API's rewrite scope exactly like the buffered path).
+// It never buffers the whole stream: lines are read one at a time under
+// hard caps (MaxLineBytes per line, MaxEventBytes per in-flight event),
+// each line is written out immediately, and flush is invoked at every event
+// boundary — the blank line that terminates an event, which is exactly what
+// SSE clients dispatch on — so events reach the client promptly with no
+// aggregation or reordering. Per-line flushing spends a write round trip
+// per line without delivering anything a client can act on earlier.
 //
 // Only lines beginning with "data:" are candidates for rewriting, and only
 // when the payload (bytes after "data:" plus one optional space) contains
@@ -77,7 +77,7 @@ var (
 // writing to dst is returned wrapped in *streamWriteError — the client side
 // went away — so the caller can log the two truncation causes apart.
 // Nothing is ever synthesized.
-func CopySSE(dst io.Writer, src io.Reader, public string, flush func()) (StreamStats, error) {
+func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func()) (StreamStats, error) {
 	var stats StreamStats
 	br := bufio.NewReaderSize(src, sseReadBuffer)
 	// pending counts the bytes of the event in flight — every line since
@@ -104,7 +104,7 @@ func CopySSE(dst io.Writer, src io.Reader, public string, flush func()) (StreamS
 						ErrSSEEventTooLarge, pending, MaxEventBytes)
 				}
 			}
-			out := rewriteSSELine(line, public)
+			out := rewriteSSELine(line, rewrite)
 			n, werr := dst.Write(out)
 			// Account exactly what dst accepted — on a failed or torn write
 			// the stats say how much of the stream actually went out. A
@@ -203,8 +203,10 @@ func isEventBoundary(line []byte) bool {
 
 // rewriteSSELine applies the data-line rewrite rule to a single raw line,
 // terminator included. Anything that is not a data line carrying a model
-// string is returned unchanged.
-func rewriteSSELine(line []byte, public string) []byte {
+// string is returned unchanged. The rewriter is the API-scoped function the
+// caller chose; its no-op contract (input returned unchanged when nothing
+// is in scope) is what the pointer-identity shortcut below relies on.
+func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
 	content, term := splitSSELineTerminator(line)
 	rest, ok := bytes.CutPrefix(content, sseDataPrefix)
 	if !ok {
@@ -220,9 +222,9 @@ func rewriteSSELine(line []byte, public string) []byte {
 	if !bytes.Contains(payload, sseModelKey) {
 		return line
 	}
-	out := inject.RewriteModel(payload, public)
+	out := rewrite(payload)
 	if &out[0] == &payload[0] {
-		// RewriteModel returns the input slice when nothing was in scope;
+		// The rewriter returned the input slice when nothing was in scope;
 		// skip the rebuild for lines that merely mention "model".
 		return line
 	}

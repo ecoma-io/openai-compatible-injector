@@ -222,11 +222,15 @@ several shapes:
 
 - **Forward:** a request's top-level `model` is replaced with the mapping's
   `upstream-model`.
-- **Reverse:** in _responses_, the model is rewritten back to the public
-  name — the top-level `model` field (chat: every streamed chunk) and the
-  nested `response.model` field of Responses envelope events.
+- **Reverse,** scoped per API surface: in _responses_, the model is rewritten
+  back to the public name — the top-level `model` field (chat: every streamed
+  chunk) and, for the Responses API only, the nested `response.model` field
+  of envelope events. A chat chunk carrying a nested `response` object is
+  client data: its model is **not** ours to rewrite. `RewriteChatModel`
+  owns the top-level key alone; `RewriteResponsesModel` additionally owns
+  `response.model`.
 
-`RewriteModel` is **byte-preserving**: only object-key `"model"` string
+Both rewrites are **byte-preserving**: only object-key `"model"` string
 values are replaced inside a string-state-aware scan. Everything else — every
 whitespace byte, key order, unknown fields — is forwarded exactly as
 received. A response whose JSON cannot be parsed is forwarded byte-for-byte

@@ -134,44 +134,34 @@ func BenchmarkRewriteModel(b *testing.B) {
 		return []byte(sb.String())
 	}
 
-	b.Run("chunk_200", func(b *testing.B) {
-		body := chunkBody(200, 1)
-		b.ReportAllocs()
-		b.ResetTimer()
-		b.SetBytes(int64(len(body)))
-		for i := 0; i < b.N; i++ {
-			RewriteModel(body, "public-name")
-		}
-	})
-	b.Run("chunk_4KB", func(b *testing.B) {
-		body := chunkBody(4<<10, 1)
-		b.ReportAllocs()
-		b.ResetTimer()
-		b.SetBytes(int64(len(body)))
-		for i := 0; i < b.N; i++ {
-			RewriteModel(body, "public-name")
-		}
-	})
-	b.Run("no_model", func(b *testing.B) {
-		// Valid JSON with no "model" key: pure scan cost.
-		body := []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":123,"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}],"usage":{"prompt_tokens":10}}`)
-		b.ReportAllocs()
-		b.ResetTimer()
-		b.SetBytes(int64(len(body)))
-		for i := 0; i < b.N; i++ {
-			RewriteModel(body, "public-name")
-		}
-	})
-	b.Run("multi_span", func(b *testing.B) {
+	// Each workload runs under both API scopes: the chat scope skips the
+	// response descent, so the delta between the two is the descent cost.
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"chunk_200", chunkBody(200, 1)},
+		{"chunk_4KB", chunkBody(4<<10, 1)},
+		{"no_model", []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":123,"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}],"usage":{"prompt_tokens":10}}`)},
 		// Several top-level "model" occurrences AND a nested response.model.
-		body := []byte(`{"model":"gpt-5","model":"x","model":"y","response":{"model":"gpt-5","id":"resp_1","object":"response","output":[]}}`)
-		b.ReportAllocs()
-		b.ResetTimer()
-		b.SetBytes(int64(len(body)))
-		for i := 0; i < b.N; i++ {
-			RewriteModel(body, "public-name")
-		}
-	})
+		{"multi_span", []byte(`{"model":"gpt-5","model":"x","model":"y","response":{"model":"gpt-5","id":"resp_1","object":"response","output":[]}}`)},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name+"/chat", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(tc.body)))
+			for i := 0; i < b.N; i++ {
+				RewriteChatModel(tc.body, "public-name")
+			}
+		})
+		b.Run(tc.name+"/responses", func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(tc.body)))
+			for i := 0; i < b.N; i++ {
+				RewriteResponsesModel(tc.body, "public-name")
+			}
+		})
+	}
 }
 
 // TestRewriteModelAllocBudget pins allocation ceilings for the hot paths.
@@ -209,13 +199,13 @@ func TestRewriteModelAllocBudget(t *testing.T) {
 	if got := testing.AllocsPerRun(5000, func() { _, _, _ = Probe(small) }); got > probeAllocs {
 		t.Errorf("Probe allocations = %.2f/op, want <= %d", got, probeAllocs)
 	}
-	if got := testing.AllocsPerRun(5000, func() { RewriteModel(noModel, "public-name") }); got > noModelAllocs {
-		t.Errorf("RewriteModel no-model allocations = %.2f/op, want <= %d", got, noModelAllocs)
+	if got := testing.AllocsPerRun(5000, func() { RewriteChatModel(noModel, "public-name") }); got > noModelAllocs {
+		t.Errorf("RewriteChatModel no-model allocations = %.2f/op, want <= %d", got, noModelAllocs)
 	}
 
 	single := []byte(`{"model":"gpt-5"}`)
-	if got := testing.AllocsPerRun(5000, func() { RewriteModel(single, "public-name") }); got > singleAllocs {
-		t.Errorf("RewriteModel single-span allocations = %.2f/op, want <= %d", got, singleAllocs)
+	if got := testing.AllocsPerRun(5000, func() { RewriteChatModel(single, "public-name") }); got > singleAllocs {
+		t.Errorf("RewriteChatModel single-span allocations = %.2f/op, want <= %d", got, singleAllocs)
 	}
 
 	// Count-only budgets cannot see size amplification: the alloc count is

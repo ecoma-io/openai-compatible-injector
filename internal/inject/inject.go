@@ -2,8 +2,9 @@
 // an upstream provider: it rewrites the requested model name to the
 // configured upstream alias and merges a per-model system-level instruction
 // prompt into the payload. It also provides Probe, a cheap request-routing
-// extractor, and RewriteModel, a byte-preserving rewriter used to sanitize
-// streamed chunks before they are relayed back to clients.
+// extractor, and RewriteChatModel/RewriteResponsesModel, byte-preserving
+// rewriters with per-API scope used to sanitize streamed chunks before they
+// are relayed back to clients.
 package inject
 
 import (

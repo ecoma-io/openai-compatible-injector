@@ -38,7 +38,7 @@ func copySSELimited(t *testing.T, input string) (string, int64, error) {
 	t.Helper()
 	var buf strings.Builder
 	src := &countingReader{r: strings.NewReader(input)}
-	stats, err := CopySSE(&buf, src, "public-name", func() {})
+	stats, err := CopySSE(&buf, src, sseRewriter("public-name"), func() {})
 	if err == nil && stats.Bytes != int64(buf.Len()) {
 		t.Fatalf("stats.Bytes = %d, want %d (output length)", stats.Bytes, buf.Len())
 	}

@@ -19,7 +19,7 @@ Owned decomposition:
 | Directory                        | Owns                                                                                                                                                                                                                                                  |
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, log level via `ParseLogLevel`), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteModel` (byte-preserving)                                                                                                                                    |
+| `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped)                                                                                            |
 | `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`)                                                                                                                                                                        |
 | `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                               |
 | `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                       |
@@ -46,10 +46,14 @@ Owned decomposition:
 - **Injection must never corrupt.** Chat prepends to `messages` only when it
   is a JSON array; Responses merges into `instructions` (string, array, or
   absent) and touches nothing else. Empty prompt = no injection.
-- **`RewriteModel` is byte-preserving.** Only object-key `"model"` string
-  values are replaced (top-level for both APIs; nested `response.model` for
-  Responses envelopes) inside a string-state-aware scan. Unparseable input
-  returns the input unchanged. Never re-serialize.
+- **Rewrite is byte-preserving and API-scoped.** `RewriteChatModel` replaces
+  only the top-level `"model"` string value; `RewriteResponsesModel`
+  additionally replaces the `"model"` directly inside a top-level
+  `"response"` object (Responses envelope events) — a chat payload's nested
+  `response.model` is client data and passes untouched. Both inside a
+  string-state-aware scan; unparseable input returns the input unchanged.
+  Never re-serialize. Every call site (chat/responses × buffered/SSE) uses
+  its own API's function.
 - **Streaming branches on the URL path**, not the body: chat = `data:`
   lines + `data: [DONE]`; responses = `event:`+`data:` pairs, no `[DONE]`
   (Responses termination events pass through untouched). `CopySSE` flushes

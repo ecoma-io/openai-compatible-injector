@@ -8,13 +8,12 @@ import (
 // through its closing quote, in the ORIGINAL body.
 type span struct{ start, end int }
 
-// RewriteModel replaces the value of "model" JSON string fields with public,
-// preserving ALL other bytes and key order (no re-serialization). The scope
-// is exactly the documented contract: the top-level "model" key (requests,
-// chat chunks) and the "model" key directly inside a top-level "response"
-// object (Responses envelope events carry model inside response.model).
-// Anything deeper — client metadata tags, tool output, usage breakdowns —
-// belongs to the caller's payload and passes through untouched.
+// RewriteChatModel replaces the value of the top-level "model" JSON string
+// field with public, preserving ALL other bytes and key order (no
+// re-serialization). This is the Chat Completions scope: request bodies and
+// streamed chat chunks carry exactly one model we own — the top-level key.
+// A chat payload's nested "response" object (if a client or tool emits one)
+// is the caller's data and passes through untouched.
 //
 // Only JSON string values are replaced ("model":"gpt-5" ->
 // "model":"reviewer"); other value types are left untouched, including
@@ -25,7 +24,28 @@ type span struct{ start, end int }
 // The scan is byte-level: a key written as "model" decodes to "model"
 // but is not matched. Providers emit canonical keys; this is a documented
 // limitation, not a corruption risk.
-func RewriteModel(body []byte, public string) []byte {
+func RewriteChatModel(body []byte, public string) []byte {
+	return rewriteModel(body, public, false)
+}
+
+// RewriteResponsesModel replaces the value of the top-level "model" JSON
+// string field AND the "model" field directly inside a top-level "response"
+// object, preserving ALL other bytes and key order (no re-serialization).
+// This is the Responses API scope: envelope events carry the model in
+// response.model alongside the top-level request model. Anything deeper —
+// client metadata tags, tool output, usage breakdowns — belongs to the
+// caller's payload and passes through untouched.
+//
+// The acceptance rules are otherwise RewriteChatModel's: string values only,
+// byte-preserving, invalid or out-of-scope input returned unchanged.
+func RewriteResponsesModel(body []byte, public string) []byte {
+	return rewriteModel(body, public, true)
+}
+
+// rewriteModel collects the in-scope "model" spans and splices the quoted
+// public name over each, copying every other byte. When nestedResponse is
+// false the scan never descends into a "response" object.
+func rewriteModel(body []byte, public string, nestedResponse bool) []byte {
 	// The validity gate is load-bearing, not an optimization: on invalid
 	// input the scan's structural assumptions do not hold (an unterminated
 	// string, for one, makes valueEnd run past the end of the document).
@@ -33,7 +53,7 @@ func RewriteModel(body []byte, public string) []byte {
 		return body
 	}
 	var spans []span
-	scanModelSpans(body, 0, len(body), &spans, 0)
+	scanModelSpans(body, 0, len(body), &spans, nestedResponse)
 
 	if len(spans) == 0 {
 		return body
@@ -53,12 +73,12 @@ func RewriteModel(body []byte, public string) []byte {
 }
 
 // scanModelSpans walks the object region [start,end) collecting the string
-// values of its direct "model" keys. At depth 0 it also descends into any
-// object that is the value of a "response" key; depth-1 regions collect
-// their "model" keys only and never descend further. Regions that are not
-// objects (arrays, scalars) hold no keys and are skipped whole — the
-// narrow, documented scope.
-func scanModelSpans(body []byte, start, end int, spans *[]span, depth int) {
+// values of its direct "model" keys. descendResponse grants a single
+// descent into an object that is the value of a "response" key — the
+// Responses envelope scope; the descended region may not descend again.
+// Regions that are not objects (arrays, scalars) hold no keys and are
+// skipped whole — the narrow, documented scope.
+func scanModelSpans(body []byte, start, end int, spans *[]span, descendResponse bool) {
 	i := skipWS(body, start)
 	if i >= end || body[i] != '{' {
 		return
@@ -90,9 +110,9 @@ func scanModelSpans(body []byte, start, end int, spans *[]span, depth int) {
 			valEnd := valueEnd(body, i)
 			*spans = append(*spans, span{start: i, end: valEnd})
 			i = valEnd
-		case depth == 0 && isKey(body, keyStart, keyEnd, "response") && body[i] == '{':
+		case descendResponse && isKey(body, keyStart, keyEnd, "response") && body[i] == '{':
 			objEnd := collectionEnd(body, i, end)
-			scanModelSpans(body, i, objEnd, spans, 1)
+			scanModelSpans(body, i, objEnd, spans, false)
 			i = objEnd
 		default:
 			i = skipValue(body, i, end)

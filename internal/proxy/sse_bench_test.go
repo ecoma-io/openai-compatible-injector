@@ -12,7 +12,7 @@ import (
 // the three shapes a stream actually hits: a data line whose payload carries
 // the model key and gets rewritten, a data line without the model key (the
 // pure scan fast path), and a single 64 KiB data line (the provider-padding
-// case that motivated the cap-free buffered reader).
+// case that must stay far below the line cap).
 func BenchmarkRewriteSSELine(b *testing.B) {
 	tests := []struct {
 		name string
@@ -37,7 +37,7 @@ func BenchmarkRewriteSSELine(b *testing.B) {
 			b.SetBytes(int64(len(tc.line)))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				rewriteSSELine(tc.line, "public-name")
+				rewriteSSELine(tc.line, sseRewriter("public-name"))
 			}
 		})
 	}
@@ -67,7 +67,7 @@ func BenchmarkCopySSE(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				src.Reset(in) // deterministic: no allocs, no state leak
-				if _, err := CopySSE(io.Discard, &src, "public-name", func() {}); err != nil {
+				if _, err := CopySSE(io.Discard, &src, sseRewriter("public-name"), func() {}); err != nil {
 					b.Fatalf("CopySSE: %v", err)
 				}
 			}
@@ -77,9 +77,9 @@ func BenchmarkCopySSE(b *testing.B) {
 }
 
 // BenchmarkCopySSELongLines measures 10 lines of 64 KiB each, with the blank
-// event boundary between every pair of data lines. The point is the case
-// the bufio reader was chosen for: no cap on line length, event boundaries
-// respected.
+// event boundary between every pair of data lines. The point is the
+// multi-buffer line case: lines far larger than the read buffer, event
+// boundaries respected, well below the caps.
 func BenchmarkCopySSELongLines(b *testing.B) {
 	n := 10
 	in, total := buildSSEInput(n, func(i int) string {
@@ -92,7 +92,7 @@ func BenchmarkCopySSELongLines(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		src.Reset(in)
-		if _, err := CopySSE(io.Discard, &src, "public-name", func() {}); err != nil {
+		if _, err := CopySSE(io.Discard, &src, sseRewriter("public-name"), func() {}); err != nil {
 			b.Fatalf("CopySSE: %v", err)
 		}
 	}
