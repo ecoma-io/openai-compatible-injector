@@ -47,6 +47,39 @@ func TestLoadRuntimeErrorsNeverEchoInput(t *testing.T) {
 			name: "endpoint with an invalid path escape and a secret query",
 			yaml: "models:\n  a:\n    endpoint: http://h.example/v1%zz?" + marker + "=x\n    upstream-model: m\n",
 		},
+		{
+			// yaml.v3 rejects duplicate keys with a TypeError that quotes the
+			// full key text — a merge tool duplicating a block, or an
+			// operator pasting a key twice while iterating, must not have it
+			// echoed.
+			name: "duplicate top-level key carrying a credential",
+			yaml: marker + ": true\nmodels:\n  a:\n    endpoint: http://h.example/v1\n    upstream-model: m\n" + marker + ": false\n",
+		},
+		{
+			name: "duplicate model-entry key whose repeated value carries a credential",
+			yaml: "models:\n  a:\n    endpoint: http://h.example/v1\n    endpoint: http://h.example/?" + marker + "=x\n    upstream-model: m\n",
+		},
+		{
+			// A file that is only a scalar cannot be a mapping; the decode
+			// error quotes (an elision of) the scalar.
+			name: "whole file is a bare scalar",
+			yaml: marker + "\n",
+		},
+		{
+			// An undefined alias names its anchor in the error text — a
+			// scanner-level failf, not a TypeError.
+			name: "undefined alias named by a credential",
+			yaml: "models:\n  a:\n    endpoint: *" + marker + "\n    upstream-model: m\n",
+		},
+		{
+			name: "self-referential anchor named by a credential",
+			yaml: "models:\n  a: &" + marker + "\n    endpoint: *" + marker + "\n    upstream-model: m\n",
+		},
+		{
+			// An explicit tag that contradicts the value quotes the scalar.
+			name: "explicit tag mismatch quoting the value",
+			yaml: "models:\n  a:\n    endpoint: !!int " + marker + "\n    upstream-model: m\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

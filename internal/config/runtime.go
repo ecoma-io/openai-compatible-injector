@@ -18,12 +18,33 @@ import (
 // TypeError reports — the only part of that error that is safe to surface.
 var typeErrorLine = regexp.MustCompile(`line (\d+)`)
 
+// inputEchoingPrefixes lists the yaml.v3 scanner-level failures whose
+// messages interpolate operator text rather than positions: an undefined
+// alias names its anchor, a recursive anchor names itself, an explicit tag
+// mismatch quotes the scalar, an unhashable key quotes the key. Error text
+// reaches logs verbatim, so each is replaced wholesale; everything else at
+// this layer (syntax errors, control-character rejections) quotes only
+// positions and passes through.
+var inputEchoingPrefixes = []struct{ prefix, safe string }{
+	{"yaml: unknown anchor ", "yaml: undefined anchor referenced (input redacted)"},
+	{"yaml: anchor ", "yaml: recursive anchor rejected (input redacted)"},
+	{"yaml: cannot decode ", "yaml: explicitly tagged value could not be decoded (input redacted)"},
+	{"yaml: invalid map key", "yaml: invalid map key (input redacted)"},
+}
+
 // decodeConfigError rewrites a YAML decode failure into log-safe text.
 // yaml.TypeError quotes the offending key or scalar value — and a botched
 // paste into any YAML position can carry credentials — so the error is
-// reduced to the line numbers that failed and a generic description.
-// Scanner/syntax errors quote only positions and pass through unchanged.
+// reduced to the line numbers that failed and a generic description. The
+// handful of scanner-level errors that quote input instead of positions are
+// replaced wholesale (see inputEchoingPrefixes).
 func decodeConfigError(err error) error {
+	msg := err.Error()
+	for _, e := range inputEchoingPrefixes {
+		if strings.HasPrefix(msg, e.prefix) {
+			return errors.New(e.safe)
+		}
+	}
 	var te *yaml.TypeError
 	if !errors.As(err, &te) {
 		return err
@@ -102,7 +123,11 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	// shape.
 	var raw map[string]any
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+		// Duplicate keys (uniqueKeys is on by default) and whole-file scalars
+		// surface here as a yaml.TypeError that quotes the key or value —
+		// the same sanitizer as every other decode failure, or the text
+		// reaches the logs verbatim.
+		return nil, fmt.Errorf("parse config: %w", decodeConfigError(err))
 	}
 	for k := range raw {
 		if k == "models" || k == "logging" {
