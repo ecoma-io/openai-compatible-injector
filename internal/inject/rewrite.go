@@ -26,6 +26,12 @@ type span struct{ start, end int }
 // but is not matched. Providers emit canonical keys; this is a documented
 // limitation, not a corruption risk.
 func RewriteModel(body []byte, public string) []byte {
+	// The validity gate is load-bearing, not an optimization: on invalid
+	// input the scan's structural assumptions do not hold (an unterminated
+	// string, for one, makes valueEnd run past the end of the document).
+	if !json.Valid(body) {
+		return body
+	}
 	var spans []span
 	scanModelSpans(body, 0, len(body), &spans, 0)
 

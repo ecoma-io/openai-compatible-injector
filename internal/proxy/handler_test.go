@@ -425,3 +425,31 @@ func TestMethodNotAllowedJSONEnvelope(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamAndBufferedRewriteParity pins that a streamed chunk and a
+// buffered body carrying the same JSON are rewritten identically — the
+// streaming path must never leak the upstream name where the buffered path
+// would rewrite it, or vice versa.
+func TestStreamAndBufferedRewriteParity(t *testing.T) {
+	payload := `{"model":"upstream-name","n":1e400}` // valid JSON, overflow number
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("upstream path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+payload+"\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model","stream":true}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"model":"test-model","n":1e400`) {
+		t.Errorf("streamed overflow payload not rewritten: %q", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "upstream-name") {
+		t.Errorf("upstream name leaked to client: %q", rec.Body.String())
+	}
+}

@@ -32,8 +32,8 @@ func TestCopySSEVerbatimPassthrough(t *testing.T) {
 	if out != input {
 		t.Errorf("verbatim passthrough mismatch:\n got %q\nwant %q", out, input)
 	}
-	if flushes != 6 {
-		t.Errorf("flushes = %d, want 6 (one per line)", flushes)
+	if flushes != 1 {
+		t.Errorf("flushes = %d, want 1 (one per event boundary)", flushes)
 	}
 }
 
@@ -100,25 +100,58 @@ func TestCopySSENoModelLineByteIdentical(t *testing.T) {
 	}
 }
 
-func TestCopySSEFlushPerLine(t *testing.T) {
+// TestCopySSEFlushPerEvent pins the flush granularity: one flush per event
+// boundary (the blank line that terminates an event) — exactly what SSE
+// clients dispatch on. Lines inside an event are written immediately but
+// not individually flushed; flushing them buys no earlier client dispatch.
+func TestCopySSEFlushPerEvent(t *testing.T) {
 	input := "data: a\n\nid: b\ndata: [DONE]\n"
 	out, flushes := copySSEOnce(t, input, "public-name")
 	if out != input {
 		t.Errorf("output corrupted: got %q want %q", out, input)
 	}
-	if flushes != 4 {
-		t.Errorf("flushes = %d, want 4 (flush after every line, blanks included)", flushes)
+	if flushes != 1 {
+		t.Errorf("flushes = %d, want 1 (single event, flushed at its blank line)", flushes)
+	}
+
+	twoEvents := "event: a\ndata: {\"x\":1}\n\nevent: b\ndata: {\"x\":2}\n\n"
+	_, flushes = copySSEOnce(t, twoEvents, "public-name")
+	if flushes != 2 {
+		t.Errorf("flushes = %d, want 2 (one per event)", flushes)
+	}
+}
+
+func TestCopySSERewritesPayloadTheBufferedPathRewrites(t *testing.T) {
+	// The rewrite gate must accept every payload the buffered path accepts:
+	// a JSON number that overflows float64 (1e400) is valid JSON and its
+	// top-level model is in scope. A full-decode gate would reject it and
+	// leak the upstream name where a non-streaming request would not.
+	input := "data: {\"model\":\"upstream-name\",\"n\":1e400}\n"
+	out, _ := copySSEOnce(t, input, "public-name")
+	if out != "data: {\"model\":\"public-name\",\"n\":1e400}\n" {
+		t.Errorf("overflow-number payload not rewritten: %q", out)
+	}
+
+	// A top-level array is out of rewrite scope on BOTH paths (the rewrite
+	// is top-level + response.model); pinned so stream and buffered paths
+	// stay consistent.
+	arrays := "data: [{\"model\":\"upstream-name\"}]\n"
+	out, _ = copySSEOnce(t, arrays, "public-name")
+	if out != arrays {
+		t.Errorf("array payload must pass through untouched: %q", out)
 	}
 }
 
 func TestCopySSEPartialFinalLine(t *testing.T) {
-	// EOF with no trailing newline: final line is still forwarded and flushed.
+	// EOF with no trailing newline: the final partial line is still
+	// forwarded (no flush — it is not an event boundary; the response
+	// completes and net/http delivers the tail when the handler returns).
 	out, flushes := copySSEOnce(t, "data: tail", "public-name")
 	if out != "data: tail" {
 		t.Errorf("got %q, want %q", out, "data: tail")
 	}
-	if flushes != 1 {
-		t.Errorf("flushes = %d, want 1", flushes)
+	if flushes != 0 {
+		t.Errorf("flushes = %d, want 0 (no event boundary seen)", flushes)
 	}
 
 	// Rewrite applies to a partial final data line too.

@@ -47,8 +47,9 @@ Owned decomposition:
 - **Streaming branches on the URL path**, not the body: chat = `data:`
   lines + `data: [DONE]`; responses = `event:`+`data:` pairs, no `[DONE]`
   (Responses termination events pass through untouched). `CopySSE` flushes
-  per line, grows its buffer without a cap, and rewrites only `data:` lines
-  containing a model string.
+  per event boundary (blank line), grows its buffer without a cap, and
+  rewrites only `data:` lines containing a model string, with the same
+  acceptance rule as the buffered path.
 - **Verbose verbatim, loud local.** 4xx/5xx upstream responses forward byte
   for byte. A 200 that is not JSON becomes 502 `upstream_invalid_response`;
   dial failure is 502 `upstream_unreachable`; unmapped model is 404

@@ -211,9 +211,10 @@ SSE streams pass through **incrementally, line by line** — nothing is
 buffered up-front and flushed at the end, so a slow upstream produces a slow,
 live stream with correct per-chunk latency. Behavior:
 
-- Every line is flushed to the client as soon as it is read. The internal
-  line buffer grows without a cap: providers pad chunks and there is no line
-  length ceiling to impose.
+- Lines are written out as they are read, and flushed to the client at
+  every event boundary — the blank line that terminates an event, which is
+  what SSE clients dispatch on. The internal line buffer grows without a
+  cap: providers pad chunks and there is no line length ceiling to impose.
 - The streaming _shape_ is decided by the **URL path**, not the body:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses
