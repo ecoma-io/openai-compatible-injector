@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -305,8 +307,10 @@ func (d *dyingRecorder) WriteHeader(int) {}
 func (d *dyingRecorder) Flush()          {}
 
 // TestRelayCopyFailureLogged pins the verbatim branch's copy failure: a
-// body that dies mid-relay is logged (ERROR — not a client cancel), while
-// the response status stays whatever upstream committed.
+// body that dies mid-relay is logged as an upstream read (ERROR — not a
+// client cancel), the outcome says upstream_read_failed — never "relayed",
+// which would report a truncated body as a finished one — while the
+// response status stays whatever upstream committed.
 func TestRelayCopyFailureLogged(t *testing.T) {
 	buf, log := captureLog(zerolog.InfoLevel)
 	client := &http.Client{Transport: &stubTransport{resp: &http.Response{
@@ -327,11 +331,184 @@ func TestRelayCopyFailureLogged(t *testing.T) {
 	if len(evs) != 1 {
 		t.Fatalf("relay_copy_failed logged %d times, want 1", len(evs))
 	}
+	if evs[0]["phase"] != "upstream_read" {
+		t.Errorf("phase = %v, want upstream_read", evs[0]["phase"])
+	}
 	completed := buf.events(t, "request_completed")
-	if len(completed) != 1 || completed[0]["outcome"] != "relayed" {
-		t.Fatalf("request_completed = %v, want outcome relayed", completed)
+	if len(completed) != 1 || completed[0]["outcome"] != "upstream_read_failed" {
+		t.Fatalf("request_completed = %v, want outcome upstream_read_failed", completed)
 	}
 }
+
+// canceledBody is an upstream body whose read fails with context.Canceled —
+// what the transport surfaces when the client request context is canceled
+// (the client went away mid-answer).
+type canceledBody struct{ used bool }
+
+func (b *canceledBody) Read(p []byte) (int, error) {
+	if b.used {
+		return 0, context.Canceled
+	}
+	b.used = true
+	s := "partial"
+	return copy(p, s), nil
+}
+
+func (b *canceledBody) Close() error { return nil }
+
+// shortResponseWriter reports fewer bytes written than it was given, with a
+// nil error — the io.Writer contract's second failure mode.
+type shortResponseWriter struct {
+	Header0 http.Header
+}
+
+func (s *shortResponseWriter) Header() http.Header {
+	if s.Header0 == nil {
+		s.Header0 = http.Header{}
+	}
+	return s.Header0
+}
+func (s *shortResponseWriter) Write(p []byte) (int, error) { return len(p) / 2, nil }
+func (s *shortResponseWriter) WriteHeader(int)             {}
+
+// TestRelayOutcomeClassification pins the verbatim and buffered branches'
+// failure taxonomy: a write-side failure of any shape (error, short write,
+// broken pipe) and a canceled context surface as WARN client-side failures
+// with outcome client_disconnected — never as a silent completion, and
+// never as an upstream failure.
+func TestRelayOutcomeClassification(t *testing.T) {
+	verbatim := func(body io.ReadCloser) (buf *logBuffer, h http.Handler) {
+		buf, log := captureLog(zerolog.InfoLevel)
+		client := &http.Client{Transport: &stubTransport{resp: &http.Response{
+			StatusCode: http.StatusTeapot,
+			Header:     http.Header{"Content-Type": {"text/plain"}},
+			Body:       body,
+			Request:    &http.Request{Method: http.MethodPost},
+		}}}
+		return buf, NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), client, log)
+	}
+	expectDisconnected := func(t *testing.T, buf *logBuffer, slug string) {
+		t.Helper()
+		completed := buf.events(t, "request_completed")
+		if len(completed) != 1 {
+			t.Fatalf("request_completed logged %d times, want 1: %s", len(completed), buf.String())
+		}
+		if completed[0]["outcome"] != "client_disconnected" {
+			t.Fatalf("outcome = %v, want client_disconnected", completed[0]["outcome"])
+		}
+		evs := buf.events(t, slug)
+		if len(evs) != 1 {
+			t.Fatalf("%s logged %d times, want 1: %s", slug, len(evs), buf.String())
+		}
+		if evs[0]["phase"] != "client_write" {
+			t.Errorf("phase = %v, want client_write", evs[0]["phase"])
+		}
+		if lvl, ok := evs[0]["level"].(string); !ok || lvl != "warn" {
+			t.Errorf("level = %v, want warn (a disconnect is operational, not an error)", evs[0]["level"])
+		}
+	}
+
+	t.Run("verbatim_write_error", func(t *testing.T) {
+		buf, h := verbatim(io.NopCloser(strings.NewReader("body bytes")))
+		dying := &dyingRecorder{limit: 0}
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		h.ServeHTTP(dying, req)
+		expectDisconnected(t, buf, "relay_copy_failed")
+	})
+
+	t.Run("verbatim_broken_pipe", func(t *testing.T) {
+		buf, h := verbatim(io.NopCloser(strings.NewReader("body bytes")))
+		pipe := &pipeRecorder{}
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		h.ServeHTTP(pipe, req)
+		expectDisconnected(t, buf, "relay_copy_failed")
+	})
+
+	t.Run("verbatim_short_write", func(t *testing.T) {
+		buf, h := verbatim(io.NopCloser(strings.NewReader("body bytes")))
+		short := &shortResponseWriter{}
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		h.ServeHTTP(short, req)
+		expectDisconnected(t, buf, "relay_copy_failed")
+	})
+
+	t.Run("verbatim_canceled_context", func(t *testing.T) {
+		// The canceled request context surfaces through the upstream READ —
+		// io.Copy's error is context.Canceled with no write wrapper. It is
+		// still a client-side disconnect: the context only cancels when the
+		// client goes away.
+		buf, h := verbatim(&canceledBody{})
+		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+		if rec.Code != http.StatusTeapot {
+			t.Fatalf("status = %d, want 418", rec.Code)
+		}
+		expectDisconnected(t, buf, "relay_copy_failed")
+	})
+
+	t.Run("buffered_read_failure", func(t *testing.T) {
+		// An upstream that dies mid-body on the buffered path: its own
+		// outcome (upstream_read_failed), a WARN, and the same client-502
+		// envelope as an unparseable body — the wire contract is unchanged,
+		// the log distinguishes the causes.
+		buf, log := captureLog(zerolog.InfoLevel)
+		client := &http.Client{Transport: &stubTransport{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       &errBody{data: []byte(`{"model":"upstream-name","partial`)},
+			Request:    &http.Request{Method: http.MethodPost},
+		}}}
+		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), client, log)
+
+		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", rec.Code)
+		}
+		completed := buf.events(t, "request_completed")
+		if len(completed) != 1 || completed[0]["outcome"] != "upstream_read_failed" {
+			t.Fatalf("request_completed = %v, want outcome upstream_read_failed", completed)
+		}
+		if evs := buf.events(t, "upstream_body_read_failed"); len(evs) != 1 {
+			t.Fatalf("upstream_body_read_failed logged %d times, want 1: %s", len(evs), buf.String())
+		}
+	})
+
+	t.Run("buffered_write_error", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"model":"upstream-name","choices":[]}`))
+		}))
+		defer upstream.Close()
+
+		buf, log := captureLog(zerolog.InfoLevel)
+		h := NewHandler(promptStore(t, upstream.URL, "prompt"), NewSharedClient(), log)
+		dying := &dyingRecorder{limit: 0}
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		h.ServeHTTP(dying, req)
+
+		completed := buf.events(t, "request_completed")
+		if len(completed) != 1 || completed[0]["outcome"] != "client_disconnected" {
+			t.Fatalf("request_completed = %v, want outcome client_disconnected", completed)
+		}
+		if evs := buf.events(t, "client_write_failed"); len(evs) != 1 {
+			t.Fatalf("client_write_failed logged %d times, want 1: %s", len(evs), buf.String())
+		}
+	})
+}
+
+// pipeRecorder fails its first write with EPIPE — the errno a real client
+// disconnect produces on the write side.
+type pipeRecorder struct {
+	Header0 http.Header
+}
+
+func (p *pipeRecorder) Header() http.Header {
+	if p.Header0 == nil {
+		p.Header0 = http.Header{}
+	}
+	return p.Header0
+}
+func (p *pipeRecorder) Write(b []byte) (int, error) { return 0, syscall.EPIPE }
+func (p *pipeRecorder) WriteHeader(int)             {}
 
 // TestMethodNotAllowedOutsideLifecycle pins the 405 path: it never loads a
 // snapshot and emits no request_completed — a wrong method is not proxy

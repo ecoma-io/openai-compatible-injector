@@ -271,15 +271,15 @@ live stream with correct per-chunk latency. Behavior:
 
 Upstream and client failures are classified, never fogged:
 
-| Condition                                                                 | Status                 | `error.type` / `code`                                                                                                                                                                          |
-| ------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Body is not JSON                                                          | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
-| Missing `model`                                                           | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
-| Request body over the 64 MiB cap                                          | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
-| Request names an unmapped model                                           | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
-| Upstream unreachable (dial/network)                                       | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
-| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
-| Upstream answers 3xx/4xx/5xx                                              | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
+| Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                          |
+| --------------------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
+| Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
+| Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
+| Request names an unmapped model                                                                                 | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
+| Upstream unreachable (dial/network)                                                                             | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
+| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap, or a body read that fails mid-answer) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
+| Upstream answers 3xx/4xx/5xx                                                                                    | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
 
 Two consequences of the table:
 
@@ -352,7 +352,12 @@ What each level carries:
   accepted; the listener itself is announced by the DEBUG
   `listener_ready`), and `drain_started`.
 - **WARN** — client disconnects and truncations (`stream_truncated` with a
-  `phase` field separating `client_write` from `upstream_read`), a client
+  `phase` field separating `client_write` from `upstream_read` and
+  `upstream_limit`, and `relay_copy_failed` with the same `phase` values on
+  the verbatim path), a buffered body that never landed
+  (`client_write_failed`, outcome `client_disconnected`), an upstream that
+  died mid-body before the answer could be parsed
+  (`upstream_body_read_failed`, outcome `upstream_read_failed`), a client
   that cancels mid-request, one warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —

@@ -286,12 +286,21 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// relayed byte for byte, whatever the content type.
 		copyRelayHeaders(sw.Header(), resp.Header)
 		sw.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(sw, resp.Body); err != nil {
-			event := log.Error()
-			if errors.Is(err, context.Canceled) {
-				event = log.Warn()
+		if _, err := copyVerbatim(sw, resp.Body); err != nil {
+			// The relay did not finish — the outcome says so. A failure on
+			// the client side (write error, or the canceled request context
+			// surfacing through the upstream read) is a disconnect; anything
+			// else died reading the upstream.
+			level, phase := log.Error(), "upstream_read"
+			if clientSide(err) {
+				level, phase, outcome = log.Warn(), "client_write", "client_disconnected"
+			} else {
+				outcome = "upstream_read_failed"
 			}
-			event.Err(err).Str("public_model", model).Msg("relay_copy_failed")
+			level.Err(err).Str("public_model", model).Str("phase", phase).
+				Msg("relay_copy_failed")
+			complete()
+			return
 		}
 		outcome = "relayed"
 		complete()
@@ -338,9 +347,19 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// Buffered non-stream path (client stream=false, or upstream ignored the
 	// stream flag): read the whole body, validate it, rewrite the model, and
 	// emit a single buffered response. The read is bounded — an over-cap
-	// body is treated like any other unparseable upstream answer.
+	// body is treated like any other unparseable upstream answer, while a
+	// read that fails mid-body is the upstream dying mid-answer and gets
+	// its own outcome; the client-visible 502 envelope is the same either
+	// way.
 	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
-	if err != nil || len(upstreamBody) > int(maxBufferedResponseBytes) || !json.Valid(upstreamBody) {
+	if err != nil {
+		outcome = "upstream_read_failed"
+		log.Warn().Err(err).Str("public_model", model).Msg("upstream_body_read_failed")
+		writeEnvelope(sw, http.StatusBadGateway, envelopeUpInvalid)
+		complete()
+		return
+	}
+	if len(upstreamBody) > int(maxBufferedResponseBytes) || !json.Valid(upstreamBody) {
 		outcome = "upstream_invalid_response"
 		writeEnvelope(sw, http.StatusBadGateway, envelopeUpInvalid)
 		complete()
@@ -349,7 +368,15 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	rewritten := rewrite(upstreamBody, m.Public)
 	copyRelayHeaders(sw.Header(), resp.Header)
 	sw.WriteHeader(resp.StatusCode)
-	_, _ = sw.Write(rewritten)
+	if _, err := sw.Write(rewritten); err != nil {
+		// The status committed and the rewrite is done; the client went
+		// away before the body could land. A disconnect, not a completion.
+		outcome = "client_disconnected"
+		log.Warn().Err(err).Str("public_model", model).
+			Int64("bytes_out", sw.bytes).Msg("client_write_failed")
+		complete()
+		return
+	}
 	complete()
 }
 
@@ -449,6 +476,59 @@ func flusher(w http.ResponseWriter) func() {
 		return f.Flush
 	}
 	return func() {}
+}
+
+// clientWriteError marks a relay failure that happened writing to the
+// client — the connection broke mid-body — as opposed to a failure reading
+// from upstream. io.Copy flattens the two sides into one error; the access
+// log must not report a vanished client as an upstream failure or the
+// reverse.
+type clientWriteError struct{ err error }
+
+func (e *clientWriteError) Error() string {
+	return "writing response to client: " + e.err.Error()
+}
+func (e *clientWriteError) Unwrap() error { return e.err }
+
+// clientSide reports whether a relay error happened on the client side: an
+// explicit write failure, or the request context surfacing canceled through
+// the upstream read — the context cancels when the client goes away, never
+// on an upstream hiccup.
+func clientSide(err error) bool {
+	var cwe *clientWriteError
+	if errors.As(err, &cwe) {
+		return true
+	}
+	return errors.Is(err, context.Canceled)
+}
+
+// copyVerbatim relays src to dst byte for byte with the same io.Copy
+// semantics (n bytes from a failed Read are relayed before the error), but
+// with every dst failure marked client-side — including a short write with
+// a nil error, which is io.ErrShortWrite. The explicit loop is deliberate:
+// io.Copy's WriterTo/ReaderFrom fast paths would bypass the tagging writer.
+func copyVerbatim(dst io.Writer, src io.Reader) (int64, error) {
+	var written int64
+	buf := make([]byte, 32<<10)
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			wn, werr := dst.Write(buf[:n])
+			written += int64(wn)
+			switch {
+			case werr != nil:
+				return written, &clientWriteError{err: werr}
+			case wn < n:
+				return written, &clientWriteError{err: io.ErrShortWrite}
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return written, nil
+			}
+			return written, rerr
+		}
+	}
 }
 
 // statusWriter records the committed status and total bytes written for the
