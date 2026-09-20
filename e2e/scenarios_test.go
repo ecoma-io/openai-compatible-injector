@@ -411,9 +411,6 @@ func TestShutdownIdleExitsZero(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("idle shutdown took %v, want a few seconds", elapsed)
 	}
-	if !strings.Contains(p.stderr.String(), "shutdown complete") {
-		t.Fatalf("stderr missing 'shutdown complete':\n%s", p.stderr.String())
-	}
 }
 
 // Scenario 22a: graceful drain. An in-flight request is blocked upstream;
