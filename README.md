@@ -108,11 +108,11 @@ The file is validated strictly, in two layers:
 - **Top-level keys** are checked against the raw YAML: only `models` is
   legal. This is the bootstrap-plane rule — a file that tries to define
   `listen`, `config-file`, `config-poll-interval` or `shutdown-grace` is
-  rejected whatever its value's shape (viper's strict decode alone misses a
-  bootstrap key whose value is an empty map).
-- **Model entries** are decoded with `viper.UnmarshalExact`: any key outside
-  `endpoint`, `upstream-model`, `injection-prompt` — including a nested
-  bootstrap key — is a rejection, not a warning.
+  rejected whatever its value's shape (a strict struct decode alone misses
+  a bootstrap key whose value is an empty map).
+- **Model entries** are decoded strictly (`yaml.v3` with known fields):
+  any key outside `endpoint`, `upstream-model`, `injection-prompt` —
+  including a nested bootstrap key — is a rejection, not a warning.
 
 The `models` table itself must contain at least one model. An empty table is
 rejected — an empty file is what a truncate-then-write config edit looks

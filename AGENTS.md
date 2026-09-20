@@ -18,7 +18,7 @@ Owned decomposition:
 
 | Directory                        | Owns                                                                                                                                                                                                 |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `viper.UnmarshalExact`), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`) |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`) |
 | `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteModel` (byte-preserving)                                                                                   |
 | `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`)                                                                                                                       |
 | `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                              |
@@ -29,8 +29,8 @@ Owned decomposition:
 
 - **Two config planes.** Bootstrap settings (`LISTEN`, `CONFIG_FILE`,
   `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE`) come from the environment and
-  are enforced by `viper.UnmarshalExact`: a runtime file defining them is
-  rejected. Runtime model mapping lives in YAML only.
+  are enforced by the runtime file's strict decoding: a runtime file
+  defining them is rejected. Runtime model mapping lives in YAML only.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
   keeps the previous snapshot.
@@ -98,8 +98,8 @@ Owned decomposition:
 
 ## Harness-agnostic conventions
 
-- Go ≥ 1.25 (toolchain owned by `go.mod`); deps viper v1.21.0 + zerolog
-  v1.35.1, stdlib tests only; no Makefile — commands live in
+- Go ≥ 1.25 (toolchain owned by `go.mod`); deps zerolog v1.35.1 +
+  gopkg.in/yaml.v3, stdlib tests only; no Makefile — commands live in
   CONTRIBUTING.md and ci.yml.
 - Conventional Commits via lefthook + commitlint (scopes: inject, proxy,
   server, config, cmd, e2e, docs, deps, ci, workspace, release). Signed
