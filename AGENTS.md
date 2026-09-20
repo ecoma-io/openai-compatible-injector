@@ -30,10 +30,16 @@ Owned decomposition:
 - **Two config planes.** Bootstrap settings (`LISTEN`, `CONFIG_FILE`,
   `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE`) come from the environment and
   are enforced by the runtime file's strict decoding: a runtime file
-  defining them is rejected. Runtime model mapping lives in YAML only.
+  defining them is rejected. The runtime file must be a single YAML
+  document — a `---`-separated second document is a rejection (a decoder
+  reading only the first would hide what follows). Runtime model mapping
+  lives in YAML only.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
-  keeps the previous snapshot.
+  keeps the previous snapshot; its hash baseline is the boot content passed
+  to `NewPoller`, never a fresh read. Rejection error text never quotes
+  operator input (position/length/line only) — error text reaches logs
+  verbatim.
 - **One snapshot per request.** A handler calls `store.Load()` exactly once
   and binds the whole request — including any active stream — to that
   snapshot forever. Reloads never affect in-flight work.
@@ -57,10 +63,11 @@ Owned decomposition:
 - **Never log or leak credentials.** No `Authorization`, keys, request
   bodies, or injection prompts in logs or error text. A quote of these is
   a security defect (SECURITY.md), not a typo.
-- **Graceful shutdown.** `signal.NotifyContext(SIGINT, SIGTERM)` →
+- **Graceful shutdown.** One signal channel: first SIGINT/SIGTERM →
   `Shutdown(grace)` → force `Close()` on overflow → `CloseIdleConnections` →
-  exit 0. Second signal forces exit 1. Compose `stop_grace_period`
-  (60s) > default `SHUTDOWN_GRACE` (55s).
+  exit 0. Second signal forces exit 1; signals after the drain are ignored
+  so a late duplicate cannot overwrite the exit code. Compose
+  `stop_grace_period` (60s) > default `SHUTDOWN_GRACE` (55s).
 - **Logging hot-reloads like config, and leaks nothing at any level.**
   `logging.level` lives in the runtime YAML (`debug|info|warn|warning|error`,
   `warning` is an alias, absent = `info`); there is no `LOG_LEVEL` env var.

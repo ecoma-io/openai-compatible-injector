@@ -335,9 +335,13 @@ What each level carries:
   (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,
   `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
   snapshot generation the request bound to — correlating reloads with
-  behavior). Also `config_reloaded` (`generation`, `model_count`,
-  `log_level`), `config_file_recovered` (a file returned byte-identical
-  after a failure), `service_started`, and `drain_started`.
+  behavior). The event is emitted when the request finishes, under the
+  level in effect at that moment — a reload mid-request can therefore
+  change whether it appears. Also `config_reloaded` (`generation`,
+  `model_count`, `log_level`), `config_file_recovered` (a file returned
+  byte-identical after a failure), `service_started` (boot config
+  accepted; the listener itself is announced by the DEBUG
+  `listener_ready`), and `drain_started`.
 - **WARN** — client disconnects and truncations (`stream_truncated` with a
   `phase` field separating `client_write` from `upstream_read`), a client
   that cancels mid-request, one warning per transition into a failed config
@@ -447,12 +451,20 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
 ## Operations
 
 - Logs are JSON on stderr. Every reload decision is logged: generation
-  number, applied/kept-last-known-good. `LOG_LEVEL=debug` adds per-request
-  routing lines (still never bodies or credentials).
+  number, applied/kept-last-known-good. `logging.level: debug` in the
+  runtime file (hot-reloadable) adds per-request routing lines (still never
+  bodies or credentials).
 - `./openai-compatible-injector version` prints the build version (injected
   via `-X main.version`, or the release tag in published images).
 - Sending a second SIGTERM/SIGINT during drain aborts immediately with
-  exit 1 — by design, for orchestrators that need a hard stop.
+  exit 1 — by design, for orchestrators that need a hard stop. After the
+  drain finishes, duplicate signals are ignored: the process keeps the exit
+  code it earned.
+- Connection hygiene is bounded: request bodies are capped at 64 MiB,
+  request headers must arrive within 10s, and idle keep-alive connections
+  are closed after 120s — a quiet client cannot pin a goroutine and a file
+  descriptor forever. An active response (including a long SSE stream) is
+  never touched by the idle timeout.
 
 ## Out of scope
 
