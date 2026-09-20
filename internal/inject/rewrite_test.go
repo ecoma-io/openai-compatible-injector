@@ -94,6 +94,7 @@ func TestRewriteModelUnchanged(t *testing.T) {
 		`{"a":"he said \"model\" ok"}`, // quoted text inside a value
 		`["model"]`,                    // array element
 		`{"my_model":"x"}`,             // key merely containing "model"
+		`{"mod\u0065l":"x"}`,           // escaped key decodes to "model" — the scan is byte-level by design
 		`""`,                           // bare string document
 		``,                             // empty body
 	}
@@ -112,6 +113,87 @@ func TestRewriteModelPreservesUnrewrittenRegions(t *testing.T) {
 	want := `{"id" : "chatcmpl-1","model" : "reviewer","n" : 1,"flag" : true,"arr" : [1,2],"obj":{"k":"v"},"text":"model not here"}`
 	got := RewriteModel([]byte(body), "reviewer")
 	if string(got) != want {
+		t.Fatalf("\n got  %s\n want %s", got, want)
+	}
+}
+
+// TestRewriteModelScopePinned pins the documented rewrite scope: only the
+// top-level "model" key and the "model" key directly inside a top-level
+// "response" object are rewritten. Any deeper "model" key belongs to the
+// client's own payload — metadata tags, tool output, usage breakdowns — and
+// rewriting it would mutate client data in transit.
+func TestRewriteModelScopePinned(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"nested metadata untouched, response.model rewritten",
+			`{"response":{"metadata":{"model":"trace-1"},"model":"up"}}`,
+			`{"response":{"metadata":{"model":"trace-1"},"model":"reviewer"}}`,
+		},
+		{
+			"arbitrary nesting untouched",
+			`{"outer":{"inner":{"model":"x"}}}`,
+			`{"outer":{"inner":{"model":"x"}}}`,
+		},
+		{
+			"usage breakdown untouched",
+			`{"usage":{"model_breakdown":{"model":"gpt-x"}}}`,
+			`{"usage":{"model_breakdown":{"model":"gpt-x"}}}`,
+		},
+		{
+			"array element untouched",
+			`[{"model":"x"}]`,
+			`[{"model":"x"}]`,
+		},
+		{
+			"response two levels down untouched",
+			`{"response":{"wrapper":{"model":"x"}}}`,
+			`{"response":{"wrapper":{"model":"x"}}}`,
+		},
+		{
+			"data envelope untouched",
+			`{"data":[{"model":"x"}]}`,
+			`{"data":[{"model":"x"}]}`,
+		},
+		{
+			"model value object untouched",
+			`{"model":{"model":"inner"}}`,
+			`{"model":{"model":"inner"}}`,
+		},
+		{
+			"response twin model untouched, model rewritten",
+			`{"response":{"model":"up","twin":{"model":"up2"}}}`,
+			`{"response":{"model":"reviewer","twin":{"model":"up2"}}}`,
+		},
+		{
+			"response string containing brace-quote does not end the object early",
+			`{"response":{"a":"x\"}y\"}","model":"up"}}`,
+			`{"response":{"a":"x\"}y\"}","model":"reviewer"}}`,
+		},
+		{
+			"whitespace-heavy response object",
+			`{ "response" : { "model" : "up" } }`,
+			`{ "response" : { "model" : "reviewer" } }`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := string(RewriteModel([]byte(tt.body), "reviewer")); got != tt.want {
+				t.Fatalf("\n got  %s\n want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRewriteModelDuplicateResponseKeys(t *testing.T) {
+	// Duplicate keys are ambiguous JSON; every matching in-scope span is
+	// rewritten, mirroring the duplicate top-level "model" behavior.
+	body := `{"response":{"model":"a"},"response":{"model":"b"}}`
+	want := `{"response":{"model":"reviewer"},"response":{"model":"reviewer"}}`
+	if got := string(RewriteModel([]byte(body), "reviewer")); got != want {
 		t.Fatalf("\n got  %s\n want %s", got, want)
 	}
 }
