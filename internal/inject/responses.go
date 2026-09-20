@@ -35,10 +35,12 @@ type responsesDevItem struct {
 //     prepended to the array;
 //   - any other type      -> left untouched.
 //
-// Every other field survives byte-for-byte via raw JSON re-marshaling, so
-// unknown and future fields are carried through untouched. The model rewrite
-// is unconditional; when m.InjectionPrompt is empty only the instructions
-// merge is skipped.
+// Every other field keeps its parsed value: values travel as raw JSON and
+// are re-marshaled from the decoded form, so unknown and future fields are
+// carried through semantically intact — JSON semantics, not input bytes
+// (member order, whitespace, and number formatting may be normalized by the
+// round trip). The model rewrite is unconditional; when m.InjectionPrompt
+// is empty only the instructions merge is skipped.
 func Responses(body []byte, m config.Model) ([]byte, error) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {

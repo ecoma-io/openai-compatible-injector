@@ -240,7 +240,7 @@ func TestSSEPassthroughRewritesModel(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	if cw.flushes < 2 {
-		t.Errorf("flushes = %d, want >= 2 (flush after every SSE line)", cw.flushes)
+		t.Errorf("flushes = %d, want >= 2 (flush per event boundary)", cw.flushes)
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)

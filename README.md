@@ -150,13 +150,23 @@ Semantics that hold:
   applies to reloads, because at boot there is no last-known-good.
 - **Unchanged file, no churn.** If the content hash is stable, nothing is
   republished; the generation number is stable too.
+- **One document per file.** A `---`-separated multi-document YAML file is
+  rejected: a decoder that reads only the first document would silently
+  hide the rest — including a bootstrap-plane key appended after a
+  separator — which is exactly the shape a two-plane violation takes.
+- **Rejection errors never quote operator input.** Error text reaches logs
+  verbatim (fatal at boot, WARN on reload), and a botched paste into any
+  YAML position can carry credentials — so an invalid value is reported by
+  position, length, and line number, never by content.
 - **The log level hot-reloads with everything else.** `logging.level` rides
   the same validate-then-publish path as the model mappings: a valid reload
   applies the new level process-wide without a restart, a restart, or any
   signal; an invalid `level` value rejects the whole file onto the
   last-known-good path. The level swap is an atomic store zerolog consults
   per event, so in-flight requests race only the old/new boundary and never
-  block.
+  block. The reload acknowledgment itself is logged under the level in
+  effect _before_ the swap: at `error` level a successful reload is silent
+  in the logs and visible only through behavior (the next event's level).
 - **Atomic replace caveat.** The poller watches the file's content, and reads
   it by path; tools that replace a file by `mv`/rename (editor safe-save)
   swap in a new inode the read still follows — but if the process opened the
@@ -240,6 +250,9 @@ live stream with correct per-chunk latency. Behavior:
   `event:`, comments, and non-model `data:` lines pass through verbatim.
 - Malformed lines are forwarded verbatim. We are a passthrough, not an SSE
   validator.
+- Known limitation: lines are terminated by `\n` (with `\r\n` accepted) —
+  the SSE standard and everything real providers emit. Bare-CR line endings
+  (no `\n`) would not be treated as line boundaries.
 - A request with `"stream": true` against an upstream that answers with a
   normal JSON body is handled as a plain 200 (the body is model-rewritten,
   not wrapped, not streamed).
@@ -313,23 +326,24 @@ What each level carries:
 
 - **DEBUG** — request lifecycle detail: `request_received`
   (method/path/remote address), `stream_started`, `stream_completed`,
-  `config_unchanged` and the poller's per-tick heartbeat while a failure
-  persists. Detailed but never payload-bearing: request bodies, SSE
-  `data:` payloads, and injection prompts do not exist at this level — or
-  at any level.
+  `log_level_applied` after each reload, `config_unchanged` and the
+  poller's per-tick heartbeat while a failure persists. Detailed but never
+  payload-bearing: request bodies, SSE `data:` payloads, and injection
+  prompts do not exist at this level — or at any level.
 - **INFO** — one `request_completed` per proxied request with the wire
   facts: `request_id` (16 hex chars, generated per request), `api`
   (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,
   `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
   snapshot generation the request bound to — correlating reloads with
   behavior). Also `config_reloaded` (`generation`, `model_count`,
-  `log_level`), reload acknowledgments, `service_started`, and
-  `drain_started`.
+  `log_level`), `config_file_recovered` (a file returned byte-identical
+  after a failure), `service_started`, and `drain_started`.
 - **WARN** — client disconnects and truncations (`stream_truncated` with a
   `phase` field separating `client_write` from `upstream_read`), a client
   that cancels mid-request, one warning per transition into a failed config
-  state (`config_file_unreadable`, `config_reload_rejected`) — never one
-  per poll tick — plus `second_signal_forced_exit` and drain overflow.
+  state (`config_file_unreadable`, `config_reload_rejected`) — including a
+  failure that changes kind, which warns again — never one per poll tick —
+  plus `second_signal_forced_exit` and drain overflow.
 - **ERROR** — upstream connection failures (`upstream_request_failed` with
   an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial`),
   unparseable upstream responses, and anything fatal at startup.
