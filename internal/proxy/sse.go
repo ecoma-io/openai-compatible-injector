@@ -229,9 +229,13 @@ func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
 		return line
 	}
 	out := rewrite(payload)
-	if &out[0] == &payload[0] {
-		// The rewriter returned the input slice when nothing was in scope;
-		// skip the rebuild for lines that merely mention "model".
+	// The pointer comparison identifies the rewriter's no-op contract: the
+	// input returned unchanged when nothing was in scope. The length guard
+	// keeps the index safe — a zero-length result would panic on &out[0] —
+	// and rules out an aliasing coincidence (same pointer, different span)
+	// being mistaken for identity.
+	if len(out) == len(payload) && &out[0] == &payload[0] {
+		// Skip the rebuild for lines that merely mention "model".
 		return line
 	}
 	// Capacity is never precomputed as a length sum: that arithmetic is the

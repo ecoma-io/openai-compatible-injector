@@ -376,3 +376,28 @@ func TestCopySSENilFlushStillCountsEvents(t *testing.T) {
 		t.Errorf("stats.Bytes = %d, want %d", stats.Bytes, buf.Len())
 	}
 }
+
+// TestRewriteSSELineZeroLengthRewriterResult pins the defensive contract on
+// the rewriter boundary: rewriteSSELine must not index the rewriter's result
+// to detect its no-op contract. A zero-length result previously panicked on
+// &out[0]; now it relays the rebuilt line the rewriter asked for — a relay
+// that must never panic on any rewriter a caller can supply.
+func TestRewriteSSELineZeroLengthRewriterResult(t *testing.T) {
+	line := []byte("data: {\"model\":\"upstream-name\"}\n")
+	out := rewriteSSELine(line, func([]byte) []byte { return []byte{} })
+	if string(out) != "data: \n" {
+		t.Errorf("zero-length rewrite = %q, want the line rebuilt around the empty payload", out)
+	}
+}
+
+// TestRewriteSSELineAliasedResultNotMistakenForNoOp pins the other half of
+// the no-op detection: identity is (length, pointer) together. A rewriter
+// returning a sub-slice of the input — same backing array, shorter span —
+// must trigger the rebuild, not be mistaken for the unchanged input.
+func TestRewriteSSELineAliasedResultNotMistakenForNoOp(t *testing.T) {
+	line := []byte("data: {\"model\":\"upstream-name\"}\n")
+	out := rewriteSSELine(line, func(p []byte) []byte { return p[:3] })
+	if string(out) != "data: {\"m\n" {
+		t.Errorf("aliased sub-slice rewrite = %q, want the rebuilt shortened line", out)
+	}
+}
