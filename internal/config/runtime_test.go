@@ -279,3 +279,30 @@ models:
 		t.Fatal("expected rejection of colliding trimmed model names")
 	}
 }
+
+// TestLoadRuntimeDocumentEdges pins the one-document rule's edges: a
+// leading separator is part of document one (accepted), a trailing bare
+// separator IS a second — null — document (rejected, same as any second
+// document), and blank trailing lines are nothing at all (accepted).
+func TestLoadRuntimeDocumentEdges(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want bool // accepted
+	}{
+		{"plain", validRuntime(), true},
+		{"leading separator", "---\n" + validRuntime(), true},
+		{"trailing blank lines", validRuntime() + "\n\n", true},
+		{"trailing bare separator", validRuntime() + "---\n", false},
+		{"two trailing separators", validRuntime() + "---\n---\n", false},
+		{"second document with content", validRuntime() + "---\nmodels: {}\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte(tt.yaml))
+			if got := err == nil; got != tt.want {
+				t.Fatalf("accepted = %v (err %v), want accepted = %v", got, err, tt.want)
+			}
+		})
+	}
+}
