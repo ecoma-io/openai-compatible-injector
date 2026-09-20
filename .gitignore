@@ -1,0 +1,7 @@
+/injector
+/dist/
+*.test
+*.out
+coverage*
+.idea/
+.vscode/
