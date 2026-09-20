@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,6 +69,40 @@ func (c *countingRecorder) Flush() {
 	c.flushes++
 	c.mu.Unlock()
 	c.ResponseRecorder.Flush()
+}
+
+// TestUpstreamFailureLogsRedactEndpoint pins the credential rule: a dial
+// failure against an endpoint whose query string carries a secret must not
+// put that secret — or the full URL — into logs, in any field. Only the
+// scheme+host origin may appear.
+func TestUpstreamFailureLogsRedactEndpoint(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close() // refuses connections
+
+	endpoint := "http://" + addr + "/v1?api-key=SECRET_ENDPOINT_TOKEN&deployment=x"
+	store := newTestStore(t, endpoint)
+	var logs bytes.Buffer
+	log := zerolog.New(&logs)
+	h := NewHandler(store, NewSharedClient(), log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+
+	out := logs.String()
+	for _, banned := range []string{"SECRET_ENDPOINT_TOKEN", "api-key", "deployment", "/v1/chat/completions?"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("log line contains %q:\n%s", banned, out)
+		}
+	}
+	if !strings.Contains(out, "http://"+addr) {
+		t.Errorf("log line lost the scheme+host origin:\n%s", out)
+	}
 }
 
 func TestHealthz(t *testing.T) {
@@ -205,7 +240,7 @@ func TestSSEPassthroughRewritesModel(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	if cw.flushes < 2 {
-		t.Errorf("flushes = %d, want >= 2 (flush after every SSE line)", cw.flushes)
+		t.Errorf("flushes = %d, want >= 2 (flush per event boundary)", cw.flushes)
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
@@ -423,5 +458,183 @@ func TestMethodNotAllowedJSONEnvelope(t *testing.T) {
 		if got := rec.Body.String(); got != want {
 			t.Errorf("%s %s: body = %s, want %s", tc.method, tc.path, got, want)
 		}
+	}
+}
+
+// TestUpstreamRedirectRelayedVerbatim pins the redirect policy: a 3xx from
+// the upstream is relayed verbatim, never followed. Following one would
+// silently convert the POST into a body-less GET (301/302/303), replay the
+// transformed request body to an arbitrary Location target (307/308), and
+// re-attach Authorization to anything on the same hostname.
+func TestUpstreamRedirectRelayedVerbatim(t *testing.T) {
+	var targetHits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits++
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer target.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", target.URL+"/elsewhere")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 relayed verbatim (body %q)", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != target.URL+"/elsewhere" {
+		t.Errorf("Location = %q, want %q", loc, target.URL+"/elsewhere")
+	}
+	if targetHits != 0 {
+		t.Errorf("redirect target was contacted %d times; redirects must never be followed", targetHits)
+	}
+}
+
+func TestUpstreamRateLimitHeadersRelayed(t *testing.T) {
+	// Operational headers drive client backoff; dropping them makes a 429
+	// indistinguishable from any other upstream error to a well-behaved SDK.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.Header().Set("X-RateLimit-Limit", "100")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset-Tokens", "1.5s")
+		w.Header().Set("OpenAI-Request-Id", "req_abc")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	for name, want := range map[string]string{
+		"Retry-After":              "30",
+		"X-RateLimit-Limit":        "100",
+		"X-RateLimit-Remaining":    "0",
+		"X-RateLimit-Reset-Tokens": "1.5s",
+		"OpenAI-Request-Id":        "req_abc",
+	} {
+		if got := rec.Header().Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if got := rec.Header().Get("X-Secret"); got != "" {
+		t.Errorf("X-Secret = %q, want empty (allow-list still holds)", got)
+	}
+}
+
+func TestUpstreamPathTrailingSlashesNormalized(t *testing.T) {
+	// "trailing slashes ignored" must hold for any number of them: an
+	// endpoint ending in `//` previously produced `//chat/completions`,
+	// which many routers 404 with the cause invisible.
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"upstream-name"}`)
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, newTestStore(t, upstream.URL+"//")) // note the double slash
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if gotPath != "/chat/completions" {
+		t.Errorf("upstream path = %q, want /chat/completions", gotPath)
+	}
+}
+
+func TestUpstream204RelayedVerbatim(t *testing.T) {
+	// 204 and 304 are defined to have no body; that is a valid upstream
+	// answer, not an invalid response, and must not become a 502.
+	for _, status := range []int{http.StatusNoContent, http.StatusNotModified} {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+		}))
+		h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+		upstream.Close()
+		if rec.Code != status {
+			t.Errorf("upstream %d: client status = %d, want verbatim %d", status, rec.Code, status)
+		}
+	}
+}
+
+func TestRequestBodyOverCapRejected413(t *testing.T) {
+	// A client (or attacker) must not be able to pin unbounded memory in
+	// the proxy with an arbitrarily large body.
+	old := maxRequestBodyBytes
+	maxRequestBodyBytes = 1 << 20 // 1 MiB for the test
+	defer func() { maxRequestBodyBytes = old }()
+
+	h := newTestHandler(t, newTestStore(t, "http://127.0.0.1:9/v1"))
+	big := `{"model":"test-model","padding":"` + strings.Repeat("x", 2<<20) + `"}`
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", big, nil)
+
+	want := `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if body := rec.Body.String(); body != want {
+		t.Errorf("body mismatch:\n got %s\nwant %s", body, want)
+	}
+}
+
+func TestUpstreamResponseOverCapRejected502(t *testing.T) {
+	old := maxBufferedResponseBytes
+	maxBufferedResponseBytes = 1 << 20 // 1 MiB for the test
+	defer func() { maxBufferedResponseBytes = old }()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"upstream-name","padding":"`+strings.Repeat("x", 2<<20)+`"}`)
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpInvalid {
+		t.Errorf("body mismatch:\n got %s\nwant %s", body, envelopeUpInvalid)
+	}
+}
+
+// TestStreamAndBufferedRewriteParity pins that a streamed chunk and a
+// buffered body carrying the same JSON are rewritten identically — the
+// streaming path must never leak the upstream name where the buffered path
+// would rewrite it, or vice versa.
+func TestStreamAndBufferedRewriteParity(t *testing.T) {
+	payload := `{"model":"upstream-name","n":1e400}` // valid JSON, overflow number
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("upstream path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+payload+"\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model","stream":true}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"model":"test-model","n":1e400`) {
+		t.Errorf("streamed overflow payload not rewritten: %q", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "upstream-name") {
+		t.Errorf("upstream name leaked to client: %q", rec.Body.String())
 	}
 }

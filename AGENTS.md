@@ -16,24 +16,30 @@ streaming passthrough.
 
 Owned decomposition:
 
-| Directory                        | Owns                                                                                                                                                                                                 |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`) |
-| `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteModel` (byte-preserving)                                                                                   |
-| `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`)                                                                                                                       |
-| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                              |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                      |
-| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                              |
+| Directory                        | Owns                                                                                                                                                                                                                                                  |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, log level via `ParseLogLevel`), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
+| `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteModel` (byte-preserving)                                                                                                                                    |
+| `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`)                                                                                                                                                                        |
+| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                               |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                       |
+| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                               |
 
 ## Non-negotiables
 
 - **Two config planes.** Bootstrap settings (`LISTEN`, `CONFIG_FILE`,
   `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE`) come from the environment and
   are enforced by the runtime file's strict decoding: a runtime file
-  defining them is rejected. Runtime model mapping lives in YAML only.
+  defining them is rejected. The runtime file must be a single YAML
+  document — a `---`-separated second document is a rejection (a decoder
+  reading only the first would hide what follows). Runtime model mapping
+  lives in YAML only.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
-  keeps the previous snapshot.
+  keeps the previous snapshot; its hash baseline is the boot content passed
+  to `NewPoller`, never a fresh read. Rejection error text never quotes
+  operator input (position/length/line only) — error text reaches logs
+  verbatim.
 - **One snapshot per request.** A handler calls `store.Load()` exactly once
   and binds the whole request — including any active stream — to that
   snapshot forever. Reloads never affect in-flight work.
@@ -47,8 +53,9 @@ Owned decomposition:
 - **Streaming branches on the URL path**, not the body: chat = `data:`
   lines + `data: [DONE]`; responses = `event:`+`data:` pairs, no `[DONE]`
   (Responses termination events pass through untouched). `CopySSE` flushes
-  per line, grows its buffer without a cap, and rewrites only `data:` lines
-  containing a model string.
+  per event boundary (blank line), grows its buffer without a cap, and
+  rewrites only `data:` lines containing a model string, with the same
+  acceptance rule as the buffered path.
 - **Verbose verbatim, loud local.** 4xx/5xx upstream responses forward byte
   for byte. A 200 that is not JSON becomes 502 `upstream_invalid_response`;
   dial failure is 502 `upstream_unreachable`; unmapped model is 404
@@ -56,10 +63,23 @@ Owned decomposition:
 - **Never log or leak credentials.** No `Authorization`, keys, request
   bodies, or injection prompts in logs or error text. A quote of these is
   a security defect (SECURITY.md), not a typo.
-- **Graceful shutdown.** `signal.NotifyContext(SIGINT, SIGTERM)` →
+- **Graceful shutdown.** One signal channel: first SIGINT/SIGTERM →
   `Shutdown(grace)` → force `Close()` on overflow → `CloseIdleConnections` →
-  exit 0. Second signal forces exit 1. Compose `stop_grace_period`
-  (60s) > default `SHUTDOWN_GRACE` (55s).
+  exit 0. Second signal forces exit 1; signals after the drain are ignored
+  so a late duplicate cannot overwrite the exit code. Compose
+  `stop_grace_period` (60s) > default `SHUTDOWN_GRACE` (55s).
+- **Logging hot-reloads like config, and leaks nothing at any level.**
+  `logging.level` lives in the runtime YAML (`debug|info|warn|warning|error`,
+  `warning` is an alias, absent = `info`); there is no `LOG_LEVEL` env var.
+  A valid reload applies the level process-wide via the poller's
+  `onPublish` hook calling `zerolog.SetGlobalLevel` (atomic store, no locks,
+  no signal, no restart). Events are JSON lines on stderr with stable
+  snake_case message slugs (`request_completed`, `config_reloaded`,
+  `stream_truncated`, ...); one INFO `request_completed` per request binds
+  `request_id`, outcome, byte counts, duration and `config_generation`. The
+  credential rule is level-independent: no bodies, no `data:` payloads, no
+  prompts, no Authorization, scheme+host only for upstream URLs. E2E pins
+  assert on message slugs and fields (never prose) for logging tests only.
 - **Healthcheck never reads YAML.** It probes `GET /healthz` (200 +
   `"ok\n"`) so a poisoned reload cannot fail the container probe.
 

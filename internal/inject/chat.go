@@ -22,8 +22,11 @@ type chatInjectedMessage struct {
 //   - when m.InjectionPrompt is non-empty, a system-level message
 //     {"role":"system","content":InjectionPrompt} is inserted at
 //     messages[0], preserving the order of every pre-existing message;
-//   - every other field survives byte-for-byte via raw JSON re-marshaling,
-//     so unknown and future fields are carried through untouched.
+//   - every other field keeps its parsed value: values travel as raw JSON
+//     and are re-marshaled from the decoded form, so unknown and future
+//     fields are carried through semantically intact — JSON semantics, not
+//     input bytes (member order, whitespace, and number formatting may be
+//     normalized by the round trip).
 //
 // Injection is skipped when "messages" is absent or not a JSON array (a
 // request is never corrupted); the model rewrite still applies.

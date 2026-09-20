@@ -84,14 +84,14 @@ type startOpts struct {
 	configPath   string   // if set, use this exact path (e.g. missing file)
 	listen       string   // LISTEN value; empty -> ephemeral loopback port
 	grace        string   // SHUTDOWN_GRACE; default "5s"
-	logLevel     string   // LOG_LEVEL; default "error"
+	logLevel     string   // runtime YAML logging.level; default "error"
 	pollInterval string   // CONFIG_POLL_INTERVAL; default "50ms"
 	extraEnv     []string // extra "K=V" entries appended to the process env
 }
 
 // proc is a running injector subprocess with captured output.
 type proc struct {
-	t       *testing.T
+	t       testing.TB
 	cmd     *exec.Cmd
 	cfgPath string
 	addr    string // loopback "IP:port" used by the harness to reach the service
@@ -101,8 +101,8 @@ type proc struct {
 	exit    int32
 }
 
-func newProc(t *testing.T, o startOpts) *proc {
-	t.Helper()
+func newProc(tb testing.TB, o startOpts) *proc {
+	tb.Helper()
 	if o.grace == "" {
 		o.grace = "5s"
 	}
@@ -114,20 +114,20 @@ func newProc(t *testing.T, o startOpts) *proc {
 	}
 	cfgPath := o.configPath
 	if cfgPath == "" {
-		cfgPath = filepath.Join(t.TempDir(), "config.yaml")
-		if err := os.WriteFile(cfgPath, []byte(o.yaml), 0o644); err != nil {
-			t.Fatalf("write config file: %v", err)
+		cfgPath = filepath.Join(tb.TempDir(), "config.yaml")
+		if err := os.WriteFile(cfgPath, []byte(withLoggingLevel(o.yaml, o.logLevel)), 0o644); err != nil {
+			tb.Fatalf("write config file: %v", err)
 		}
 	}
 	listen := o.listen
-	port := freePort(t)
+	port := freePort(tb)
 	if listen == "" {
 		listen = "127.0.0.1:" + port
 	} else {
 		port = portOf(listen)
 	}
 	p := &proc{
-		t:       t,
+		t:       tb,
 		cmd:     exec.Command(binPath),
 		cfgPath: cfgPath,
 		addr:    "127.0.0.1:" + port,
@@ -141,7 +141,6 @@ func newProc(t *testing.T, o startOpts) *proc {
 		"CONFIG_FILE="+cfgPath,
 		"CONFIG_POLL_INTERVAL="+o.pollInterval,
 		"SHUTDOWN_GRACE="+o.grace,
-		"LOG_LEVEL="+o.logLevel,
 	)
 	p.cmd.Env = append(p.cmd.Env, o.extraEnv...)
 	p.cmd.Stdout = p.stdout
@@ -234,8 +233,8 @@ func startSubprocessExpectExit(t *testing.T, o startOpts) (int, string) {
 }
 
 // waitHealth polls /healthz until it returns 200 "ok\n" or the timeout passes.
-func (p *proc) waitHealth(t *testing.T, timeout time.Duration) {
-	t.Helper()
+func (p *proc) waitHealth(tb testing.TB, timeout time.Duration) {
+	tb.Helper()
 	url := "http://" + p.addr + "/healthz"
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	deadline := time.Now().Add(timeout)
@@ -250,21 +249,21 @@ func (p *proc) waitHealth(t *testing.T, timeout time.Duration) {
 		}
 		select {
 		case <-p.done:
-			t.Fatalf("subprocess exited before healthz ready; stderr:\n%s", p.stderr.String())
+			tb.Fatalf("subprocess exited before healthz ready; stderr:\n%s", p.stderr.String())
 		case <-time.After(50 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("healthz not ready within %v (stderr:\n%s)", timeout, p.stderr.String())
+			tb.Fatalf("healthz not ready within %v (stderr:\n%s)", timeout, p.stderr.String())
 		}
 	}
 }
 
 // freePort reserves an ephemeral loopback TCP port and releases it for reuse.
-func freePort(t *testing.T) string {
-	t.Helper()
+func freePort(tb testing.TB) string {
+	tb.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve port: %v", err)
+		tb.Fatalf("reserve port: %v", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
@@ -299,6 +298,18 @@ func runtimeYAML(publicName, endpoint, upstreamModel, injectionPrompt string) st
 		fmt.Fprintf(&sb, "    injection-prompt: %s\n", injectionPrompt)
 	}
 	return sb.String()
+}
+
+// withLoggingLevel appends a logging.level section to a runtime YAML body.
+// The log level travels in the runtime file — the same hot-reloadable plane
+// as model mappings — because LOG_LEVEL no longer exists: the runtime file
+// is mandatory at boot, so an env override had no legitimate window. A body
+// that already carries a logging section is returned unchanged.
+func withLoggingLevel(yamlBody, level string) string {
+	if level == "" || strings.Contains(yamlBody, "\nlogging:") {
+		return yamlBody
+	}
+	return yamlBody + "\nlogging:\n  level: " + level + "\n"
 }
 
 // recordedRequest is an immutable snapshot of one upstream HTTP request.

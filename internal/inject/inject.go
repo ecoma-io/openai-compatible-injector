@@ -14,10 +14,12 @@ import (
 
 // Probe cheaply extracts the fields the proxy needs to route a Chat
 // Completions request body without fully decoding it: the requested model
-// name and the stream flag. stream is reported as false when absent, and as
-// given for true/false. Probe returns an error only when body is not valid
-// JSON or when the "stream" field is present but is not a JSON boolean (null
-// included). A "model" field that is not a JSON string is ignored without
+// name and the stream flag. stream is reported as false when absent or
+// null (the OpenAI APIs treat a null flag as its zero value, so rejecting
+// here would 400 requests the upstream accepts), and as given for
+// true/false. Probe returns an error only when body is not valid JSON or
+// when the "stream" field is present but is neither a JSON boolean nor
+// null. A "model" field that is not a JSON string is ignored without
 // error, and a valid JSON body that is not an object reports an empty model
 // and stream=false.
 func Probe(body []byte) (model string, stream bool, err error) {
@@ -41,10 +43,9 @@ func Probe(body []byte) (model string, stream bool, err error) {
 		if err := json.Unmarshal(raw, &flag); err != nil {
 			return "", false, fmt.Errorf("probe: stream is not a bool: %w", err)
 		}
-		if flag == nil {
-			return "", false, errors.New("probe: stream is not a bool: null")
+		if flag != nil {
+			stream = *flag
 		}
-		stream = *flag
 	}
 	return model, stream, nil
 }

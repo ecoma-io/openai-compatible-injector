@@ -69,6 +69,7 @@ Division of responsibility:
 | ----------------------------------------------------------------- | ----------------------- |
 | `LISTEN`, `CONFIG_FILE`, `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE` | Environment (bootstrap) |
 | `models.<name>.{endpoint,upstream-model,injection-prompt}`        | YAML file (runtime)     |
+| `logging.level`                                                   | YAML file (runtime)     |
 
 ### Bootstrap environment
 
@@ -78,7 +79,12 @@ Division of responsibility:
 | `CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled            |
 | `CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                    |
 | `SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed |
-| `LOG_LEVEL`            | `info`                | `debug`, `info`, `warn`, `error` (JSON logs to stderr)             |
+
+There is no `LOG_LEVEL` environment variable — it was removed together with
+the introduction of `logging.level` in the runtime file, which hot-reloads.
+The runtime file is mandatory at boot, so an environment override had no
+window in which it could take effect; one setting has exactly one source of
+truth.
 
 ### Runtime YAML
 
@@ -93,6 +99,9 @@ models:
   echo-model:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
+
+logging:
+  level: info # optional; debug | info | warn | warning | error (absent = info)
 ```
 
 - `endpoint` — base URL of the upstream provider. Scheme `http` or `https`
@@ -105,14 +114,15 @@ models:
 
 The file is validated strictly, in two layers:
 
-- **Top-level keys** are checked against the raw YAML: only `models` is
-  legal. This is the bootstrap-plane rule — a file that tries to define
-  `listen`, `config-file`, `config-poll-interval` or `shutdown-grace` is
-  rejected whatever its value's shape (a strict struct decode alone misses
-  a bootstrap key whose value is an empty map).
-- **Model entries** are decoded strictly (`yaml.v3` with known fields):
-  any key outside `endpoint`, `upstream-model`, `injection-prompt` —
-  including a nested bootstrap key — is a rejection, not a warning.
+- **Top-level keys** are checked against the raw YAML: only `models` and
+  `logging` are legal. This is the bootstrap-plane rule — a file that tries
+  to define `listen`, `config-file`, `config-poll-interval` or
+  `shutdown-grace` is rejected whatever its value's shape (a strict struct
+  decode alone misses a bootstrap key whose value is an empty map).
+- **Model entries and the logging section** are decoded strictly (`yaml.v3`
+  with known fields): any key outside `endpoint`, `upstream-model`,
+  `injection-prompt` — including a nested bootstrap key — is a rejection,
+  not a warning, and so is any key inside `logging` other than `level`.
 
 The `models` table itself must contain at least one model. An empty table is
 rejected — an empty file is what a truncate-then-write config edit looks
@@ -140,6 +150,23 @@ Semantics that hold:
   applies to reloads, because at boot there is no last-known-good.
 - **Unchanged file, no churn.** If the content hash is stable, nothing is
   republished; the generation number is stable too.
+- **One document per file.** A `---`-separated multi-document YAML file is
+  rejected: a decoder that reads only the first document would silently
+  hide the rest — including a bootstrap-plane key appended after a
+  separator — which is exactly the shape a two-plane violation takes.
+- **Rejection errors never quote operator input.** Error text reaches logs
+  verbatim (fatal at boot, WARN on reload), and a botched paste into any
+  YAML position can carry credentials — so an invalid value is reported by
+  position, length, and line number, never by content.
+- **The log level hot-reloads with everything else.** `logging.level` rides
+  the same validate-then-publish path as the model mappings: a valid reload
+  applies the new level process-wide without a restart, a restart, or any
+  signal; an invalid `level` value rejects the whole file onto the
+  last-known-good path. The level swap is an atomic store zerolog consults
+  per event, so in-flight requests race only the old/new boundary and never
+  block. The reload acknowledgment itself is logged under the level in
+  effect _before_ the swap: at `error` level a successful reload is silent
+  in the logs and visible only through behavior (the next event's level).
 - **Atomic replace caveat.** The poller watches the file's content, and reads
   it by path; tools that replace a file by `mv`/rename (editor safe-save)
   swap in a new inode the read still follows — but if the process opened the
@@ -211,9 +238,10 @@ SSE streams pass through **incrementally, line by line** — nothing is
 buffered up-front and flushed at the end, so a slow upstream produces a slow,
 live stream with correct per-chunk latency. Behavior:
 
-- Every line is flushed to the client as soon as it is read. The internal
-  line buffer grows without a cap: providers pad chunks and there is no line
-  length ceiling to impose.
+- Lines are written out as they are read, and flushed to the client at
+  every event boundary — the blank line that terminates an event, which is
+  what SSE clients dispatch on. The internal line buffer grows without a
+  cap: providers pad chunks and there is no line length ceiling to impose.
 - The streaming _shape_ is decided by the **URL path**, not the body:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses
@@ -222,6 +250,9 @@ live stream with correct per-chunk latency. Behavior:
   `event:`, comments, and non-model `data:` lines pass through verbatim.
 - Malformed lines are forwarded verbatim. We are a passthrough, not an SSE
   validator.
+- Known limitation: lines are terminated by `\n` (with `\r\n` accepted) —
+  the SSE standard and everything real providers emit. Bare-CR line endings
+  (no `\n`) would not be treated as line boundaries.
 - A request with `"stream": true` against an upstream that answers with a
   normal JSON body is handled as a plain 200 (the body is model-rewritten,
   not wrapped, not streamed).
@@ -231,26 +262,41 @@ live stream with correct per-chunk latency. Behavior:
 
 Upstream and client failures are classified, never fogged:
 
-| Condition                           | Status                 | `error.type` / `code`                                                                                                                                                                          |
-| ----------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Body is not JSON                    | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
-| Missing `model`                     | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
-| Request names an unmapped model     | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
-| Upstream unreachable (dial/network) | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
-| Upstream 200 with unparseable body  | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
-| Upstream answers 4xx/5xx            | **forwarded verbatim** | status, headers, and bytes pass through untouched                                                                                                                                              |
+| Condition                                                                 | Status                 | `error.type` / `code`                                                                                                                                                                          |
+| ------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Body is not JSON                                                          | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
+| Missing `model`                                                           | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
+| Request body over the 64 MiB cap                                          | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
+| Request names an unmapped model                                           | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
+| Upstream unreachable (dial/network)                                       | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
+| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
+| Upstream answers 3xx/4xx/5xx                                              | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
 
 Two consequences of the table:
 
 - **An unmapped model is never forwarded.** 404 is local; the upstream never
   sees that request. This is a hard boundary (SECURITY.md treats its breach
   as a vulnerability).
-- **Upstream errors are the upstream's shape.** Any 4xx/5xx — JSON, text,
-  whatever the provider sent — is relayed byte-for-byte. We only synthesize
-  errors for what the upstream _did not_ deliver.
+- **Upstream errors are the upstream's shape.** Any 3xx/4xx/5xx — JSON, text,
+  whatever the provider sent — is relayed byte-for-byte. Redirects are
+  **never followed**: following one would silently convert the POST into a
+  body-less GET (301/302/303) and replay the transformed request body to
+  whatever the `Location` names (307/308). An unexpected 3xx is the
+  upstream's answer, and the client's to judge. We only synthesize errors
+  for what the upstream _did not_ deliver.
+- **Error bodies can name the upstream model.** Verbatim means verbatim: an
+  upstream error that quotes its own model name discloses the alias target.
+  That is the price of honest passthrough; we do not rewrite error bodies.
 - There is **no overall request timeout**. A slow upstream is a slow
   response, not a timeout race. Dial and TLS handshake timeouts bound the
   connection phase only.
+
+**Relayed response headers** (an allow-list, everything else is dropped):
+`Content-Type`, `Cache-Control`, `X-Request-Id`, `OpenAI-Request-Id`,
+`Retry-After`, `Location`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+`X-RateLimit-Reset`, `X-RateLimit-Reset-Requests`, `X-RateLimit-Reset-Tokens`.
+Rate-limit and retry headers are load-bearing for client backoff; dropping
+them would make a 429 indistinguishable from any other upstream failure.
 
 ## Safety and credentials
 
@@ -258,9 +304,61 @@ Two consequences of the table:
   untouched.
 - **Credentials never reach logs or error text** — no `Authorization`
   values, request bodies, or injection prompts in log lines, and no
-  upstream URL details beyond the endpoint's scheme+host in startup logs.
-  A quote of any of these is a security defect, not a typo (SECURITY.md).
-- `endpoint` URLs with userinfo are rejected at config load.
+  upstream URL details beyond the endpoint's scheme+host in **any** log
+  line or error text (a query-parameter API key survives even a dial
+  failure). A quote of any of these is a security defect, not a typo
+  (SECURITY.md).
+- `endpoint` URLs with userinfo are rejected at config load; fragments are
+  rejected too (a fragment is never sent to a server, so accepting one would
+  silently ignore part of the configured endpoint). An endpoint's query
+  string is preserved and sent with every request — that is how providers
+  that authenticate via query parameter (e.g. `api-version`) work.
+
+## Logging
+
+JSON lines on stderr only (zerolog; stdout is never written). Every line is
+machine-parseable and carries `level`, `time`, and a stable snake_case
+`message` slug. Levels are `debug`, `info`, `warn` (the runtime file also
+accepts the spelling `warning`), and `error`, defaulting to `info`; the
+level is hot-reloadable through `logging.level` (see Hot reload).
+
+What each level carries:
+
+- **DEBUG** — request lifecycle detail: `request_received`
+  (method/path/remote address), `stream_started`, `stream_completed`,
+  `log_level_applied` after each reload, `config_unchanged` and the
+  poller's per-tick heartbeat while a failure persists. Detailed but never
+  payload-bearing: request bodies, SSE `data:` payloads, and injection
+  prompts do not exist at this level — or at any level.
+- **INFO** — one `request_completed` per proxied request with the wire
+  facts: `request_id` (16 hex chars, generated per request), `api`
+  (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,
+  `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
+  snapshot generation the request bound to — correlating reloads with
+  behavior). The event is emitted when the request finishes, under the
+  level in effect at that moment — a reload mid-request can therefore
+  change whether it appears. Also `config_reloaded` (`generation`,
+  `model_count`, `log_level`), `config_file_recovered` (a file returned
+  byte-identical after a failure), `service_started` (boot config
+  accepted; the listener itself is announced by the DEBUG
+  `listener_ready`), and `drain_started`.
+- **WARN** — client disconnects and truncations (`stream_truncated` with a
+  `phase` field separating `client_write` from `upstream_read`), a client
+  that cancels mid-request, one warning per transition into a failed config
+  state (`config_file_unreadable`, `config_reload_rejected`) — including a
+  failure that changes kind, which warns again — never one per poll tick —
+  plus `second_signal_forced_exit` and drain overflow.
+- **ERROR** — upstream connection failures (`upstream_request_failed` with
+  an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial`),
+  unparseable upstream responses, and anything fatal at startup.
+
+The credential rule is absolute: no log line, at any level, ever contains
+an `Authorization` value, a request or response body, an injection prompt,
+or upstream URL detail beyond scheme+host. Endpoint query strings (which
+providers use for API keys) survive even a dial failure's error text —
+errors are sanitized before logging. The planted-secret E2E suite
+(`TestLoggingNeverLeaksSecrets`) holds this rule under success, streaming,
+rejection, dial-failure, and verbatim-echo traffic at maximum verbosity.
 
 ## Healthcheck
 
@@ -353,12 +451,20 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
 ## Operations
 
 - Logs are JSON on stderr. Every reload decision is logged: generation
-  number, applied/kept-last-known-good. `LOG_LEVEL=debug` adds per-request
-  routing lines (still never bodies or credentials).
+  number, applied/kept-last-known-good. `logging.level: debug` in the
+  runtime file (hot-reloadable) adds per-request routing lines (still never
+  bodies or credentials).
 - `./openai-compatible-injector version` prints the build version (injected
   via `-X main.version`, or the release tag in published images).
 - Sending a second SIGTERM/SIGINT during drain aborts immediately with
-  exit 1 — by design, for orchestrators that need a hard stop.
+  exit 1 — by design, for orchestrators that need a hard stop. After the
+  drain finishes, duplicate signals are ignored: the process keeps the exit
+  code it earned.
+- Connection hygiene is bounded: request bodies are capped at 64 MiB,
+  request headers must arrive within 10s, and idle keep-alive connections
+  are closed after 120s — a quiet client cannot pin a goroutine and a file
+  descriptor forever. An active response (including a long SSE stream) is
+  never touched by the idle timeout.
 
 ## Out of scope
 

@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -537,9 +538,12 @@ func TestPlaneViolationListenKey(t *testing.T) {
 	if code == 0 {
 		t.Fatal("startup with plane-violating config exited 0, want nonzero")
 	}
-	if !strings.Contains(stderr, "listen") {
-		t.Fatalf("startup error must mention the offending key 'listen':\n%s", stderr)
+	if !strings.Contains(stderr, "unknown top-level key") {
+		t.Fatalf("startup error must name the violation class:\n%s", stderr)
 	}
+	// The key itself is never echoed: a paste into a key position can carry
+	// credentials just as well as a value, and the fatal reaches logs
+	// verbatim.
 }
 
 // Scenario 25: missing config file at startup -> nonzero exit.
@@ -551,6 +555,27 @@ func TestMissingConfigFileStartup(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "config") {
 		t.Fatalf("startup error should mention the config file:\n%s", stderr)
+	}
+}
+
+// Scenario 26: listen failure — a listen address that is already bound fails
+// the startup with exit 1 and a server_failed event; the process never sits
+// silently half-started.
+func TestListenFailureExitsOne(t *testing.T) {
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind blocker listener: %v", err)
+	}
+	defer func() { _ = blocker.Close() }()
+	code, stderr := startSubprocessExpectExit(t, startOpts{
+		yaml:   runtimeYAML(chatPublic, "http://127.0.0.1:1/v1", chatUpstream, ""),
+		listen: blocker.Addr().String(),
+	})
+	if code != 1 {
+		t.Fatalf("startup with an occupied listen address exited %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "server_failed") {
+		t.Fatalf("server_failed event missing from listen failure:\n%s", stderr)
 	}
 }
 

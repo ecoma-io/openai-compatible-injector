@@ -33,6 +33,12 @@ func New(store *config.Store, addr string, grace time.Duration, log zerolog.Logg
 			Addr:              addr,
 			Handler:           proxy.NewHandler(store, client, log),
 			ReadHeaderTimeout: 10 * time.Second,
+			// Without an IdleTimeout a client that opens a keep-alive
+			// connection and goes quiet pins a goroutine and a file
+			// descriptor for the process's whole life. Two minutes
+			// comfortably exceeds any client's keep-alive pooling window
+			// while bounding the leak.
+			IdleTimeout: 120 * time.Second,
 		},
 		client: client,
 		grace:  grace,
@@ -52,6 +58,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.log.Debug().Str("addr", ln.Addr().String()).Msg("listener_ready")
 
 	serveDone := make(chan error, 1)
 	go func() {
@@ -69,10 +76,11 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
+	s.log.Info().Dur("grace", s.grace).Msg("drain_started")
 	drainCtx, cancel := context.WithTimeout(context.Background(), s.grace)
 	defer cancel()
 	if err := s.http.Shutdown(drainCtx); err != nil {
-		s.log.Warn().Err(err).Msg("server: drain deadline exceeded; force-closing remaining connections")
+		s.log.Warn().Err(err).Dur("grace", s.grace).Msg("drain_deadline_exceeded")
 		// Shutdown failed (typically context deadline exceeded): force-close
 		// every remaining connection so the drain deadline is enforced.
 		_ = s.http.Close()

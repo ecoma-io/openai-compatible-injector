@@ -3,7 +3,6 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"io"
 
 	"openai-compatible-injector/internal/inject"
@@ -18,42 +17,88 @@ var (
 // rewriting the model field inside data lines from the upstream name to the
 // public name. It never buffers the whole stream: lines are read one at a
 // time with no size cap (providers pad lines), each line is written out
-// immediately, and flush is invoked after every line so events reach the
-// client promptly with no aggregation or reordering.
+// immediately, and flush is invoked at every event boundary — the blank
+// line that terminates an event, which is exactly what SSE clients dispatch
+// on — so events reach the client promptly with no aggregation or
+// reordering. Per-line flushing spends a write round trip per line without
+// delivering anything a client can act on earlier.
 //
 // Only lines beginning with "data:" are candidates for rewriting, and only
-// when the payload (bytes after "data:" plus one optional space) both
-// contains `"model"` and parses as a JSON object; the rewrite itself is
-// delegated to inject.RewriteModel and re-emitted with the original
-// prefix, separator, and line terminator. Comments, event lines, blank
-// lines, and terminators such as [DONE] pass through byte-for-byte.
+// when the payload (bytes after "data:" plus one optional space) contains
+// `"model"`; payload validation and the rewrite itself are delegated to
+// inject.RewriteModel, whose acceptance rule is identical to the buffered
+// response path — a deliberate parity: a stream and a buffered body with
+// the same JSON are rewritten identically. The line is re-emitted with the
+// original prefix, separator, and line terminator. Comments, event lines,
+// blank lines, and terminators such as [DONE] pass through byte-for-byte.
 //
 // io.EOF ends the copy with a nil error; any other read error is returned
-// so the caller can truncate the stream. Nothing is ever synthesized.
-func CopySSE(dst io.Writer, src io.Reader, public string, flush func()) error {
+// so the caller can truncate the stream. A failure writing to dst is
+// returned wrapped in *streamWriteError — the client side went away — so
+// the caller can log the two truncation causes apart. Nothing is ever
+// synthesized.
+func CopySSE(dst io.Writer, src io.Reader, public string, flush func()) (StreamStats, error) {
+	var stats StreamStats
 	br := bufio.NewReader(src)
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
-			if _, werr := dst.Write(rewriteSSELine(line, public)); werr != nil {
-				return werr
+			out := rewriteSSELine(line, public)
+			n, werr := dst.Write(out)
+			// Account exactly what dst accepted — on a failed or torn write
+			// the stats say how much of the stream actually went out. A
+			// short write with a nil error is the io.Writer contract's other
+			// failure mode (io.ErrShortWrite); continuing past it would
+			// relay a torn line and overcount, so it truncates too — as a
+			// client-side failure, since dst is the client.
+			stats.Bytes += int64(n)
+			if werr != nil {
+				return stats, &streamWriteError{err: werr}
 			}
-			if flush != nil {
+			if n < len(out) {
+				return stats, &streamWriteError{err: io.ErrShortWrite}
+			}
+			if flush != nil && isEventBoundary(line) {
 				flush()
+				stats.Events++
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				return nil
+				return stats, nil
 			}
-			return err
+			return stats, err
 		}
 	}
 }
 
+// StreamStats reports what a finished CopySSE pass put on the wire: byte
+// count and dispatched events. Metadata for the access log only — payloads
+// never reach logs at any level.
+type StreamStats struct {
+	Bytes  int64
+	Events int
+}
+
+// streamWriteError marks a CopySSE failure that happened writing to the
+// client — the connection broke mid-stream — as opposed to a failure
+// reading from upstream. The distinction decides the truncation log's
+// phase field.
+type streamWriteError struct{ err error }
+
+func (e *streamWriteError) Error() string { return "writing SSE stream to client: " + e.err.Error() }
+func (e *streamWriteError) Unwrap() error { return e.err }
+
+// isEventBoundary reports whether the raw line (terminator included) is a
+// blank line — the terminator that completes an SSE event.
+func isEventBoundary(line []byte) bool {
+	return len(line) == 1 && line[0] == '\n' ||
+		len(line) == 2 && line[0] == '\r' && line[1] == '\n'
+}
+
 // rewriteSSELine applies the data-line rewrite rule to a single raw line,
-// terminator included. Anything that is not a JSON-object data line carrying
-// a model key is returned unchanged.
+// terminator included. Anything that is not a data line carrying a model
+// string is returned unchanged.
 func rewriteSSELine(line []byte, public string) []byte {
 	content, term := splitSSELineTerminator(line)
 	rest, ok := bytes.CutPrefix(content, sseDataPrefix)
@@ -70,11 +115,12 @@ func rewriteSSELine(line []byte, public string) []byte {
 	if !bytes.Contains(payload, sseModelKey) {
 		return line
 	}
-	var obj map[string]any
-	if err := json.Unmarshal(payload, &obj); err != nil {
+	out := inject.RewriteModel(payload, public)
+	if &out[0] == &payload[0] {
+		// RewriteModel returns the input slice when nothing was in scope;
+		// skip the rebuild for lines that merely mention "model".
 		return line
 	}
-	out := inject.RewriteModel(payload, public)
 	// Capacity is never precomputed as a length sum: that arithmetic is the
 	// integer-overflow class CodeQL flags, and the per-line cost of append
 	// growth is negligible next to the bufio read and network I/O anyway.

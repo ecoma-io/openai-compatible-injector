@@ -3,7 +3,10 @@ package config
 import (
 	"errors"
 	"net/url"
+	"sync"
 	"sync/atomic"
+
+	"github.com/rs/zerolog"
 )
 
 // Model is one validated public-model mapping. It is immutable after the
@@ -25,13 +28,19 @@ type Model struct {
 // Snapshot for its whole lifetime, so a reload mid-request cannot change the
 // endpoint, model, or prompt that request is using.
 type Snapshot struct {
-	gen    uint64
-	models map[string]Model
+	gen      uint64
+	models   map[string]Model
+	logLevel zerolog.Level
 }
 
 // Gen returns the snapshot's generation number (0 for the initial snapshot,
 // incremented on every successful reload).
 func (s *Snapshot) Gen() uint64 { return s.gen }
+
+// LogLevel returns the log level this snapshot carries. It is applied to the
+// process-wide logger when the snapshot is published, making the level
+// hot-reloadable through the same content-hash poll as everything else.
+func (s *Snapshot) LogLevel() zerolog.Level { return s.logLevel }
 
 // Model resolves a public model name. The second return value reports
 // whether the model exists.
@@ -49,11 +58,16 @@ func (s *Snapshot) Models() map[string]Model {
 	return out
 }
 
+// Len returns the number of models in the table without copying it —
+// the cheap form used by reload logging.
+func (s *Snapshot) Len() int { return len(s.models) }
+
 // Store holds the currently active Snapshot behind an atomic pointer. The
 // reload loop is the only publisher; every request is a reader.
 type Store struct {
-	p   atomic.Pointer[Snapshot]
-	gen atomic.Uint64
+	p     atomic.Pointer[Snapshot]
+	gen   atomic.Uint64
+	pubMu sync.Mutex // orders Publish's gen assignment with its pointer store
 }
 
 // NewStore returns a store seeded with the initial snapshot.
@@ -71,10 +85,18 @@ func (s *Store) Load() *Snapshot { return s.p.Load() }
 // Publish atomically replaces the active snapshot with next and assigns it a
 // monotonically increasing generation. Only the reload loop (or tests) may
 // call it.
+//
+// The mutex is not about the pointer store (that is atomic on its own) but
+// about pairing gen assignment with the store: without it, two concurrent
+// publishers can assign generations 4 then 5 yet store in the opposite
+// order — the active snapshot's generation visibly going backwards, and a
+// final Gen() below the publish count.
 func (s *Store) Publish(next *Snapshot) error {
 	if next == nil {
 		return errors.New("cannot publish a nil snapshot")
 	}
+	s.pubMu.Lock()
+	defer s.pubMu.Unlock()
 	next.gen = s.gen.Add(1)
 	s.p.Store(next)
 	return nil
