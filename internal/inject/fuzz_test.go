@@ -123,12 +123,13 @@ func FuzzProbe(f *testing.F) {
 	})
 }
 
-// FuzzRewriteModel pins RewriteModel's two load-bearing invariants against
+// FuzzRewriteModel pins both rewrites' load-bearing invariants against
 // arbitrary bytes: the validity gate is byte-exact — invalid input comes
 // back byte-identical — and the rewrite never turns valid JSON into invalid
-// JSON. Anything else (which spans are found, what the replacement looks
-// like) is the unit table's business; here the gate and validity are the
-// contract, because a violated gate corrupts a client's payload in flight.
+// JSON, for EITHER API scope. Anything else (which spans are found, what
+// the replacement looks like) is the unit table's business; here the gate
+// and validity are the contract, because a violated gate corrupts a
+// client's payload in flight.
 func FuzzRewriteModel(f *testing.F) {
 	seeds := []string{
 		``,                               // empty body
@@ -175,20 +176,39 @@ func FuzzRewriteModel(f *testing.F) {
 
 	const public = "public-name"
 	f.Fuzz(func(t *testing.T, body []byte) {
-		got := RewriteModel(body, public)
-		if !json.Valid(body) {
-			if !bytes.Equal(got, body) {
-				t.Fatalf("invalid input was not returned unchanged:\n in  %q\n out %q", body, got)
+		// The invariants hold for both API scopes; run each.
+		for name, got := range map[string][]byte{
+			"chat":      RewriteChatModel(body, public),
+			"responses": RewriteResponsesModel(body, public),
+		} {
+			if !json.Valid(body) {
+				if !bytes.Equal(got, body) {
+					t.Fatalf("%s: invalid input was not returned unchanged:\n in  %q\n out %q", name, body, got)
+				}
+				continue
 			}
-			return
-		}
-		if !json.Valid(got) {
-			t.Fatalf("rewrite broke JSON validity:\n in  %q\n out %q", body, got)
-		}
-		// No in-scope key can exist when the exact key bytes are absent, so
-		// the output must be the input, byte for byte.
-		if !bytes.Contains(body, []byte(`"model"`)) && !bytes.Equal(got, body) {
-			t.Fatalf("no \"model\" key present, input mutated:\n in  %q\n out %q", body, got)
+			if !json.Valid(got) {
+				t.Fatalf("%s: rewrite broke JSON validity:\n in  %q\n out %q", name, body, got)
+			}
+			// No in-scope key can exist when the exact key bytes are absent,
+			// so the output must be the input, byte for byte.
+			if !bytes.Contains(body, []byte(`"model"`)) && !bytes.Equal(got, body) {
+				t.Fatalf("%s: no \"model\" key present, input mutated:\n in  %q\n out %q", name, body, got)
+			}
+			// Scope agreement: where the input carries no "response" object
+			// key at top level, both scopes must produce identical bytes —
+			// their only difference is the descent into it.
+			if !hasTopLevelResponseKey(body) && !bytes.Equal(got, RewriteChatModel(body, public)) {
+				t.Fatalf("%s: scopes disagree without a top-level response key:\n in  %q\n out %q", name, body, got)
+			}
 		}
 	})
+}
+
+// hasTopLevelResponseKey reports whether the valid-JSON object body has a
+// direct "response" key. Approximate (a matching key inside a string or a
+// nested object also reports true), which only weakens the check's reach —
+// it never demands a difference where the scopes agree.
+func hasTopLevelResponseKey(body []byte) bool {
+	return bytes.Contains(body, []byte(`"response"`))
 }

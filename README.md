@@ -73,12 +73,12 @@ Division of responsibility:
 
 ### Bootstrap environment
 
-| Variable               | Default               | Meaning                                                            |
-| ---------------------- | --------------------- | ------------------------------------------------------------------ |
-| `LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)   |
-| `CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled            |
-| `CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                    |
-| `SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed |
+| Variable               | Default               | Meaning                                                                                                                                                                 |
+| ---------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                        |
+| `CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled                                                                                                                 |
+| `CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                                                                                                                         |
+| `SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain) |
 
 There is no `LOG_LEVEL` environment variable — it was removed together with
 the introduction of `logging.level` in the runtime file, which hot-reloads.
@@ -164,9 +164,13 @@ Semantics that hold:
   signal; an invalid `level` value rejects the whole file onto the
   last-known-good path. The level swap is an atomic store zerolog consults
   per event, so in-flight requests race only the old/new boundary and never
-  block. The reload acknowledgment itself is logged under the level in
-  effect _before_ the swap: at `error` level a successful reload is silent
-  in the logs and visible only through behavior (the next event's level).
+  block. Every successful swap is acknowledged by `log_level_applied`,
+  emitted _after_ the swap and _at the new level_ — the only severity
+  guaranteed visible under the level it announces — carrying `generation`,
+  `previous_level`, and `log_level`. (The companion `config_reloaded` INFO
+  line is written before the swap, so it disappears on transitions out of
+  `warn`/`error`; the ack exists so no transition is ever silent.) A
+  rejected file acknowledges nothing and leaves the level in force.
 - **Atomic replace caveat.** The poller watches the file's content, and reads
   it by path; tools that replace a file by `mv`/rename (editor safe-save)
   swap in a new inode the read still follows — but if the process opened the
@@ -222,11 +226,15 @@ several shapes:
 
 - **Forward:** a request's top-level `model` is replaced with the mapping's
   `upstream-model`.
-- **Reverse:** in _responses_, the model is rewritten back to the public
-  name — the top-level `model` field (chat: every streamed chunk) and the
-  nested `response.model` field of Responses envelope events.
+- **Reverse,** scoped per API surface: in _responses_, the model is rewritten
+  back to the public name — the top-level `model` field (chat: every streamed
+  chunk) and, for the Responses API only, the nested `response.model` field
+  of envelope events. A chat chunk carrying a nested `response` object is
+  client data: its model is **not** ours to rewrite. `RewriteChatModel`
+  owns the top-level key alone; `RewriteResponsesModel` additionally owns
+  `response.model`.
 
-`RewriteModel` is **byte-preserving**: only object-key `"model"` string
+Both rewrites are **byte-preserving**: only object-key `"model"` string
 values are replaced inside a string-state-aware scan. Everything else — every
 whitespace byte, key order, unknown fields — is forwarded exactly as
 received. A response whose JSON cannot be parsed is forwarded byte-for-byte
@@ -240,13 +248,21 @@ live stream with correct per-chunk latency. Behavior:
 
 - Lines are written out as they are read, and flushed to the client at
   every event boundary — the blank line that terminates an event, which is
-  what SSE clients dispatch on. The internal line buffer grows without a
-  cap: providers pad chunks and there is no line length ceiling to impose.
+  what SSE clients dispatch on. Input is **bounded**: a single line is
+  capped at 1 MiB and an in-flight event (the lines since the last blank
+  separator, the dispatching blank line excluded) at 2 MiB. Real provider
+  events are far below both; the caps exist so a hostile or broken upstream
+  cannot pin unbounded memory. Crossing a cap stops the relay cleanly — the
+  offending line is never forwarded, and the request is logged with the
+  `stream_limit_exceeded` outcome.
 - The streaming _shape_ is decided by the **URL path**, not the body:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses
     termination events are part of the protocol and pass through untouched.
-- Only `data:` lines whose JSON contains a model string are rewritten.
+- Only `data:` lines whose JSON carries an in-scope `model` string value are
+  rewritten — the top-level key (and, for responses, the envelope's
+  `response.model`). Model text appearing anywhere else in the payload — a
+  substring of a message, another field's value — never matches.
   `event:`, comments, and non-model `data:` lines pass through verbatim.
 - Malformed lines are forwarded verbatim. We are a passthrough, not an SSE
   validator.
@@ -256,21 +272,32 @@ live stream with correct per-chunk latency. Behavior:
 - A request with `"stream": true` against an upstream that answers with a
   normal JSON body is handled as a plain 200 (the body is model-rewritten,
   not wrapped, not streamed).
+- Known limitation: which 2xx handling applies is decided by the upstream's
+  `Content-Type` alone. A 200 under `text/event-stream` is relayed line by
+  line even if the body is not actually SSE — such a body carries no
+  rewriteable `data:` lines, so a non-conforming upstream that mislabels a
+  JSON body as `text/event-stream` would pass its upstream model alias
+  through unrewritten (conforming providers never do this). Symmetrically,
+  an upstream that streams SSE at a `"stream": false` request gets its body
+  buffered, fails the JSON validation, and surfaces as the documented 502
+  `upstream_invalid_response` — the fog belongs to the upstream, and the
+  access log's outcome says so.
 - Reloads never interrupt a stream: it is bound to its request's snapshot.
 
 ## Errors
 
 Upstream and client failures are classified, never fogged:
 
-| Condition                                                                 | Status                 | `error.type` / `code`                                                                                                                                                                          |
-| ------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Body is not JSON                                                          | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
-| Missing `model`                                                           | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
-| Request body over the 64 MiB cap                                          | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
-| Request names an unmapped model                                           | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
-| Upstream unreachable (dial/network)                                       | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
-| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
-| Upstream answers 3xx/4xx/5xx                                              | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
+| Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                          |
+| --------------------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
+| Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
+| Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
+| Request names an unmapped model                                                                                 | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
+| Request path matches no route (unknown path, trailing slash, wrong case)                                        | 404                    | `invalid_request_error` — exact body: `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`                                          |
+| Upstream unreachable (dial/network)                                                                             | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
+| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap, or a body read that fails mid-answer) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
+| Upstream answers 3xx/4xx/5xx                                                                                    | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
 
 Two consequences of the table:
 
@@ -312,7 +339,10 @@ them would make a 429 indistinguishable from any other upstream failure.
   rejected too (a fragment is never sent to a server, so accepting one would
   silently ignore part of the configured endpoint). An endpoint's query
   string is preserved and sent with every request — that is how providers
-  that authenticate via query parameter (e.g. `api-version`) work.
+  that authenticate via query parameter (e.g. `api-version`) work. The
+  client's own query string, by contrast, is dropped: only the configured
+  endpoint defines where a request goes, and a client-supplied
+  `?api-key=` must never travel.
 
 ## Logging
 
@@ -324,12 +354,24 @@ level is hot-reloadable through `logging.level` (see Hot reload).
 
 What each level carries:
 
-- **DEBUG** — request lifecycle detail: `request_received`
-  (method/path/remote address), `stream_started`, `stream_completed`,
-  `log_level_applied` after each reload, `config_unchanged` and the
-  poller's per-tick heartbeat while a failure persists. Detailed but never
-  payload-bearing: request bodies, SSE `data:` payloads, and injection
-  prompts do not exist at this level — or at any level.
+- **DEBUG** — the full request lifecycle, every event bound to its
+  `request_id`: `request_received` (method/path/remote address),
+  `probe_completed` (model + stream flag), `model_resolved` (public model,
+  upstream model, upstream scheme+host origin), `request_transform_started`/
+  `request_transform_completed` (byte counts around prompt injection),
+  `upstream_request_started` (origin + forwarded byte count),
+  `upstream_response_received` (upstream status + content type). From there
+  the lifecycle forks: a buffered response continues with
+  `response_transform_started`/`response_transform_completed` (byte counts
+  around the model rewrite) and `client_write_completed`; a streamed
+  response instead emits `stream_started`, periodic
+  `stream_event_progress` heartbeats (running event/byte counts, one every
+  256 dispatched events — a stuck stream shows up as a heartbeat that
+  stops advancing), and `stream_completed`. Plus the poller's per-tick
+  debug heartbeat while a config failure persists (the healthy unchanged
+  state logs nothing at all). Detailed but never payload-bearing: request
+  bodies, SSE `data:` payloads, and injection prompts do not exist at this
+  level — or at any level.
 - **INFO** — one `request_completed` per proxied request with the wire
   facts: `request_id` (16 hex chars, generated per request), `api`
   (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,
@@ -343,14 +385,32 @@ What each level carries:
   accepted; the listener itself is announced by the DEBUG
   `listener_ready`), and `drain_started`.
 - **WARN** — client disconnects and truncations (`stream_truncated` with a
-  `phase` field separating `client_write` from `upstream_read`), a client
-  that cancels mid-request, one warning per transition into a failed config
+  `phase` field separating `client_write` from `upstream_read` and
+  `upstream_limit`, and `relay_copy_failed` with phase `client_write` on
+  the verbatim and buffered paths — the buffered case covers a client whose
+  cancel surfaces through the upstream body read, with no envelope written
+  to the connection that is already gone), a response that never landed because the client was
+  already gone — a buffered body or any locally generated error envelope
+  (`client_write_failed`, outcome `client_disconnected`, superseding the
+  envelope's own classification), an upstream that
+  died mid-body before the answer could be parsed
+  (`upstream_body_read_failed`, outcome `upstream_read_failed`), a client
+  that cancels mid-request — including while the upstream request is in
+  flight (`upstream_request_failed` with `error_class` `client_canceled`,
+  outcome `client_disconnected`, and no error envelope, since the client is
+  gone) — one warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —
   plus `second_signal_forced_exit` and drain overflow.
 - **ERROR** — upstream connection failures (`upstream_request_failed` with
-  an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial`),
-  unparseable upstream responses, and anything fatal at startup.
+  an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial` —
+  never `client_canceled`, which is the WARN disconnect above) and an
+  upstream that died mid-relay on the verbatim path (`relay_copy_failed`
+  with phase `upstream_read` — the one relay failure that is not a
+  disconnect), plus anything fatal at startup. A 200 that is not
+  parseable JSON is not an event of its own: it surfaces only as the
+  `upstream_invalid_response` outcome on the INFO completion line, with
+  the 502 envelope on the wire.
 
 The credential rule is absolute: no log line, at any level, ever contains
 an `Authorization` value, a request or response body, an injection prompt,
@@ -435,7 +495,7 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
   copying, and server shutdown ordering.
 - **E2E suite** (`e2e/`) drives the real binary as a subprocess against
   in-process fake upstreams: forwarding, injection, streaming, hot reload,
-  drain, startup failures, plane violations. Everything needs is Go —
+  drain, startup failures, plane violations. Everything it needs is Go —
   no Docker required:
 
   ```sh
@@ -461,10 +521,12 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
   drain finishes, duplicate signals are ignored: the process keeps the exit
   code it earned.
 - Connection hygiene is bounded: request bodies are capped at 64 MiB,
-  request headers must arrive within 10s, and idle keep-alive connections
-  are closed after 120s — a quiet client cannot pin a goroutine and a file
-  descriptor forever. An active response (including a long SSE stream) is
-  never touched by the idle timeout.
+  request headers must arrive within 10s, idle keep-alive connections
+  are closed after 120s, and SSE relay input is capped per line and per
+  event (see [Streaming](#streaming)) — a quiet client cannot pin a
+  goroutine and a file descriptor forever, and a hostile upstream cannot
+  pin unbounded memory. An active response (including a long SSE stream)
+  is never touched by the idle timeout.
 
 ## Out of scope
 
@@ -478,8 +540,11 @@ Decided, and not coming back without a design discussion:
 - **Per-request overrides** of prompt or upstream model — the mapping is
   static per public name; a request field that changes forwarding is a
   footgun.
-- **Non-HTTPS(S) upstreams, proxies, TLS config** — endpoints verify chain
-  and host with system roots; no `insecure-skip-verify`.
+- **Proxy and TLS configuration** — upstream connections follow the standard
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables (inherited
+  from `net/http`'s default transport) and verify chain and host with
+  system roots; custom TLS setup (client certificates, custom CA pools,
+  `insecure-skip-verify`) is not coming.
 - **Authz on the inbound side** — requests are forwarded as received; the
   service is not an identity boundary.
 

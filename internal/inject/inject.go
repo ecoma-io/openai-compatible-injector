@@ -2,8 +2,9 @@
 // an upstream provider: it rewrites the requested model name to the
 // configured upstream alias and merges a per-model system-level instruction
 // prompt into the payload. It also provides Probe, a cheap request-routing
-// extractor, and RewriteModel, a byte-preserving rewriter used to sanitize
-// streamed chunks before they are relayed back to clients.
+// extractor, and RewriteChatModel/RewriteResponsesModel, byte-preserving
+// rewriters with per-API scope used to sanitize streamed chunks before they
+// are relayed back to clients.
 package inject
 
 import (
@@ -12,10 +13,13 @@ import (
 	"fmt"
 )
 
-// Probe cheaply extracts the fields the proxy needs to route a Chat
-// Completions request body without fully decoding it: the requested model
-// name and the stream flag. stream is reported as false when absent or
-// null (the OpenAI APIs treat a null flag as its zero value, so rejecting
+// Probe extracts the fields the proxy needs to route a Chat Completions
+// request body: the requested model name and the stream flag. It does not
+// fully decode the body into typed values, but it does validate the whole
+// body and decode the top-level object — deliberately the same acceptance
+// the transform applies, so a request Probe passes is one the transform
+// cannot fail on different grounds. stream is reported as false when absent
+// or null (the OpenAI APIs treat a null flag as its zero value, so rejecting
 // here would 400 requests the upstream accepts), and as given for
 // true/false. Probe returns an error only when body is not valid JSON or
 // when the "stream" field is present but is neither a JSON boolean nor

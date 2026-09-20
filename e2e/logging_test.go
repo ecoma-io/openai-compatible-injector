@@ -186,8 +186,10 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 		t.Fatalf("request_completed events = %d, want still 2 (INFO suppressed at error level)", got)
 	}
 
-	// error -> debug: no INFO ack can appear at error level, so wait on the
-	// behavior itself — the next debug event proves the new level applied.
+	// error -> debug: config_reloaded is invisible (INFO under the old error
+	// level), so wait on the behavior itself — the next debug event proves
+	// the new level applied. (The DEBUG log_level_applied ack is asserted
+	// per-transition by TestLogLevelTransitionMatrix.)
 	before := received()
 	rewriteConfig(t, p.cfgPath, loggingYAML(upstream.url(), upstream.url(), "debug"))
 	deadline := time.Now().Add(5 * time.Second)
@@ -214,6 +216,165 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 	// count. Fewer than four means a request was dropped.
 	if got := len(completions(4)); got < 4 {
 		t.Fatalf("request_completed events = %d, want >= 4 (every request answered)", got)
+	}
+}
+
+// TestLogLevelTransitionMatrix walks the level through every ordered pair of
+// the four documented levels plus the `warning` alias, requiring an
+// observable acknowledgement per transition: log_level_applied is emitted
+// at the level it announces, so it is visible on every transition —
+// including error->warn and anything->error, where the INFO config_reloaded
+// line is suppressed by the level still in force when it is written. Each
+// ack must also carry the generation the reload produced, incremented by
+// exactly one per successful publish. A rejected file afterwards must
+// neither bump the generation nor disturb the level in force.
+func TestLogLevelTransitionMatrix(t *testing.T) {
+	upstream := newFakeUpstream(t)
+	upstream.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","model":"up-live","choices":[]}`))
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     loggingYAML(upstream.url(), upstream.url(), "info"),
+		logLevel: "",
+	})
+
+	rewrite := func(level string) {
+		t.Helper()
+		rewriteConfig(t, p.cfgPath, loggingYAML(upstream.url(), upstream.url(), level))
+	}
+	generation := 0
+	expectAck := func(previous, level string) {
+		t.Helper()
+		generation++
+		waitForLogEvent(t, p, func(ev logEvent) bool {
+			return ev["message"] == "log_level_applied" &&
+				ev["previous_level"] == previous &&
+				ev["log_level"] == level &&
+				fmt.Sprint(ev["generation"]) == fmt.Sprint(generation)
+		}, fmt.Sprintf("log_level_applied %s->%s (generation %d)", previous, level, generation))
+	}
+
+	// Twelve rewrites, every ordered pair of the documented levels exactly
+	// once. The chain starts from the boot level (info) and returns to it.
+	for _, step := range [][2]string{
+		{"info", "debug"}, {"debug", "warn"}, {"warn", "info"},
+		{"info", "error"}, {"error", "debug"}, {"debug", "error"},
+		{"error", "warn"}, {"warn", "debug"}, {"debug", "info"},
+		{"info", "warn"}, {"warn", "error"}, {"error", "info"},
+	} {
+		rewrite(step[1])
+		expectAck(step[0], step[1])
+	}
+
+	// The alias: `warning` publishes warn and acknowledges with the
+	// canonical name.
+	rewrite("warning")
+	expectAck("info", "warn")
+
+	// A rejected file changes nothing: the ack generation the recovery
+	// produces must be exactly one past the alias reload's — no generation
+	// was consumed by the rejection — and DEBUG traffic must still flow
+	// while the file is broken, so first move to a level where the
+	// behavior is observable.
+	rewrite("debug")
+	expectAck("warn", "debug")
+	postJSON(t, p.addr, "/v1/chat/completions", secretBody, nil)
+	before := len(eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_received"))
+	if before == 0 {
+		t.Fatal("no request_received at debug level — precondition broken")
+	}
+
+	rewriteConfig(t, p.cfgPath, "models: [unclosed")
+	waitForLogEvent(t, p, func(ev logEvent) bool {
+		return ev["message"] == "config_reload_rejected"
+	}, "config_reload_rejected")
+	postJSON(t, p.addr, "/v1/chat/completions", secretBody, nil)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := len(eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_received")); got > before {
+			break // debug-level events still flowing: the level survived
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("level did not survive the rejected reload — no new request_received; stderr:\n%s", p.stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Recovery with the alias spelling: generation resumes one past the
+	// last successful publish.
+	rewrite("warning")
+	expectAck("debug", "warn")
+}
+
+// TestDebugLifecycleCheckpoints pins the lifecycle chain black-box: at debug
+// verbosity one buffered request produces every checkpoint exactly once, in
+// flow order, correlated by request_id — and the response body's own bytes
+// appear nowhere.
+func TestDebugLifecycleCheckpoints(t *testing.T) {
+	upstream := newFakeUpstream(t)
+	upstream.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","model":"up-live","choices":[{"marker":"SECRET_RESPONSE_BODY"}]}`))
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     loggingYAML(upstream.url(), upstream.url(), "debug"),
+		logLevel: "",
+	})
+
+	status, _, _ := postJSON(t, p.addr, "/v1/chat/completions", secretBody, nil)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	completed := waitForEventCount(t, p, "request_completed", 1)
+	requestID, _ := completed[0]["request_id"].(string)
+	if requestID == "" {
+		t.Fatalf("request_completed missing request_id:\n%v", completed[0])
+	}
+
+	chain := []string{
+		"request_received", "probe_completed", "model_resolved",
+		"request_transform_started", "request_transform_completed",
+		"upstream_request_started", "upstream_response_received",
+		"response_transform_started", "response_transform_completed",
+		"client_write_completed", "request_completed",
+	}
+	byID := func(evs []logEvent) map[string]int {
+		m := make(map[string]int, len(evs))
+		for i, ev := range evs {
+			if ev["request_id"] == requestID {
+				if _, dup := m[ev["message"].(string)]; !dup {
+					m[ev["message"].(string)] = i
+				}
+			}
+		}
+		return m
+	}
+	all := parseLogEvents(t, p.stderr.String())
+	m := byID(all)
+	prev := -1
+	for _, msg := range chain {
+		idx, ok := m[msg]
+		if !ok {
+			t.Fatalf("checkpoint %q missing for request %s:\n%s", msg, requestID, p.stderr.String())
+		}
+		if idx <= prev {
+			t.Errorf("checkpoint %q out of order", msg)
+		}
+		prev = idx
+	}
+	// One process-wide repetition guard: each slug appears exactly once per
+	// buffered request.
+	for _, msg := range chain {
+		if got := len(eventsWithMessage(all, msg)); got != 1 {
+			t.Errorf("%s appeared %d times, want 1", msg, got)
+		}
+	}
+
+	if strings.Contains(p.stderr.String(), "SECRET_RESPONSE_BODY") {
+		t.Error("upstream response body bytes reached the logs — leak")
 	}
 }
 

@@ -156,6 +156,57 @@ func TestResponsesEmptyPromptSkipsOnlyInjection(t *testing.T) {
 	}
 }
 
+// TestResponsesInstructionsEdges pins the instruction-shape edges that sit
+// between the documented cases: an explicit null is "any other type" (left
+// untouched — absent and null are distinct shapes and only absent selects the
+// prompt), and an array with members that are not instruction objects still
+// takes the developer item at index 0 with every original member carried
+// through as raw JSON.
+func TestResponsesInstructionsEdges(t *testing.T) {
+	t.Run("null left untouched", func(t *testing.T) {
+		body := `{"model":"gpt-5","instructions":null,"input":"hi"}`
+		in := decodeMap(t, []byte(body))
+		out, err := Responses([]byte(body), testModel(testPrompt))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		m := decodeMap(t, out)
+		if !bytes.Equal(m["instructions"], in["instructions"]) {
+			t.Errorf("null instructions changed: got %s, want %s", m["instructions"], in["instructions"])
+		}
+		var model string
+		if err := json.Unmarshal(m["model"], &model); err != nil || model != "upstream-model" {
+			t.Errorf("model = %q (err %v), want upstream-model", model, err)
+		}
+	})
+
+	t.Run("array with scalar members takes the prepend", func(t *testing.T) {
+		body := `{"model":"gpt-5","instructions":["str",7,null],"input":"hi"}`
+		out, err := Responses([]byte(body), testModel(testPrompt))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		m := decodeMap(t, out)
+		var items []json.RawMessage
+		if err := json.Unmarshal(m["instructions"], &items); err != nil {
+			t.Fatalf("decode instructions: %v", err)
+		}
+		if len(items) != 4 {
+			t.Fatalf("got %d items, want 4", len(items))
+		}
+		var dev map[string]any
+		if err := json.Unmarshal(items[0], &dev); err != nil {
+			t.Fatalf("decode items[0]: %v", err)
+		}
+		if dev["role"] != "developer" {
+			t.Fatalf("items[0] = %v, want the injected developer item", dev)
+		}
+		if string(items[1]) != `"str"` || string(items[2]) != `7` || string(items[3]) != `null` {
+			t.Fatalf("original members not preserved: %s %s %s", items[1], items[2], items[3])
+		}
+	})
+}
+
 func TestResponsesErrors(t *testing.T) {
 	for _, body := range []string{`{bad`, `null`, `[1,2]`} {
 		if _, err := Responses([]byte(body), testModel(testPrompt)); err == nil {

@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,20 +36,33 @@ func perfMax(a, b int) int {
 
 // perfUpstream is a fake upstream tuned for benchmarking: it answers every
 // request with a JSON body padded to bodySize bytes, or — when
-// streamEvents > 0 — with that many ~200B SSE events, flushed per event and
-// never paced (the benchmark measures proxy overhead, not upstream timing).
+// streamEvents > 0 — with that many SSE events (perfEvent(shape, 200)),
+// flushed per event and unpaced unless eventInterval is set (the benchmarks
+// measure proxy overhead, not upstream timing). shape is fixed at
+// construction — baking the event bytes there keeps the event loop free of
+// per-request building, but it also means a shape chosen after construction
+// would never take effect.
 type perfUpstream struct {
 	srv          *httptest.Server
 	hits         atomic.Int64
 	bodySize     int
 	streamEvents int
+	// eventInterval, when set, spaces the stream's events that far apart —
+	// the pacing a buffering relay would hide (BenchmarkStreamFirstBytePaced).
+	eventInterval time.Duration
 }
 
-func newPerfUpstream(b *testing.B, bodySize, streamEvents int) *perfUpstream {
+// newPerfUpstream starts the fake upstream. shape selects the SSE envelope
+// the streaming arms emit: "" (or "chat") emits bare data: lines;
+// "responses" emits the event:+data: pairs the Responses surface branches on.
+func newPerfUpstream(b *testing.B, bodySize, streamEvents int, shape string) *perfUpstream {
 	b.Helper()
 	u := &perfUpstream{bodySize: bodySize, streamEvents: streamEvents}
 	pad := strings.Repeat("x", perfMax(bodySize-90, 1))
-	event := `data: {"model":"up-name","choices":[{"delta":{"content":"` + strings.Repeat("y", 100) + `"}}]}` + "\n\n"
+	if shape == "" {
+		shape = "chat"
+	}
+	event := perfEvent(shape, 200)
 	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u.hits.Add(1)
 		if u.streamEvents == 0 {
@@ -59,6 +73,9 @@ func newPerfUpstream(b *testing.B, bodySize, streamEvents int) *perfUpstream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
 		for i := 0; i < u.streamEvents; i++ {
+			if u.eventInterval > 0 && i > 0 {
+				time.Sleep(u.eventInterval)
+			}
 			_, _ = io.WriteString(w, event)
 			if fl != nil {
 				fl.Flush()
@@ -108,30 +125,30 @@ func perfChatBody(model string, want int) string {
 }
 
 // perfPostAt issues one non-streaming request to the given route and returns
-// its duration; it fails the benchmark on any non-200.
-func perfPostAt(b *testing.B, addr, path, body string) time.Duration {
-	b.Helper()
+// its duration; it fails the caller on any non-200.
+func perfPostAt(tb testing.TB, addr, path, body string) time.Duration {
+	tb.Helper()
 	start := time.Now()
 	resp, err := http.Post("http://"+addr+path, "application/json",
 		strings.NewReader(body))
 	if err != nil {
-		b.Fatalf("post: %v", err)
+		tb.Fatalf("post: %v", err)
 	}
 	got, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
-		b.Fatalf("read: %v", err)
+		tb.Fatalf("read: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		b.Fatalf("status = %d body %s", resp.StatusCode, got)
+		tb.Fatalf("status = %d body %s", resp.StatusCode, got)
 	}
 	return time.Since(start)
 }
 
 // perfPost issues one non-streaming chat request and returns its duration.
-func perfPost(b *testing.B, addr, body string) time.Duration {
-	b.Helper()
-	return perfPostAt(b, addr, "/v1/chat/completions", body)
+func perfPost(tb testing.TB, addr, body string) time.Duration {
+	tb.Helper()
+	return perfPostAt(tb, addr, "/v1/chat/completions", body)
 }
 
 // perfStream reads one streaming request to EOF and returns its duration.
@@ -184,13 +201,12 @@ func BenchmarkThroughputChat(b *testing.B) {
 		}
 		for _, arm := range arms {
 			b.Run(tc.name+"/"+arm, func(b *testing.B) {
-				u := newPerfUpstream(b, tc.size, 0)
+				u := newPerfUpstream(b, tc.size, 0, "")
 				addr := benchmarkArm(b, u, arm)
 				body := perfChatBody("public", 128)
 				for i := 0; i < 100; i++ {
 					perfPost(b, addr, body)
 				}
-				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					perfPost(b, addr, body)
@@ -204,13 +220,12 @@ func BenchmarkThroughputChat(b *testing.B) {
 func BenchmarkThroughputResponses(b *testing.B) {
 	for _, arm := range []string{"direct", "injector_error"} {
 		b.Run("nonstream/"+arm, func(b *testing.B) {
-			u := newPerfUpstream(b, 200, 0)
+			u := newPerfUpstream(b, 200, 0, "")
 			addr := benchmarkArm(b, u, arm)
 			body := `{"model":"public","input":"hello"}`
 			for i := 0; i < 100; i++ {
 				perfPostAt(b, addr, "/v1/responses", body)
 			}
-			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				perfPostAt(b, addr, "/v1/responses", body)
@@ -220,19 +235,20 @@ func BenchmarkThroughputResponses(b *testing.B) {
 }
 
 // BenchmarkThroughputStream measures streaming overhead at 10/100/1000
-// events (~200B each, unpaced): read-to-EOF round trip.
+// events (perfEvent's exact byte count feeds SetBytes; unpaced):
+// read-to-EOF round trip. No ReportAllocs: these measure the benchmark
+// client's heap, not the binary under test.
 func BenchmarkThroughputStream(b *testing.B) {
 	for _, events := range []int{10, 100, 1000} {
 		for _, arm := range []string{"direct", "injector_error"} {
 			b.Run(fmt.Sprintf("events_%d/%s", events, arm), func(b *testing.B) {
-				u := newPerfUpstream(b, 0, events)
+				u := newPerfUpstream(b, 0, events, "")
 				addr := benchmarkArm(b, u, arm)
 				body := `{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 				for i := 0; i < 100; i++ {
 					perfStream(b, addr, body)
 				}
-				b.ReportAllocs()
-				b.SetBytes(int64(events * 200))
+				b.SetBytes(int64(len(perfEvent("chat", 200))) * int64(events))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					perfStream(b, addr, body)
@@ -242,34 +258,316 @@ func BenchmarkThroughputStream(b *testing.B) {
 	}
 }
 
-// BenchmarkLatencyPercentiles reports p50/p95/p99 over a fixed 1000-request
-// sample (100 warmups) — report metrics, not per-iteration timings. Run
-// with -benchtime 1x.
+// BenchmarkLatencyPercentiles reports buffered p50/p95/p99 over a fixed
+// 1000-request sample (100 warmups), direct vs injector, so the proxy's
+// added latency is visible against the zero-proxy baseline over the same
+// upstream — report metrics, not per-iteration timings. Run with
+// -benchtime 1x.
 func BenchmarkLatencyPercentiles(b *testing.B) {
-	u := newPerfUpstream(b, 200, 0)
-	p := startProcB(b, startOpts{
-		yaml:     runtimeYAML("public", u.srv.URL+"/v1", "up-name", ""),
-		logLevel: "error",
-	})
-	body := perfChatBody("public", 128)
-	for i := 0; i < 100; i++ {
-		perfPost(b, p.addr, body)
-	}
-	const n = 1000
-	sample := make([]time.Duration, 0, n)
-	b.ResetTimer()
-	for i := 0; i < n; i++ {
-		sample = append(sample, perfPost(b, p.addr, body))
-	}
-	b.StopTimer()
+	for _, arm := range []string{"direct", "injector_error"} {
+		b.Run(arm, func(b *testing.B) {
+			if b.N != 1 {
+				b.Fatalf("fixed-sample benchmark: run with -benchtime 1x (got b.N=%d)", b.N)
+			}
+			u := newPerfUpstream(b, 200, 0, "")
+			addr := benchmarkArm(b, u, arm)
+			body := perfChatBody("public", 128)
+			for i := 0; i < 100; i++ {
+				perfPost(b, addr, body)
+			}
+			const n = 1000
+			sample := make([]time.Duration, 0, n)
+			b.ResetTimer()
+			for i := 0; i < n; i++ {
+				sample = append(sample, perfPost(b, addr, body))
+			}
+			b.StopTimer()
 
-	sort.Slice(sample, func(i, j int) bool { return sample[i] < sample[j] })
-	pct := func(p float64) float64 {
-		return float64(sample[int(float64(len(sample)-1)*p)].Microseconds()) / 1000.0
+			sort.Slice(sample, func(i, j int) bool { return sample[i] < sample[j] })
+			pct := func(p float64) float64 {
+				return float64(sample[int(float64(len(sample)-1)*p)].Microseconds()) / 1000.0
+			}
+			b.ReportMetric(pct(0.50), "p50-ms")
+			b.ReportMetric(pct(0.95), "p95-ms")
+			b.ReportMetric(pct(0.99), "p99-ms")
+			b.Logf("buffered latency over %d requests (%s): p50=%.3fms p95=%.3fms p99=%.3fms",
+				n, arm, pct(0.50), pct(0.95), pct(0.99))
+		})
 	}
-	b.ReportMetric(pct(0.50), "p50-ms")
-	b.ReportMetric(pct(0.95), "p95-ms")
-	b.ReportMetric(pct(0.99), "p99-ms")
-	b.Logf("latency over %d requests: p50=%.3fms p95=%.3fms p99=%.3fms",
-		n, pct(0.50), pct(0.95), pct(0.99))
+}
+
+// perfEvent builds one SSE event of the given API shape, ~size bytes.
+// Responses envelopes carry event:+data: pairs — the shape the injector's
+// path-branching stream reader expects on /v1/responses — and pack BOTH
+// model keys the responses rewrite covers (top-level and inside the
+// top-level "response" object) so every event exercises the full rewrite
+// scope, not just the chat-shared top-level one.
+func perfEvent(shape string, size int) string {
+	pad := strings.Repeat("y", perfMax(size-60, 1))
+	data := `data: {"model":"up-name","delta":{"text":"` + pad + `"}}` + "\n"
+	if shape == "responses" {
+		data = `data: {"model":"up-name","response":{"model":"up-name"},"delta":{"text":"` + pad + `"}}` + "\n"
+		return "event: response.output_text.delta\n" + data + "\n"
+	}
+	return data + "\n"
+}
+
+// perfStreamRead reads one streaming request until the first SSE event
+// boundary (first-byte proxy) and then to EOF; it returns both durations.
+func perfStreamRead(tb testing.TB, addr, path, body string) (ttfb, total time.Duration) {
+	tb.Helper()
+	start := time.Now()
+	resp, err := http.Post("http://"+addr+path, "application/json",
+		strings.NewReader(body))
+	if err != nil {
+		tb.Fatalf("post: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		tb.Fatalf("status = %d", resp.StatusCode)
+	}
+	br := bufio.NewReader(resp.Body)
+	// The first event ends at its blank line; every shape emits one.
+	sawBoundary := false
+	for !sawBoundary {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			tb.Fatalf("stream read: %v", err)
+		}
+		if line == "\n" {
+			sawBoundary = true
+		}
+	}
+	ttfb = time.Since(start)
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		tb.Fatalf("copy: %v", err)
+	}
+	return ttfb, time.Since(start)
+}
+
+// BenchmarkThroughputResponsesStream completes the matrix cell the other
+// benchmarks leave empty: Responses, streaming, injector vs direct, with the
+// upstream emitting the responses SSE shape (event:+data: pairs), so the
+// responses stream reader and its response.model rewrite run at benchmark
+// scale. The level axis rides on this benchmark's 1000-event cell.
+func BenchmarkThroughputResponsesStream(b *testing.B) {
+	body := `{"model":"public","stream":true,"input":"hi"}`
+	for _, events := range []int{10, 100, 1000} {
+		arms := []string{"direct", "injector_error"}
+		if events == 1000 {
+			arms = append(arms, "injector_info", "injector_debug")
+		}
+		for _, arm := range arms {
+			b.Run(fmt.Sprintf("events_%d/%s", events, arm), func(b *testing.B) {
+				u := newPerfUpstream(b, 0, events, "responses")
+				addr := benchmarkArm(b, u, arm)
+				for i := 0; i < 100; i++ {
+					_, _ = perfStreamRead(b, addr, "/v1/responses", body)
+				}
+				b.SetBytes(int64(len(perfEvent("responses", 200))) * int64(events))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					_, _ = perfStreamRead(b, addr, "/v1/responses", body)
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkStreamFirstBytePercentiles reports first-event (TTFB) p50/p95/p99
+// over a fixed 500-request sample (50 warmups), injector vs direct, so the
+// streaming interaction cost is visible separately from the full-stream
+// duration the throughput benchmarks measure. Run with -benchtime 1x.
+func BenchmarkStreamFirstBytePercentiles(b *testing.B) {
+	const (
+		n      = 500
+		warmup = 50
+	)
+	for _, arm := range []string{"direct", "injector_error"} {
+		b.Run(arm, func(b *testing.B) {
+			if b.N != 1 {
+				b.Fatalf("fixed-sample benchmark: run with -benchtime 1x (got b.N=%d)", b.N)
+			}
+			u := newPerfUpstream(b, 0, 20, "")
+			addr := benchmarkArm(b, u, arm)
+			body := `{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+			for i := 0; i < warmup; i++ {
+				_, _ = perfStreamRead(b, addr, "/v1/chat/completions", body)
+			}
+			sample := make([]time.Duration, 0, n)
+			b.ResetTimer()
+			for i := 0; i < n; i++ {
+				ttfb, _ := perfStreamRead(b, addr, "/v1/chat/completions", body)
+				sample = append(sample, ttfb)
+			}
+			b.StopTimer()
+
+			sort.Slice(sample, func(i, j int) bool { return sample[i] < sample[j] })
+			pct := func(p float64) float64 {
+				return float64(sample[int(float64(len(sample)-1)*p)].Microseconds()) / 1000.0
+			}
+			b.ReportMetric(pct(0.50), "ttfb-p50-ms")
+			b.ReportMetric(pct(0.95), "ttfb-p95-ms")
+			b.ReportMetric(pct(0.99), "ttfb-p99-ms")
+			b.Logf("ttfb over %d requests (%s): p50=%.3fms p95=%.3fms p99=%.3fms",
+				n, arm, pct(0.50), pct(0.95), pct(0.99))
+		})
+	}
+}
+
+// BenchmarkStreamFirstBytePaced makes buffering measurable where the
+// unpaced benchmarks cannot see it: the upstream spaces its events 25ms
+// apart (the first event is available immediately; events 2..6 arrive one
+// interval apart), so a pass-through relay delivers the first event almost
+// instantly while a buffering relay cannot deliver anything until the
+// upstream finishes — roughly (events-1)×interval ≈ 125ms later. The
+// reported ttfb-p50 per arm is the instrument: near-zero for both arms is
+// the pass-through evidence, and a regression to ~125ms is the caught
+// buffering. Report metrics, not per-iteration timings; run with
+// -benchtime 1x.
+func BenchmarkStreamFirstBytePaced(b *testing.B) {
+	const (
+		events   = 6
+		interval = 25 * time.Millisecond
+		samples  = 20
+		warmup   = 3
+	)
+	for _, arm := range []string{"direct", "injector_error"} {
+		b.Run(arm, func(b *testing.B) {
+			if b.N != 1 {
+				b.Fatalf("fixed-sample benchmark: run with -benchtime 1x (got b.N=%d)", b.N)
+			}
+			u := newPerfUpstream(b, 0, events, "")
+			u.eventInterval = interval
+			addr := benchmarkArm(b, u, arm)
+			body := `{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+			for i := 0; i < warmup; i++ {
+				_, _ = perfStreamRead(b, addr, "/v1/chat/completions", body)
+			}
+			sample := make([]time.Duration, 0, samples)
+			b.ResetTimer()
+			for i := 0; i < samples; i++ {
+				ttfb, _ := perfStreamRead(b, addr, "/v1/chat/completions", body)
+				sample = append(sample, ttfb)
+			}
+			b.StopTimer()
+
+			sort.Slice(sample, func(i, j int) bool { return sample[i] < sample[j] })
+			p50 := float64(sample[len(sample)/2].Microseconds()) / 1000.0
+			b.ReportMetric(p50, "ttfb-p50-ms")
+			b.Logf("paced ttfb over %d requests (%s): p50=%.3fms (pass-through lands near zero; buffering would land near %v)",
+				samples, arm, p50, time.Duration(events-1)*interval)
+		})
+	}
+}
+
+// TestProxyOverheadGuard is the coarse overhead tripwire for the whole proxy
+// path: the injector's median round trip must stay within 8x the
+// direct-upstream median plus an absolute floor — for a buffered request and
+// for a stream's first event. At realistic loopback medians (tens of
+// microseconds) the floor dominates the bound, so in practice this behaves
+// like an absolute ~5ms ceiling: it catches structural catastrophes
+// (per-request config work, per-request dials, synchronous heavy logging),
+// not microsecond deltas — and it cannot detect buffering of an unpaced
+// upstream stream at all, because an unpaced stream arrives nearly instantly
+// either way; BenchmarkStreamFirstBytePaced is the instrument for buffering.
+// The multiple only binds if the upstream itself is slow, where scaling with
+// the baseline is the fairer bound. Skipped under -short (keeps the suite
+// quick) and -race (timings are meaningless with the detector on).
+func TestProxyOverheadGuard(t *testing.T) {
+	if testing.Short() {
+		t.Skip("relative wall-clock guard skipped under -short")
+	}
+	if raceDetectorOn() {
+		t.Skip("relative wall-clock guard skipped under -race")
+	}
+
+	u := &perfUpstream{streamEvents: 20}
+	event := `data: {"model":"up-name","choices":[{"delta":{"content":"hello"}}]}` + "\n\n"
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqBody, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(reqBody), `"stream":true`) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":"p","model":"up-name","choices":[{"message":{"role":"assistant","content":"hi"}}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		for i := 0; i < u.streamEvents; i++ {
+			if u.eventInterval > 0 && i > 0 {
+				time.Sleep(u.eventInterval)
+			}
+			_, _ = io.WriteString(w, event)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	t.Cleanup(u.srv.Close)
+	direct := strings.TrimPrefix(u.srv.URL, "http://")
+
+	p := newProc(t, startOpts{yaml: runtimeYAML("public", u.srv.URL+"/v1", "up-name", "")})
+	p.start()
+	t.Cleanup(func() { p.terminate(10 * time.Second) })
+	p.waitHealth(t, 10*time.Second)
+
+	chatBody := perfChatBody("public", 128)
+	streamBody := `{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+	// bufferedSample returns the sorted round-trip sample of n buffered POSTs.
+	bufferedSample := func(addr string, n int) []time.Duration {
+		s := make([]time.Duration, 0, n)
+		for i := 0; i < n; i++ {
+			s = append(s, perfPostAt(t, addr, "/v1/chat/completions", chatBody))
+		}
+		sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+		return s
+	}
+	// ttfbSample returns the sorted first-event sample of n streamed POSTs.
+	ttfbSample := func(addr string, n int) []time.Duration {
+		s := make([]time.Duration, 0, n)
+		for i := 0; i < n; i++ {
+			ttfb, _ := perfStreamRead(t, addr, "/v1/chat/completions", streamBody)
+			s = append(s, ttfb)
+		}
+		sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+		return s
+	}
+
+	median := func(s []time.Duration) time.Duration { return s[len(s)/2] }
+
+	const (
+		n      = 400
+		warmup = 50
+	)
+	// Warm both arms before sampling: first-request connection setup would
+	// otherwise sit in the median.
+	bufferedSample(direct, warmup)
+	bufferedSample(p.addr, warmup)
+	ttfbSample(direct, warmup)
+	ttfbSample(p.addr, warmup)
+
+	directBuf := median(bufferedSample(direct, n))
+	injBuf := median(bufferedSample(p.addr, n))
+	directTTFB := median(ttfbSample(direct, n))
+	injTTFB := median(ttfbSample(p.addr, n))
+
+	// 8x the direct median plus a 5ms floor. On loopback the direct median
+	// is microseconds, so the floor is what binds and the guard is an
+	// order-of-magnitude tripwire; the multiple takes over only when the
+	// upstream itself is slow, where a scaled bound stays fair.
+	const multiple = 8.0
+	const floor = 5 * time.Millisecond
+	limit := func(direct time.Duration) time.Duration {
+		return time.Duration(float64(direct)*multiple) + floor
+	}
+	t.Logf("buffered: direct p50=%v injector p50=%v (limit %v)", directBuf, injBuf, limit(directBuf))
+	t.Logf("stream ttfb: direct p50=%v injector p50=%v (limit %v)", directTTFB, injTTFB, limit(directTTFB))
+
+	if injBuf > limit(directBuf) {
+		t.Errorf("buffered median overhead blown: injector %v vs direct %v, limit %v", injBuf, directBuf, limit(directBuf))
+	}
+	if injTTFB > limit(directTTFB) {
+		t.Errorf("stream first-event median overhead blown: injector %v vs direct %v, limit %v", injTTFB, directTTFB, limit(directTTFB))
+	}
 }

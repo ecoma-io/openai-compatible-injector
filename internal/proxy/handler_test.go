@@ -2,15 +2,19 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -70,6 +74,60 @@ func (c *countingRecorder) Flush() {
 	c.mu.Unlock()
 	c.ResponseRecorder.Flush()
 }
+
+// TestQueryStringEncoding pins both halves of the query contract. The
+// client's query string is dropped: only the operator-configured endpoint
+// defines where the request goes, and a client-supplied `?api-key=` must
+// never travel — not to the configured upstream, and not into a URL this
+// proxy might otherwise log. The endpoint's OWN query is preserved verbatim:
+// query-authenticated providers configure their key there, on purpose.
+func TestQueryStringEncoding(t *testing.T) {
+	var gotQuery muquery
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery.set(r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"upstream-name","choices":[]}`))
+	}))
+	defer up.Close()
+
+	t.Run("client query dropped", func(t *testing.T) {
+		gotQuery.set("")
+		h := newTestHandler(t, newTestStore(t, up.URL+"/v1"))
+		rec := doRequest(t, h, http.MethodPost,
+			"/v1/chat/completions?api-key=CLIENT_SECRET&x=1",
+			`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if q := gotQuery.get(); q != "" {
+			t.Fatalf("upstream RawQuery = %q, want empty (client query must not travel)", q)
+		}
+	})
+
+	t.Run("endpoint query preserved", func(t *testing.T) {
+		gotQuery.set("")
+		h := newTestHandler(t, newTestStore(t, up.URL+"/v1?api-version=2024-02-01"))
+		rec := doRequest(t, h, http.MethodPost,
+			"/v1/chat/completions",
+			`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if q := gotQuery.get(); q != "api-version=2024-02-01" {
+			t.Fatalf("upstream RawQuery = %q, want the endpoint's configured query", q)
+		}
+	})
+}
+
+// muquery is a mutex-guarded string cell for the single-variable capture the
+// test above needs.
+type muquery struct {
+	mu sync.Mutex
+	v  string
+}
+
+func (q *muquery) set(v string) { q.mu.Lock(); q.v = v; q.mu.Unlock() }
+func (q *muquery) get() string  { q.mu.Lock(); defer q.mu.Unlock(); return q.v }
 
 // TestUpstreamFailureLogsRedactEndpoint pins the credential rule: a dial
 // failure against an endpoint whose query string carries a secret must not
@@ -636,5 +694,396 @@ func TestStreamAndBufferedRewriteParity(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "upstream-name") {
 		t.Errorf("upstream name leaked to client: %q", rec.Body.String())
+	}
+}
+
+// TestUnknownPathsJSON404 pins the catch-all: every path the exact routes do
+// not match — unknown paths, trailing slashes, wrong case — answers with the
+// OpenAI-compatible JSON envelope, never the mux's plain-text default, so
+// SDK clients always receive an error body they can decode.
+func TestUnknownPathsJSON404(t *testing.T) {
+	h := newTestHandler(t, newTestStore(t, "http://127.0.0.1:9/v1"))
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/nope"},
+		{http.MethodGet, "/"},
+		{http.MethodPost, "/v1/chat/completions/"},
+		{http.MethodPost, "/V1/RESPONSES"},
+		{http.MethodPost, "/v1/embeddings"},
+	} {
+		rec := doRequest(t, h, tc.method, tc.path, `{}`, nil)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s: status = %d, want 404", tc.method, tc.path, rec.Code)
+			continue
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("%s %s: Content-Type = %q, want application/json", tc.method, tc.path, ct)
+		}
+		var env struct {
+			Error struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Errorf("%s %s: body not valid envelope JSON: %v (%q)", tc.method, tc.path, err, rec.Body.String())
+			continue
+		}
+		if !strings.HasPrefix(env.Error.Message, "Invalid URL (") {
+			t.Errorf("%s %s: message = %q, want the \"Invalid URL (...)\" shape", tc.method, tc.path, env.Error.Message)
+		}
+		if env.Error.Type != "invalid_request_error" {
+			t.Errorf("%s %s: type = %q, want invalid_request_error", tc.method, tc.path, env.Error.Type)
+		}
+	}
+}
+
+// TestModelNotFoundPreservesNameBytes pins the byte-exact envelope for names
+// carrying characters Go's default JSON encoding would HTML-escape (< > &):
+// the requested model is interpolated verbatim into the documented shape.
+func TestModelNotFoundPreservesNameBytes(t *testing.T) {
+	h := newTestHandler(t, newTestStore(t, "http://127.0.0.1:9/v1"))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"ghost<&>"}`, nil)
+	want := `{"error":{"message":"The model 'ghost<&>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if got := rec.Body.String(); got != want {
+		t.Errorf("body mismatch (HTML-escaped or reshaped):\n got %s\nwant %s", got, want)
+	}
+}
+
+// TestClientCancelBeforeUpstreamAnswer pins the cancel classification: a
+// client that goes away while the upstream request is in flight gets the
+// client_disconnected outcome at WARN — not a 502 upstream_unreachable — and
+// no error envelope is written, so the access log's status stays
+// uncommitted.
+func TestClientCancelBeforeUpstreamAnswer(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+	}))
+	// Declared after up.Close on purpose: defers run LIFO, so the upstream
+	// handler is unblocked before the server joins it.
+	defer up.Close()
+	defer close(release)
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(rec, req)
+		close(done)
+	}()
+	<-entered
+	cancel()
+	<-done
+
+	if got := rec.Body.String(); got != "" {
+		t.Errorf("envelope written for a gone client: %q", got)
+	}
+	var sawCompleted, sawFailed bool
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, line)
+		}
+		switch m["message"] {
+		case "request_completed":
+			sawCompleted = true
+			if m["outcome"] != "client_disconnected" {
+				t.Errorf("outcome = %v, want client_disconnected (%s)", m["outcome"], line)
+			}
+			if m["status"] != float64(0) {
+				t.Errorf("status = %v, want 0 (no response committed)", m["status"])
+			}
+		case "upstream_request_failed":
+			sawFailed = true
+			if m["level"] != "warn" {
+				t.Errorf("level = %v, want warn", m["level"])
+			}
+			if m["error_class"] != "client_canceled" {
+				t.Errorf("error_class = %v, want client_canceled", m["error_class"])
+			}
+		}
+	}
+	if !sawCompleted || !sawFailed {
+		t.Fatalf("missing events: request_completed=%v upstream_request_failed=%v\n%s", sawCompleted, sawFailed, logs.String())
+	}
+}
+
+// TestStreamLineLimitOutcome pins the limit-breach outcome chain, which no
+// other test observed: an upstream line crossing MaxLineBytes truncates the
+// relay under a committed 200, and the access log reports outcome
+// stream_limit_exceeded with the WARN stream_truncated event carrying phase
+// upstream_limit — the wall a hostile peer runs into is its own class, never
+// folded into an upstream read failure.
+func TestStreamLineLimitOutcome(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"model\":\"upstream-name\"}\n\n")
+		_, _ = io.WriteString(w, "data: "+strings.Repeat("x", MaxLineBytes+1)+"\n")
+	}))
+	defer up.Close()
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model","stream":true}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (status committed before the truncation)", rec.Code)
+	}
+
+	var sawCompleted, sawTruncated bool
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, line)
+		}
+		switch m["message"] {
+		case "request_completed":
+			sawCompleted = true
+			if m["outcome"] != "stream_limit_exceeded" {
+				t.Errorf("outcome = %v, want stream_limit_exceeded (%s)", m["outcome"], line)
+			}
+			if m["status"] != float64(http.StatusOK) {
+				t.Errorf("status = %v, want 200", m["status"])
+			}
+		case "stream_truncated":
+			sawTruncated = true
+			if m["level"] != "warn" {
+				t.Errorf("level = %v, want warn", m["level"])
+			}
+			if m["phase"] != "upstream_limit" {
+				t.Errorf("phase = %v, want upstream_limit", m["phase"])
+			}
+		}
+	}
+	if !sawCompleted || !sawTruncated {
+		t.Fatalf("missing events: request_completed=%v stream_truncated=%v\n%s", sawCompleted, sawTruncated, logs.String())
+	}
+}
+
+// TestConcurrentReloadAndTraffic pins the snapshot discipline under the race
+// detector: a publisher swapping snapshots the way the poller does, while
+// concurrent traffic loads and serves. Every request must answer from one
+// coherent snapshot — the response model is always the public name that was
+// requested (never the upstream alias), whatever the publisher races. CI
+// runs this package under -race.
+func TestConcurrentReloadAndTraffic(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"upstream-name","choices":[]}`))
+	}))
+	defer up.Close()
+
+	yaml := fmt.Sprintf("models:\n  model-a:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n  model-b:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n", up.URL+"/v1", up.URL+"/v1")
+	snap, err := config.LoadRuntime([]byte(yaml))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	store := config.NewStore(snap)
+	h := NewHandler(store, NewSharedClient(), zerolog.Nop())
+
+	stop := make(chan struct{})
+	pubDone := make(chan struct{})
+	var publishes atomic.Int64
+	go func() {
+		defer close(pubDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			next, err := config.LoadRuntime([]byte(yaml))
+			if err != nil {
+				t.Errorf("reload: %v", err)
+				return
+			}
+			if err := store.Publish(next); err != nil {
+				t.Errorf("publish: %v", err)
+				return
+			}
+			publishes.Add(1)
+		}
+	}()
+
+	const workers = 8
+	const perWorker = 100
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				name := "model-a"
+				if (w+i)%2 == 0 {
+					name = "model-b"
+				}
+				rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+					`{"model":"`+name+`","messages":[]}`, nil)
+				if rec.Code != http.StatusOK {
+					t.Errorf("%s: status = %d body %s", name, rec.Code, rec.Body.String())
+					return
+				}
+				var body map[string]any
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Errorf("%s: body not JSON: %v (%q)", name, err, rec.Body.String())
+					return
+				}
+				if body["model"] != name {
+					t.Errorf("%s: response model = %v, want the requested public name (alias leak or torn snapshot)", name, body["model"])
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(stop)
+	<-pubDone
+	if publishes.Load() == 0 {
+		t.Error("publisher never ran; the test pinned nothing")
+	}
+}
+
+// TestSanitizeUpstreamErrorRedactsNestedURLBytes pins the no-echo rule one
+// layer deeper: the nested url errors a *url.Error can carry quote raw
+// bytes (the offending escape sequence, the rejected host). They are
+// replaced with static text; only the scheme+host origin survives.
+func TestSanitizeUpstreamErrorRedactsNestedURLBytes(t *testing.T) {
+	endpoint := &url.URL{Scheme: "http", Host: "up.example:1"}
+
+	sanitized := sanitizeUpstreamError(
+		&url.Error{Op: "Post", URL: "http://up.example:1/v1?api-key=S", Err: url.EscapeError("%zz")},
+		endpoint)
+	msg := sanitized.Error()
+	if strings.Contains(msg, "%zz") {
+		t.Errorf("sanitized error echoes the raw escape bytes: %q", msg)
+	}
+	if !strings.Contains(msg, "invalid URL escape") {
+		t.Errorf("sanitized error lost the failure class: %q", msg)
+	}
+	if !strings.Contains(msg, "http://up.example:1") {
+		t.Errorf("sanitized error lost the origin: %q", msg)
+	}
+
+	sanitized = sanitizeUpstreamError(
+		&url.Error{Op: "Post", URL: "http://HOSTMARK:1/", Err: url.InvalidHostError("HOSTMARK")},
+		endpoint)
+	if strings.Contains(sanitized.Error(), "HOSTMARK") {
+		t.Errorf("sanitized error echoes the rejected host bytes: %q", sanitized.Error())
+	}
+}
+
+// TestUpstreamTimeoutClassified pins the timeout branch of the upstream
+// failure taxonomy: an upstream that accepts the connection and then goes
+// quiet past the header deadline surfaces as the 502 upstream_unreachable
+// envelope with error_class timeout — a genuine upstream failure, never a
+// client disconnect. The deadline is the client's own ResponseHeaderTimeout
+// (a hard local timer, not a race), so the test is deterministic; the shared
+// client's zero value is pinned separately (long-lived SSE must not have one).
+func TestUpstreamTimeoutClassified(t *testing.T) {
+	// Accepts connections, never answers. The handler cannot wait on
+	// r.Context(): the proxy forwards a body it never reads, and net/http
+	// arms its client-disconnect detector only once the body hits EOF — so
+	// the context survives the transport giving up. A test-owned channel
+	// releases the handler at teardown instead (deferred LIFO: released
+	// before Close waits on it).
+	done := make(chan struct{})
+	silent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-done
+	}))
+	defer silent.Close()
+	defer close(done)
+
+	client := NewSharedClient()
+	client.Transport.(*http.Transport).ResponseHeaderTimeout = 150 * time.Millisecond
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, silent.URL+"/v1"), client, zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpUnreach {
+		t.Errorf("body = %s, want the upstream_unreachable envelope", body)
+	}
+	sawClass := false
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, line)
+		}
+		if m["message"] == "upstream_request_failed" {
+			sawClass = true
+			if m["error_class"] != "timeout" {
+				t.Errorf("error_class = %v, want timeout (%s)", m["error_class"], line)
+			}
+			if lvl, _ := m["level"].(string); lvl != "error" {
+				t.Errorf("level = %v, want error (an upstream timeout is the upstream's failure)", m["level"])
+			}
+			if m["outcome"] != nil {
+				t.Errorf("failure event must not carry the outcome; got %v", m["outcome"])
+			}
+		}
+		if m["message"] == "request_completed" && m["outcome"] != "upstream_unreachable" {
+			t.Errorf("outcome = %v, want upstream_unreachable", m["outcome"])
+		}
+	}
+	if !sawClass {
+		t.Fatalf("upstream_request_failed not logged:\n%s", logs.String())
+	}
+}
+
+// TestUpstreamTLSFailureClassified pins the TLS branch: an upstream serving
+// a certificate the shared client cannot verify (httptest's self-signed pair
+// against the default verifier) fails the handshake and surfaces as the 502
+// upstream_unreachable envelope with error_class tls — deterministic, no
+// timing involved.
+func TestUpstreamTLSFailureClassified(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"upstream-name"}`)
+	}))
+	defer up.Close()
+
+	var logs bytes.Buffer
+	// The shared client does not trust httptest's self-signed certificate.
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpUnreach {
+		t.Errorf("body = %s, want the upstream_unreachable envelope", body)
+	}
+	sawClass := false
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, line)
+		}
+		if m["message"] == "upstream_request_failed" {
+			sawClass = true
+			if m["error_class"] != "tls" {
+				t.Errorf("error_class = %v, want tls (%s)", m["error_class"], line)
+			}
+			// The credential rule: scheme+host only, never the full URL with
+			// any path/query the endpoint carried.
+			if strings.Contains(fmt.Sprint(m["upstream"]), "/"+strings.TrimPrefix(up.URL, "http://")) {
+				t.Errorf("upstream field carries more than the origin: %v", m["upstream"])
+			}
+		}
+	}
+	if !sawClass {
+		t.Fatalf("upstream_request_failed not logged:\n%s", logs.String())
 	}
 }

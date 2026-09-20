@@ -19,7 +19,7 @@ Owned decomposition:
 | Directory                        | Owns                                                                                                                                                                                                                                                  |
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, log level via `ParseLogLevel`), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteModel` (byte-preserving)                                                                                                                                    |
+| `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped)                                                                                            |
 | `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`)                                                                                                                                                                        |
 | `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                               |
 | `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                       |
@@ -46,14 +46,20 @@ Owned decomposition:
 - **Injection must never corrupt.** Chat prepends to `messages` only when it
   is a JSON array; Responses merges into `instructions` (string, array, or
   absent) and touches nothing else. Empty prompt = no injection.
-- **`RewriteModel` is byte-preserving.** Only object-key `"model"` string
-  values are replaced (top-level for both APIs; nested `response.model` for
-  Responses envelopes) inside a string-state-aware scan. Unparseable input
-  returns the input unchanged. Never re-serialize.
+- **Rewrite is byte-preserving and API-scoped.** `RewriteChatModel` replaces
+  only the top-level `"model"` string value; `RewriteResponsesModel`
+  additionally replaces the `"model"` directly inside a top-level
+  `"response"` object (Responses envelope events) — a chat payload's nested
+  `response.model` is client data and passes untouched. Both inside a
+  string-state-aware scan; unparseable input returns the input unchanged.
+  Never re-serialize. Every call site (chat/responses × buffered/SSE) uses
+  its own API's function.
 - **Streaming branches on the URL path**, not the body: chat = `data:`
   lines + `data: [DONE]`; responses = `event:`+`data:` pairs, no `[DONE]`
   (Responses termination events pass through untouched). `CopySSE` flushes
-  per event boundary (blank line), grows its buffer without a cap, and
+  per event boundary (blank line), is bounded (1 MiB per line, 2 MiB per
+  in-flight event — breach stops the relay with outcome
+  `stream_limit_exceeded`, the offending line never forwarded), and
   rewrites only `data:` lines containing a model string, with the same
   acceptance rule as the buffered path.
 - **Verbose verbatim, loud local.** 4xx/5xx upstream responses forward byte
@@ -73,7 +79,9 @@ Owned decomposition:
   `warning` is an alias, absent = `info`); there is no `LOG_LEVEL` env var.
   A valid reload applies the level process-wide via the poller's
   `onPublish` hook calling `zerolog.SetGlobalLevel` (atomic store, no locks,
-  no signal, no restart). Events are JSON lines on stderr with stable
+  no signal, no restart) and acknowledges it with `log_level_applied`
+  emitted at the new level — the only severity visible under the level it
+  announces — so no transition, even `error→warn`, is ever silent. Events are JSON lines on stderr with stable
   snake_case message slugs (`request_completed`, `config_reloaded`,
   `stream_truncated`, ...); one INFO `request_completed` per request binds
   `request_id`, outcome, byte counts, duration and `config_generation`. The
@@ -88,8 +96,14 @@ Owned decomposition:
 - 400 `invalid_request_error` — body not JSON, or missing `model`.
 - 404 `model_not_found` — exact shape
   `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`.
+  Interpolated names land byte-exact (no HTML escaping).
+- 404 `invalid_request_error` — unknown path (no route matched):
+  `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`.
+  OpenAI SDK clients always get parseable JSON, never the mux's plain text.
 - 502 `upstream_error` — `code: "upstream_unreachable"` on dial failure;
-  `code: "upstream_invalid_response"` on 200 + unparseable JSON.
+  `code: "upstream_invalid_response"` on 200 + unparseable JSON. A client
+  cancel while the upstream request is in flight is the WARN
+  `client_disconnected` outcome, never this 502.
 - Anything else from upstream (any 4xx/5xx) forwards verbatim.
 - No overall request timeout; upstream timeouts surface as 502.
 

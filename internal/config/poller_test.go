@@ -341,10 +341,10 @@ func TestPollerUnreadableTransitionLogging(t *testing.T) {
 	waitGenStable(t, store, store.Gen(), 120*time.Millisecond)
 }
 
-// TestPollerDebugHeartbeat pins the debug-level heartbeat contract: with the
-// level raised to debug, unchanged ticks and persistent failures each emit
-// their documented debug event, so an operator debugging a stuck reload can
-// see every poll outcome without recompiling.
+// TestPollerDebugHeartbeat pins the debug-level persistence contract: with
+// the level raised to debug, a failure that persists across ticks emits its
+// documented debug event, so an operator debugging a stuck reload can see
+// every failing poll outcome without recompiling.
 func TestPollerDebugHeartbeat(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -365,6 +365,56 @@ func TestPollerDebugHeartbeat(t *testing.T) {
 	writeFile(t, path, "models: [unclosed\n")
 	waitUntil(t, 2*time.Second, func() bool { return buf.countEvents("config_reload_still_rejected") >= 1 },
 		"no config_reload_still_rejected DEBUG while the failure persists")
+}
+
+// TestPollerHealthyTicksAreSilent pins the healthy-state logging contract:
+// an unchanged file produces no event per tick — not even at debug level —
+// so a process serving one static config emits no perpetual heartbeat
+// (86,400 lines a day at the default interval) on top of an unchanged
+// generation. The reload path keeps its own events; only the quiet state is
+// quiet.
+func TestPollerHealthyTicksAreSilent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, validRuntime())
+
+	store := NewStore(mustSnapshot(t, validRuntime()))
+	var buf syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.DebugLevel), nil)
+	go p.Run(ctx)
+
+	// Enough unchanged ticks that the old per-tick DEBUG event would have
+	// fired many times over.
+	waitGenStable(t, store, store.Gen(), 300*time.Millisecond)
+	if got := buf.countEvents("config_unchanged"); got != 0 {
+		t.Errorf("config_unchanged logged %d times on healthy ticks, want 0 (no perpetual heartbeat)", got)
+	}
+	if lines := buf.lines(); lines != 0 {
+		t.Errorf("healthy ticks emitted %d log lines, want 0:\n%s", lines, buf.String())
+	}
+
+	// The silence is scoped to the unchanged state: a change still logs.
+	changed := strings.Replace(validRuntime(), "gpt-5-pro", "gpt-9", 1)
+	writeFile(t, path, changed)
+	waitGen(t, store, 1)
+	waitUntil(t, 2*time.Second, func() bool { return buf.countEvents("config_reloaded") >= 1 },
+		"no config_reloaded INFO for the changed file")
+}
+
+// lines counts captured log lines (every line is one JSON event).
+func (b *syncBuffer) lines() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, line := range strings.Split(b.buf.String(), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // TestPollerSeedsHashFromBootContent pins the boot-content seed: Run must
@@ -425,6 +475,74 @@ func TestPollerBootReadFailureDoesNotSpuriouslyRepublish(t *testing.T) {
 	if got := buf.countEvents("config_initial_read_failed"); got != 0 {
 		t.Errorf("config_initial_read_failed logged %d times — there must be no initial read", got)
 	}
+}
+
+// TestPollerRapidEditsConvergeToFinalContent pins the rapid-edit contract: a
+// content-hash poller observes file STATE at each tick, not write events, so
+// edits landing between two reads are collapsed. Whatever the interleaving,
+// once the writes have settled the poller must converge to the final content
+// and never wedge on an intermediate invalid file it may never see.
+func TestPollerRapidEditsConvergeToFinalContent(t *testing.T) {
+	valid := func(model string) string {
+		return `
+models:
+  gpt-reviewer:
+    endpoint: https://api.provider.example/v2
+    upstream-model: ` + model + `
+    injection-prompt: p
+`
+	}
+	t.Run("two valid edits collapse to the last", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		writeFile(t, path, valid("first"))
+
+		store := NewStore(mustSnapshot(t, valid("first")))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		p := NewPoller(store, path, []byte(valid("first")), 50*time.Millisecond, testLog(t), nil)
+		go p.Run(ctx)
+
+		time.Sleep(3 * 50 * time.Millisecond)
+		// Both writes land well inside one interval: the middle state
+		// ("second") may or may not ever be read.
+		writeFile(t, path, valid("second"))
+		writeFile(t, path, valid("third"))
+
+		waitUntil(t, 2*time.Second, func() bool {
+			m, _ := store.Load().Model("gpt-reviewer")
+			return m.UpstreamModel == "third"
+		}, "poller did not converge to the final content")
+		// Convergence is monotone: the generation only ever moved forward,
+		// and no further reload happens after the content has settled.
+		gen := store.Gen()
+		waitGenStable(t, store, gen, 200*time.Millisecond)
+	})
+
+	t.Run("invalid intermediate never wedges the poller", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		writeFile(t, path, valid("first"))
+
+		store := NewStore(mustSnapshot(t, valid("first")))
+		var buf syncBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		p := NewPoller(store, path, []byte(valid("first")), 50*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
+		go p.Run(ctx)
+
+		time.Sleep(3 * 50 * time.Millisecond)
+		// valid -> invalid -> valid: the broken state exists only inside one
+		// interval, so the poller may legitimately never observe it. Whether
+		// it does or not, the final valid content must win.
+		writeFile(t, path, "models: [unclosed\n")
+		writeFile(t, path, valid("final"))
+
+		waitUntil(t, 2*time.Second, func() bool {
+			m, _ := store.Load().Model("gpt-reviewer")
+			return m.UpstreamModel == "final"
+		}, "poller did not converge past a transient invalid file")
+	})
 }
 
 // TestPollerFailureKindSwitchWarns pins the failure-kind tracking: a file

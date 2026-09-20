@@ -164,21 +164,31 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 
 	models := make(map[string]Model, len(rf.Models))
 	seen := make(map[string]struct{}, len(rf.Models))
-	for name, rm := range rf.Models {
-		name = strings.TrimSpace(name)
+	// Entries are validated in sorted-key order so the rejection's ordinal
+	// ("model entry 3") is deterministic: the key text itself is never
+	// named — error text reaches logs verbatim, and a pasted credential can
+	// land in a key position just as well as a value position.
+	names := make([]string, 0, len(rf.Models))
+	for name := range rf.Models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for i, rawName := range names {
+		name := strings.TrimSpace(rawName)
+		ordinal := i + 1
 		if name == "" {
-			return nil, errors.New("model name must not be empty")
+			return nil, fmt.Errorf("model entry %d: name must not be empty", ordinal)
 		}
 		if _, dup := seen[name]; dup {
 			// `"  a":` and `a:` are distinct YAML keys that trim to the same
 			// model name; which one wins must not depend on map iteration
 			// order, so an ambiguous file is a reject, not a coin toss.
-			return nil, fmt.Errorf("model %q: name collides with another entry after trimming whitespace", name)
+			return nil, fmt.Errorf("model entry %d: name collides with another entry after trimming whitespace", ordinal)
 		}
 		seen[name] = struct{}{}
-		m, err := buildModel(name, rm)
+		m, err := buildModel(name, rf.Models[rawName])
 		if err != nil {
-			return nil, fmt.Errorf("model %q: %w", name, err)
+			return nil, fmt.Errorf("model entry %d: %w", ordinal, err)
 		}
 		models[name] = m
 	}
@@ -207,17 +217,28 @@ func buildModel(name string, rm runtimeModel) (Model, error) {
 	}
 	u, err := url.Parse(rm.Endpoint)
 	if err != nil {
-		// url.Parse errors quote the raw input, query string included; error
-		// text reaches logs verbatim, so the raw endpoint must not. A
-		// *url.Error is unwrapped to its cause, which never carries the
-		// input; a bare stdlib message (e.g. control-character rejection)
-		// has no echo and passes through. If the text ever does contain the
-		// input's quoted form, it is dropped entirely — the sanitizer fails
-		// closed, never open.
+		// url.Parse errors can quote the raw input, query string included;
+		// error text reaches logs verbatim, so the raw endpoint must not.
+		// A *url.Error is unwrapped to its cause — position-free for most
+		// parse failures, but two stdlib causes quote raw bytes of the
+		// input (the offending escape sequence, the rejected host byte) and
+		// are swapped for static text below, mirroring the proxy's
+		// sanitizeUpstreamError. If the text ever does contain the input's
+		// quoted form, it is dropped entirely — the sanitizer fails closed,
+		// never open.
 		var ue *url.Error
 		switch {
 		case errors.As(err, &ue):
-			return Model{}, fmt.Errorf("endpoint: %s", ue.Err)
+			inner := ue.Err
+			var ee url.EscapeError
+			var he url.InvalidHostError
+			switch {
+			case errors.As(inner, &ee):
+				inner = errors.New("invalid URL escape")
+			case errors.As(inner, &he):
+				inner = errors.New("invalid host")
+			}
+			return Model{}, fmt.Errorf("endpoint: %s", inner)
 		case strings.Contains(err.Error(), strconv.Quote(rm.Endpoint)):
 			return Model{}, errors.New("endpoint: invalid URL (input redacted)")
 		default:
@@ -225,7 +246,9 @@ func buildModel(name string, rm runtimeModel) (Model, error) {
 		}
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return Model{}, fmt.Errorf("endpoint scheme %q (host %q) must be http(s) with a host", u.Scheme, u.Host)
+		// Scheme and host are operator input like any other; a botched paste
+		// into the endpoint position can carry a credential into either.
+		return Model{}, errors.New("endpoint scheme and host must be http(s) with a host (input redacted)")
 	}
 	if u.User != nil {
 		return Model{}, errors.New("endpoint must not contain credentials")

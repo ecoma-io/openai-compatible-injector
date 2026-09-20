@@ -65,6 +65,16 @@ func chatStreamRequest(model string) string {
 func TestChatStreamIncremental(t *testing.T) {
 	up := newFakeUpstream(t)
 	gate := make(chan struct{})
+	// A failed assertion must not leave the upstream handler blocked on the
+	// gate forever: httptest.Server.Close waits for it, and with it the
+	// whole test binary.
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
 	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -308,6 +318,16 @@ func TestActiveStreamSurvivesReload(t *testing.T) {
 	upB := newFakeUpstream(t)
 	chunk1Sent := make(chan struct{})
 	gate := make(chan struct{})
+	// A failed assertion must not leave the upstream handler blocked on the
+	// gate forever: httptest.Server.Close waits for it, and with it the
+	// whole test binary.
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
 	var once sync.Once
 	upA.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -494,5 +514,223 @@ func TestResponsesStreamEnvelopeRewrite(t *testing.T) {
 	}
 	if !sawDelta {
 		t.Fatal("never saw the delta event")
+	}
+}
+
+// TestPromptHotSwapsOnWire pins the reload half of the injection contract on
+// the wire: scenario 2 proves a configured prompt reaches the upstream at
+// boot, but nothing proved a CHANGED prompt takes over — the load-bearing
+// direction is a prompt that stops being the old one after a reload.
+func TestPromptHotSwapsOnWire(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(jsonChatHandler(chatUpstream))
+	yamlP1 := runtimeYAML(chatPublic, up.url()+"/v1", chatUpstream, "P1")
+	yamlP2 := runtimeYAML(chatPublic, up.url()+"/v1", chatUpstream, "P2")
+	p := startSubprocess(t, startOpts{yaml: yamlP1})
+
+	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions", chatBody, nil); status != http.StatusOK {
+		t.Fatalf("first request status %d, want 200", status)
+	}
+	first := decodeMap(t, up.requests()[0].Body)
+	msgs := first["messages"].([]any)
+	sys := msgs[0].(map[string]any)
+	if sys["content"] != "P1" {
+		t.Fatalf("boot prompt = %v, want P1", sys["content"])
+	}
+
+	rewriteConfig(t, p.cfgPath, yamlP2)
+	// Await the reload ack: it is the one reload event emitted AT the live
+	// level, visible even at the harness default level (error), where the
+	// INFO config_reloaded line never shows.
+	waitForEventCount(t, p, "log_level_applied", 1)
+
+	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions", chatBody, nil); status != http.StatusOK {
+		t.Fatalf("second request status %d, want 200", status)
+	}
+	reqs := up.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("upstream got %d requests, want 2", len(reqs))
+	}
+	second := decodeMap(t, reqs[1].Body)
+	msgs = second["messages"].([]any)
+	sys = msgs[0].(map[string]any)
+	if sys["content"] != "P2" {
+		t.Fatalf("post-reload prompt = %v, want P2 (reload did not take over on the wire)", sys["content"])
+	}
+}
+
+// TestActiveStreamPromptBoundToOldSnapshot extends scenario 20 with prompt
+// binding: a stream in flight against a prompt-carrying snapshot survives a
+// reload that changes BOTH the prompt and the upstream. The request the old
+// upstream is still holding was transformed with the OLD prompt; the new
+// upstream is never contacted; the remaining chunks still rewrite to the old
+// public name.
+func TestActiveStreamPromptBoundToOldSnapshot(t *testing.T) {
+	upA := newFakeUpstream(t)
+	upB := newFakeUpstream(t)
+	chunk1Sent := make(chan struct{})
+	gate := make(chan struct{})
+	// A failed assertion must not leave the upstream handler blocked on the
+	// gate forever: httptest.Server.Close waits for it, and with it the
+	// whole test binary.
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
+	upA.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"s1\",\"model\":\"upA\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one\"},\"finish_reason\":null}]}\n\n")
+		fl.Flush()
+		close(chunk1Sent)
+		<-gate
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"s1\",\"model\":\"upA\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\"two\"},\"finish_reason\":null}]}\n\n")
+		fl.Flush()
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		fl.Flush()
+	})
+	upB.setHandler(jsonChatHandler("upB"))
+	yamlA := runtimeYAML("common", upA.url()+"/v1", "upA", "P1")
+	yamlB := runtimeYAML("common", upB.url()+"/v1", "upB", "P2")
+	p := startSubprocess(t, startOpts{yaml: yamlA})
+
+	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("common"),
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	<-chunk1Sent
+	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	if eof {
+		t.Fatal("stream ended before chunk1")
+	}
+	assertChatSSE(t, lines, "common", "one")
+
+	rewriteConfig(t, p.cfgPath, yamlB)
+	waitForEventCount(t, p, "log_level_applied", 1) // ack visible at any level
+
+	// The forwarded request was bound to the old snapshot: its body carries
+	// P1 and only P1 (the body was recorded when A received the request).
+	if n := upA.count(); n != 1 {
+		t.Fatalf("A saw %d requests, want 1", n)
+	}
+	forwarded := string(upA.requests()[0].Body)
+	if !strings.Contains(forwarded, "P1") || strings.Contains(forwarded, "P2") {
+		t.Fatalf("forwarded body not bound to the old prompt: %s", forwarded)
+	}
+	if n := upB.count(); n != 0 {
+		t.Fatalf("B saw %d requests mid-stream, want 0", n)
+	}
+
+	close(gate)
+	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	if eof {
+		t.Fatal("stream ended before chunk2")
+	}
+	assertChatSSE(t, lines, "common", "two")
+	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
+		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
+	}
+	if n := upB.count(); n != 0 {
+		t.Fatalf("B saw %d requests after completion, want 0", n)
+	}
+}
+
+// TestResponsesStreamIncremental pins the pass-through contract on the
+// Responses surface — the deterministic protocol regression for stream
+// buffering, mirroring TestChatStreamIncremental. The upstream writes one
+// envelope event, flushes it, and then holds the stream open on a gate; the
+// test only opens the gate after the client has read that first event. A
+// pass-through relay (CopySSE writing and flushing at the event boundary)
+// delivers the event while the upstream is still holding; an accidentally
+// buffering relay can deliver nothing until the stream completes — which
+// never happens — so the read times out and fails. The 3s deadline is not a
+// timing threshold: under the buffering failure mode the event arrives at
+// never, so any nonzero deadline detects it with certainty, and under
+// pass-through the event is already in the client's buffer microseconds
+// after the flush. The gate's cleanup close keeps a failed assertion from
+// wedging the whole binary inside httptest.Server.Close.
+func TestResponsesStreamIncremental(t *testing.T) {
+	up := newFakeUpstream(t)
+	gate := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
+	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		for i := 0; i < 3; i++ {
+			_, _ = fmt.Fprintf(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"response\":{\"model\":\"%s\"},\"delta\":\"d%d\"}\n\n", respUpstream, i)
+			fl.Flush()
+			if i == 0 {
+				<-gate // hold the remaining events until the client has read event 1
+			}
+		}
+	})
+	p := startSubprocess(t, startOpts{
+		yaml: runtimeYAML(respPublic, up.url()+"/v1", respUpstream, ""),
+	})
+
+	resp := openJSON(t, p.addr, "/v1/responses",
+		`{"model":"resp-public","input":"hi","stream":true}`,
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	// Event 1 must arrive while the upstream is still blocked on the gate.
+	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	if eof {
+		t.Fatal("stream ended before the first response event")
+	}
+	assertResponsesEnvelopeModel(t, lines, respPublic)
+
+	close(gate)
+	for i := 1; i < 3; i++ {
+		lines, eof = nextSSEEvent(t, br, 3*time.Second)
+		if eof {
+			t.Fatalf("stream ended before event %d", i+1)
+		}
+		assertResponsesEnvelopeModel(t, lines, respPublic)
+	}
+}
+
+// assertResponsesEnvelopeModel checks that a Responses envelope event's data
+// line rewrites response.model to the public name.
+func assertResponsesEnvelopeModel(t *testing.T, lines []string, wantModel string) {
+	t.Helper()
+	type envelope struct {
+		Response *struct {
+			Model string `json:"model"`
+		} `json:"response"`
+	}
+	found := false
+	for _, ln := range lines {
+		if !strings.HasPrefix(ln, "data:") {
+			continue
+		}
+		var ev envelope
+		if err := json.Unmarshal([]byte(sseDataContent(t, ln)), &ev); err != nil {
+			t.Fatalf("envelope %q not JSON: %v", ln, err)
+		}
+		if ev.Response == nil {
+			continue
+		}
+		if ev.Response.Model != wantModel {
+			t.Fatalf("response.model = %q, want %q (line %q)", ev.Response.Model, wantModel, ln)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("no data line with a response object in event %q", lines)
 	}
 }
