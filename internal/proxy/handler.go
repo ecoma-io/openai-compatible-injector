@@ -114,7 +114,9 @@ type injectorHandler struct {
 
 func (h *injectorHandler) healthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
+		// Outside the request lifecycle: nothing to account if the write
+		// fails.
+		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
 		return
 	}
 	w.Header().Set(contentTypeHeader, "text/plain; charset=utf-8")
@@ -139,7 +141,9 @@ func (h *injectorHandler) notFound(w http.ResponseWriter, r *http.Request) {
 		Type:    "invalid_request_error",
 	}}
 	body, err := marshalEnvelopeJSON(env)
-	writeEnvelopeErr(w, http.StatusNotFound, body, err)
+	// Outside the request lifecycle: no outcome to keep honest on a failed
+	// write.
+	_ = writeEnvelopeErr(w, http.StatusNotFound, body, err)
 }
 
 type transformFunc func(body []byte, m config.Model) ([]byte, error)
@@ -172,7 +176,9 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		h.log.Debug().Str("api", api).Str("method", r.Method).
 			Str("path", r.URL.Path).Str("remote_addr", r.RemoteAddr).
 			Msg("request_method_not_allowed")
-		writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
+		// Outside the request lifecycle — nothing below can observe or
+		// report a failed write, so the error has nowhere to land.
+		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
 		return
 	}
 
@@ -203,6 +209,21 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Msg("request_completed")
 	}
 
+	// reject writes a locally generated error envelope and completes the
+	// request. A failed write means the envelope never reached its
+	// recipient — the connection is gone — so the outcome becomes the
+	// disconnect rather than the classification, however certain the local
+	// decision was. The envelope's own cause still shows in the status and,
+	// on the failure, in the WARN.
+	reject := func(status int, b []byte, err error) {
+		if werr := writeEnvelopeErr(sw, status, b, err); werr != nil {
+			outcome = "client_disconnected"
+			log.Warn().Err(werr).Str("public_model", publicModel).
+				Int64("bytes_out", sw.bytes).Msg("client_write_failed")
+		}
+		complete()
+	}
+
 	// Bound the request body before reading it: without a cap, a single
 	// oversized client request pins unbounded memory in the proxy.
 	r.Body = http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes)
@@ -211,13 +232,11 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			outcome = "body_too_large"
-			writeEnvelope(sw, http.StatusRequestEntityTooLarge, envelopeTooLarge)
-			complete()
+			reject(http.StatusRequestEntityTooLarge, []byte(envelopeTooLarge), nil)
 			return
 		}
 		outcome = "body_read_error"
-		writeEnvelope(sw, http.StatusBadRequest, envelopeInvalidReq)
-		complete()
+		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		return
 	}
 	bytesIn = int64(len(body))
@@ -225,15 +244,13 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	model, stream, err := inject.Probe(body)
 	if err != nil {
 		outcome = "invalid_json"
-		writeEnvelope(sw, http.StatusBadRequest, envelopeInvalidReq)
-		complete()
+		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		return
 	}
 	publicModel = model
 	if model == "" {
 		outcome = "missing_model"
-		writeEnvelope(sw, http.StatusBadRequest, envelopeMissingMod)
-		complete()
+		reject(http.StatusBadRequest, []byte(envelopeMissingMod), nil)
 		return
 	}
 	log.Debug().Str("public_model", model).Bool("stream", stream).Msg("probe_completed")
@@ -241,8 +258,8 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	m, ok := snap.Model(model)
 	if !ok {
 		outcome = "model_not_found"
-		h.writeModelNotFound(sw, model)
-		complete()
+		body, merr := modelNotFoundEnvelope(model)
+		reject(http.StatusNotFound, body, merr)
 		return
 	}
 	log.Debug().Str("public_model", m.Public).Str("upstream_model", m.UpstreamModel).
@@ -252,8 +269,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	out, err := transform(body, m)
 	if err != nil {
 		outcome = "transform_error"
-		writeEnvelope(sw, http.StatusBadRequest, envelopeInvalidReq)
-		complete()
+		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		return
 	}
 	log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
@@ -276,8 +292,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("error_class", "request_build").
 			Msg("upstream_request_build_failed")
 		outcome = "upstream_unreachable"
-		writeEnvelope(sw, http.StatusBadGateway, envelopeUpUnreach)
-		complete()
+		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
 		return
 	}
 	copyForwardHeaders(req.Header, r.Header)
@@ -317,8 +332,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("error_class", upstreamErrorClass(err)).
 			Msg("upstream_request_failed")
 		outcome = "upstream_unreachable"
-		writeEnvelope(sw, http.StatusBadGateway, envelopeUpUnreach)
-		complete()
+		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -382,11 +396,17 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			phase := "upstream_read"
 			outcome = "stream_truncated"
 			var swe *streamWriteError
-			if errors.As(err, &swe) {
-				// The client connection broke mid-stream; the upstream may
-				// have been fine. An operational warning, not an error.
+			switch {
+			case errors.As(err, &swe), clientSide(err):
+				// The client connection broke mid-stream — as a failed
+				// write (streamWriteError), or as the canceled request
+				// context surfacing through the next upstream read — and
+				// the upstream may have been fine. The outcome names the
+				// disconnect, the same accounting the buffered and verbatim
+				// paths apply, while the WARN keeps the truncation's phase.
 				phase = "client_write"
-			} else if errors.Is(err, ErrSSELineTooLong) || errors.Is(err, ErrSSEEventTooLarge) {
+				outcome = "client_disconnected"
+			case errors.Is(err, ErrSSELineTooLong) || errors.Is(err, ErrSSEEventTooLarge):
 				// The upstream crossed a bounded-relay cap: a hostile or
 				// broken peer, stopped cleanly at the wall. The logged
 				// error carries counts only, never the bytes themselves.
@@ -414,16 +434,26 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// way.
 	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
 	if err != nil {
+		if clientSide(err) {
+			// The canceled request context surfaced through the upstream
+			// read: the client is gone mid-answer and the upstream may be
+			// fine. No envelope write is attempted — nobody is left to
+			// receive it — and the WARN keeps the relay's phase vocabulary
+			// instead of blaming the upstream.
+			outcome = "client_disconnected"
+			log.Warn().Err(err).Str("public_model", model).
+				Str("phase", "client_write").Msg("relay_copy_failed")
+			complete()
+			return
+		}
 		outcome = "upstream_read_failed"
 		log.Warn().Err(err).Str("public_model", model).Msg("upstream_body_read_failed")
-		writeEnvelope(sw, http.StatusBadGateway, envelopeUpInvalid)
-		complete()
+		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
 		return
 	}
 	if len(upstreamBody) > int(maxBufferedResponseBytes) || !json.Valid(upstreamBody) {
 		outcome = "upstream_invalid_response"
-		writeEnvelope(sw, http.StatusBadGateway, envelopeUpInvalid)
-		complete()
+		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
 		return
 	}
 	log.Debug().Int64("bytes_in", int64(len(upstreamBody))).Msg("response_transform_started")
@@ -444,14 +474,15 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	complete()
 }
 
-func (h *injectorHandler) writeModelNotFound(w http.ResponseWriter, model string) {
+// modelNotFoundEnvelope builds the 404 envelope whose message interpolates
+// the requested model, byte-exact per the documented shape.
+func modelNotFoundEnvelope(model string) ([]byte, error) {
 	env := openAIError{Error: openAIErrorBody{
 		Message: "The model '" + model + "' does not exist or you do not have access to it.",
 		Type:    "invalid_request_error",
 		Code:    "model_not_found",
 	}}
-	body, err := marshalEnvelopeJSON(env)
-	writeEnvelopeErr(w, http.StatusNotFound, body, err)
+	return marshalEnvelopeJSON(env)
 }
 
 // marshalEnvelopeJSON marshals an error envelope without HTML escaping:
@@ -520,22 +551,28 @@ func upstreamErrorClass(err error) string {
 	return "dial"
 }
 
-func writeEnvelope(w http.ResponseWriter, status int, body string) {
+// writeEnvelope writes a locally generated error envelope and reports the
+// write outcome: a client that disconnected before the envelope landed is
+// the caller's signal to account the request as a disconnect instead of the
+// envelope's cause. The ignored-error call sites (healthz, the catch-all)
+// sit outside the request lifecycle and have no outcome to keep honest.
+func writeEnvelope(w http.ResponseWriter, status int, body string) error {
 	w.Header().Set(contentTypeHeader, envelopeJSONType)
 	w.WriteHeader(status)
-	_, _ = io.WriteString(w, body)
+	_, err := io.WriteString(w, body)
+	return err
 }
 
 // writeEnvelopeErr writes a marshaled envelope, falling back to a static
 // body if marshaling somehow fails.
-func writeEnvelopeErr(w http.ResponseWriter, status int, b []byte, err error) {
+func writeEnvelopeErr(w http.ResponseWriter, status int, b []byte, err error) error {
 	if err != nil {
-		writeEnvelope(w, status, envelopeInvalidReq)
-		return
+		return writeEnvelope(w, status, envelopeInvalidReq)
 	}
 	w.Header().Set(contentTypeHeader, envelopeJSONType)
 	w.WriteHeader(status)
-	_, _ = w.Write(b)
+	_, werr := w.Write(b)
+	return werr
 }
 
 // copyForwardHeaders copies exactly the allow-listed client headers onto the

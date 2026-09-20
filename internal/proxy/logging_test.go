@@ -244,8 +244,11 @@ func TestStreamTruncationPhaseLogging(t *testing.T) {
 			t.Errorf("public_model = %v, want test-model", evs[0]["public_model"])
 		}
 		completed := buf.events(t, "request_completed")
-		if len(completed) != 1 || completed[0]["outcome"] != "stream_truncated" {
-			t.Fatalf("request_completed outcome = %v, want stream_truncated", completed)
+		if len(completed) != 1 || completed[0]["outcome"] != "client_disconnected" {
+			t.Fatalf("request_completed outcome = %v, want client_disconnected", completed)
+		}
+		if evs[0]["public_model"] == nil {
+			t.Errorf("truncation event missing public_model")
 		}
 	})
 
@@ -277,6 +280,39 @@ func TestStreamTruncationPhaseLogging(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), "test-model") ||
 			strings.Contains(rec.Body.String(), "upstream-name") {
 			t.Errorf("rewritten events lost on truncation: %q", rec.Body.String())
+		}
+	})
+
+	t.Run("client_cancel_via_read", func(t *testing.T) {
+		// The client went away mid-stream and the canceled request context
+		// surfaced through the next upstream READ instead of a write: the
+		// classification must still be the client's disconnect, never a
+		// stream_truncated blamed on the upstream.
+		buf, log := captureLog(zerolog.InfoLevel)
+		client := &http.Client{Transport: &stubTransport{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       &canceledBody{},
+			Request:    &http.Request{Method: http.MethodPost},
+		}}}
+		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), client, log)
+
+		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+			`{"model":"test-model","stream":true}`, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (committed before the disconnect)", rec.Code)
+		}
+
+		evs := buf.events(t, "stream_truncated")
+		if len(evs) != 1 {
+			t.Fatalf("stream_truncated logged %d times, want 1: %s", len(evs), buf.String())
+		}
+		if evs[0]["phase"] != "client_write" {
+			t.Errorf("phase = %v, want client_write (the client canceled, not the upstream)", evs[0]["phase"])
+		}
+		completed := buf.events(t, "request_completed")
+		if len(completed) != 1 || completed[0]["outcome"] != "client_disconnected" {
+			t.Fatalf("request_completed outcome = %v, want client_disconnected", completed)
 		}
 	})
 }
@@ -493,6 +529,31 @@ func TestRelayOutcomeClassification(t *testing.T) {
 			t.Fatalf("client_write_failed logged %d times, want 1: %s", len(evs), buf.String())
 		}
 	})
+
+	t.Run("buffered_canceled_context", func(t *testing.T) {
+		// The canceled request context surfaces through the upstream READ
+		// on the buffered path: the outcome is the client's disconnect, the
+		// upstream is never blamed (no upstream_body_read_failed), and no
+		// 502 envelope write is attempted for a client that is gone.
+		buf, log := captureLog(zerolog.InfoLevel)
+		client := &http.Client{Transport: &stubTransport{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       &canceledBody{},
+			Request:    &http.Request{Method: http.MethodPost},
+		}}}
+		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), client, log)
+
+		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+			`{"model":"test-model"}`, nil)
+		if rec.Body.Len() != 0 {
+			t.Errorf("envelope written for a disconnected client: %q", rec.Body.String())
+		}
+		expectDisconnected(t, buf, "relay_copy_failed")
+		if evs := buf.events(t, "upstream_body_read_failed"); len(evs) != 0 {
+			t.Errorf("upstream blamed for a client cancel: %s", buf.String())
+		}
+	})
 }
 
 // TestDebugLifecycleChain pins the DEBUG checkpoint sequence for one
@@ -699,5 +760,111 @@ func TestBodyTooLargeOutcome(t *testing.T) {
 	evs := buf.events(t, "request_completed")
 	if len(evs) != 1 || evs[0]["outcome"] != "body_too_large" {
 		t.Fatalf("request_completed = %v, want outcome body_too_large", evs)
+	}
+}
+
+// TestErrorEnvelopeWriteFailureOutcome pins outcome fidelity on the
+// locally generated envelopes: when the client has gone away before the
+// envelope can land, the request is accounted client_disconnected with a
+// WARN client_write_failed — never with the envelope's own classification,
+// which would report a decision as delivered when it reached nobody. Every
+// rejection path is exercised: the write dies on the first attempt, so the
+// classification outcome on the old code would be the one reported.
+func TestErrorEnvelopeWriteFailureOutcome(t *testing.T) {
+	cases := []struct {
+		name        string
+		store       func(t *testing.T) *config.Store
+		client      func(t *testing.T) *http.Client
+		bodyCap     int64
+		body        string
+		wantAttempt int
+	}{
+		{
+			name:        "invalid_json",
+			store:       func(t *testing.T) *config.Store { return newTestStore(t, "http://127.0.0.1:1/v1") },
+			body:        `{nope`,
+			wantAttempt: http.StatusBadRequest,
+		},
+		{
+			name:        "missing_model",
+			store:       func(t *testing.T) *config.Store { return newTestStore(t, "http://127.0.0.1:1/v1") },
+			body:        `{"messages":[]}`,
+			wantAttempt: http.StatusBadRequest,
+		},
+		{
+			name:        "model_not_found",
+			store:       func(t *testing.T) *config.Store { return newTestStore(t, "http://127.0.0.1:1/v1") },
+			body:        `{"model":"no-such-model"}`,
+			wantAttempt: http.StatusNotFound,
+		},
+		{
+			name:        "body_too_large",
+			store:       func(t *testing.T) *config.Store { return newTestStore(t, "http://127.0.0.1:1/v1") },
+			bodyCap:     16,
+			body:        `{"model":"test-model","overflow":"xxxxxxxxxxxxxxxxxxxxxxxx"}`,
+			wantAttempt: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:        "upstream_unreachable",
+			store:       func(t *testing.T) *config.Store { return newTestStore(t, "http://127.0.0.1:1/v1") },
+			body:        `{"model":"test-model"}`,
+			wantAttempt: http.StatusBadGateway,
+		},
+		{
+			name: "upstream_invalid_response",
+			store: func(t *testing.T) *config.Store {
+				return newTestStore(t, "http://stub.invalid/v1")
+			},
+			client: func(t *testing.T) *http.Client {
+				return &http.Client{Transport: &stubTransport{resp: &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader("definitely not json")),
+					Request:    &http.Request{Method: http.MethodPost},
+				}}}
+			},
+			body:        `{"model":"test-model"}`,
+			wantAttempt: http.StatusBadGateway,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.bodyCap != 0 {
+				old := maxRequestBodyBytes
+				maxRequestBodyBytes = tc.bodyCap
+				defer func() { maxRequestBodyBytes = old }()
+			}
+			buf, log := captureLog(zerolog.InfoLevel)
+			client := NewSharedClient()
+			if tc.client != nil {
+				client = tc.client(t)
+			}
+			h := NewHandler(tc.store(t), client, log)
+
+			// The client died before anything could be written: every
+			// envelope write attempt fails on the spot.
+			dying := &dyingRecorder{limit: 0}
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(tc.body))
+			h.ServeHTTP(dying, req)
+
+			completed := buf.events(t, "request_completed")
+			if len(completed) != 1 {
+				t.Fatalf("request_completed logged %d times, want 1: %s", len(completed), buf.String())
+			}
+			if completed[0]["outcome"] != "client_disconnected" {
+				t.Errorf("outcome = %v, want client_disconnected (the envelope never reached the client)", completed[0]["outcome"])
+			}
+			if completed[0]["status"].(float64) != float64(tc.wantAttempt) {
+				t.Errorf("status = %v, want %d (the attempted envelope's status)", completed[0]["status"], tc.wantAttempt)
+			}
+			failed := buf.events(t, "client_write_failed")
+			if len(failed) != 1 {
+				t.Fatalf("client_write_failed logged %d times, want 1: %s", len(failed), buf.String())
+			}
+			if lvl, ok := failed[0]["level"].(string); !ok || lvl != "warn" {
+				t.Errorf("level = %v, want warn", failed[0]["level"])
+			}
+		})
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -978,5 +979,111 @@ func TestSanitizeUpstreamErrorRedactsNestedURLBytes(t *testing.T) {
 		endpoint)
 	if strings.Contains(sanitized.Error(), "HOSTMARK") {
 		t.Errorf("sanitized error echoes the rejected host bytes: %q", sanitized.Error())
+	}
+}
+
+// TestUpstreamTimeoutClassified pins the timeout branch of the upstream
+// failure taxonomy: an upstream that accepts the connection and then goes
+// quiet past the header deadline surfaces as the 502 upstream_unreachable
+// envelope with error_class timeout — a genuine upstream failure, never a
+// client disconnect. The deadline is the client's own ResponseHeaderTimeout
+// (a hard local timer, not a race), so the test is deterministic; the shared
+// client's zero value is pinned separately (long-lived SSE must not have one).
+func TestUpstreamTimeoutClassified(t *testing.T) {
+	// Accepts connections, never answers. The handler cannot wait on
+	// r.Context(): the proxy forwards a body it never reads, and net/http
+	// arms its client-disconnect detector only once the body hits EOF — so
+	// the context survives the transport giving up. A test-owned channel
+	// releases the handler at teardown instead (deferred LIFO: released
+	// before Close waits on it).
+	done := make(chan struct{})
+	silent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-done
+	}))
+	defer silent.Close()
+	defer close(done)
+
+	client := NewSharedClient()
+	client.Transport.(*http.Transport).ResponseHeaderTimeout = 150 * time.Millisecond
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, silent.URL+"/v1"), client, zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpUnreach {
+		t.Errorf("body = %s, want the upstream_unreachable envelope", body)
+	}
+	sawClass := false
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, line)
+		}
+		if m["message"] == "upstream_request_failed" {
+			sawClass = true
+			if m["error_class"] != "timeout" {
+				t.Errorf("error_class = %v, want timeout (%s)", m["error_class"], line)
+			}
+			if lvl, _ := m["level"].(string); lvl != "error" {
+				t.Errorf("level = %v, want error (an upstream timeout is the upstream's failure)", m["level"])
+			}
+			if m["outcome"] != nil {
+				t.Errorf("failure event must not carry the outcome; got %v", m["outcome"])
+			}
+		}
+		if m["message"] == "request_completed" && m["outcome"] != "upstream_unreachable" {
+			t.Errorf("outcome = %v, want upstream_unreachable", m["outcome"])
+		}
+	}
+	if !sawClass {
+		t.Fatalf("upstream_request_failed not logged:\n%s", logs.String())
+	}
+}
+
+// TestUpstreamTLSFailureClassified pins the TLS branch: an upstream serving
+// a certificate the shared client cannot verify (httptest's self-signed pair
+// against the default verifier) fails the handshake and surfaces as the 502
+// upstream_unreachable envelope with error_class tls — deterministic, no
+// timing involved.
+func TestUpstreamTLSFailureClassified(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"upstream-name"}`)
+	}))
+	defer up.Close()
+
+	var logs bytes.Buffer
+	// The shared client does not trust httptest's self-signed certificate.
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpUnreach {
+		t.Errorf("body = %s, want the upstream_unreachable envelope", body)
+	}
+	sawClass := false
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, line)
+		}
+		if m["message"] == "upstream_request_failed" {
+			sawClass = true
+			if m["error_class"] != "tls" {
+				t.Errorf("error_class = %v, want tls (%s)", m["error_class"], line)
+			}
+			// The credential rule: scheme+host only, never the full URL with
+			// any path/query the endpoint carried.
+			if strings.Contains(fmt.Sprint(m["upstream"]), "/"+strings.TrimPrefix(up.URL, "http://")) {
+				t.Errorf("upstream field carries more than the origin: %v", m["upstream"])
+			}
+		}
+	}
+	if !sawClass {
+		t.Fatalf("upstream_request_failed not logged:\n%s", logs.String())
 	}
 }
