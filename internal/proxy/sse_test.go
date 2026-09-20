@@ -176,6 +176,43 @@ func TestCopySSEPartialFinalLine(t *testing.T) {
 
 type failingWriter struct{}
 
+// limitedWriter accepts only limit bytes in total across all writes,
+// reporting exactly what it accepted (and an error once the limit is hit).
+// It exists to pin the partial-write contract: the bytes a dst actually
+// accepted are accounted, and a short write is a stream truncation, not a
+// silent success.
+type limitedWriter struct {
+	limit   int
+	written int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if remaining := w.limit - w.written; n > remaining {
+		n = remaining
+	}
+	w.written += n
+	if n < len(p) {
+		return n, errors.New("simulated write failure")
+	}
+	return n, nil
+}
+
+// shortWriter succeeds but reports fewer bytes than it was given — the
+// io.Writer contract's second failure mode, which must not be treated as a
+// complete write.
+type shortWriter struct {
+	quiet int // writes to swallow before going short
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if w.quiet > 0 {
+		w.quiet--
+		return len(p), nil
+	}
+	return len(p) / 2, nil
+}
+
 func (failingWriter) Write(p []byte) (int, error) { return 0, errors.New("boom") }
 
 type failingReader struct{}
@@ -202,5 +239,45 @@ func TestCopySSEPropagatesErrors(t *testing.T) {
 	}
 	if errors.As(err, &swe) {
 		t.Errorf("read error wrongly marked as client write failure: %v", err)
+	}
+}
+
+// TestCopySSEAccountsPartialWrite pins the stats contract on the failure
+// path: bytes dst actually accepted before failing are counted in
+// stats.Bytes, not lost — the access log must report what went on the wire,
+// and the write is still marked as a client-side failure.
+func TestCopySSEAccountsPartialWrite(t *testing.T) {
+	w := &limitedWriter{limit: 5}
+	stats, err := CopySSE(w, strings.NewReader("data: x\ndata: y\n"), "p", nil)
+	if err == nil {
+		t.Fatal("write failure not propagated")
+	}
+	var swe *streamWriteError
+	if !errors.As(err, &swe) {
+		t.Errorf("partial write not marked *streamWriteError: %v", err)
+	}
+	if stats.Bytes != 5 {
+		t.Errorf("stats.Bytes = %d, want 5 (the bytes dst accepted)", stats.Bytes)
+	}
+}
+
+// TestCopySSERejectsShortWrite pins the second io.Writer failure mode: a
+// write that returns n < len(p) with a nil error is an io.ErrShortWrite and
+// must truncate the stream as a client-side failure — continuing past it
+// would relay a torn line and overcount the bytes.
+func TestCopySSERejectsShortWrite(t *testing.T) {
+	stats, err := CopySSE(&shortWriter{}, strings.NewReader("data: x\ndata: y\n"), "p", nil)
+	if err == nil {
+		t.Fatal("short write not detected")
+	}
+	var swe *streamWriteError
+	if !errors.As(err, &swe) {
+		t.Errorf("short write not marked *streamWriteError: %v", err)
+	}
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("short write error = %v, want io.ErrShortWrite", err)
+	}
+	if stats.Bytes+int64(len("data: x\n")) > int64(len("data: x\ndata: y\n")) {
+		t.Errorf("stats.Bytes = %d exceeds the accepted input", stats.Bytes)
 	}
 }

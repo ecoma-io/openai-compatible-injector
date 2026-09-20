@@ -44,10 +44,20 @@ func CopySSE(dst io.Writer, src io.Reader, public string, flush func()) (StreamS
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			out := rewriteSSELine(line, public)
-			if _, werr := dst.Write(out); werr != nil {
+			n, werr := dst.Write(out)
+			// Account exactly what dst accepted — on a failed or torn write
+			// the stats say how much of the stream actually went out. A
+			// short write with a nil error is the io.Writer contract's other
+			// failure mode (io.ErrShortWrite); continuing past it would
+			// relay a torn line and overcount, so it truncates too — as a
+			// client-side failure, since dst is the client.
+			stats.Bytes += int64(n)
+			if werr != nil {
 				return stats, &streamWriteError{err: werr}
 			}
-			stats.Bytes += int64(len(out))
+			if n < len(out) {
+				return stats, &streamWriteError{err: io.ErrShortWrite}
+			}
 			if flush != nil && isEventBoundary(line) {
 				flush()
 				stats.Events++
