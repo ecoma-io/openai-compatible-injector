@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"net/url"
+	"sync"
 	"sync/atomic"
 
 	"github.com/rs/zerolog"
@@ -64,8 +65,9 @@ func (s *Snapshot) Len() int { return len(s.models) }
 // Store holds the currently active Snapshot behind an atomic pointer. The
 // reload loop is the only publisher; every request is a reader.
 type Store struct {
-	p   atomic.Pointer[Snapshot]
-	gen atomic.Uint64
+	p     atomic.Pointer[Snapshot]
+	gen   atomic.Uint64
+	pubMu sync.Mutex // orders Publish's gen assignment with its pointer store
 }
 
 // NewStore returns a store seeded with the initial snapshot.
@@ -83,10 +85,18 @@ func (s *Store) Load() *Snapshot { return s.p.Load() }
 // Publish atomically replaces the active snapshot with next and assigns it a
 // monotonically increasing generation. Only the reload loop (or tests) may
 // call it.
+//
+// The mutex is not about the pointer store (that is atomic on its own) but
+// about pairing gen assignment with the store: without it, two concurrent
+// publishers can assign generations 4 then 5 yet store in the opposite
+// order — the active snapshot's generation visibly going backwards, and a
+// final Gen() below the publish count.
 func (s *Store) Publish(next *Snapshot) error {
 	if next == nil {
 		return errors.New("cannot publish a nil snapshot")
 	}
+	s.pubMu.Lock()
+	defer s.pubMu.Unlock()
 	next.gen = s.gen.Add(1)
 	s.p.Store(next)
 	return nil

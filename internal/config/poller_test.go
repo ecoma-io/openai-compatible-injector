@@ -96,7 +96,7 @@ func TestPollerReloadAndLastKnownGood(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := NewPoller(store, path, 20*time.Millisecond, testLog(t), nil)
+	p := NewPoller(store, path, []byte(validRuntime()), 20*time.Millisecond, testLog(t), nil)
 	go p.Run(ctx)
 
 	// Let the poller record its initial hash before changing the file. A
@@ -144,7 +144,7 @@ func TestPollerUnchangedFileDoesNotRepublish(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := NewPoller(store, path, 15*time.Millisecond, testLog(t), nil)
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, testLog(t), nil)
 	go p.Run(ctx)
 
 	// Initial Run() must not republish: generation stays at its snapshot seed.
@@ -160,7 +160,7 @@ func TestPollerMissingFileKeepsLastKnownGood(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := NewPoller(store, path, 15*time.Millisecond, testLog(t), nil)
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, testLog(t), nil)
 	go p.Run(ctx)
 
 	_ = os.Remove(path)
@@ -177,7 +177,7 @@ func TestPollerStopsOnCancel(t *testing.T) {
 
 	store := NewStore(mustSnapshot(t, validRuntime()))
 	ctx, cancel := context.WithCancel(context.Background())
-	p := NewPoller(store, path, 10*time.Millisecond, testLog(t), nil)
+	p := NewPoller(store, path, []byte(validRuntime()), 10*time.Millisecond, testLog(t), nil)
 	done := make(chan struct{})
 	go func() {
 		p.Run(ctx)
@@ -230,7 +230,7 @@ func TestPollerOnPublishCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := NewPoller(store, path, 15*time.Millisecond, testLog(t), func(s *Snapshot) { published <- s })
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, testLog(t), func(s *Snapshot) { published <- s })
 	go p.Run(ctx)
 
 	time.Sleep(3 * 15 * time.Millisecond)
@@ -276,7 +276,7 @@ func TestPollerFailureLoggingTransitions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := NewPoller(store, path, 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
 	go p.Run(ctx)
 
 	time.Sleep(3 * 15 * time.Millisecond)
@@ -318,7 +318,7 @@ func TestPollerUnreadableTransitionLogging(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := NewPoller(store, path, 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
 	go p.Run(ctx)
 
 	time.Sleep(3 * 15 * time.Millisecond)
@@ -355,7 +355,7 @@ func TestPollerDebugHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := NewPoller(store, path, 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.DebugLevel), nil)
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.DebugLevel), nil)
 	go p.Run(ctx)
 
 	time.Sleep(3 * 15 * time.Millisecond)
@@ -365,4 +365,98 @@ func TestPollerDebugHeartbeat(t *testing.T) {
 	writeFile(t, path, "models: [unclosed\n")
 	waitUntil(t, 2*time.Second, func() bool { return buf.countEvents("config_reload_still_rejected") >= 1 },
 		"no config_reload_still_rejected DEBUG while the failure persists")
+}
+
+// TestPollerSeedsHashFromBootContent pins the boot-content seed: Run must
+// compare against the exact bytes that were loaded at startup, not re-read
+// the file when it starts. A file rewritten in the window between the boot
+// LoadRuntime and Run is still a change the poller must observe — seeded by a
+// fresh read, that window's write would be mistaken for the initial content
+// and swallowed forever.
+func TestPollerSeedsHashFromBootContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, validRuntime())
+
+	store := NewStore(mustSnapshot(t, validRuntime()))
+
+	// The file changes after boot, before Run.
+	changed := strings.Replace(validRuntime(), "gpt-5-pro", "gpt-8", 1)
+	writeFile(t, path, changed)
+
+	var buf syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
+	go p.Run(ctx)
+
+	waitGen(t, store, 1)
+	if m, _ := store.Load().Model("gpt-reviewer"); m.UpstreamModel != "gpt-8" {
+		t.Errorf("post-boot change swallowed: %+v", m)
+	}
+	if got := buf.countEvents("config_initial_read_failed"); got != 0 {
+		t.Errorf("config_initial_read_failed logged %d times — the seed must come from boot content, not a fresh read", got)
+	}
+}
+
+// TestPollerBootReadFailureDoesNotSpuriouslyRepublish: with the seed taken
+// from boot content, a file that is unreadable when Run starts and returns
+// byte-identical afterward is unchanged — no reload, no generation bump, no
+// config_initial_read_failed WARN (there is no initial read to fail).
+func TestPollerBootReadFailureDoesNotSpuriouslyRepublish(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, validRuntime())
+
+	store := NewStore(mustSnapshot(t, validRuntime()))
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	var buf syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
+	go p.Run(ctx)
+
+	time.Sleep(3 * 15 * time.Millisecond)
+	writeFile(t, path, validRuntime())
+	waitGenStable(t, store, 0, 200*time.Millisecond)
+	if got := buf.countEvents("config_initial_read_failed"); got != 0 {
+		t.Errorf("config_initial_read_failed logged %d times — there must be no initial read", got)
+	}
+}
+
+// TestPollerFailureKindSwitchWarns pins the failure-kind tracking: a file
+// that fails as invalid content and then fails as unreadable has produced a
+// NEW failure condition, which must warn again — a single failing bit would
+// downgrade the second kind to a debug heartbeat and leave the operator
+// looking at a file that no longer exists.
+func TestPollerFailureKindSwitchWarns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, validRuntime())
+
+	store := NewStore(mustSnapshot(t, validRuntime()))
+	var buf syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := NewPoller(store, path, []byte(validRuntime()), 15*time.Millisecond, zerolog.New(&buf).Level(zerolog.InfoLevel), nil)
+	go p.Run(ctx)
+
+	// Fail as invalid content: one WARN on the transition into failure.
+	writeFile(t, path, "models:\n  x:\n    endpoint: nope\n    upstream-model: m\n")
+	waitUntil(t, 2*time.Second, func() bool { return buf.countEvents("config_reload_rejected") >= 1 },
+		"no config_reload_rejected WARN for the invalid file")
+	time.Sleep(3 * 15 * time.Millisecond)
+	if got := buf.countEvents("config_reload_rejected"); got != 1 {
+		t.Fatalf("config_reload_rejected logged %d times, want 1 before the kind switch", got)
+	}
+
+	// The failure switches kind (invalid content -> unreadable): warn again.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	waitUntil(t, 2*time.Second, func() bool { return buf.countEvents("config_file_unreadable") >= 1 },
+		"no config_file_unreadable WARN when the failure switched kind")
 }
