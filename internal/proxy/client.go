@@ -26,5 +26,16 @@ func NewSharedClient() *http.Client {
 	tr.MaxIdleConns = 100
 	tr.MaxIdleConnsPerHost = 100
 	tr.ForceAttemptHTTP2 = true
-	return &http.Client{Transport: tr}
+	return &http.Client{
+		Transport: tr,
+		// Redirects are relayed verbatim, never followed. Go's default
+		// policy would convert the POST into a body-less GET on 301/302/303,
+		// replay the transformed request body to whatever Location names on
+		// 307/308, and re-attach Authorization to any target on the same
+		// hostname. An OpenAI-compatible API does not redirect; an
+		// unexpected 3xx is the upstream's answer and the client's to judge.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }

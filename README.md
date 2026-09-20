@@ -232,26 +232,41 @@ live stream with correct per-chunk latency. Behavior:
 
 Upstream and client failures are classified, never fogged:
 
-| Condition                           | Status                 | `error.type` / `code`                                                                                                                                                                          |
-| ----------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Body is not JSON                    | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
-| Missing `model`                     | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
-| Request names an unmapped model     | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
-| Upstream unreachable (dial/network) | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
-| Upstream 200 with unparseable body  | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
-| Upstream answers 4xx/5xx            | **forwarded verbatim** | status, headers, and bytes pass through untouched                                                                                                                                              |
+| Condition                                                                 | Status                 | `error.type` / `code`                                                                                                                                                                          |
+| ------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Body is not JSON                                                          | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
+| Missing `model`                                                           | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
+| Request body over the 64 MiB cap                                          | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
+| Request names an unmapped model                                           | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
+| Upstream unreachable (dial/network)                                       | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
+| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
+| Upstream answers 3xx/4xx/5xx                                              | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
 
 Two consequences of the table:
 
 - **An unmapped model is never forwarded.** 404 is local; the upstream never
   sees that request. This is a hard boundary (SECURITY.md treats its breach
   as a vulnerability).
-- **Upstream errors are the upstream's shape.** Any 4xx/5xx — JSON, text,
-  whatever the provider sent — is relayed byte-for-byte. We only synthesize
-  errors for what the upstream _did not_ deliver.
+- **Upstream errors are the upstream's shape.** Any 3xx/4xx/5xx — JSON, text,
+  whatever the provider sent — is relayed byte-for-byte. Redirects are
+  **never followed**: following one would silently convert the POST into a
+  body-less GET (301/302/303) and replay the transformed request body to
+  whatever the `Location` names (307/308). An unexpected 3xx is the
+  upstream's answer, and the client's to judge. We only synthesize errors
+  for what the upstream _did not_ deliver.
+- **Error bodies can name the upstream model.** Verbatim means verbatim: an
+  upstream error that quotes its own model name discloses the alias target.
+  That is the price of honest passthrough; we do not rewrite error bodies.
 - There is **no overall request timeout**. A slow upstream is a slow
   response, not a timeout race. Dial and TLS handshake timeouts bound the
   connection phase only.
+
+**Relayed response headers** (an allow-list, everything else is dropped):
+`Content-Type`, `Cache-Control`, `X-Request-Id`, `OpenAI-Request-Id`,
+`Retry-After`, `Location`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+`X-RateLimit-Reset`, `X-RateLimit-Reset-Requests`, `X-RateLimit-Reset-Tokens`.
+Rate-limit and retry headers are load-bearing for client backoff; dropping
+them would make a 429 indistinguishable from any other upstream failure.
 
 ## Safety and credentials
 
@@ -261,7 +276,11 @@ Two consequences of the table:
   values, request bodies, or injection prompts in log lines, and no
   upstream URL details beyond the endpoint's scheme+host in startup logs.
   A quote of any of these is a security defect, not a typo (SECURITY.md).
-- `endpoint` URLs with userinfo are rejected at config load.
+- `endpoint` URLs with userinfo are rejected at config load; fragments are
+  rejected too (a fragment is never sent to a server, so accepting one would
+  silently ignore part of the configured endpoint). An endpoint's query
+  string is preserved and sent with every request — that is how providers
+  that authenticate via query parameter (e.g. `api-version`) work.
 
 ## Healthcheck
 

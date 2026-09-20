@@ -125,6 +125,11 @@ func buildModel(name string, rm runtimeModel) (Model, error) {
 	if u.User != nil {
 		return Model{}, errors.New("endpoint must not contain credentials")
 	}
+	if u.Fragment != "" {
+		// A fragment is never sent to a server; accepting one would silently
+		// ignore part of the configured endpoint.
+		return Model{}, errors.New("endpoint must not contain a fragment")
+	}
 	if strings.TrimSpace(rm.UpstreamModel) == "" {
 		return Model{}, errors.New("upstream-model is required")
 	}

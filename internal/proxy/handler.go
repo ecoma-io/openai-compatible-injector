@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -24,6 +25,7 @@ const (
 	envelopeJSONType   = "application/json"
 	envelopeInvalidReq = `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeMissingMod = `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`
+	envelopeTooLarge   = `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeUpInvalid  = `{"error":{"message":"upstream returned an invalid response","type":"upstream_error","code":"upstream_invalid_response"}}`
 	envelopeUpUnreach  = `{"error":{"message":"upstream request failed","type":"upstream_error","code":"upstream_unreachable"}}`
 	envelopeBadMethod  = `{"error":{"message":"method not allowed","type":"invalid_request_error","param":null,"code":null}}`
@@ -33,8 +35,32 @@ const (
 // deliberately: credentials must never be forwarded beyond Authorization.
 var forwardHeaderNames = []string{"Authorization", "Content-Type", "Accept", "OpenAI-Beta"}
 
-// response headers relayed back to the client from upstream.
-var relayHeaderNames = []string{"Content-Type", "Cache-Control", "X-Request-Id"}
+// response headers relayed back to the client from upstream. Rate-limit and
+// retry headers are load-bearing for well-behaved client SDK backoff; a 429
+// without Retry-After is indistinguishable from any other upstream error.
+var relayHeaderNames = []string{
+	"Content-Type",
+	"Cache-Control",
+	"X-Request-Id",
+	"OpenAI-Request-Id",
+	"Retry-After",
+	"Location",
+	"X-RateLimit-Limit",
+	"X-RateLimit-Remaining",
+	"X-RateLimit-Reset",
+	"X-RateLimit-Reset-Requests",
+	"X-RateLimit-Reset-Tokens",
+}
+
+// Body size caps. Requests are bounded so a single client cannot pin
+// unbounded memory; buffered upstream responses are bounded so a broken or
+// hostile peer cannot do the same from the other side. Both are generous —
+// multimodal requests and tool schemas are legitimately large — and exist
+// to turn a memory-amplification attack into a clean error.
+var (
+	maxRequestBodyBytes      int64 = 64 << 20 // 64 MiB
+	maxBufferedResponseBytes int64 = 64 << 20 // 64 MiB
+)
 
 // openAIError is the envelope shape for model-not-found responses, whose
 // message interpolates the requested model.
@@ -101,8 +127,16 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 	snap := h.store.Load()
 	defer func() { _ = r.Body.Close() }()
 
+	// Bound the request body before reading it: without a cap, a single
+	// oversized client request pins unbounded memory in the proxy.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeEnvelope(w, http.StatusRequestEntityTooLarge, envelopeTooLarge)
+			return
+		}
 		writeEnvelope(w, http.StatusBadRequest, envelopeInvalidReq)
 		return
 	}
@@ -130,7 +164,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 	}
 
 	upstream := *m.Endpoint
-	upstream.Path = strings.TrimSuffix(upstream.Path, "/") + suffix
+	// Trim every trailing slash ("trailing slashes ignored" holds for any
+	// number) and clear RawPath: mutating Path can leave a RawPath that no
+	// longer matches, which makes EscapedPath silently percent-decode the
+	// endpoint path. Encoded endpoint paths are normalized, not preserved.
+	upstream.Path = strings.TrimRight(upstream.Path, "/") + suffix
+	upstream.RawPath = ""
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String(), bytes.NewReader(out))
 	if err != nil {
@@ -148,9 +187,13 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode >= http.StatusBadRequest {
-		// Error passthrough: upstream's status and body relayed verbatim,
-		// byte for byte, whatever its content type.
+	if resp.StatusCode >= http.StatusMultipleChoices || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		// Verbatim relay: anything outside a body-bearing 2xx — upstream
+		// errors (any 4xx/5xx), redirects (3xx, which CheckRedirect never
+		// follows), and the two body-less statuses, which are valid upstream
+		// answers. A 204 or an unexpected 3xx is the upstream's answer;
+		// turning it into a 502 would fog the root cause. Status and body
+		// relayed byte for byte, whatever the content type.
 		copyRelayHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
@@ -171,9 +214,10 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 
 	// Buffered non-stream path (client stream=false, or upstream ignored the
 	// stream flag): read the whole body, validate it, rewrite the model, and
-	// emit a single buffered response.
-	upstreamBody, err := io.ReadAll(resp.Body)
-	if err != nil || !json.Valid(upstreamBody) {
+	// emit a single buffered response. The read is bounded — an over-cap
+	// body is treated like any other unparseable upstream answer.
+	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
+	if err != nil || len(upstreamBody) > int(maxBufferedResponseBytes) || !json.Valid(upstreamBody) {
 		writeEnvelope(w, http.StatusBadGateway, envelopeUpInvalid)
 		return
 	}

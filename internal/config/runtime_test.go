@@ -91,6 +91,7 @@ func TestLoadRuntimeModelValidation(t *testing.T) {
 		{"non-http endpoint", "models:\n  a:\n    endpoint: ftp://h\n    upstream-model: m\n", "http(s) URL"},
 		{"hostless endpoint", "models:\n  a:\n    endpoint: https://\n    upstream-model: m\n", "http(s) URL"},
 		{"credentials in endpoint", "models:\n  a:\n    endpoint: https://user:pass@h/v1\n    upstream-model: m\n", "credentials"},
+		{"fragment in endpoint", "models:\n  a:\n    endpoint: https://h/v1#page\n    upstream-model: m\n", "fragment"},
 		{"missing upstream model", "models:\n  a:\n    endpoint: https://h/v1\n", "upstream-model is required"},
 		{"empty model name", "models:\n  \"  \":\n    endpoint: https://h/v1\n    upstream-model: m\n", "empty"},
 	}
