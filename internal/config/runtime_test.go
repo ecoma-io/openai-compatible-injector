@@ -131,6 +131,39 @@ func TestConfigErrorsDoNotEmbedRawEndpoint(t *testing.T) {
 	}
 }
 
+// TestEndpointParseErrorDoesNotQuoteRawBytes pins the two stdlib parse
+// causes that quote raw bytes of the endpoint input — the offending escape
+// sequence and the rejected host byte (url.EscapeError, url.InvalidHostError).
+// Rejection text reaches logs verbatim, so these arrive as the static
+// classification instead, mirroring the proxy's sanitizeUpstreamError.
+// The port failure keeps its text: the authority substring it quotes is
+// inside the scheme+host disclosure set the config plane allows.
+func TestEndpointParseErrorDoesNotQuoteRawBytes(t *testing.T) {
+	cases := []struct {
+		name        string
+		endpoint    string
+		want        string
+		mustNotHave string
+	}{
+		{"bad escape quotes no bytes", "https://h/v1%zz?api-key=SECRET", "invalid URL escape", "%zz"},
+		{"invalid host quotes no bytes", `"https://exa mple.com/v1?api-key=SECRET"`, "invalid host", "exa mple"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte("models:\n  a:\n    endpoint: " + tc.endpoint + "\n    upstream-model: m\n"))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want containing %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), tc.mustNotHave) {
+				t.Errorf("error text quotes raw input bytes: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRuntimeRejectsEmptyModels(t *testing.T) {
 	// Zero models serves nothing — worse, an empty file is what a
 	// truncate-then-write config edit looks like mid-write. Accepting it

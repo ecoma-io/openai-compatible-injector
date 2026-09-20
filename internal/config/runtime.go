@@ -217,17 +217,28 @@ func buildModel(name string, rm runtimeModel) (Model, error) {
 	}
 	u, err := url.Parse(rm.Endpoint)
 	if err != nil {
-		// url.Parse errors quote the raw input, query string included; error
-		// text reaches logs verbatim, so the raw endpoint must not. A
-		// *url.Error is unwrapped to its cause, which never carries the
-		// input; a bare stdlib message (e.g. control-character rejection)
-		// has no echo and passes through. If the text ever does contain the
-		// input's quoted form, it is dropped entirely — the sanitizer fails
-		// closed, never open.
+		// url.Parse errors can quote the raw input, query string included;
+		// error text reaches logs verbatim, so the raw endpoint must not.
+		// A *url.Error is unwrapped to its cause — position-free for most
+		// parse failures, but two stdlib causes quote raw bytes of the
+		// input (the offending escape sequence, the rejected host byte) and
+		// are swapped for static text below, mirroring the proxy's
+		// sanitizeUpstreamError. If the text ever does contain the input's
+		// quoted form, it is dropped entirely — the sanitizer fails closed,
+		// never open.
 		var ue *url.Error
 		switch {
 		case errors.As(err, &ue):
-			return Model{}, fmt.Errorf("endpoint: %s", ue.Err)
+			inner := ue.Err
+			var ee url.EscapeError
+			var he url.InvalidHostError
+			switch {
+			case errors.As(inner, &ee):
+				inner = errors.New("invalid URL escape")
+			case errors.As(inner, &he):
+				inner = errors.New("invalid host")
+			}
+			return Model{}, fmt.Errorf("endpoint: %s", inner)
 		case strings.Contains(err.Error(), strconv.Quote(rm.Endpoint)):
 			return Model{}, errors.New("endpoint: invalid URL (input redacted)")
 		default:
