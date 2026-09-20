@@ -337,12 +337,22 @@ level is hot-reloadable through `logging.level` (see Hot reload).
 
 What each level carries:
 
-- **DEBUG** — request lifecycle detail: `request_received`
-  (method/path/remote address), `stream_started`, `stream_completed`,
-  `config_unchanged` and the poller's per-tick heartbeat while a failure
-  persists. Detailed but never payload-bearing: request bodies, SSE `data:`
-  payloads, and injection prompts do not exist at this level — or at any
-  level.
+- **DEBUG** — the full request lifecycle, every event bound to its
+  `request_id`: `request_received` (method/path/remote address),
+  `probe_completed` (model + stream flag), `model_resolved` (public model,
+  upstream model, upstream scheme+host origin), `request_transform_started`/
+  `request_transform_completed` (byte counts around prompt injection),
+  `upstream_request_started` (origin + forwarded byte count),
+  `upstream_response_received` (upstream status + content type),
+  `response_transform_started`/`response_transform_completed` (byte counts
+  around the model rewrite), `client_write_completed`; streamed responses
+  add `stream_started`, periodic `stream_event_progress` heartbeats
+  (running event/byte counts, one every 256 dispatched events — a stuck
+  stream shows up as a heartbeat that stops advancing), and
+  `stream_completed`. Plus `config_unchanged` and the poller's per-tick
+  heartbeat while a failure persists. Detailed but never payload-bearing:
+  request bodies, SSE `data:` payloads, and injection prompts do not exist
+  at this level — or at any level.
 - **INFO** — one `request_completed` per proxied request with the wire
   facts: `request_id` (16 hex chars, generated per request), `api`
   (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,

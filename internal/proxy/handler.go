@@ -76,6 +76,10 @@ type openAIError struct {
 	Error openAIErrorBody `json:"error"`
 }
 
+// sseProgressEvery is how many dispatched events separate two DEBUG
+// stream_event_progress heartbeats.
+const sseProgressEvery = 256
+
 type openAIErrorBody struct {
 	Message string      `json:"message"`
 	Type    string      `json:"type"`
@@ -134,11 +138,15 @@ type rewriteFunc func(body []byte, public string) []byte
 // at entry and every later step (resolution, transformation, forwarding,
 // trailing rewrite) binds to it.
 //
-// Logging rides the same flow: a debug-level request_received, one INFO
-// request_completed per request with the wire facts (status, outcome,
-// duration, byte counts, snapshot generation), and WARN-level stream
-// truncation split by phase. Metadata only — bodies, prompts, payloads,
-// and Authorization never enter any log event at any level.
+// Logging rides the same flow: the DEBUG lifecycle chain (request_received,
+// probe_completed, model_resolved, request_transform_started/completed,
+// upstream_request_started, upstream_response_received,
+// response_transform_started/completed, client_write_completed — and for
+// streams stream_started, periodic stream_event_progress, stream_completed),
+// one INFO request_completed per request with the wire facts (status,
+// outcome, duration, byte counts, snapshot generation), and WARN-level
+// failures split by phase. Metadata only — bodies, prompts, payloads, and
+// Authorization never enter any log event at any level.
 func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, suffix string) {
 	start := time.Now()
 	if r.Method != http.MethodPost {
@@ -212,6 +220,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 		return
 	}
+	log.Debug().Str("public_model", model).Bool("stream", stream).Msg("probe_completed")
 
 	m, ok := snap.Model(model)
 	if !ok {
@@ -220,7 +229,10 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 		return
 	}
+	log.Debug().Str("public_model", m.Public).Str("upstream_model", m.UpstreamModel).
+		Str("upstream", origin(m.Endpoint)).Msg("model_resolved")
 
+	log.Debug().Int64("bytes_in", bytesIn).Msg("request_transform_started")
 	out, err := transform(body, m)
 	if err != nil {
 		outcome = "transform_error"
@@ -228,6 +240,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 		return
 	}
+	log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
 
 	upstream := *m.Endpoint
 	// Trim every trailing slash ("trailing slashes ignored" holds for any
@@ -252,8 +265,15 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		return
 	}
 	copyForwardHeaders(req.Header, r.Header)
+	log.Debug().Str("upstream", origin(&upstream)).
+		Int64("bytes_out", int64(len(out))).Msg("upstream_request_started")
 
 	resp, err := h.client.Do(req)
+	if err == nil {
+		log.Debug().Int("status", resp.StatusCode).
+			Str("content_type", resp.Header.Get(contentTypeHeader)).
+			Msg("upstream_response_received")
+	}
 	if err != nil {
 		// The *url.Error from client.Do embeds the full request URL —
 		// query string included, which is how query-authenticated
@@ -303,6 +323,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			return
 		}
 		outcome = "relayed"
+		log.Debug().Int64("bytes_out", sw.bytes).Msg("client_write_completed")
 		complete()
 		return
 	}
@@ -314,9 +335,23 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		copyRelayHeaders(sw.Header(), resp.Header)
 		sw.WriteHeader(resp.StatusCode)
 		log.Debug().Str("public_model", model).Msg("stream_started")
+		// Progress rides the flush: CopySSE invokes it exactly once per
+		// dispatched event, so the wrapper counts events for free and emits
+		// a periodic DEBUG heartbeat — a stuck stream shows up as a heartbeat
+		// that stops advancing. Counts only, never event payloads.
+		flush := flusher(sw)
+		events := 0
 		stats, err := CopySSE(sw, resp.Body, func(payload []byte) []byte {
 			return rewrite(payload, m.Public)
-		}, flusher(sw))
+		}, func() {
+			events++
+			if events%sseProgressEvery == 0 {
+				log.Debug().Str("public_model", model).
+					Int("events", events).Int64("bytes_out", sw.bytes).
+					Msg("stream_event_progress")
+			}
+			flush()
+		})
 		if err != nil {
 			phase := "upstream_read"
 			outcome = "stream_truncated"
@@ -365,7 +400,9 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 		return
 	}
+	log.Debug().Int64("bytes_in", int64(len(upstreamBody))).Msg("response_transform_started")
 	rewritten := rewrite(upstreamBody, m.Public)
+	log.Debug().Int64("bytes_out", int64(len(rewritten))).Msg("response_transform_completed")
 	copyRelayHeaders(sw.Header(), resp.Header)
 	sw.WriteHeader(resp.StatusCode)
 	if _, err := sw.Write(rewritten); err != nil {
@@ -377,6 +414,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 		return
 	}
+	log.Debug().Int64("bytes_out", sw.bytes).Msg("client_write_completed")
 	complete()
 }
 

@@ -495,6 +495,162 @@ func TestRelayOutcomeClassification(t *testing.T) {
 	})
 }
 
+// TestDebugLifecycleChain pins the DEBUG checkpoint sequence for one
+// buffered request: every lifecycle checkpoint fires exactly once, in flow
+// order, and the chain carries metadata only — the planted markers (request
+// body, injection prompt, upstream query secret) appear in no event at any
+// field even at maximum verbosity.
+func TestDebugLifecycleChain(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Authorization"), "SECRET") {
+			t.Errorf("upstream did not receive the forwarded Authorization — forward rule broken, audit test invalid")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"upstream-name","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	buf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me"), NewSharedClient(), log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"test-model","messages":"SECRET_REQUEST_BODY"}`,
+		map[string]string{"Authorization": "Bearer SECRET_AUTH_VALUE"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	chain := []string{
+		"request_received", "probe_completed", "model_resolved",
+		"request_transform_started", "request_transform_completed",
+		"upstream_request_started", "upstream_response_received",
+		"response_transform_started", "response_transform_completed",
+		"client_write_completed", "request_completed",
+	}
+	seen := make(map[string]int, len(chain))
+	all := parseEvents(t, buf)
+	for i, ev := range all {
+		msg, _ := ev["message"].(string)
+		if _, dup := seen[msg]; !dup {
+			seen[msg] = i
+		}
+	}
+	prev := -1
+	for _, msg := range chain {
+		idx, ok := seen[msg]
+		if !ok {
+			t.Fatalf("lifecycle checkpoint %q missing at debug level:\n%s", msg, buf.String())
+		}
+		if countMessage(all, msg) != 1 {
+			t.Errorf("%s fired %d times, want exactly 1", msg, countMessage(all, msg))
+		}
+		if idx <= prev {
+			t.Errorf("%s out of order (index %d, previous checkpoint at %d)", msg, idx, prev)
+		}
+		prev = idx
+	}
+
+	// The resolution checkpoint carries the routing facts an operator needs,
+	// and nothing else.
+	resolved := all[seen["model_resolved"]]
+	if resolved["upstream_model"] != "upstream-name" {
+		t.Errorf("model_resolved upstream_model = %v", resolved["upstream_model"])
+	}
+	if !strings.HasPrefix(resolved["upstream"].(string), "http://127.0.0.1:") {
+		t.Errorf("model_resolved upstream = %v, want scheme+host origin only", resolved["upstream"])
+	}
+	if resolved["request_id"] == nil {
+		t.Error("model_resolved missing request_id correlation")
+	}
+
+	// The upstream response checkpoint reports the status and content type.
+	received := all[seen["upstream_response_received"]]
+	if received["status"].(float64) != 200 {
+		t.Errorf("upstream_response_received status = %v", received["status"])
+	}
+
+	// upstream_model is deliberately metadata (operator-authored config),
+	// but the request body, the prompt, the credentials, and the upstream
+	// response body's own bytes ("choices" only exists inside the relayed
+	// payload) must appear nowhere.
+	for _, secret := range []string{"SECRET_REQUEST_BODY", "SECRET_PROMPT_VALUE", "SECRET_AUTH_VALUE", `"choices"`} {
+		if strings.Contains(buf.String(), secret) {
+			t.Errorf("debug log output contains %q — payload leak", secret)
+		}
+	}
+}
+
+// TestStreamProgressHeartbeat pins the stream progress equivalent: the
+// flush boundary doubles as the event counter, so a stream longer than the
+// heartbeat interval emits periodic DEBUG stream_event_progress events with
+// running counts — and a shorter one emits none.
+func TestStreamProgressHeartbeat(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher(w)()
+		for i := 0; i < 300; i++ {
+			_, _ = io.WriteString(w, "data: {\"model\":\"upstream-name\",\"i\":"+fmt.Sprint(i)+"}\n\n")
+			flusher(w)()
+		}
+	}))
+	defer upstream.Close()
+
+	buf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(newTestStore(t, upstream.URL), NewSharedClient(), log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"test-model","stream":true}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	all := parseEvents(t, buf)
+	progress := filterMessage(all, "stream_event_progress")
+	if len(progress) != 1 {
+		t.Fatalf("stream_event_progress fired %d times, want 1 (300 events, heartbeat every %d):\n%s", len(progress), sseProgressEvery, buf.String())
+	}
+	if progress[0]["events"].(float64) != sseProgressEvery {
+		t.Errorf("progress events = %v, want %d", progress[0]["events"], sseProgressEvery)
+	}
+	// The relayed event payloads (`"i":N` markers) appear nowhere; counts
+	// only.
+	if strings.Contains(buf.String(), `"i":`) {
+		t.Error("stream log carries event payload — leak")
+	}
+}
+
+// parseEvents decodes every captured line into objects, failing on
+// non-JSON output.
+func parseEvents(t *testing.T, b *logBuffer) []map[string]any {
+	t.Helper()
+	var evs []map[string]any
+	for _, line := range strings.Split(b.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("log line is not JSON: %q (%v)", line, err)
+		}
+		evs = append(evs, ev)
+	}
+	return evs
+}
+
+func countMessage(evs []map[string]any, msg string) int {
+	return len(filterMessage(evs, msg))
+}
+
+func filterMessage(evs []map[string]any, msg string) []map[string]any {
+	var found []map[string]any
+	for _, ev := range evs {
+		if ev["message"] == msg {
+			found = append(found, ev)
+		}
+	}
+	return found
+}
+
 // pipeRecorder fails its first write with EPIPE — the errno a real client
 // disconnect produces on the write side.
 type pipeRecorder struct {
