@@ -33,6 +33,12 @@ func New(store *config.Store, addr string, grace time.Duration, log zerolog.Logg
 			Addr:              addr,
 			Handler:           proxy.NewHandler(store, client, log),
 			ReadHeaderTimeout: 10 * time.Second,
+			// Without an IdleTimeout a client that opens a keep-alive
+			// connection and goes quiet pins a goroutine and a file
+			// descriptor for the process's whole life. Two minutes
+			// comfortably exceeds any client's keep-alive pooling window
+			// while bounding the leak.
+			IdleTimeout: 120 * time.Second,
 		},
 		client: client,
 		grace:  grace,

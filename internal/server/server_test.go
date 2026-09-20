@@ -272,3 +272,19 @@ func TestRunListenError(t *testing.T) {
 		t.Logf("Run returned listen error as expected: %v", err)
 	}
 }
+
+// TestServerHasReadAndIdleTimeouts pins the connection hygiene: a server
+// without a ReadHeaderTimeout accepts slowloris writes forever, and one
+// without an IdleTimeout lets a client that opens a keep-alive connection
+// and goes quiet pin a goroutine and a file descriptor for the process's
+// whole life. Waiting out a real idle deadline in CI is not viable, so the
+// pin is on the configuration itself.
+func TestServerHasReadAndIdleTimeouts(t *testing.T) {
+	srv := New(testStore(t, "http://127.0.0.1:9/v1"), "127.0.0.1:0", time.Second, testLogger(t))
+	if srv.http.ReadHeaderTimeout <= 0 {
+		t.Errorf("ReadHeaderTimeout = %v, want a positive bound", srv.http.ReadHeaderTimeout)
+	}
+	if srv.http.IdleTimeout <= 0 {
+		t.Errorf("IdleTimeout = %v, want a positive bound so quiet keep-alive connections are reaped", srv.http.IdleTimeout)
+	}
+}
