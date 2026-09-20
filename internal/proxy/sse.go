@@ -33,27 +33,51 @@ var (
 // blank lines, and terminators such as [DONE] pass through byte-for-byte.
 //
 // io.EOF ends the copy with a nil error; any other read error is returned
-// so the caller can truncate the stream. Nothing is ever synthesized.
-func CopySSE(dst io.Writer, src io.Reader, public string, flush func()) error {
+// so the caller can truncate the stream. A failure writing to dst is
+// returned wrapped in *streamWriteError — the client side went away — so
+// the caller can log the two truncation causes apart. Nothing is ever
+// synthesized.
+func CopySSE(dst io.Writer, src io.Reader, public string, flush func()) (StreamStats, error) {
+	var stats StreamStats
 	br := bufio.NewReader(src)
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
-			if _, werr := dst.Write(rewriteSSELine(line, public)); werr != nil {
-				return werr
+			out := rewriteSSELine(line, public)
+			if _, werr := dst.Write(out); werr != nil {
+				return stats, &streamWriteError{err: werr}
 			}
+			stats.Bytes += int64(len(out))
 			if flush != nil && isEventBoundary(line) {
 				flush()
+				stats.Events++
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				return nil
+				return stats, nil
 			}
-			return err
+			return stats, err
 		}
 	}
 }
+
+// StreamStats reports what a finished CopySSE pass put on the wire: byte
+// count and dispatched events. Metadata for the access log only — payloads
+// never reach logs at any level.
+type StreamStats struct {
+	Bytes  int64
+	Events int
+}
+
+// streamWriteError marks a CopySSE failure that happened writing to the
+// client — the connection broke mid-stream — as opposed to a failure
+// reading from upstream. The distinction decides the truncation log's
+// phase field.
+type streamWriteError struct{ err error }
+
+func (e *streamWriteError) Error() string { return "writing SSE stream to client: " + e.err.Error() }
+func (e *streamWriteError) Unwrap() error { return e.err }
 
 // isEventBoundary reports whether the raw line (terminator included) is a
 // blank line — the terminator that completes an SSE event.

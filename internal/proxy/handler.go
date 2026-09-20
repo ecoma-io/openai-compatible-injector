@@ -3,7 +3,9 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -112,11 +115,11 @@ func (h *injectorHandler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, inject.Chat, "/chat/completions")
+	h.serve(w, r, "chat", inject.Chat, "/chat/completions")
 }
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, inject.Responses, "/responses")
+	h.serve(w, r, "responses", inject.Responses, "/responses")
 }
 
 type transformFunc func(body []byte, m config.Model) ([]byte, error)
@@ -124,47 +127,99 @@ type transformFunc func(body []byte, m config.Model) ([]byte, error)
 // serve runs the full injector flow for one request. One snapshot is loaded
 // at entry and every later step (resolution, transformation, forwarding,
 // trailing rewrite) binds to it.
-func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transform transformFunc, suffix string) {
+//
+// Logging rides the same flow: a debug-level request_received, one INFO
+// request_completed per request with the wire facts (status, outcome,
+// duration, byte counts, snapshot generation), and WARN-level stream
+// truncation split by phase. Metadata only — bodies, prompts, payloads,
+// and Authorization never enter any log event at any level.
+func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, suffix string) {
+	start := time.Now()
 	if r.Method != http.MethodPost {
+		// Outside the request lifecycle: no snapshot is loaded and no
+		// generation exists to bind, and a wrong method is a client bug
+		// rather than proxy traffic — debug is the honest level.
+		h.log.Debug().Str("api", api).Str("method", r.Method).
+			Str("path", r.URL.Path).Str("remote_addr", r.RemoteAddr).
+			Msg("request_method_not_allowed")
 		writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
 		return
 	}
+
 	snap := h.store.Load()
 	defer func() { _ = r.Body.Close() }()
 
+	sw := &statusWriter{ResponseWriter: w}
+	log := h.log.With().Str("request_id", newRequestID()).Str("api", api).Logger()
+	log.Debug().Str("method", r.Method).Str("path", r.URL.Path).
+		Str("remote_addr", r.RemoteAddr).Msg("request_received")
+
+	var (
+		outcome     = "completed"
+		stream      bool
+		publicModel string
+		bytesIn     int64
+	)
+	complete := func() {
+		log.Info().
+			Int("status", sw.status).
+			Str("outcome", outcome).
+			Str("public_model", publicModel).
+			Bool("stream", stream).
+			Int64("bytes_in", bytesIn).
+			Int64("bytes_out", sw.bytes).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Uint64("config_generation", snap.Gen()).
+			Msg("request_completed")
+	}
+
 	// Bound the request body before reading it: without a cap, a single
 	// oversized client request pins unbounded memory in the proxy.
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	r.Body = http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			writeEnvelope(w, http.StatusRequestEntityTooLarge, envelopeTooLarge)
+			outcome = "body_too_large"
+			writeEnvelope(sw, http.StatusRequestEntityTooLarge, envelopeTooLarge)
+			complete()
 			return
 		}
-		writeEnvelope(w, http.StatusBadRequest, envelopeInvalidReq)
+		outcome = "body_read_error"
+		writeEnvelope(sw, http.StatusBadRequest, envelopeInvalidReq)
+		complete()
 		return
 	}
+	bytesIn = int64(len(body))
 
 	model, stream, err := inject.Probe(body)
 	if err != nil {
-		writeEnvelope(w, http.StatusBadRequest, envelopeInvalidReq)
+		outcome = "invalid_json"
+		writeEnvelope(sw, http.StatusBadRequest, envelopeInvalidReq)
+		complete()
 		return
 	}
+	publicModel = model
 	if model == "" {
-		writeEnvelope(w, http.StatusBadRequest, envelopeMissingMod)
+		outcome = "missing_model"
+		writeEnvelope(sw, http.StatusBadRequest, envelopeMissingMod)
+		complete()
 		return
 	}
 
 	m, ok := snap.Model(model)
 	if !ok {
-		h.writeModelNotFound(w, model)
+		outcome = "model_not_found"
+		h.writeModelNotFound(sw, model)
+		complete()
 		return
 	}
 
 	out, err := transform(body, m)
 	if err != nil {
-		writeEnvelope(w, http.StatusBadRequest, envelopeInvalidReq)
+		outcome = "transform_error"
+		writeEnvelope(sw, http.StatusBadRequest, envelopeInvalidReq)
+		complete()
 		return
 	}
 
@@ -181,11 +236,13 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 		// Unreachable by construction (the endpoint was validated to a
 		// *url.URL at config load), but if it ever fires the raw error text
 		// must still not reach logs — it would embed the full URL.
-		h.log.Error().Str("model", model).
+		log.Error().Str("model", model).
 			Str("upstream", origin(&upstream)).
 			Str("error_class", "request_build").
-			Msg("proxy: building upstream request failed")
-		writeEnvelope(w, http.StatusBadGateway, envelopeUpUnreach)
+			Msg("upstream_request_build_failed")
+		outcome = "upstream_unreachable"
+		writeEnvelope(sw, http.StatusBadGateway, envelopeUpUnreach)
+		complete()
 		return
 	}
 	copyForwardHeaders(req.Header, r.Header)
@@ -196,18 +253,20 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 		// query string included, which is how query-authenticated
 		// providers leak credentials. Log the sanitized error and the
 		// scheme+host origin only, per the credential rule.
-		event := h.log.Error()
+		event := log.Error()
 		if errors.Is(err, context.Canceled) {
 			// The client went away mid-request; that is an operational
 			// warning, not an upstream failure.
-			event = h.log.Warn()
+			event = log.Warn()
 		}
 		event.Err(sanitizeUpstreamError(err, &upstream)).
-			Str("model", model).
+			Str("public_model", model).
 			Str("upstream", origin(&upstream)).
 			Str("error_class", upstreamErrorClass(err)).
-			Msg("proxy: upstream request failed")
-		writeEnvelope(w, http.StatusBadGateway, envelopeUpUnreach)
+			Msg("upstream_request_failed")
+		outcome = "upstream_unreachable"
+		writeEnvelope(sw, http.StatusBadGateway, envelopeUpUnreach)
+		complete()
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -219,9 +278,17 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 		// answers. A 204 or an unexpected 3xx is the upstream's answer;
 		// turning it into a 502 would fog the root cause. Status and body
 		// relayed byte for byte, whatever the content type.
-		copyRelayHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		copyRelayHeaders(sw.Header(), resp.Header)
+		sw.WriteHeader(resp.StatusCode)
+		if _, err := io.Copy(sw, resp.Body); err != nil {
+			event := log.Error()
+			if errors.Is(err, context.Canceled) {
+				event = log.Warn()
+			}
+			event.Err(err).Str("public_model", model).Msg("relay_copy_failed")
+		}
+		outcome = "relayed"
+		complete()
 		return
 	}
 
@@ -229,11 +296,28 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 		// Incremental SSE passthrough. The 2xx status is committed here; any
 		// subsequent failure only truncates the stream, never switches the
 		// response to an error body.
-		copyRelayHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		if err := CopySSE(w, resp.Body, m.Public, flusher(w)); err != nil {
-			h.log.Error().Err(err).Str("model", model).Msg("proxy: SSE passthrough truncated")
+		copyRelayHeaders(sw.Header(), resp.Header)
+		sw.WriteHeader(resp.StatusCode)
+		log.Debug().Str("public_model", model).Msg("stream_started")
+		stats, err := CopySSE(sw, resp.Body, m.Public, flusher(sw))
+		if err != nil {
+			phase := "upstream_read"
+			var swe *streamWriteError
+			if errors.As(err, &swe) {
+				// The client connection broke mid-stream; the upstream may
+				// have been fine. An operational warning, not an error.
+				phase = "client_write"
+			}
+			log.Warn().Err(err).Str("public_model", model).Str("phase", phase).
+				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
+				Msg("stream_truncated")
+			outcome = "stream_truncated"
+		} else {
+			log.Debug().Str("public_model", model).
+				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
+				Msg("stream_completed")
 		}
+		complete()
 		return
 	}
 
@@ -243,13 +327,16 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, transfor
 	// body is treated like any other unparseable upstream answer.
 	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
 	if err != nil || len(upstreamBody) > int(maxBufferedResponseBytes) || !json.Valid(upstreamBody) {
-		writeEnvelope(w, http.StatusBadGateway, envelopeUpInvalid)
+		outcome = "upstream_invalid_response"
+		writeEnvelope(sw, http.StatusBadGateway, envelopeUpInvalid)
+		complete()
 		return
 	}
 	rewritten := inject.RewriteModel(upstreamBody, m.Public)
-	copyRelayHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(rewritten)
+	copyRelayHeaders(sw.Header(), resp.Header)
+	sw.WriteHeader(resp.StatusCode)
+	_, _ = sw.Write(rewritten)
+	complete()
 }
 
 func (h *injectorHandler) writeModelNotFound(w http.ResponseWriter, model string) {
@@ -348,4 +435,50 @@ func flusher(w http.ResponseWriter) func() {
 		return f.Flush
 	}
 	return func() {}
+}
+
+// statusWriter records the committed status and total bytes written for the
+// access log, forwarding everything else. The status falls back to 200 when
+// a handler writes without an explicit WriteHeader — net/http's own rule.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// requestIDSource is 8 bytes of crypto/rand per request — 16 hex characters.
+// Full UUIDs cost an order of magnitude more for the same operational value:
+// the id only needs to be unique within this process's log stream.
+const requestIDSource = 8
+
+func newRequestID() string {
+	var b [requestIDSource]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// A dead entropy source must not fail requests; the all-zero id
+		// stays a valid, if colliding, correlation key.
+		return "0000000000000000"
+	}
+	return hex.EncodeToString(b[:])
 }

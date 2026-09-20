@@ -10,15 +10,24 @@ import (
 )
 
 // copySSEOnce runs CopySSE over input and returns the exact output bytes and
-// the number of flush invocations.
+// the number of flush invocations. The reported stats are checked against
+// the output on every call.
 func copySSEOnce(t *testing.T, input, public string) (string, int) {
 	t.Helper()
 	var buf bytes.Buffer
 	flushes := 0
-	if err := CopySSE(&buf, strings.NewReader(input), public, func() { flushes++ }); err != nil {
+	stats, err := CopySSE(&buf, strings.NewReader(input), public, func() { flushes++ })
+	if err != nil {
 		t.Fatalf("CopySSE: %v", err)
 	}
-	return buf.String(), flushes
+	out := buf.String()
+	if stats.Bytes != int64(len(out)) {
+		t.Fatalf("stats.Bytes = %d, want %d (output length)", stats.Bytes, len(out))
+	}
+	if stats.Events != flushes {
+		t.Fatalf("stats.Events = %d, want %d (flush count)", stats.Events, flushes)
+	}
+	return out, flushes
 }
 
 func TestCopySSEVerbatimPassthrough(t *testing.T) {
@@ -174,10 +183,24 @@ type failingReader struct{}
 func (failingReader) Read(p []byte) (int, error) { return 0, errors.New("read boom") }
 
 func TestCopySSEPropagatesErrors(t *testing.T) {
-	if err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), "p", func() {}); err == nil {
-		t.Error("write error not propagated")
+	// A write failure is client-side; the caller logs it as a client
+	// disconnect via the *streamWriteError marker.
+	_, err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), "p", func() {})
+	if err == nil {
+		t.Fatal("write error not propagated")
 	}
-	if err := CopySSE(io.Discard, failingReader{}, "p", func() {}); err == nil || err == io.EOF {
+	var swe *streamWriteError
+	if !errors.As(err, &swe) {
+		t.Errorf("write error not marked *streamWriteError: %v", err)
+	}
+
+	// A read failure is upstream-side and must NOT carry the marker — the
+	// truncation phase in the access log depends on the distinction.
+	_, err = CopySSE(io.Discard, failingReader{}, "p", func() {})
+	if err == nil || err == io.EOF {
 		t.Errorf("read error not propagated as-is: %v", err)
+	}
+	if errors.As(err, &swe) {
+		t.Errorf("read error wrongly marked as client write failure: %v", err)
 	}
 }
