@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.1.0...v0.2.0) (2026-09-20)
+
+
+### Features
+
+* production-readiness pass — bounded SSE, per-API rewrite, outcome fidelity, observable reload ([#11](https://github.com/ecoma-io/openai-compatible-injector/issues/11)) ([b26576f](https://github.com/ecoma-io/openai-compatible-injector/commit/b26576f47411f8cf74234ba0769ad7825649deed))
+
 ## 0.1.0 (2026-09-20)
 
 
