@@ -75,7 +75,10 @@ func rewriteSSELine(line []byte, public string) []byte {
 		return line
 	}
 	out := inject.RewriteModel(payload, public)
-	buf := make([]byte, 0, len(prefix)+len(sep)+len(out)+len(term))
+	// Capacity is never precomputed as a length sum: that arithmetic is the
+	// integer-overflow class CodeQL flags, and the per-line cost of append
+	// growth is negligible next to the bufio read and network I/O anyway.
+	var buf []byte
 	buf = append(buf, prefix...)
 	buf = append(buf, sep...)
 	buf = append(buf, out...)
