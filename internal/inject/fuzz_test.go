@@ -11,9 +11,9 @@ import (
 // panics; on error it reports no routeable fields; and on success the model
 // is exactly the top-level "model" string value (empty when that key is
 // absent, not a string, or the document is not an object), and the stream
-// flag is true exactly when a top-level "stream" carries the literal true
-// and false for the literal false — a stream value of any other shape must
-// have produced the error, not a success.
+// flag is true exactly when a top-level "stream" carries the literal true,
+// false for the literal false and for null — a stream value of any other
+// shape must have produced the error, not a success.
 func FuzzProbe(f *testing.F) {
 	seeds := []string{
 		``,                                  // empty body
@@ -24,7 +24,7 @@ func FuzzProbe(f *testing.F) {
 		`{"model":"gpt-5","stream": true }`, // whitespace around the value
 		`{"model":""}`,                      // empty model string
 		`{"stream":true}`,                   // stream without model
-		`{"model":"gpt-5","stream":null}`,   // null stream: error
+		`{"model":"gpt-5","stream":null}`,   // null stream: stream=false
 		`{"model":"gpt-5","stream":"true"}`, // string stream: error
 		`{"model":"gpt-5","stream":1}`,      // number stream: error
 		`{"model":"gpt-5","stream":-0.5}`,   // negative number stream: error
@@ -112,9 +112,10 @@ func FuzzProbe(f *testing.F) {
 			if !stream {
 				t.Fatalf("top-level \"stream\":true but stream flag = false: %q", body)
 			}
-		case "false":
+		case "false", "null":
+			// null reads as the zero value, exactly like an absent flag.
 			if stream {
-				t.Fatalf("top-level \"stream\":false but stream flag = true: %q", body)
+				t.Fatalf("top-level \"stream\":%s but stream flag = true: %q", compacted.String(), body)
 			}
 		default:
 			t.Fatalf("Probe reported success while \"stream\" is %s, not a bool: %q", compacted.String(), body)

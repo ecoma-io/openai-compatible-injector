@@ -39,6 +39,7 @@ func TestProbeStream(t *testing.T) {
 		{"absent defaults false", `{"model":"gpt-5"}`, false},
 		{"true", `{"model":"gpt-5","stream":true}`, true},
 		{"false", `{"model":"gpt-5","stream":false}`, false},
+		{"null reads as false", `{"model":"gpt-5","stream":null}`, false},
 		{"non-object array", `[1,2]`, false},
 	}
 	for _, tt := range tests {
@@ -63,7 +64,6 @@ func TestProbeErrors(t *testing.T) {
 		{"garbage", `not json`},
 		{"stream string", `{"stream":"true"}`},
 		{"stream number", `{"stream":123}`},
-		{"stream null", `{"stream":null}`},
 		{"stream array", `{"stream":[]}`},
 		{"stream object", `{"stream":{}}`},
 	}
