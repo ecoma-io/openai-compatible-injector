@@ -14,21 +14,25 @@ import (
 // asserted absent from the process output.
 
 const (
-	secretLevelURL   = "SECRET_LEVEL_URL"
-	secretTopKeyURL  = "SECRET_TOPKEY_URL"
-	secretModelKey   = "SECRET_MODELKEY_URL"
-	secretScalar     = "SECRET_SCALAR_VALUE"
-	secretSecondDoc  = "SECRET_SECONDDOC_KEY"
-	secretEscapePath = "SECRET_ESCAPE_QUERY"
+	secretLevelURL    = "SECRET_LEVEL_URL"
+	secretTopKeyURL   = "SECRET_TOPKEY_URL"
+	secretModelKey    = "SECRET_MODELKEY_URL"
+	secretScalar      = "SECRET_SCALAR_VALUE"
+	secretSecondDoc   = "SECRET_SECONDDOC_KEY"
+	secretEscapePath  = "SECRET_ESCAPE_QUERY"
+	secretDuplicate   = "SECRET_DUPKEY_URL"
+	secretAnchorAlias = "SECRET_ANCHOR_NAME"
 )
 
 // allConfigSecrets is the full marker inventory the sweep asserts absent.
 var allConfigSecrets = []string{
-	secretLevelURL, secretTopKeyURL, secretModelKey,
-	secretScalar, secretSecondDoc, secretEscapePath,
+	secretLevelURL, secretTopKeyURL, secretModelKey, secretScalar,
+	secretSecondDoc, secretEscapePath, secretDuplicate, secretAnchorAlias,
 }
 
-// rejectedYAML renders one rejected runtime file per echo position.
+// rejectedYAML renders one rejected runtime file per echo position. Every
+// case must stay driven by the reload sweep below: a marker that is declared
+// but never planted is coverage that can only ever pass.
 func rejectedYAML(i int) string {
 	switch i {
 	case 0: // secret URL as the logging.level value
@@ -41,6 +45,12 @@ func rejectedYAML(i int) string {
 		return "models: " + secretScalar + "\n"
 	case 4: // secret URL in a rejected endpoint (invalid path escape + secret query)
 		return "models:\n  m:\n    endpoint: http://gw.example/v1%zz?" + secretEscapePath + "=x\n    upstream-model: up\n"
+	case 5: // a --- separated second document (must be a rejection, never decoded)
+		return "models:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\n---\n" + secretSecondDoc + ": true\n"
+	case 6: // duplicate top-level key (yaml.v3 uniqueKeys; the error quotes the key)
+		return secretDuplicate + ": true\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\n" + secretDuplicate + ": false\n"
+	case 7: // undefined alias whose anchor name carries a secret
+		return "models:\n  m:\n    endpoint: *" + secretAnchorAlias + "\n    upstream-model: up\n"
 	default:
 		panic("no such rejected yaml case")
 	}
@@ -80,7 +90,7 @@ func TestReloadRejectionNeverEchoesSecrets(t *testing.T) {
 		return len(eventsWithMessage(parseLogEvents(t, p.stderr.String()), "config_reloaded"))
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 8; i++ {
 		rewriteConfig(t, p.cfgPath, rejectedYAML(i))
 		waitForEventCount(t, p, "config_reload_rejected", i+1)
 
@@ -92,8 +102,8 @@ func TestReloadRejectionNeverEchoesSecrets(t *testing.T) {
 		waitForEventCount(t, p, "config_reloaded", i+1)
 	}
 
-	if got := reloadedEvents(); got != 5 {
-		t.Errorf("config_reloaded events = %d, want 5 (every heal applied)", got)
+	if got := reloadedEvents(); got != 8 {
+		t.Errorf("config_reloaded events = %d, want 8 (every heal applied)", got)
 	}
 
 	for _, secret := range allConfigSecrets {
