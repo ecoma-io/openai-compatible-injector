@@ -161,6 +161,13 @@ func perfStream(b *testing.B, addr, body string) time.Duration {
 // request per iteration, ns/op is the full round trip including the client.
 // The size matrix runs at error level; the level axis is pinned on the
 // small body.
+//
+// What the size axis actually varies: only the upstream RESPONSE body is
+// padded — the request body is a fixed ~69 bytes and the injection prompt
+// is empty, so a size arm measures the response path (read, validate, model
+// rewrite, copy), not inject.Chat at that size. Recorded deltas must be
+// read on those terms; the request-side transform is pinned by the
+// inject package's own benchmarks.
 func BenchmarkThroughputChat(b *testing.B) {
 	sizes := []struct {
 		name string
