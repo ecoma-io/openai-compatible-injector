@@ -60,7 +60,27 @@ func waitForLogEvent(t *testing.T, p *proc, want func(logEvent) bool, desc strin
 		if time.Now().After(deadline) {
 			t.Fatalf("no log event %s within timeout; stderr:\n%s", desc, p.stderr.String())
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitForEventCount polls until at least want events with msg have appeared
+// in stderr. The subprocess's stderr travels through a pipe and a copying
+// goroutine, so an event written by the handler is only guaranteed visible
+// to the test some time after the HTTP response has completed — counts must
+// always be awaited, never asserted synchronously.
+func waitForEventCount(t *testing.T, p *proc, msg string, want int) []logEvent {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		evs := eventsWithMessage(parseLogEvents(t, p.stderr.String()), msg)
+		if len(evs) >= want {
+			return evs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d %q events appeared; stderr:\n%s", len(evs), want, msg, p.stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -110,19 +130,20 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 		status, _, _ := postJSON(t, p.addr, "/v1/chat/completions", body, nil)
 		return status
 	}
-	completions := func() []logEvent {
-		return eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_completed")
+	completions := func(want int) []logEvent {
+		return waitForEventCount(t, p, "request_completed", want)
 	}
 	received := func() int {
 		return len(eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_received"))
 	}
 
-	// info: completions visible, DEBUG request_received suppressed.
+	// info: completions visible, DEBUG request_received suppressed. The
+	// count wait also settles the stderr copy before the absence assertion.
 	if status := post("live"); status != http.StatusOK {
 		t.Fatalf("status = %d, want 200", status)
 	}
-	if len(completions()) != 1 {
-		t.Fatalf("request_completed events = %d, want 1 at info level", len(completions()))
+	if got := completions(1); len(got) != 1 {
+		t.Fatalf("request_completed events = %d, want 1 at info level", len(got))
 	}
 	if got := received(); got != 0 {
 		t.Fatalf("request_received visible at info level (%d events) — debug leak", got)
@@ -133,33 +154,35 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 	// level in effect before it applied).
 	rewriteConfig(t, p.cfgPath, loggingYAML(upstream.url(), upstream.url(), "debug"))
 	waitForLogEvent(t, p, func(ev logEvent) bool {
-		return ev["log_level"] == "debug"
+		return ev["message"] == "config_reloaded" && ev["log_level"] == "debug"
 	}, "config_reloaded with log_level=debug")
 
 	if status := post("live"); status != http.StatusOK {
 		t.Fatalf("status after debug reload = %d, want 200", status)
 	}
+	evs := completions(2)
 	if got := received(); got != 1 {
 		t.Fatalf("request_received events = %d, want 1 after switching to debug", got)
 	}
 	// The completion events bind to the snapshot generation: the post-reload
 	// request must carry generation 1 — proof that the same process reloaded
 	// rather than restarted (a restart would begin at 0 again).
-	evs := completions()
 	if evs[1]["config_generation"].(float64) != 1 {
 		t.Fatalf("config_generation = %v, want 1 after first reload", evs[1]["config_generation"])
 	}
 
-	// debug -> error: completions are INFO and must disappear.
+	// debug -> error: completions are INFO and must disappear. Allow the
+	// stderr copy to settle before asserting the absence.
 	rewriteConfig(t, p.cfgPath, loggingYAML(upstream.url(), upstream.url(), "error"))
 	waitForLogEvent(t, p, func(ev logEvent) bool {
-		return ev["log_level"] == "error"
+		return ev["message"] == "config_reloaded" && ev["log_level"] == "error"
 	}, "config_reloaded with log_level=error")
 
 	if status := post("live"); status != http.StatusOK {
 		t.Fatalf("status after error reload = %d, want 200", status)
 	}
-	if got := len(completions()); got != 2 {
+	time.Sleep(300 * time.Millisecond)
+	if got := len(completions(2)); got != 2 {
 		t.Fatalf("request_completed events = %d, want still 2 (INFO suppressed at error level)", got)
 	}
 
@@ -186,7 +209,7 @@ func TestLogLevelHotReloadWithoutRestart(t *testing.T) {
 	if p.cmd.Process.Pid != pid {
 		t.Fatal("process PID changed — the level was not hot-reloaded but restarted")
 	}
-	if got := len(completions()); got != 4 {
+	if got := len(completions(4)); got != 4 {
 		t.Fatalf("request_completed events = %d, want 4 (every request answered)", got)
 	}
 }
@@ -320,7 +343,9 @@ func TestServeStderrIsJSONLines(t *testing.T) {
 	postJSON(t, p.addr, "/v1/chat/completions", `{"model":"dead"}`, nil)
 	postJSON(t, p.addr, "/healthz", "", nil) // wrong method on a proxied route
 
-	// The traffic above is synchronous; its log lines are already written.
+	// Settle the stderr copy before scanning: the five POSTs above each end
+	// with a completion line (the 405 route logs at debug only).
+	waitForEventCount(t, p, "request_completed", 5)
 	for _, line := range strings.Split(p.stderr.String(), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
