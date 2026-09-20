@@ -84,7 +84,7 @@ type startOpts struct {
 	configPath   string   // if set, use this exact path (e.g. missing file)
 	listen       string   // LISTEN value; empty -> ephemeral loopback port
 	grace        string   // SHUTDOWN_GRACE; default "5s"
-	logLevel     string   // LOG_LEVEL; default "error"
+	logLevel     string   // runtime YAML logging.level; default "error"
 	pollInterval string   // CONFIG_POLL_INTERVAL; default "50ms"
 	extraEnv     []string // extra "K=V" entries appended to the process env
 }
@@ -115,7 +115,7 @@ func newProc(t *testing.T, o startOpts) *proc {
 	cfgPath := o.configPath
 	if cfgPath == "" {
 		cfgPath = filepath.Join(t.TempDir(), "config.yaml")
-		if err := os.WriteFile(cfgPath, []byte(o.yaml), 0o644); err != nil {
+		if err := os.WriteFile(cfgPath, []byte(withLoggingLevel(o.yaml, o.logLevel)), 0o644); err != nil {
 			t.Fatalf("write config file: %v", err)
 		}
 	}
@@ -141,7 +141,6 @@ func newProc(t *testing.T, o startOpts) *proc {
 		"CONFIG_FILE="+cfgPath,
 		"CONFIG_POLL_INTERVAL="+o.pollInterval,
 		"SHUTDOWN_GRACE="+o.grace,
-		"LOG_LEVEL="+o.logLevel,
 	)
 	p.cmd.Env = append(p.cmd.Env, o.extraEnv...)
 	p.cmd.Stdout = p.stdout
@@ -299,6 +298,18 @@ func runtimeYAML(publicName, endpoint, upstreamModel, injectionPrompt string) st
 		fmt.Fprintf(&sb, "    injection-prompt: %s\n", injectionPrompt)
 	}
 	return sb.String()
+}
+
+// withLoggingLevel appends a logging.level section to a runtime YAML body.
+// The log level travels in the runtime file — the same hot-reloadable plane
+// as model mappings — because LOG_LEVEL no longer exists: the runtime file
+// is mandatory at boot, so an env override had no legitimate window. A body
+// that already carries a logging section is returned unchanged.
+func withLoggingLevel(yamlBody, level string) string {
+	if level == "" || strings.Contains(yamlBody, "\nlogging:") {
+		return yamlBody
+	}
+	return yamlBody + "\nlogging:\n  level: " + level + "\n"
 }
 
 // recordedRequest is an immutable snapshot of one upstream HTTP request.
