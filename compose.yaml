@@ -15,16 +15,17 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Bootstrap-only settings: changes require a container restart.
-      LISTEN: :8080
-      CONFIG_FILE: /app/config.yaml
+      # Bootstrap-only settings: changes require a container restart. Every
+      # variable the service reads is OAICR_-prefixed.
+      OAICR_LISTEN: :8080
+      OAICR_CONFIG_FILE: /app/config.yaml
       # Optional. The drain budget must stay below stop_grace_period so
       # docker's SIGKILL never cuts it short.
-      # SHUTDOWN_GRACE: 45s
-      # CONFIG_POLL_INTERVAL: 1s
+      # OAICR_SHUTDOWN_GRACE: 45s
+      # OAICR_CONFIG_POLL_INTERVAL: 1s
     # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
-    # above the service's SHUTDOWN_GRACE (default 55s) plus a little margin
-    # so an active SSE stream gets its full drain before the kill.
+    # above the service's OAICR_SHUTDOWN_GRACE (default 55s) plus a little
+    # margin so an active SSE stream gets its full drain before the kill.
     stop_grace_period: 60s
     logging:
       driver: json-file

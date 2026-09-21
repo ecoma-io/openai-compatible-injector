@@ -50,7 +50,7 @@ func usage() {
 func healthcheck() int {
 	log := zerolog.New(os.Stderr).With().Timestamp().Logger()
 
-	addr := os.Getenv("LISTEN")
+	addr := os.Getenv("OAICR_LISTEN")
 	if addr == "" {
 		addr = config.DefaultListen
 	}

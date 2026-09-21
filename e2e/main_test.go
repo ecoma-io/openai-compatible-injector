@@ -82,10 +82,10 @@ func (l *lockedBuf) String() string {
 type startOpts struct {
 	yaml         string   // runtime config file content (used unless configPath set)
 	configPath   string   // if set, use this exact path (e.g. missing file)
-	listen       string   // LISTEN value; empty -> ephemeral loopback port
-	grace        string   // SHUTDOWN_GRACE; default "5s"
+	listen       string   // OAICR_LISTEN value; empty -> ephemeral loopback port
+	grace        string   // OAICR_SHUTDOWN_GRACE; default "5s"
 	logLevel     string   // runtime YAML logging.level; default "error"
-	pollInterval string   // CONFIG_POLL_INTERVAL; default "50ms"
+	pollInterval string   // OAICR_CONFIG_POLL_INTERVAL; default "50ms"
 	extraEnv     []string // extra "K=V" entries appended to the process env
 }
 
@@ -137,10 +137,10 @@ func newProc(tb testing.TB, o startOpts) *proc {
 		exit:    -1,
 	}
 	p.cmd.Env = append(os.Environ(),
-		"LISTEN="+listen,
-		"CONFIG_FILE="+cfgPath,
-		"CONFIG_POLL_INTERVAL="+o.pollInterval,
-		"SHUTDOWN_GRACE="+o.grace,
+		"OAICR_LISTEN="+listen,
+		"OAICR_CONFIG_FILE="+cfgPath,
+		"OAICR_CONFIG_POLL_INTERVAL="+o.pollInterval,
+		"OAICR_SHUTDOWN_GRACE="+o.grace,
 	)
 	p.cmd.Env = append(p.cmd.Env, o.extraEnv...)
 	p.cmd.Stdout = p.stdout
@@ -270,7 +270,7 @@ func freePort(tb testing.TB) string {
 	return strconv.Itoa(port)
 }
 
-// portOf extracts the port from a LISTEN-style address (":8080", "[::]:8080",
+// portOf extracts the port from a listen-style address (":8080", "[::]:8080",
 // "127.0.0.1:8080").
 func portOf(listen string) string {
 	_, port, err := net.SplitHostPort(listen)

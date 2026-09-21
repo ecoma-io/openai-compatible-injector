@@ -2,7 +2,8 @@
 //
 //   - Bootstrap settings, read once from the environment and immutable for
 //     the lifetime of the process (listen address, config file path, poll
-//     interval, shutdown grace).
+//     interval, shutdown grace). Every variable carries the OAICR_ prefix;
+//     the service reads no unprefixed names of its own.
 //   - Runtime settings, validated from a YAML file and hot-reloaded into
 //     immutable snapshots that are atomically swapped.
 package config
@@ -14,8 +15,9 @@ import (
 )
 
 // Bootstrap holds process-lifetime settings. Every field is read exclusively
-// from the environment; none of them are part of the runtime YAML schema.
-// Changing any of them requires a process restart.
+// from the environment (OAICR_-prefixed variables only); none of them are
+// part of the runtime YAML schema. Changing any of them requires a process
+// restart.
 type Bootstrap struct {
 	// Listen is the TCP address the HTTP server binds, e.g. ":8080".
 	Listen string
@@ -44,24 +46,24 @@ func LoadBootstrap(env func(string) string) (Bootstrap, error) {
 	var b Bootstrap
 	var errs []error
 
-	b.Listen = env("LISTEN")
+	b.Listen = env("OAICR_LISTEN")
 	if b.Listen == "" {
 		b.Listen = DefaultListen
 	}
 
-	b.ConfigFile = env("CONFIG_FILE")
+	b.ConfigFile = env("OAICR_CONFIG_FILE")
 	if b.ConfigFile == "" {
 		b.ConfigFile = DefaultConfigFile
 	}
 
-	if v := env("CONFIG_POLL_INTERVAL"); v != "" {
+	if v := env("OAICR_CONFIG_POLL_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			// time.ParseDuration quotes the raw input; error text reaches
 			// logs verbatim, so the value is not echoed (length only).
-			errs = append(errs, fmt.Errorf("CONFIG_POLL_INTERVAL is not a duration (%d characters; e.g. 500ms, 5s)", len(v)))
+			errs = append(errs, fmt.Errorf("OAICR_CONFIG_POLL_INTERVAL is not a duration (%d characters; e.g. 500ms, 5s)", len(v)))
 		} else if d <= 0 {
-			errs = append(errs, errors.New("CONFIG_POLL_INTERVAL must be a positive duration"))
+			errs = append(errs, errors.New("OAICR_CONFIG_POLL_INTERVAL must be a positive duration"))
 		} else {
 			b.PollInterval = d
 		}
@@ -69,15 +71,15 @@ func LoadBootstrap(env func(string) string) (Bootstrap, error) {
 		b.PollInterval = DefaultPollInterval
 	}
 
-	if v := env("SHUTDOWN_GRACE"); v != "" {
+	if v := env("OAICR_SHUTDOWN_GRACE"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE is not a duration (%d characters; e.g. 55s)", len(v)))
+			errs = append(errs, fmt.Errorf("OAICR_SHUTDOWN_GRACE is not a duration (%d characters; e.g. 55s)", len(v)))
 		} else if d <= 0 {
 			// Zero silently disables the graceful drain — in-flight streams
 			// would be force-closed the moment shutdown starts. That must be
 			// a startup error, not a surprise.
-			errs = append(errs, errors.New("SHUTDOWN_GRACE must be a positive duration"))
+			errs = append(errs, errors.New("OAICR_SHUTDOWN_GRACE must be a positive duration"))
 		} else {
 			b.ShutdownGrace = d
 		}

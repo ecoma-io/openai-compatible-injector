@@ -46,7 +46,7 @@ func jsonResponsesHandler(upstreamModel string) http.HandlerFunc {
 	}
 }
 
-// Scenario 1: /healthz returns 200 "ok\n" with a wildcard LISTEN, and the
+// Scenario 1: /healthz returns 200 "ok\n" with a wildcard OAICR_LISTEN, and the
 // healthcheck subcommand succeeds against that same wildcard address (while
 // deliberately not reading the config file).
 func TestHealthzAndHealthcheckWildcard(t *testing.T) {
@@ -65,18 +65,18 @@ func TestHealthzAndHealthcheckWildcard(t *testing.T) {
 		t.Fatalf("healthz: status %d body %q, want 200 %q", resp.StatusCode, body, "ok\n")
 	}
 
-	// healthcheck subcommand against the same wildcard LISTEN; it must not
-	// read the config file, so point CONFIG_FILE at a nonexistent path.
+	// healthcheck subcommand against the same wildcard OAICR_LISTEN; it must not
+	// read the config file, so point OAICR_CONFIG_FILE at a nonexistent path.
 	cmd := exec.Command(binPath, "healthcheck")
-	cmd.Env = append(os.Environ(), "LISTEN=:"+port, "CONFIG_FILE=/nonexistent/config.yaml")
+	cmd.Env = append(os.Environ(), "OAICR_LISTEN=:"+port, "OAICR_CONFIG_FILE=/nonexistent/config.yaml")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("healthcheck with wildcard LISTEN failed: %v\n%s", err, out)
+		t.Fatalf("healthcheck with wildcard OAICR_LISTEN failed: %v\n%s", err, out)
 	}
 
 	// Negative: healthcheck against a closed port must exit nonzero.
 	closedPort := freePort(t)
 	cmd = exec.Command(binPath, "healthcheck")
-	cmd.Env = append(os.Environ(), "LISTEN=127.0.0.1:"+closedPort)
+	cmd.Env = append(os.Environ(), "OAICR_LISTEN=127.0.0.1:"+closedPort)
 	if err := cmd.Run(); err == nil {
 		t.Fatal("healthcheck against closed port succeeded, want failure")
 	}

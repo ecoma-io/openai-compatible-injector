@@ -6,8 +6,9 @@
 # not want in the tree (and, if the upstream ever requires credentials, they
 # belong in the Authorization header the client sends, never here).
 #
-# Bootstrap settings (LISTEN, CONFIG_FILE, CONFIG_POLL_INTERVAL,
-# SHUTDOWN_GRACE) come from the environment and do NOT belong in this file.
+# Bootstrap settings (OAICR_LISTEN, OAICR_CONFIG_FILE,
+# OAICR_CONFIG_POLL_INTERVAL, OAICR_SHUTDOWN_GRACE) come from the
+# environment and do NOT belong in this file.
 # A runtime file that tries to define them is rejected by strict decoding —
 # when a bad reload is writing, the last-known-good config keeps serving;
 # when first boot is reading, the process refuses to start.
