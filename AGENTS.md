@@ -27,8 +27,11 @@ Owned decomposition:
 
 ## Non-negotiables
 
-- **Two config planes.** Bootstrap settings (`LISTEN`, `CONFIG_FILE`,
-  `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE`) come from the environment and
+- **Two config planes.** Bootstrap settings (`OAICR_LISTEN`,
+  `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`,
+  `OAICR_SHUTDOWN_GRACE` — every environment variable the service reads is
+  `OAICR_`-prefixed; no unprefixed fallback exists) come from the
+  environment and
   are enforced by the runtime file's strict decoding: a runtime file
   defining them is rejected. The runtime file must be a single YAML
   document — a `---`-separated second document is a rejection (a decoder
@@ -94,7 +97,7 @@ Owned decomposition:
   `Shutdown(grace)` → force `Close()` on overflow → `CloseIdleConnections` →
   exit 0. Second signal forces exit 1; signals after the drain are ignored
   so a late duplicate cannot overwrite the exit code. Compose
-  `stop_grace_period` (60s) > default `SHUTDOWN_GRACE` (55s).
+  `stop_grace_period` (60s) > default `OAICR_SHUTDOWN_GRACE` (55s).
 - **Logging hot-reloads like config, and leaks nothing at any level.**
   `logging.level` lives in the runtime YAML (`debug|info|warn|warning|error`,
   `warning` is an alias, absent = `info`); there is no `LOG_LEVEL` env var.

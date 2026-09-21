@@ -63,22 +63,25 @@ which file to load, how often to poll) come from the **environment**. The
 the **YAML file**. The runtime file cannot redefine bootstrap settings, and
 the environment cannot define models.
 
+Every environment variable the service reads is `OAICR_`-prefixed; the
+service consumes no unprefixed names of its own.
+
 Division of responsibility:
 
-| Concern                                                                   | Where it lives          |
-| ------------------------------------------------------------------------- | ----------------------- |
-| `LISTEN`, `CONFIG_FILE`, `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE`         | Environment (bootstrap) |
-| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}` | YAML file (runtime)     |
-| `logging.level`                                                           | YAML file (runtime)     |
+| Concern                                                                                   | Where it lives          |
+| ----------------------------------------------------------------------------------------- | ----------------------- |
+| `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE` | Environment (bootstrap) |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}`                 | YAML file (runtime)     |
+| `logging.level`                                                                           | YAML file (runtime)     |
 
 ### Bootstrap environment
 
-| Variable               | Default               | Meaning                                                                                                                                                                 |
-| ---------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                        |
-| `CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled                                                                                                                 |
-| `CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                                                                                                                         |
-| `SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain) |
+| Variable                     | Default               | Meaning                                                                                                                                                                 |
+| ---------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OAICR_LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                        |
+| `OAICR_CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled                                                                                                                 |
+| `OAICR_CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                                                                                                                         |
+| `OAICR_SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain) |
 
 There is no `LOG_LEVEL` environment variable — it was removed together with
 the introduction of `logging.level` in the runtime file, which hot-reloads.
@@ -146,8 +149,8 @@ live service; rejecting it lands the reload on the last-known-good path.
 
 ## Hot reload
 
-The process polls `CONFIG_FILE` for a SHA-256 content change every
-`CONFIG_POLL_INTERVAL`. When the content changes:
+The process polls `OAICR_CONFIG_FILE` for a SHA-256 content change every
+`OAICR_CONFIG_POLL_INTERVAL`. When the content changes:
 
 1. New content is parsed and validated.
 2. **Valid** → a new snapshot is published atomically; subsequent requests
@@ -523,10 +526,10 @@ The `healthcheck` subcommand (used by the Docker image and compose) probes
 the running service and requires `200` + `ok\n`:
 
 ```sh
-./openai-compatible-injector healthcheck    # LISTEN env decides what is probed
+./openai-compatible-injector healthcheck    # OAICR_LISTEN env decides what is probed
 ```
 
-It reads only the `LISTEN` environment variable (a wildcard address is
+It reads only the `OAICR_LISTEN` environment variable (a wildcard address is
 rewritten to the loopback) and **never reads the YAML file** — a poisoned
 reload must not fail the container probe.
 
@@ -535,7 +538,7 @@ reload must not fail the container probe.
 On SIGTERM or SIGINT the service stops accepting new connections and drains:
 
 1. `http.Server.Shutdown(grace)` — in-flight requests and streams get up to
-   `SHUTDOWN_GRACE` (default 55s) to complete.
+   `OAICR_SHUTDOWN_GRACE` (default 55s) to complete.
 2. If the budget runs out, `Close()` force-terminates the remainder.
 3. Idle keep-alive connections are closed; the process exits `0`.
 
@@ -550,7 +553,7 @@ budget so Docker's SIGKILL never cuts a drain short.
 ```sh
 docker build --build-arg VERSION=0.1.0-dev -t openai-compatible-injector .
 docker run --rm -p 8080:8080 \
-  -e LISTEN=:8080 -e CONFIG_FILE=/app/config.yaml \
+  -e OAICR_LISTEN=:8080 -e OAICR_CONFIG_FILE=/app/config.yaml \
   -v "$PWD/config.yaml:/app/config.yaml:ro" \
   openai-compatible-injector
 ```

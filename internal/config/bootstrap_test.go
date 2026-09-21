@@ -31,10 +31,10 @@ func TestLoadBootstrapDefaults(t *testing.T) {
 
 func TestLoadBootstrapOverrides(t *testing.T) {
 	b, err := LoadBootstrap(envOf(map[string]string{
-		"LISTEN":               "127.0.0.1:9999",
-		"CONFIG_FILE":          "/tmp/cfg.yaml",
-		"CONFIG_POLL_INTERVAL": "250ms",
-		"SHUTDOWN_GRACE":       "5s",
+		"OAICR_LISTEN":               "127.0.0.1:9999",
+		"OAICR_CONFIG_FILE":          "/tmp/cfg.yaml",
+		"OAICR_CONFIG_POLL_INTERVAL": "250ms",
+		"OAICR_SHUTDOWN_GRACE":       "5s",
 	}))
 	if err != nil {
 		t.Fatalf("LoadBootstrap: %v", err)
@@ -56,13 +56,13 @@ func TestLoadBootstrapErrors(t *testing.T) {
 		env  map[string]string
 		want string // substring of the joined error
 	}{
-		{"bad interval", map[string]string{"CONFIG_POLL_INTERVAL": "soon"}, "CONFIG_POLL_INTERVAL"},
-		{"zero interval", map[string]string{"CONFIG_POLL_INTERVAL": "0s"}, "positive"},
-		{"negative interval", map[string]string{"CONFIG_POLL_INTERVAL": "-1s"}, "positive"},
-		{"bad grace", map[string]string{"SHUTDOWN_GRACE": "abc"}, "SHUTDOWN_GRACE"},
-		{"negative grace", map[string]string{"SHUTDOWN_GRACE": "-2s"}, "positive"},
+		{"bad interval", map[string]string{"OAICR_CONFIG_POLL_INTERVAL": "soon"}, "OAICR_CONFIG_POLL_INTERVAL"},
+		{"zero interval", map[string]string{"OAICR_CONFIG_POLL_INTERVAL": "0s"}, "positive"},
+		{"negative interval", map[string]string{"OAICR_CONFIG_POLL_INTERVAL": "-1s"}, "positive"},
+		{"bad grace", map[string]string{"OAICR_SHUTDOWN_GRACE": "abc"}, "OAICR_SHUTDOWN_GRACE"},
+		{"negative grace", map[string]string{"OAICR_SHUTDOWN_GRACE": "-2s"}, "positive"},
 		// Zero disables the graceful drain entirely — rejected, not honored.
-		{"zero grace", map[string]string{"SHUTDOWN_GRACE": "0s"}, "positive"},
+		{"zero grace", map[string]string{"OAICR_SHUTDOWN_GRACE": "0s"}, "positive"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,15 +74,44 @@ func TestLoadBootstrapErrors(t *testing.T) {
 
 	// Multiple invalid values join into one error.
 	_, err := LoadBootstrap(envOf(map[string]string{
-		"CONFIG_POLL_INTERVAL": "nope",
-		"SHUTDOWN_GRACE":       "also-nope",
+		"OAICR_CONFIG_POLL_INTERVAL": "nope",
+		"OAICR_SHUTDOWN_GRACE":       "also-nope",
 	}))
 	if err == nil {
 		t.Fatal("expected joined error")
 	}
 	joined := err.Error()
-	if !strings.Contains(joined, "CONFIG_POLL_INTERVAL") || !strings.Contains(joined, "SHUTDOWN_GRACE") {
+	if !strings.Contains(joined, "OAICR_CONFIG_POLL_INTERVAL") || !strings.Contains(joined, "OAICR_SHUTDOWN_GRACE") {
 		t.Errorf("joined error missing a field diagnosis: %s", joined)
+	}
+}
+
+// TestLoadBootstrapIgnoresUnprefixedNames pins the namespace contract: the
+// service consumes only OAICR_-prefixed variables. The quiet direction of a
+// prefix rename is an operator still setting an unprefixed name and getting
+// a silently honored override — here the unprefixed names must fall through
+// to the defaults, so a stale deployment variable is inert, never half-read.
+func TestLoadBootstrapIgnoresUnprefixedNames(t *testing.T) {
+	b, err := LoadBootstrap(envOf(map[string]string{
+		"LISTEN":               "127.0.0.1:1",
+		"CONFIG_FILE":          "/elsewhere/config.yaml",
+		"CONFIG_POLL_INTERVAL": "9s",
+		"SHUTDOWN_GRACE":       "9s",
+	}))
+	if err != nil {
+		t.Fatalf("LoadBootstrap: %v", err)
+	}
+	if b.Listen != DefaultListen {
+		t.Errorf("Listen = %q, unprefixed name was honored", b.Listen)
+	}
+	if b.ConfigFile != DefaultConfigFile {
+		t.Errorf("ConfigFile = %q, unprefixed name was honored", b.ConfigFile)
+	}
+	if b.PollInterval != DefaultPollInterval {
+		t.Errorf("PollInterval = %v, unprefixed name was honored", b.PollInterval)
+	}
+	if b.ShutdownGrace != DefaultShutdownGrace {
+		t.Errorf("ShutdownGrace = %v, unprefixed name was honored", b.ShutdownGrace)
 	}
 }
 
@@ -93,8 +122,8 @@ func TestLoadBootstrapErrors(t *testing.T) {
 func TestLoadBootstrapErrorsDoNotEchoValues(t *testing.T) {
 	const marker = "SECRET_DURATION_PASTE"
 	_, err := LoadBootstrap(envOf(map[string]string{
-		"CONFIG_POLL_INTERVAL": marker,
-		"SHUTDOWN_GRACE":       "https://h/v1?" + marker + "=x",
+		"OAICR_CONFIG_POLL_INTERVAL": marker,
+		"OAICR_SHUTDOWN_GRACE":       "https://h/v1?" + marker + "=x",
 	}))
 	if err == nil {
 		t.Fatal("expected rejection")
