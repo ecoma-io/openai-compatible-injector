@@ -212,3 +212,85 @@ func FuzzRewriteModel(f *testing.F) {
 func hasTopLevelResponseKey(body []byte) bool {
 	return bytes.Contains(body, []byte(`"response"`))
 }
+
+// FuzzSynthesizeThinkingUsage pins the synthesizers' load-bearing
+// invariants against arbitrary bytes: they never panic; an inactive plan,
+// invalid JSON, and (valid) input without the "usage" key bytes are all
+// returned byte-identical; an active plan never turns valid JSON into
+// invalid JSON, for EITHER API scope. Which usage objects are found and
+// what the synthesized number is stay the unit table's business — here the
+// gate and validity are the contract, because a violated gate corrupts a
+// client's payload in flight. (Unlike the model rewriters, the two scopes
+// may legitimately disagree on the same body: they differ not only in the
+// response-object descent but in the usage shape's member names.)
+func FuzzSynthesizeThinkingUsage(f *testing.F) {
+	seeds := []string{
+		``,                                    // empty body
+		`   `,                                 // whitespace only
+		`[DONE]`,                              // SSE terminator, not JSON
+		`{"usage":{"completion_tokens":100}}`, // the happy path, no details
+		`{"usage":{"completion_tokens":100,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		`{"usage":{"completion_tokens":100,"reasoning_tokens":40}}`, // reported reasoning wins
+		`{"usage":null}`, // null usage
+		`{"usage":{}}`,   // empty usage
+		`{ "usage" : { "completion_tokens" : 100 } }`,                                   // whitespace framing
+		`{"response":{"usage":{"output_tokens":100}}}`,                                  // responses descent scope
+		`{"usage":{"output_tokens":1e2}}`,                                               // exponent form
+		`{"usage":{"completion_tokens":1e400}}`,                                         // float64-overflow number
+		`{"usage":{"completion_tokens":-3}}`,                                            // negative completion
+		`{"usage":{"completion_tokens":"many"}}`,                                        // non-numeric completion
+		`{"usage":{"completion_tokens":7,"completion_tokens":100}}`,                     // duplicate reads
+		`{"usage":{"completion_tokens":100},"usage":{"completion_tokens":100}}`,         // duplicate usage objects
+		`{"content":"the \"usage\" key in a string","usage":{"completion_tokens":100}}`, // string decoy
+		`{"mödél":"x","usage":{"模型":100,"completion_tokens":100}}`,                      // unicode keys
+		`{"usage":` + strings.Repeat("[", 64) + strings.Repeat("]", 64) + `}`,           // deep nesting
+		`{"usage":{"completion_tokens":` + strings.Repeat("9", 32) + `}}`,               // huge count
+		`{"usage":{"completion_tokens":100`,                                             // truncated JSON
+		`not json`,                                                                      // garbage
+		`data: {"usage":{"completion_tokens":100}}`,                                     // an SSE line fed whole
+	}
+	for _, s := range seeds {
+		f.Add([]byte(s))
+	}
+	rawSeeds := [][]byte{
+		[]byte("\xff"),
+		[]byte("{\"usage\":\xff}"),
+		[]byte("{\"usage\":{\"completion_tokens\":\"a\xffb\"}"),
+		[]byte("\xef\xbb\xbf{\"usage\":{}}"),
+	}
+	for _, b := range rawSeeds {
+		f.Add(b)
+	}
+
+	active := ThinkingPlan{Active: true, Share: 0.75}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		// Inactive plans are pure identity, whatever the bytes.
+		if got := SynthesizeChatThinkingUsage(body, ThinkingPlan{}); !bytes.Equal(got, body) {
+			t.Fatalf("inactive chat plan mutated the body:\n in  %q\n out %q", body, got)
+		}
+		if got := SynthesizeResponsesThinkingUsage(body, ThinkingPlan{}); !bytes.Equal(got, body) {
+			t.Fatalf("inactive responses plan mutated the body:\n in  %q\n out %q", body, got)
+		}
+
+		// The invariants hold for both API scopes; run each.
+		for name, got := range map[string][]byte{
+			"chat":      SynthesizeChatThinkingUsage(body, active),
+			"responses": SynthesizeResponsesThinkingUsage(body, active),
+		} {
+			if !json.Valid(body) {
+				if !bytes.Equal(got, body) {
+					t.Fatalf("%s: invalid input was not returned unchanged:\n in  %q\n out %q", name, body, got)
+				}
+				continue
+			}
+			if !json.Valid(got) {
+				t.Fatalf("%s: synthesis broke JSON validity:\n in  %q\n out %q", name, body, got)
+			}
+			// No in-scope usage object can exist when the exact key bytes
+			// are absent, so the output must be the input, byte for byte.
+			if !bytes.Contains(body, []byte(`"usage"`)) && !bytes.Equal(got, body) {
+				t.Fatalf("%s: no \"usage\" key present, input mutated:\n in  %q\n out %q", name, body, got)
+			}
+		}
+	})
+}

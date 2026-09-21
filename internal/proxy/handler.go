@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -125,11 +126,11 @@ func (h *injectorHandler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "chat", inject.Chat, inject.RewriteChatModel, "/chat/completions")
+	h.serve(w, r, "chat", inject.Chat, inject.RewriteChatModel, inject.SynthesizeChatThinkingUsage, "/chat/completions")
 }
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "responses", inject.Responses, inject.RewriteResponsesModel, "/responses")
+	h.serve(w, r, "responses", inject.Responses, inject.RewriteResponsesModel, inject.SynthesizeResponsesThinkingUsage, "/responses")
 }
 
 // notFound is the catch-all for paths no route matched. The interpolated
@@ -154,12 +155,38 @@ type transformFunc func(body []byte, m config.Model) ([]byte, error)
 // scopes obey the same byte-preserving acceptance rule.
 type rewriteFunc func(body []byte, public string) []byte
 
+// synthesizeFunc is the API-scoped thinking-usage synthesizer
+// (SynthesizeChatThinkingUsage or SynthesizeResponsesThinkingUsage), the
+// response paths' second, optional transform: when the per-request plan is
+// active it splices a reasoning_tokens count into existing usage objects,
+// with the same API-scope split and byte-preserving discipline as
+// rewriteFunc.
+type synthesizeFunc func(body []byte, plan inject.ThinkingPlan) []byte
+
+// thinkingDraw is the share draw the plan resolver consults for ranged
+// ratios — a package var so tests can pin the draw-once contract without
+// reaching into math/rand/v2's process-global state.
+var thinkingDraw = mrand.Float64
+
+// thinkingModeName renders a thinking-usage mode for log metadata.
+func thinkingModeName(mode config.ThinkingMode) string {
+	switch mode {
+	case config.ThinkingAuto:
+		return "auto"
+	case config.ThinkingAlways:
+		return "always"
+	default:
+		return "off"
+	}
+}
+
 // serve runs the full injector flow for one request. One snapshot is loaded
 // at entry and every later step (resolution, transformation, forwarding,
 // trailing rewrite) binds to it.
 //
 // Logging rides the same flow: the DEBUG lifecycle chain (request_received,
-// probe_completed, model_resolved, request_transform_started/completed,
+// probe_completed, model_resolved, thinking_usage_resolved when the model
+// configures the feature, request_transform_started/completed,
 // upstream_request_started, upstream_response_received,
 // response_transform_started/completed, client_write_completed — and for
 // streams stream_started, periodic stream_event_progress, stream_completed),
@@ -167,7 +194,7 @@ type rewriteFunc func(body []byte, public string) []byte
 // outcome, duration, byte counts, snapshot generation), and WARN-level
 // failures split by phase. Metadata only — bodies, prompts, payloads, and
 // Authorization never enter any log event at any level.
-func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, suffix string) {
+func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, synthesize synthesizeFunc, suffix string) {
 	start := time.Now()
 	if r.Method != http.MethodPost {
 		// Outside the request lifecycle: no snapshot is loaded and no
@@ -264,6 +291,34 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 	log.Debug().Str("public_model", m.Public).Str("upstream_model", m.UpstreamModel).
 		Str("upstream", origin(m.Endpoint)).Msg("model_resolved")
+
+	// The thinking-usage plan is resolved once, here, from the same snapshot
+	// and the same request body — before any upstream I/O — so every usage
+	// object this request returns (buffered, or any chunk of the stream)
+	// reports the same share, and a config reload mid-request cannot change
+	// what applies. Metadata only in the event: mode, the request's signal,
+	// the decision. The intent re-read is guarded so a deployment with the
+	// feature configured but debug off never pays a second body parse.
+	plan := inject.ThinkingPlanFor(m.ThinkingUsage, body, thinkingDraw)
+	if m.ThinkingUsage.Mode != config.ThinkingOff {
+		if event := log.Debug(); event.Enabled() {
+			event.Str("mode", thinkingModeName(m.ThinkingUsage.Mode)).
+				Bool("intent", inject.ThinkingIntent(body)).
+				Bool("active", plan.Active).
+				Msg("thinking_usage_resolved")
+		}
+	}
+	// rewriteOut is the single response rewriter both response paths share —
+	// parity by construction: the model rewrite, then, when the plan is
+	// active, the usage synthesis. Under an inactive plan it is exactly
+	// today's model-rewrite closure, byte for byte.
+	rewriteOut := func(payload []byte) []byte {
+		out := rewrite(payload, m.Public)
+		if plan.Active {
+			out = synthesize(out, plan)
+		}
+		return out
+	}
 
 	log.Debug().Int64("bytes_in", bytesIn).Msg("request_transform_started")
 	out, err := transform(body, m)
@@ -381,9 +436,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// that stops advancing. Counts only, never event payloads.
 		flush := flusher(sw)
 		events := 0
-		stats, err := CopySSE(sw, resp.Body, func(payload []byte) []byte {
-			return rewrite(payload, m.Public)
-		}, func() {
+		stats, err := CopySSE(sw, resp.Body, rewriteOut, func() {
 			events++
 			if events%sseProgressEvery == 0 {
 				log.Debug().Str("public_model", model).
@@ -457,7 +510,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		return
 	}
 	log.Debug().Int64("bytes_in", int64(len(upstreamBody))).Msg("response_transform_started")
-	rewritten := rewrite(upstreamBody, m.Public)
+	rewritten := rewriteOut(upstreamBody)
 	log.Debug().Int64("bytes_out", int64(len(rewritten))).Msg("response_transform_completed")
 	copyRelayHeaders(sw.Header(), resp.Header)
 	sw.WriteHeader(resp.StatusCode)
