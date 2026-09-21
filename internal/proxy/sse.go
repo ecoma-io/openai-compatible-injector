@@ -11,6 +11,7 @@ import (
 var (
 	sseDataPrefix = []byte("data:")
 	sseModelKey   = []byte(`"model"`)
+	sseUsageKey   = []byte(`"usage"`)
 )
 
 // Bounded SSE input. Without caps, a single upstream line without a
@@ -49,9 +50,10 @@ var (
 )
 
 // CopySSE incrementally passes an upstream SSE stream through to dst,
-// rewriting the model field inside data lines via the API-scoped rewriter
-// the caller supplies (RewriteChatModel or RewriteResponsesModel — the
-// stream must obey its API's rewrite scope exactly like the buffered path).
+// rewriting data-line payloads via the API-scoped rewriter the caller
+// supplies (the model rewrite composed with, when its plan is active, the
+// thinking-usage synthesis — the stream must obey its API's rewrite scope
+// exactly like the buffered path).
 // It never buffers the whole stream: lines are read one at a time under
 // hard caps (MaxLineBytes per line, MaxEventBytes per in-flight event),
 // each line is written out immediately, and flush is invoked at every event
@@ -62,12 +64,17 @@ var (
 //
 // Only lines beginning with "data:" are candidates for rewriting, and only
 // when the payload (bytes after "data:" plus one optional space) contains
-// `"model"`; payload validation and the rewrite itself are delegated to the
+// `"model"` or `"usage"` — the two keys the caller's rewriter owns (the
+// model rewrite always; the usage synthesis when its per-request plan is
+// active). Payload validation and the rewrite itself are delegated to the
 // caller's rewriter, whose acceptance rule is identical to the buffered
 // response path — a deliberate parity: a stream and a buffered body with
-// the same JSON are rewritten identically. The line is re-emitted with the
-// original prefix, separator, and line terminator. Comments, event lines,
-// blank lines, and terminators such as [DONE] pass through byte-for-byte.
+// the same JSON are rewritten identically. When the synthesis is inactive
+// the composed rewriter returns its input unchanged, so a usage-only line
+// takes the no-op shortcut and the wire stays byte-identical. The line is
+// re-emitted with the original prefix, separator, and line terminator.
+// Comments, event lines, blank lines, and terminators such as [DONE] pass
+// through byte-for-byte.
 //
 // Limit breaches stop the relay: the offending (partial) line is never
 // written, no further reads happen, and the returned error wraps
@@ -76,7 +83,6 @@ var (
 // error is returned so the caller can truncate the stream. A failure
 // writing to dst is returned wrapped in *streamWriteError — the client side
 // went away — so the caller can log the two truncation causes apart.
-// Nothing is ever synthesized.
 func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func()) (StreamStats, error) {
 	var stats StreamStats
 	br := bufio.NewReaderSize(src, sseReadBuffer)
@@ -208,8 +214,8 @@ func isEventBoundary(line []byte) bool {
 }
 
 // rewriteSSELine applies the data-line rewrite rule to a single raw line,
-// terminator included. Anything that is not a data line carrying a model
-// string is returned unchanged. The rewriter is the API-scoped function the
+// terminator included. Anything that is not a data line carrying a model or
+// usage key is returned unchanged. The rewriter is the composed function the
 // caller chose; its no-op contract (input returned unchanged when nothing
 // is in scope) is what the pointer-identity shortcut below relies on.
 func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
@@ -225,7 +231,7 @@ func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
 		sep = payload[:1]
 		payload = payload[1:]
 	}
-	if !bytes.Contains(payload, sseModelKey) {
+	if !bytes.Contains(payload, sseModelKey) && !bytes.Contains(payload, sseUsageKey) {
 		return line
 	}
 	out := rewrite(payload)

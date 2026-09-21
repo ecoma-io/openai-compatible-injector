@@ -5,14 +5,20 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"openai-compatible-injector/internal/inject"
 )
 
 // FuzzRewriteSSELine pins the per-line rewrite rule against arbitrary line
 // bytes: it never panics; a line that is not a data line — or a data line
-// whose payload either never mentions "model" or is not valid JSON — comes
-// back byte-identical, terminator included; and when a valid-JSON payload is
+// whose payload never mentions "model" or "usage" — comes back
+// byte-identical, terminator included; and when a valid-JSON payload is
 // rewritten, the rebuilt line keeps its framing ("data:" prefix, line
-// terminator) and the rewritten payload is still valid JSON.
+// terminator) and the rewritten payload is still valid JSON. The rewriter
+// under test is the handler's composed closure (model rewrite plus, under
+// an active plan, the thinking-usage synthesis), so both transforms' line
+// invariants are pinned in one pass; an inactive-plan variant asserts the
+// whole pipeline stays byte-identical whatever the bytes.
 func FuzzRewriteSSELine(f *testing.F) {
 	seeds := []string{
 		``,                                      // empty line
@@ -27,19 +33,25 @@ func FuzzRewriteSSELine(f *testing.F) {
 		"data: {\"model\": \"unterminated\n",    // unterminated string
 		"data: {\"model\":\"upstream-name\"}\n", // the happy path, LF
 		"data:{\"model\":\"upstream-name\"}\n",  // no separator space
-		"data:   {\"model\":\"upstream-name\"}\n",   // extra leading spaces
-		"data: {\"model\":\"upstream-name\"}\r\n",   // CRLF terminator
-		"data: {\"model\":\"upstream-name\"}",       // partial final line, no terminator
-		"event: {\"model\":\"upstream-name\"}\n",    // event line is not a data line
-		": keep-alive {\"model\":\"x\"}\n",          // comment line
-		"retry: 100\n",                              // other SSE field
-		"DATA: {\"model\":\"x\"}\n",                 // prefix matching is case-sensitive
-		"data",                                      // bare prefix with no colon
-		"data: {\"temperature\":0.7}\n",             // JSON without a model key
-		"data: \"the \\\"model\\\" key\"\n",         // model text inside a string value
-		"data: {\"model\":\"x\",\"n\":1e400}\n",     // float64-overflow number
-		"data: {\"model\":\"x\",\"n\":-1.5e-300}\n", // negative numbers
-		"data: {\"模型\":\"x\",\"mödél\":\"y\"}\n",    // unicode keys
+		"data:   {\"model\":\"upstream-name\"}\n",                                                   // extra leading spaces
+		"data: {\"model\":\"upstream-name\"}\r\n",                                                   // CRLF terminator
+		"data: {\"model\":\"upstream-name\"}",                                                       // partial final line, no terminator
+		"event: {\"model\":\"upstream-name\"}\n",                                                    // event line is not a data line
+		": keep-alive {\"model\":\"x\"}\n",                                                          // comment line
+		"retry: 100\n",                                                                              // other SSE field
+		"DATA: {\"model\":\"x\"}\n",                                                                 // prefix matching is case-sensitive
+		"data",                                                                                      // bare prefix with no colon
+		"data: {\"temperature\":0.7}\n",                                                             // JSON without a model key
+		"data: \"the \\\"model\\\" key\"\n",                                                         // model text inside a string value
+		"data: {\"model\":\"x\",\"n\":1e400}\n",                                                     // float64-overflow number
+		"data: {\"model\":\"x\",\"n\":-1.5e-300}\n",                                                 // negative numbers
+		"data: {\"模型\":\"x\",\"mödél\":\"y\"}\n",                                                    // unicode keys
+		"data: {\"usage\":{\"completion_tokens\":100}}\n",                                           // usage-only, the widened gate
+		"data: {\"usage\":{\"output_tokens\":100,\"output_tokens_details\":{}}}\n",                  // responses shape, empty details
+		"data: {\"usage\":{\"completion_tokens\":100,\"reasoning_tokens\":40}}\n",                   // reported reasoning wins
+		"data: {\"response\":{\"usage\":{\"output_tokens\":1e2}}}\n",                                // responses descent scope
+		"data: \"the \\\"usage\\\" key\"\n",                                                         // usage text inside a string value
+		"data: {\"usage\":{\"completion_tokens\":\"many\"}}\n",                                      // non-numeric completion
 		"data: {\"model\":\"x\",\"a\":" + strings.Repeat("[", 64) + strings.Repeat("]", 64) + "}\n", // deep nesting
 		"data: {\"model\":\"" + strings.Repeat("x", 8192) + "\"}\n",                                 // huge string value
 	}
@@ -53,19 +65,28 @@ func FuzzRewriteSSELine(f *testing.F) {
 		[]byte("data: \xff\n"),
 		[]byte("\r"),
 		[]byte("data: {\"model\":\"x\"}\r"),
+		[]byte("data: {\"usage\":{\"completion_tokens\":\xff}}\n"),
 	}
 	for _, b := range rawSeeds {
 		f.Add(b)
 	}
 
 	const public = "public-name"
+	active := inject.ThinkingPlan{Active: true, Share: 0.75}
+	composed := func(p []byte) []byte {
+		out := inject.RewriteChatModel(p, public)
+		return inject.SynthesizeChatThinkingUsage(out, active)
+	}
 	f.Fuzz(func(t *testing.T, line []byte) {
-		got := rewriteSSELine(line, sseRewriter(public))
+		// Inactive plan: the composed rewriter degenerates to the model
+		// rewrite, byte for byte, whatever the line.
+		inactiveOut := rewriteSSELine(line, sseRewriter(public))
+		got := rewriteSSELine(line, composed)
 
 		content, term := splitSSELineTerminator(line)
 		rest, isData := bytes.CutPrefix(content, sseDataPrefix)
 		if !isData {
-			if !bytes.Equal(got, line) {
+			if !bytes.Equal(got, line) || !bytes.Equal(inactiveOut, line) {
 				t.Fatalf("non-data line mutated:\n in  %q\n out %q", line, got)
 			}
 			return
@@ -74,38 +95,49 @@ func FuzzRewriteSSELine(f *testing.F) {
 		if len(payload) > 0 && payload[0] == ' ' {
 			payload = payload[1:]
 		}
-		if !bytes.Contains(payload, sseModelKey) {
-			if !bytes.Equal(got, line) {
-				t.Fatalf("data line without a \"model\" key mutated:\n in  %q\n out %q", line, got)
+		if !bytes.Contains(payload, sseModelKey) && !bytes.Contains(payload, sseUsageKey) {
+			if !bytes.Equal(got, line) || !bytes.Equal(inactiveOut, line) {
+				t.Fatalf("data line without a \"model\" or \"usage\" key mutated:\n in  %q\n out %q", line, got)
 			}
 			return
 		}
 		if !json.Valid(payload) {
-			if !bytes.Equal(got, line) {
+			if !bytes.Equal(got, line) || !bytes.Equal(inactiveOut, line) {
 				t.Fatalf("data line with an invalid-JSON payload mutated:\n in  %q\n out %q", line, got)
 			}
 			return
 		}
 
 		// A candidate payload: untouched, or rebuilt without losing the
-		// framing and without breaking the JSON.
-		if bytes.Equal(got, line) {
-			return
-		}
-		outContent, outTerm := splitSSELineTerminator(got)
-		if !bytes.Equal(outTerm, term) {
-			t.Fatalf("line terminator changed by the rewrite:\n in  %q\n out %q", line, got)
-		}
-		outRest, ok := bytes.CutPrefix(outContent, sseDataPrefix)
-		if !ok {
-			t.Fatalf("data: prefix lost by the rewrite:\n in  %q\n out %q", line, got)
-		}
-		outPayload := outRest
-		if len(outPayload) > 0 && outPayload[0] == ' ' {
-			outPayload = outPayload[1:]
-		}
-		if !json.Valid(outPayload) {
-			t.Fatalf("rewrite broke payload JSON validity:\n in  %q\n out %q", line, got)
+		// framing and without breaking the JSON. The inactive variant's own
+		// output obeys the same framing rule and stays valid JSON.
+		for name, out := range map[string][]byte{"active": got, "inactive": inactiveOut} {
+			checkCandidate(t, name, line, out, term)
 		}
 	})
+}
+
+// checkCandidate asserts one rewritten candidate line: either byte-identical
+// to the input, or rebuilt with the original "data:" framing, the original
+// line terminator, and a still-valid JSON payload.
+func checkCandidate(t *testing.T, name string, line, got, term []byte) {
+	t.Helper()
+	if bytes.Equal(got, line) {
+		return
+	}
+	outContent, outTerm := splitSSELineTerminator(got)
+	if !bytes.Equal(outTerm, term) {
+		t.Fatalf("%s: line terminator changed by the rewrite:\n in  %q\n out %q", name, line, got)
+	}
+	outRest, ok := bytes.CutPrefix(outContent, sseDataPrefix)
+	if !ok {
+		t.Fatalf("%s: data: prefix lost by the rewrite:\n in  %q\n out %q", name, line, got)
+	}
+	outPayload := outRest
+	if len(outPayload) > 0 && outPayload[0] == ' ' {
+		outPayload = outPayload[1:]
+	}
+	if !json.Valid(outPayload) {
+		t.Fatalf("%s: rewrite broke payload JSON validity:\n in  %q\n out %q", name, line, got)
+	}
 }
