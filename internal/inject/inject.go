@@ -4,7 +4,11 @@
 // prompt into the payload. It also provides Probe, a cheap request-routing
 // extractor, and RewriteChatModel/RewriteResponsesModel, byte-preserving
 // rewriters with per-API scope used to sanitize streamed chunks before they
-// are relayed back to clients.
+// are relayed back to clients. On the response side it carries the simulated
+// thinking-usage transforms: ThinkingPlanFor resolves a per-request plan
+// (mode, intent, share drawn once) and SynthesizeChatThinkingUsage/
+// SynthesizeResponsesThinkingUsage enrich existing usage objects with the
+// API-native reasoning details field, byte-preserving outside that member.
 package inject
 
 import (

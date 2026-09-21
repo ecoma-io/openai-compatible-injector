@@ -122,7 +122,8 @@ logging:
   share of output tokens attributed to thinking (each optional, finite, in
   `[0,1]`, with `min-ratio ≤ max-ratio`; both absent → fixed `0.75`, one set →
   fixed to it). An absent or null block means off — responses stay
-  byte-identical to an unconfigured deployment.
+  byte-identical to an unconfigured deployment. See
+  [Simulated thinking usage](#simulated-thinking-usage).
 
 The file is validated strictly, in two layers:
 
@@ -254,6 +255,80 @@ whitespace byte, key order, unknown fields — is forwarded exactly as
 received. A response whose JSON cannot be parsed is forwarded byte-for-byte
 unchanged.
 
+## Simulated thinking usage
+
+Some upstream models reason internally but never report it: their usage
+objects count completion tokens with no reasoning breakdown, and client tools
+that display — or gate — on `reasoning_tokens` misbehave. A model entry can
+opt into synthesizing that number on the client-facing side:
+
+```yaml
+models:
+  deep-thinker:
+    endpoint: https://api.provider.example/v1
+    upstream-model: some-reasoner
+    thinking-usage:
+      mode: auto # or always | off
+      min-ratio: 0.6
+      max-ratio: 0.9
+```
+
+The synthesis is **response-side only** — the request is forwarded untouched.
+
+| Mode     | When the count is synthesized                             |
+| -------- | --------------------------------------------------------- |
+| `off`    | Never — also what an absent or `null` block means         |
+| `auto`   | Only when the request itself signals thinking (see below) |
+| `always` | Every request for the model, whatever the request says    |
+
+**The number.** Each usage object in the response gains
+`floor(share × completion_tokens)` in chat (`floor(share × output_tokens)` in
+responses), written into the API-native details field:
+`usage.completion_tokens_details.reasoning_tokens` for chat,
+`usage.output_tokens_details.reasoning_tokens` for responses. The share is
+drawn **once per request** from `min-ratio`/`max-ratio` — both set → uniform
+in `[min, max]`; exactly one set → fixed to it; neither → fixed `0.75` — and
+the draw happens before any upstream I/O. Every usage object in the request,
+a stream's intermediate chunks included, reports the same share; a reload
+mid-request cannot change it, because the plan is bound to the request's
+[config snapshot](#hot-reload) like everything else.
+
+**When the upstream speaks, it wins.** A usage object that already reports
+reasoning — a direct `reasoning_tokens`, or a details object whose
+`reasoning_tokens` is anything above zero — passes untouched. A details
+`reasoning_tokens` of exactly `0` is the "never reported" case and receives
+the synthesized number; a non-object details value is replaced by the details
+object. Completions of 10 tokens or fewer synthesize `0` — a fraction of
+nothing is nothing.
+
+**Intent signals (`mode: auto`).** A request counts as signaling thinking
+when any of: `reasoning_effort` is a string other than `"none"` (the value
+`"none"` is explicitly off), `reasoning.effort` likewise, `enable_thinking`
+is `true`, or `thinking.type` is `"enabled"`. Each signal is read
+independently and leniently — an unparseable one is ignored, never fatal.
+
+**Scope and limits.**
+
+- Both API surfaces, buffered and streamed. One composed rewriter — the model
+  rename plus, when the plan is active, the synthesis — serves the buffered
+  and SSE paths, so a stream chunk and a buffered body carrying the same
+  JSON rewrite to the same bytes, by construction.
+- **Only existing usage objects are enriched.** A response with no usage
+  object never gains one; the synthesis never fabricates a usage block and
+  never touches `completion_tokens`, `output_tokens` or totals.
+- Like the model rewrite, the edit is byte-preserving around itself: key
+  order, whitespace and unknown fields all survive; a payload that cannot be
+  parsed is forwarded byte-for-byte.
+- Scope mirrors the model rewrite: chat owns the top-level `usage`; responses
+  owns the top-level `usage` and the one inside the top-level `response`
+  envelope object. Anything nested deeper is client data.
+- Fail-open everywhere: a malformed usage object, non-numeric counts or a
+  missing completion field leave that object untouched.
+
+With no `thinking-usage` block on the model, the composed rewriter degenerates
+to the plain model rename and both response paths are byte-identical to an
+unconfigured deployment.
+
 ## Streaming
 
 SSE streams pass through **incrementally, line by line** — nothing is
@@ -277,7 +352,10 @@ live stream with correct per-chunk latency. Behavior:
   rewritten — the top-level key (and, for responses, the envelope's
   `response.model`). Model text appearing anywhere else in the payload — a
   substring of a message, another field's value — never matches.
-  `event:`, comments, and non-model `data:` lines pass through verbatim.
+  `event:`, comments, and other `data:` lines pass through verbatim. When
+  [thinking-usage](#simulated-thinking-usage) synthesis is active for the
+  model, a `data:` line carrying a `usage` object is a rewrite candidate
+  too.
 - Malformed lines are forwarded verbatim. We are a passthrough, not an SSE
   validator.
 - Known limitation: lines are terminated by `\n` (with `\r\n` accepted) —
@@ -371,7 +449,9 @@ What each level carries:
 - **DEBUG** — the full request lifecycle, every event bound to its
   `request_id`: `request_received` (method/path/remote address),
   `probe_completed` (model + stream flag), `model_resolved` (public model,
-  upstream model, upstream scheme+host origin), `request_transform_started`/
+  upstream model, upstream scheme+host origin), `thinking_usage_resolved`
+  (mode, whether the request signaled intent, whether synthesis is active —
+  models with a `thinking-usage` block only), `request_transform_started`/
   `request_transform_completed` (byte counts around prompt injection),
   `upstream_request_started` (origin + forwarded byte count),
   `upstream_response_received` (upstream status + content type). From there
@@ -567,7 +647,7 @@ Decided, and not coming back without a design discussion:
 ```
 cmd/openai-compatible-injector/  entrypoint + version/healthcheck subcommands
 internal/config/                 bootstrap, runtime YAML, snapshot store, poller
-internal/inject/                 pure request transforms (probe, chat, responses, rewrite)
+internal/inject/                 pure request/response transforms (probe, chat, responses, rewrite, thinking usage)
 internal/proxy/                  handler, upstream client, SSE copy, error envelopes
 internal/server/                 listener + graceful shutdown
 e2e/                             black-box subprocess suite

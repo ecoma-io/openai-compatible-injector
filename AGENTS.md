@@ -16,14 +16,14 @@ streaming passthrough.
 
 Owned decomposition:
 
-| Directory                        | Owns                                                                                                                                                                                                                                                  |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, log level via `ParseLogLevel`), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped)                                                                                            |
-| `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`)                                                                                                                                                                        |
-| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                               |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                       |
-| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                               |
+| Directory                        | Owns                                                                                                                                                                                                                                                                                                           |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, log level via `ParseLogLevel`), thinking-usage validation/normalization in `buildModel`, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
+| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                           |
+| `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis)                                                                                                                                             |
+| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                        |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                |
+| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                        |
 
 ## Non-negotiables
 
@@ -54,6 +54,27 @@ Owned decomposition:
   string-state-aware scan; unparseable input returns the input unchanged.
   Never re-serialize. Every call site (chat/responses × buffered/SSE) uses
   its own API's function.
+- **Simulated thinking usage is opt-in, response-side, and fail-open.**
+  A model's `thinking-usage` block (absent/null = off, the zero value)
+  enriches existing client-facing usage objects with
+  `floor(share × completion tokens)` (responses: `output tokens`), written
+  into the API-native details field (`completion_tokens_details`/
+  `output_tokens_details.reasoning_tokens`) under the API's own scope
+  (responses also descends into the top-level `response` envelope). The
+  share comes from `min-ratio`/`max-ratio` (both unset → 0.75, one → fixed,
+  both → per-request uniform draw) and is drawn ONCE per request, before any
+  upstream I/O, bound to the request's snapshot — every usage object in the
+  request, streamed chunks included, reports the same share. Upstream-reported
+  reasoning always wins (direct `reasoning_tokens`, or details > 0);
+  completion ≤ 10 → 0; `mode: auto` activates only on the request's own
+  thinking signals (`reasoning_effort`/`reasoning.effort` ≠ `"none"`,
+  `enable_thinking`, `thinking.type == "enabled"`). Never fabricates a usage
+  object, never touches other members, byte-preserving outside the single
+  inserted/replaced details member. Buffered and SSE paths share one composed
+  rewriter (`rewriteOut`), so parity is by construction; the SSE data-line
+  gate accepts `"usage"` as well as `"model"`. Default off = byte-identical
+  traffic, structurally: the zero-value plan is inactive and the composed
+  rewriter degenerates to the model rename.
 - **Streaming branches on the URL path**, not the body: chat = `data:`
   lines + `data: [DONE]`; responses = `event:`+`data:` pairs, no `[DONE]`
   (Responses termination events pass through untouched). `CopySSE` flushes
