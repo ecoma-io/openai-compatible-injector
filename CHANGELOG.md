@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.3.0...v0.4.0) (2026-09-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** read only OAICR_-prefixed bootstrap env vars ([#21](https://github.com/ecoma-io/openai-compatible-injector/issues/21))
+
+### Features
+
+* **config:** read only OAICR_-prefixed bootstrap env vars ([#21](https://github.com/ecoma-io/openai-compatible-injector/issues/21)) ([48bb953](https://github.com/ecoma-io/openai-compatible-injector/commit/48bb95316763329c2250fa0dc11e9b099f0764f0))
+* **workspace:** default VERSION build-arg to dev, drop compose build args ([#22](https://github.com/ecoma-io/openai-compatible-injector/issues/22)) ([0733470](https://github.com/ecoma-io/openai-compatible-injector/commit/0733470b927fb765b2afadb2231d631393699887))
+
 ## [0.3.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.2.0...v0.3.0) (2026-09-21)
 
 
