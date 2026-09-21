@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.2.0...v0.3.0) (2026-09-21)
+
+
+### Features
+
+* **config:** per-model thinking-usage block ([#16](https://github.com/ecoma-io/openai-compatible-injector/issues/16)) ([b77fde7](https://github.com/ecoma-io/openai-compatible-injector/commit/b77fde77b4dd19d78855bc5108f6f044921d5e78))
+* simulated thinking-usage synthesis (inject + proxy + e2e) ([#17](https://github.com/ecoma-io/openai-compatible-injector/issues/17)) ([4412632](https://github.com/ecoma-io/openai-compatible-injector/commit/4412632d312a4267173fe4343fd3dcb1b1644de3))
+
 ## [0.2.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.1.0...v0.2.0) (2026-09-20)
 
 
