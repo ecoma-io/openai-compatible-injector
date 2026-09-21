@@ -40,6 +40,21 @@ models:
     injection-prompt: |
       Review the following code rigorously. Report every bug you can find,
       ordered by severity, and suggest a fix for each.
+    # Optional. Simulated thinking-usage synthesis: attribute a share of the
+    # upstream-reported output tokens to thinking in the client-facing usage
+    # object, for upstream models that reason without ever reporting
+    # reasoning tokens. Absent or null (like echo-model below) means the
+    # feature is off and responses stay byte-identical.
+    thinking-usage:
+      # Required when the block is present: auto (only when the request
+      # signals thinking), always (every request, overriding the request's
+      # signal), or off.
+      mode: auto
+      # Optional share bounds, each a finite number in [0,1] with
+      # min-ratio <= max-ratio. Both omitted -> fixed 0.75; one set -> fixed
+      # to it; both set -> the share is drawn per request in this range.
+      min-ratio: 0.6
+      max-ratio: 0.9
 
   # A second example, without injection — pure model renaming.
   echo-model:

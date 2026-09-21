@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"regexp"
 	"sort"
@@ -105,9 +106,19 @@ type runtimeLogging struct {
 }
 
 type runtimeModel struct {
-	Endpoint        string `yaml:"endpoint"`
-	UpstreamModel   string `yaml:"upstream-model"`
-	InjectionPrompt string `yaml:"injection-prompt"`
+	Endpoint        string                `yaml:"endpoint"`
+	UpstreamModel   string                `yaml:"upstream-model"`
+	InjectionPrompt string                `yaml:"injection-prompt"`
+	ThinkingUsage   *runtimeThinkingUsage `yaml:"thinking-usage"`
+}
+
+// runtimeThinkingUsage mirrors the optional per-model thinking-usage block.
+// The pointer distinguishes an absent or null block (feature off) from a
+// present-but-empty one, which rejects on the missing mode.
+type runtimeThinkingUsage struct {
+	Mode     string   `yaml:"mode"`
+	MinRatio *float64 `yaml:"min-ratio"`
+	MaxRatio *float64 `yaml:"max-ratio"`
 }
 
 // LoadRuntime parses and validates runtime configuration bytes into an
@@ -261,10 +272,79 @@ func buildModel(name string, rm runtimeModel) (Model, error) {
 	if strings.TrimSpace(rm.UpstreamModel) == "" {
 		return Model{}, errors.New("upstream-model is required")
 	}
+	tu, err := buildThinkingUsage(rm.ThinkingUsage)
+	if err != nil {
+		return Model{}, err
+	}
 	return Model{
 		Public:          name,
 		Endpoint:        u,
 		UpstreamModel:   rm.UpstreamModel,
 		InjectionPrompt: rm.InjectionPrompt,
+		ThinkingUsage:   tu,
 	}, nil
+}
+
+// defaultThinkingShare is the share of output tokens attributed to thinking
+// when a thinking-usage block configures no ratio bounds (both absent). One
+// bound set pins the share to it; both set leave the [Lo, Hi] range intact.
+const defaultThinkingShare = 0.75
+
+// buildThinkingUsage validates and normalizes the optional thinking-usage
+// block. Every message is fixed text: value positions can carry a botched
+// paste of anything, so neither the mode string nor the ratios are echoed.
+// A block configured under mode off is validated like any other — a bad
+// ratio in a disabled block is still a config error — but normalizes to the
+// off mode, behaviorally identical to no block at all.
+func buildThinkingUsage(rt *runtimeThinkingUsage) (ThinkingUsage, error) {
+	if rt == nil {
+		return ThinkingUsage{}, nil
+	}
+	var mode ThinkingMode
+	switch rt.Mode {
+	case "":
+		return ThinkingUsage{}, errors.New("thinking-usage: mode is required (auto, always, off)")
+	case "auto":
+		mode = ThinkingAuto
+	case "always":
+		mode = ThinkingAlways
+	case "off":
+		mode = ThinkingOff
+	default:
+		return ThinkingUsage{}, errors.New("thinking-usage: mode must be one of auto, always, off")
+	}
+	lo, err := thinkingRatio(rt.MinRatio, "min-ratio")
+	if err != nil {
+		return ThinkingUsage{}, err
+	}
+	hi, err := thinkingRatio(rt.MaxRatio, "max-ratio")
+	if err != nil {
+		return ThinkingUsage{}, err
+	}
+	if lo != nil && hi != nil && *lo > *hi {
+		return ThinkingUsage{}, errors.New("thinking-usage: min-ratio must not exceed max-ratio")
+	}
+	share := ThinkingUsage{Mode: mode, Lo: defaultThinkingShare, Hi: defaultThinkingShare}
+	switch {
+	case lo != nil && hi != nil:
+		share.Lo, share.Hi = *lo, *hi
+	case lo != nil:
+		share.Lo, share.Hi = *lo, *lo
+	case hi != nil:
+		share.Lo, share.Hi = *hi, *hi
+	}
+	return share, nil
+}
+
+// thinkingRatio validates one optional ratio bound. Finiteness is explicit:
+// YAML's .nan and .inf decode straight into float64 and NaN defeats every
+// comparison, range and ordering alike.
+func thinkingRatio(v *float64, name string) (*float64, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if math.IsNaN(*v) || math.IsInf(*v, 0) || *v < 0 || *v > 1 {
+		return nil, fmt.Errorf("thinking-usage: %s must be a number between 0 and 1", name)
+	}
+	return v, nil
 }

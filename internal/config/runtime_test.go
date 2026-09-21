@@ -317,6 +317,90 @@ models:
 // leading separator is part of document one (accepted), a trailing bare
 // separator IS a second — null — document (rejected, same as any second
 // document), and blank trailing lines are nothing at all (accepted).
+// TestLoadRuntimeThinkingUsageValidation pins the thinking-usage block's
+// reject matrix: a present block demands a known mode, ratios are finite,
+// bounded to [0,1], and ordered, and no rejection text echoes the configured
+// values. YAML's .nan and .inf decode straight into float64 and NaN defeats
+// every comparison, so those are rejected by name here.
+func TestLoadRuntimeThinkingUsageValidation(t *testing.T) {
+	entry := func(block string) string {
+		return "models:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n" + block
+	}
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"empty block", entry("    thinking-usage: {}\n"), "mode is required"},
+		{"mode omitted with ratios", entry("    thinking-usage:\n      min-ratio: 0.5\n"), "mode is required"},
+		{"unknown mode", entry("    thinking-usage:\n      mode: nonsense-SECRET\n"), "mode must be one of auto, always, off"},
+		{"uppercase mode", entry("    thinking-usage:\n      mode: Always\n"), "mode must be one of auto, always, off"},
+		{"min below range", entry("    thinking-usage:\n      mode: auto\n      min-ratio: -0.1\n"), "min-ratio must be a number between 0 and 1"},
+		{"max above range", entry("    thinking-usage:\n      mode: auto\n      max-ratio: 1.1\n"), "max-ratio must be a number between 0 and 1"},
+		{"nan min", entry("    thinking-usage:\n      mode: auto\n      min-ratio: .nan\n"), "min-ratio must be a number between 0 and 1"},
+		{"inf max", entry("    thinking-usage:\n      mode: auto\n      max-ratio: .inf\n"), "max-ratio must be a number between 0 and 1"},
+		{"negative inf min", entry("    thinking-usage:\n      mode: auto\n      min-ratio: -.inf\n"), "min-ratio must be a number between 0 and 1"},
+		{"min above max", entry("    thinking-usage:\n      mode: always\n      min-ratio: 0.9\n      max-ratio: 0.1\n"), "min-ratio must not exceed max-ratio"},
+		{"ratios still validated under off", entry("    thinking-usage:\n      mode: off\n      min-ratio: 2\n"), "min-ratio must be a number between 0 and 1"},
+		{"unknown nested key", entry("    thinking-usage:\n      mode: auto\n      ratio: 0.5\n"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want containing %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "nonsense-SECRET") {
+				t.Errorf("error text echoes the configured mode value: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadRuntimeThinkingUsageNormalization pins the accept side: absent or
+// null is off with a zero-valued config (the response plane's byte-identity
+// default), and the share bounds normalize — both unset to the fixed
+// default, one set pinned to it, both kept as the [Lo, Hi] range.
+func TestLoadRuntimeThinkingUsageNormalization(t *testing.T) {
+	entry := func(block string) string {
+		return "models:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n" + block
+	}
+	cases := []struct {
+		name  string
+		block string
+		mode  ThinkingMode
+		lo    float64
+		hi    float64
+	}{
+		{"absent block stays off", "", ThinkingOff, 0, 0},
+		{"null block stays off", "    thinking-usage:\n", ThinkingOff, 0, 0},
+		{"explicit off", "    thinking-usage:\n      mode: off\n", ThinkingOff, defaultThinkingShare, defaultThinkingShare},
+		{"auto default share", "    thinking-usage:\n      mode: auto\n", ThinkingAuto, defaultThinkingShare, defaultThinkingShare},
+		{"always default share", "    thinking-usage:\n      mode: always\n", ThinkingAlways, defaultThinkingShare, defaultThinkingShare},
+		{"min only pins both", "    thinking-usage:\n      mode: auto\n      min-ratio: 0.6\n", ThinkingAuto, 0.6, 0.6},
+		{"max only pins both", "    thinking-usage:\n      mode: auto\n      max-ratio: 0.4\n", ThinkingAuto, 0.4, 0.4},
+		{"both keep range", "    thinking-usage:\n      mode: always\n      min-ratio: 0.6\n      max-ratio: 0.9\n", ThinkingAlways, 0.6, 0.9},
+		{"equal bounds", "    thinking-usage:\n      mode: auto\n      min-ratio: 0.5\n      max-ratio: 0.5\n", ThinkingAuto, 0.5, 0.5},
+		{"zero share", "    thinking-usage:\n      mode: auto\n      min-ratio: 0\n      max-ratio: 0\n", ThinkingAuto, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := mustSnapshot(t, entry(tc.block))
+			m, ok := s.Model("a")
+			if !ok {
+				t.Fatal("model a not found")
+			}
+			tu := m.ThinkingUsage
+			if tu.Mode != tc.mode || tu.Lo != tc.lo || tu.Hi != tc.hi {
+				t.Fatalf("ThinkingUsage = %+v, want mode %d lo %v hi %v", tu, tc.mode, tc.lo, tc.hi)
+			}
+		})
+	}
+}
+
 func TestLoadRuntimeDocumentEdges(t *testing.T) {
 	tests := []struct {
 		name string

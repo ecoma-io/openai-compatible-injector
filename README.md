@@ -65,11 +65,11 @@ the environment cannot define models.
 
 Division of responsibility:
 
-| Concern                                                           | Where it lives          |
-| ----------------------------------------------------------------- | ----------------------- |
-| `LISTEN`, `CONFIG_FILE`, `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE` | Environment (bootstrap) |
-| `models.<name>.{endpoint,upstream-model,injection-prompt}`        | YAML file (runtime)     |
-| `logging.level`                                                   | YAML file (runtime)     |
+| Concern                                                                   | Where it lives          |
+| ------------------------------------------------------------------------- | ----------------------- |
+| `LISTEN`, `CONFIG_FILE`, `CONFIG_POLL_INTERVAL`, `SHUTDOWN_GRACE`         | Environment (bootstrap) |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}` | YAML file (runtime)     |
+| `logging.level`                                                           | YAML file (runtime)     |
 
 ### Bootstrap environment
 
@@ -96,6 +96,10 @@ models:
     injection-prompt: | # optional; empty/omitted disables injection
       Review the following code rigorously. Report every bug you can find,
       ordered by severity, and suggest a fix for each.
+    thinking-usage: # optional; absent/null = off (responses byte-identical)
+      mode: auto # required when the block is present: auto | always | off
+      min-ratio: 0.6 # optional; finite, 0..1
+      max-ratio: 0.9 # optional; finite, 0..1; min-ratio <= max-ratio
   echo-model:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
@@ -111,6 +115,14 @@ logging:
 - `upstream-model` — the `model` value actually forwarded upstream.
 - `injection-prompt` — the system instruction injected into every request for
   this model. Multi-line supported; the exact text is used verbatim.
+- `thinking-usage` — optional block configuring simulated thinking-usage
+  synthesis: `mode` is required when the block is present (`auto` — only when
+  the request signals thinking; `always` — every request, overriding the
+  request's signal; `off` — never) and `min-ratio`/`max-ratio` bound the
+  share of output tokens attributed to thinking (each optional, finite, in
+  `[0,1]`, with `min-ratio ≤ max-ratio`; both absent → fixed `0.75`, one set →
+  fixed to it). An absent or null block means off — responses stay
+  byte-identical to an unconfigured deployment.
 
 The file is validated strictly, in two layers:
 
@@ -121,8 +133,10 @@ The file is validated strictly, in two layers:
   decode alone misses a bootstrap key whose value is an empty map).
 - **Model entries and the logging section** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `upstream-model`,
-  `injection-prompt` — including a nested bootstrap key — is a rejection,
-  not a warning, and so is any key inside `logging` other than `level`.
+  `injection-prompt` and `thinking-usage` (and, inside the block, outside
+  `mode`, `min-ratio`, `max-ratio`) — including a nested bootstrap key — is a
+  rejection, not a warning, and so is any key inside `logging` other than
+  `level`.
 
 The `models` table itself must contain at least one model. An empty table is
 rejected — an empty file is what a truncate-then-write config edit looks

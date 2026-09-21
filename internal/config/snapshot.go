@@ -9,6 +9,33 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// ThinkingMode selects when simulated thinking-usage synthesis applies to a
+// model's responses.
+type ThinkingMode int
+
+const (
+	// ThinkingOff never synthesizes. It is the zero value and the state of
+	// every model whose runtime entry carries no thinking-usage block.
+	ThinkingOff ThinkingMode = iota
+	// ThinkingAuto synthesizes only when the request body signals thinking.
+	ThinkingAuto
+	// ThinkingAlways synthesizes for every request, overriding whatever
+	// thinking signal the request does or does not carry.
+	ThinkingAlways
+)
+
+// ThinkingUsage is the validated per-model simulated thinking-usage config:
+// some upstream models reason without ever reporting reasoning tokens, and
+// this synthesis attributes a share of the upstream-reported output tokens to
+// thinking in the client-facing usage object. Lo and Hi are that share's
+// bounds in [0,1]; Lo == Hi is a fixed share with no per-request draw. The
+// zero value is off.
+type ThinkingUsage struct {
+	Mode ThinkingMode
+	Lo   float64
+	Hi   float64
+}
+
 // Model is one validated public-model mapping. It is immutable after the
 // Snapshot is built.
 type Model struct {
@@ -21,6 +48,9 @@ type Model struct {
 	// InjectionPrompt is the system-level instruction injected into every
 	// request. Empty means no injection.
 	InjectionPrompt string
+	// ThinkingUsage is the validated simulated thinking-usage synthesis
+	// config. The zero value means the feature is off for this model.
+	ThinkingUsage ThinkingUsage
 }
 
 // Snapshot is an immutable view of a validated runtime configuration. It is
