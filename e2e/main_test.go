@@ -290,12 +290,17 @@ func rewriteConfig(t *testing.T, path, content string) {
 }
 
 // runtimeYAML renders the runtime config file body for a single model entry.
-func runtimeYAML(publicName, endpoint, upstreamModel, injectionPrompt string) string {
+// Each extraFields line is appended verbatim under the entry (indented as a
+// member), for optional blocks such as thinking-usage.
+func runtimeYAML(publicName, endpoint, upstreamModel, injectionPrompt string, extraFields ...string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "models:\n  %s:\n    endpoint: %s\n    upstream-model: %s\n",
 		publicName, endpoint, upstreamModel)
 	if injectionPrompt != "" {
 		fmt.Fprintf(&sb, "    injection-prompt: %s\n", injectionPrompt)
+	}
+	for _, f := range extraFields {
+		sb.WriteString("    " + f + "\n")
 	}
 	return sb.String()
 }
