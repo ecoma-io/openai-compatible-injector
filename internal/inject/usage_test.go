@@ -19,7 +19,13 @@ var (
 // what the SSE path's pointer-identity shortcut depends on.
 func sameSlice(t *testing.T, name string, in, out []byte) {
 	t.Helper()
-	if &out[0] != &in[0] {
+	if len(in) == 0 {
+		if len(out) != 0 {
+			t.Fatalf("%s: empty input came back non-empty", name)
+		}
+		return
+	}
+	if len(out) == 0 || &out[0] != &in[0] {
 		t.Fatalf("%s: no-op returned a different backing slice", name)
 	}
 }
@@ -51,13 +57,15 @@ func TestSynthesizeUsageUntouched(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			in := []byte(tt.body)
 			for name, got := range map[string][]byte{
-				"chat":      SynthesizeChatThinkingUsage([]byte(tt.body), activePlan),
-				"responses": SynthesizeResponsesThinkingUsage([]byte(tt.body), activePlan),
+				"chat":      SynthesizeChatThinkingUsage(in, activePlan),
+				"responses": SynthesizeResponsesThinkingUsage(in, activePlan),
 			} {
-				if !bytes.Equal(got, []byte(tt.body)) {
-					t.Fatalf("%s: body should pass through untouched:\n in  %s\n out %s", name, tt.body, got)
+				if !bytes.Equal(got, in) {
+					t.Fatalf("%s: body should pass through untouched:\n in  %s\n out %s", name, in, got)
 				}
+				sameSlice(t, name, in, got)
 			}
 		})
 	}
