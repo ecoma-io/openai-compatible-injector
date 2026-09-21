@@ -551,7 +551,7 @@ budget so Docker's SIGKILL never cuts a drain short.
 ### Docker
 
 ```sh
-docker build --build-arg VERSION=0.1.0-dev -t openai-compatible-injector .
+docker build -t openai-compatible-injector . # VERSION build-arg defaults to "dev"
 docker run --rm -p 8080:8080 \
   -e OAICR_LISTEN=:8080 -e OAICR_CONFIG_FILE=/app/config.yaml \
   -v "$PWD/config.yaml:/app/config.yaml:ro" \

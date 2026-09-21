@@ -9,8 +9,6 @@ services:
   injector:
     build:
       context: .
-      args:
-        VERSION: 0.1.0-dev
     container_name: injector
     ports:
       - "8080:8080"
