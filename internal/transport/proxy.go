@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 )
@@ -23,6 +24,20 @@ func newProxyClient(proxy *url.URL) *http.Client {
 	switch proxy.Scheme {
 	case "http", "https":
 		tr.Proxy = http.ProxyURL(proxy)
+		// A 407 on the CONNECT itself is the proxy speaking, not the
+		// upstream: typing it here turns an otherwise generic broken-tunnel
+		// error into a classified proxy-auth failure (fallback/health can
+		// read the type; the text stays static). A 407 on an absolute-form
+		// plain-http request never passes through here — that shape reaches
+		// the caller as an ordinary response, because the status came from
+		// the target's side of the wire.
+		tr.OnProxyConnectResponse = func(_ context.Context, _ *url.URL, _ *http.Request, connectRes *http.Response) error {
+			if connectRes.StatusCode != http.StatusProxyAuthRequired {
+				return nil
+			}
+			_ = connectRes.Body.Close()
+			return &ProxyAuthError{msg: "proxy CONNECT replied 407"}
+		}
 	case "socks5", "socks5h":
 		// The dialer is the proxy hop; the cloned transport's ambient
 		// ProxyFromEnvironment would put a second, unconfigured proxy in
