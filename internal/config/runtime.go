@@ -220,12 +220,16 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	// The client API key is required — fail-closed. A file without one never
 	// becomes a snapshot: first boot refuses to start and a keyless rewrite
 	// lands on the last-known-good path instead of reopening the front door.
-	// Whitespace-only is the same as absent; the trimmed value is exactly
-	// what clients must present as the bearer token. The value is never
-	// named in the error: error text reaches logs verbatim.
-	key := strings.TrimSpace(rf.APIKey)
+	// A space-only value is the same as absent. Outer spaces are normalized, but
+	// every other character must form an RFC 6750 bearer token, or clients could
+	// not present it legally. The value is never named in the error: error text
+	// reaches logs verbatim.
+	key := strings.Trim(rf.APIKey, " ")
 	if key == "" {
 		return nil, errors.New("api-key is required")
+	}
+	if !validBearerToken(key) {
+		return nil, errors.New("api-key must be a valid bearer token")
 	}
 
 	level, err := ParseLogLevel(rf.LogLevel)
@@ -234,6 +238,38 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	}
 
 	return &Snapshot{models: models, apiKey: key, logLevel: level}, nil
+}
+
+// validBearerToken reports whether token is an RFC 6750 b64token. Keeping
+// this validation in the config plane ensures every accepted configured key
+// can be presented legally in an Authorization: Bearer header.
+func validBearerToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	padding := false
+	hasTokenChar := false
+	for i := range len(token) {
+		c := token[i]
+		if c == '=' {
+			if !hasTokenChar {
+				return false
+			}
+			padding = true
+			continue
+		}
+		if padding || !isBearerTokenChar(c) {
+			return false
+		}
+		hasTokenChar = true
+	}
+	return true
+}
+
+func isBearerTokenChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+		c == '~' || c == '+' || c == '/'
 }
 
 func buildModel(name string, rm runtimeModel) (Model, error) {

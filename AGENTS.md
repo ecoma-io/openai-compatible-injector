@@ -48,8 +48,9 @@ Owned decomposition:
   — to that snapshot forever. Reloads never affect in-flight work.
 - **Client authentication is mandatory and terminal at this proxy.** Every
   Chat/Responses request presents the configured `api-key` as
-  `Authorization: Bearer <key>`; the scheme is case-insensitive and a
-  missing/malformed key gets the static missing-key 401, while a wrong key
+  `Authorization: Bearer <key>`; the scheme is case-insensitive, and keys
+  must be RFC 6750 bearer tokens (no whitespace or other invalid characters).
+  A missing/malformed key gets the static missing-key 401, while a wrong key
   gets the static `invalid_api_key` 401. Authenticate before reading the body
   or upstream I/O; retain 405-before-401 ordering. `/healthz` and the 404
   catch-all stay unauthenticated. Consume — never forward or replace — the

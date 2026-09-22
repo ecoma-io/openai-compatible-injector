@@ -17,8 +17,10 @@
 # client TO this proxy and is consumed here — it is never forwarded upstream
 # (upstreams are expected to be trusted/internal). Rotating the key is a
 # hot-reload: write the new value and clients must switch on their next
-# request. A file without a non-empty api-key is rejected — a keyless boot
-# refuses to start, a keyless reload keeps the last-known-good key serving.
+# request. The key is an RFC 6750 Bearer token (letters, digits, - . _ ~ + /
+# and trailing = padding only). A file without a non-empty valid api-key is
+# rejected — a keyless boot refuses to
+# start, a keyless reload keeps the last-known-good key serving.
 api-key: change-me-client-key
 
 models:

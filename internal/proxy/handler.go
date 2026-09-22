@@ -672,8 +672,9 @@ func copyForwardHeaders(dst, src http.Header) {
 
 // bearerToken extracts the bearer credential from an Authorization header
 // value. The scheme match is case-insensitive per RFC 9110 (clients send
-// "Bearer" and "bearer" alike); the token is used as trimmed. A missing
-// header, a non-bearer scheme, or an empty token is reported as ok=false and
+// "Bearer" and "bearer" alike); outer spaces are tolerated, but a bearer
+// credential cannot contain ASCII whitespace. A missing header,
+// a non-bearer scheme, or a malformed/empty token is reported as ok=false and
 // answered like a missing header. Nothing about the header's text is echoed
 // or logged.
 func bearerToken(header string) (string, bool) {
@@ -681,11 +682,43 @@ func bearerToken(header string) (string, bool) {
 	if !strings.EqualFold(scheme, "bearer") {
 		return "", false
 	}
-	token := strings.TrimSpace(rest)
-	if token == "" {
+	token := strings.Trim(rest, " ")
+	if !validBearerToken(token) {
 		return "", false
 	}
 	return token, true
+}
+
+// validBearerToken reports whether token is an RFC 6750 b64token. Its
+// counterpart in config keeps accepted configured keys representable in a
+// valid Authorization: Bearer header.
+func validBearerToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	padding := false
+	hasTokenChar := false
+	for i := range len(token) {
+		c := token[i]
+		if c == '=' {
+			if !hasTokenChar {
+				return false
+			}
+			padding = true
+			continue
+		}
+		if padding || !isBearerTokenChar(c) {
+			return false
+		}
+		hasTokenChar = true
+	}
+	return true
+}
+
+func isBearerTokenChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+		c == '~' || c == '+' || c == '/'
 }
 
 // keyMatches compares a presented bearer token against the configured API

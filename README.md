@@ -118,9 +118,9 @@ models:
 log-level: info # optional; debug | info | warn | error (absent = info)
 ```
 
-- `api-key` — required non-empty shared credential. Clients present it as
+- `api-key` — required shared [Bearer token](https://www.rfc-editor.org/rfc/rfc6750#section-2.1): non-empty ASCII letters, digits, `-`, `.`, `_`, `~`, `+`, `/`, and trailing `=` padding only. Clients present it as
   `Authorization: Bearer <key>` on both model-serving routes; the scheme is
-  case-insensitive and surrounding token whitespace is ignored. It is bound
+  case-insensitive and outer spaces are ignored. It is bound
   to the [per-request config snapshot](#hot-reload), so rotating the YAML
   value affects subsequent requests without a restart. The key is credential
   material: it never appears in logs, error text, or reload metadata.
@@ -155,8 +155,10 @@ The file is validated strictly, in two layers:
   rejection, not a warning.
 
 The `models` table itself must contain at least one model, and `api-key` must
-be a non-empty string after trimming whitespace. Both failures are
-fail-closed: an invalid initial config exits `1`; an invalid reload preserves
+be a non-empty Bearer token after trimming outer spaces (only the
+Bearer-token characters documented above; no embedded whitespace). Both
+failures are fail-closed: an invalid initial config exits
+`1`; an invalid reload preserves
 the complete last-known-good snapshot (including its prior client key). An
 empty model table is what a truncate-then-write config edit looks like
 mid-write, and accepting it would silently drop every model from the live
