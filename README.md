@@ -101,14 +101,28 @@ truth.
 # It authenticates clients to this proxy only and is never forwarded upstream.
 api-key: replace-with-a-secret-client-key
 
-# Optional. Named outbound paths providers can share: direct (the default)
-# or exactly one proxy endpoint. See "Provider transports".
+# Optional. Named outbound paths providers can share: direct (the default),
+# exactly one proxy endpoint, or a pool of such endpoints with scheduling,
+# eligibility and bounded fallback. See "Provider transports".
 transports:
   egress:
-    type: proxy # direct | proxy; proxy requires the proxy URL below
+    type: proxy # direct | proxy | pool; proxy requires the proxy URL below
     proxy: socks5h://user:pass@10.0.0.5:1080 # http | https | socks5 | socks5h, host + explicit port, optional userinfo auth
   lan:
     type: direct # must not set a proxy URL
+  kilo-pool:
+    type: pool # ordered member references to direct/proxy entries above
+    members:
+      - transport: lan # bare form, or a mapping with the gates below
+        max-body-bytes: 4718592 # eligibility gate on the outgoing body
+    strategy: round_robin # round_robin (default) | weighted_round_robin
+    fallback:
+      enabled: true # default true
+      max-attempts: 3 # distinct endpoints dialed; default 3, cap 16
+    health:
+      enabled: true # default true
+      failure-threshold: 3 # default 3
+      cooldown: 30s # default 30s, min 1s
 
 # Optional. Named upstream bases, each routed through a transport.
 providers:
@@ -201,8 +215,11 @@ The file is validated strictly, in two layers:
   `upstream-model`, `injection-prompt` and `thinking-usage` (and, inside the
   block, outside `mode`, `min-ratio`, `max-ratio`) — including a nested
   bootstrap key — is a rejection, not a warning. The same strictness holds
-  inside `providers` entries (`base-url`, `transport`) and `transports`
-  entries (`type`, `proxy`).
+  inside `providers` entries (`base-url`, `transport`), `transports` entries
+  (`type`, `proxy`, and the pool fields `members`, `strategy`, `fallback`,
+  `health`, each with their own strict field sets), and pool `members`
+  entries (`transport`, `max-body-bytes`, `max-concurrency`, `streaming`,
+  `weight`).
 
 The `models` table itself must contain at least one model, and `api-key` must
 be a non-empty Bearer token after trimming outer spaces (only the
@@ -250,7 +267,11 @@ Semantics that hold:
   process. A reload that leaves a transport's config byte-identical keeps
   its warm pool; one that drops the last reference to a transport closes
   only that pool's idle connections — in-flight requests on it finish
-  untouched.
+  untouched. A `pool` transport adds a second layer on the same rule: its
+  scheduler position, health state and concurrency permits are keyed by the
+  pool's policy content, so an unchanged pool stays warm across reloads, a
+  changed policy starts fresh, and a pool still executing requests is torn
+  down only when its last in-flight request releases it.
 - **The log level hot-reloads with everything else.** The top-level
   `log-level` key rides
   the same validate-then-publish path as the model mappings: a valid reload
@@ -346,15 +367,18 @@ client ────▶│    injector    │────────────
             └────────────────┘                               ▼
                      │ transport (HOW)              provider base URL
                      │
-        ┌────────────┴────────────┐
-        ▼                         ▼
-     direct                    proxy
-        │                         │
-        ▼                         ▼
-   provider                 proxy endpoint ────▶ provider
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+     direct       proxy        pool ────▶ one member per request
+        │            │            │        (direct or proxy endpoints,
+        ▼            ▼            ▼         scheduled, with bounded
+   provider    proxy endpoint  member     fallback + health)
+                     │         selection
+                     ▼              │
+                 provider ◀─────────┘
 ```
 
-Two kinds exist today, configured through the `transports` table and
+Three kinds exist, configured through the `transports` table and
 referenced by name from `providers`:
 
 - **`direct`** — the standard Go HTTP stack with the same tuning the service
@@ -374,6 +398,67 @@ referenced by name from `providers`:
   Credentials in the proxy URL's userinfo (`user:pass@host`) authenticate to
   the proxy (Basic auth for http/https, RFC 1929 for SOCKS5) and never
   appear in logs or error text.
+- **`pool`** — a set of endpoint members (direct or proxy transports,
+  referenced by name; pools do not nest) with per-request scheduling,
+  eligibility, bounded egress fallback, and passive health. Each request is
+  scheduled onto ONE member; eligibility is checked before anything dials:
+
+  ```yaml
+  transports:
+    http-relay:
+      type: proxy
+      proxy: http://http-relay-gateway:20130
+    rotation-socks:
+      type: proxy
+      proxy: "socks5h://user:pass@rotation-proxy-gateway:30121"
+    kilo-egress:
+      type: pool
+      members:
+        - transport: http-relay
+          max-body-bytes: 4718592 # eligibility gate on the OUTGOING body
+          max-concurrency: 4 # 0/unset = unlimited; held until body close
+          streaming: true # default true; false = no streamed requests
+          weight: 1 # weighted_round_robin shares only; >= 1
+        - transport: rotation-socks # bare form: all defaults
+      strategy: round_robin # default; or weighted_round_robin
+      fallback:
+        enabled: true # default
+        max-attempts: 3 # distinct endpoints dialed; default 3, cap 16
+      health:
+        enabled: true # default
+        failure-threshold: 3 # consecutive transport failures ...
+        cooldown: 30s # ... trip this cooldown (min 1s)
+  ```
+
+  - **Eligibility before scheduling.** A member the request cannot legally
+    use — `streaming: false` vs a streamed request, `max-body-bytes` below
+    the outgoing body, at its concurrency cap, or in a health cooldown — is
+    skipped without a dial. A 6 MB request never produces a 413 on a 4.5 MB
+    relay: it was never sent there. Skipped members consume no attempt and
+    no health strike.
+  - **Scheduling.** `round_robin` rotates across the eligible members;
+    `weighted_round_robin` gives a member with weight 2 twice the share, in
+    a deterministic interleaving. Weight never affects eligibility or the
+    fallback order — only who is tried first.
+  - **Bounded fallback, transport failures only.** When a dialed member
+    fails before any response arrives (connection, proxy connect, proxy
+    auth, timeout), the next eligible member is tried, up to
+    `max-attempts` distinct endpoints. A client cancellation aborts
+    everything — no fallback, no strike, no penalty. **Any response — 429
+    and 5xx included — ends the attempt loop**: an HTTP status is the
+    upstream's answer, never a fallback trigger and never a health strike.
+  - **Passive health.** `failure-threshold` consecutive fallback-eligible
+    failures open a `cooldown` during which the member is skipped. Recovery
+    needs no probe: any response proves the path delivered and resets the
+    count.
+  - **Zero eligible members** (all skipped or the fallback budget spent on
+    skips) answers the canonical 502 `upstream_unreachable` envelope — the
+    access log carries `egress_attempts`, `egress_kind`, `egress_target`
+    and `egress_exhausted` so the pool's decision is visible per request.
+  - **Reload identity.** A pool whose policy bytes are unchanged across a
+    reload keeps its scheduler position, health state and connection pools.
+    A changed policy is a new identity: fresh state, and the old state
+    drains via its in-flight requests before its idle connections close.
 
 Semantics the transports guarantee, and that the rest of the service relies
 on:
@@ -393,13 +478,15 @@ on:
 
 A broken `transports` or `providers` table is a whole-file rejection at
 boot (exit 1) and a last-known-good on reload — an invalid proxy never
-silently degrades into direct egress.
+silently degrades into direct egress, and a member reference that names
+nothing (or names another pool) rejects the file.
 
-**Not included, by design:** transport pools with multiple egresses,
-rotation, health checks, cooldown, fallback between transports, or retries.
-A `type: proxy` transport names exactly one endpoint. The schema's shape
-(named transports referenced by named providers) is what a future `pool`
-kind would slot into; nothing of that machinery exists today.
+**Not included, by design:** provider fallback and retries (a failed or
+rate-limited _provider_ is never retried elsewhere — egress fallback moves
+a request between network paths, never between providers), automatic
+egress rotation over time, active health probes, and any
+proxy-to-direct silent downgrade: when a pool's members are all unusable
+the request fails loudly with `upstream_unreachable`.
 
 ## Simulated thinking usage
 
