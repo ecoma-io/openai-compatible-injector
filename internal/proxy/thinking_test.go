@@ -342,7 +342,7 @@ func TestThinkingUsageResolvedDebugEvent(t *testing.T) {
 
 	t.Run("configured model logs the event", func(t *testing.T) {
 		buf, log := captureLog(zerolog.DebugLevel)
-		h := NewHandler(thinkingStore(t, upstream.URL+"/v1", "auto", "", ""), NewSharedClient(), log)
+		h := NewHandler(thinkingStore(t, upstream.URL+"/v1", "auto", "", ""), directResolver(), log)
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model","reasoning_effort":"high"}`, nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d", rec.Code)
@@ -364,7 +364,7 @@ func TestThinkingUsageResolvedDebugEvent(t *testing.T) {
 
 	t.Run("default model logs nothing", func(t *testing.T) {
 		buf, log := captureLog(zerolog.DebugLevel)
-		h := NewHandler(newTestStore(t, upstream.URL+"/v1"), NewSharedClient(), log)
+		h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), log)
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d", rec.Code)

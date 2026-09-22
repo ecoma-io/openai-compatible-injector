@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"openai-compatible-injector/internal/config"
+	"openai-compatible-injector/internal/transport"
 )
 
 func testLogger(t *testing.T) zerolog.Logger {
@@ -88,7 +89,7 @@ func TestRunDrainsInFlightRequest(t *testing.T) {
 	upstreamURL := "http://" + upLn.Addr().String() + "/v1"
 
 	addr := freeAddr(t)
-	srv := New(testStore(t, upstreamURL), addr, 10*time.Second, testLogger(t))
+	srv := New(testStore(t, upstreamURL), transport.NewRegistry(), addr, 10*time.Second, testLogger(t))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -176,7 +177,7 @@ func TestRunForceClosesPastGrace(t *testing.T) {
 
 	const grace = 300 * time.Millisecond
 	addr := freeAddr(t)
-	srv := New(testStore(t, upstreamURL), addr, grace, testLogger(t))
+	srv := New(testStore(t, upstreamURL), transport.NewRegistry(), addr, grace, testLogger(t))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -249,7 +250,7 @@ func TestRunRefusesNewConnsAfterShutdown(t *testing.T) {
 	upstreamURL := "http://" + upLn.Addr().String() + "/v1"
 
 	addr := freeAddr(t)
-	srv := New(testStore(t, upstreamURL), addr, time.Second, testLogger(t))
+	srv := New(testStore(t, upstreamURL), transport.NewRegistry(), addr, time.Second, testLogger(t))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
@@ -281,7 +282,7 @@ func TestRunListenError(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 	occupied := ln.Addr().String()
 
-	srv := New(testStore(t, "http://127.0.0.1:9/v1"), occupied, time.Second, testLogger(t))
+	srv := New(testStore(t, "http://127.0.0.1:9/v1"), transport.NewRegistry(), occupied, time.Second, testLogger(t))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := srv.Run(ctx); err == nil {
@@ -298,7 +299,7 @@ func TestRunListenError(t *testing.T) {
 // whole life. Waiting out a real idle deadline in CI is not viable, so the
 // pin is on the configuration itself.
 func TestServerHasReadAndIdleTimeouts(t *testing.T) {
-	srv := New(testStore(t, "http://127.0.0.1:9/v1"), "127.0.0.1:0", time.Second, testLogger(t))
+	srv := New(testStore(t, "http://127.0.0.1:9/v1"), transport.NewRegistry(), "127.0.0.1:0", time.Second, testLogger(t))
 	if srv.http.ReadHeaderTimeout <= 0 {
 		t.Errorf("ReadHeaderTimeout = %v, want a positive bound", srv.http.ReadHeaderTimeout)
 	}

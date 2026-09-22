@@ -18,6 +18,7 @@ import (
 
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/server"
+	"openai-compatible-injector/internal/transport"
 )
 
 // version is the build version, overridable at link time with
@@ -120,6 +121,12 @@ func run() int {
 	zerolog.SetGlobalLevel(snap.LogLevel())
 
 	store := config.NewStore(snap)
+	// The process-wide transport registry: one long-lived client (and one
+	// connection pool) per distinct transport configuration, shared across
+	// config reloads — a reload that does not change a transport keeps its
+	// warm pool, and one that removes one drains only that pool's idle
+	// connections. Built before the poller and server so both can hold it.
+	doers := transport.NewRegistry()
 	log.Info().
 		Str("version", version).
 		Str("listen", b.Listen).
@@ -172,12 +179,21 @@ func run() int {
 	// acknowledges it at the new level (config.LogLevelHook): the global
 	// level is an atomic int32 that zerolog consults per event, so a reload
 	// swaps it without locks and in-flight events race only to the old/new
-	// boundary, never around a mutex. The poller is seeded with the exact
-	// bytes loaded above: its hash baseline is the boot content, not a fresh
-	// read of a file that may have changed in between.
-	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, config.LogLevelHook(log)).Run(ctx)
+	// boundary, never around a mutex. It then retains the snapshot's
+	// transport set on the registry: doers the new config no longer
+	// references have their idle pooled connections closed (in-flight
+	// requests on them finish untouched), while unchanged transports keep
+	// their pools warm. The poller is seeded with the exact bytes loaded
+	// above: its hash baseline is the boot content, not a fresh read of a
+	// file that may have changed in between.
+	levelHook := config.LogLevelHook(log)
+	onPublish := func(next *config.Snapshot) {
+		levelHook(next)
+		doers.Retain(next.Transports())
+	}
+	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, onPublish).Run(ctx)
 
-	err = server.New(store, b.Listen, b.ShutdownGrace, log).Run(ctx)
+	err = server.New(store, doers, b.Listen, b.ShutdownGrace, log).Run(ctx)
 	// Ignore before announcing the drain done: from the instant Run returns
 	// the process is committed to its exit code, and a duplicate signal must
 	// fall on the ignored disposition, not the default handler's 143.

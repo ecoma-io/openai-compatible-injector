@@ -23,17 +23,51 @@
 # start, a keyless reload keeps the last-known-good key serving.
 api-key: change-me-client-key
 
+# Optional. Named outbound paths a provider can route through: direct (the
+# default — plain egress, ambient HTTP_PROXY/HTTPS_PROXY/NO_PROXY honored)
+# or exactly ONE configured proxy endpoint. Pools with several egresses,
+# rotation, health checks, cooldown, fallback and retries do NOT exist —
+# one transport, one path. Userinfo in a proxy URL (user:pass@) is the
+# proxy's own authentication and never appears in logs or error text.
+#
+# Proxy schemes:
+#   http://   HTTP forward proxy (https targets ride CONNECT tunnels)
+#   https://  same, TLS-encrypted hop to the proxy
+#   socks5:// upstream hostname resolved LOCALLY (the proxy sees only the IP)
+#   socks5h:// hostname sent to the proxy — REMOTE DNS, keeps upstream
+#             hostnames out of the local resolver
+# The proxy URL needs a host, an explicit port, and nothing after the
+# authority (no path, query or fragment).
+transports:
+  direct-egress:
+    # direct must not set a proxy URL; a provider without a transport
+    # reference gets this implicitly.
+    type: direct
+  # proxy-egress:
+  #   type: proxy
+  #   proxy: "socks5h://user:pass@10.0.0.5:1080"
+
+# Optional. Named upstream bases, so several models can share one endpoint
+# and one egress. base-url is validated exactly like a model endpoint;
+# transport must name an entry of the transports table above (there is no
+# fallback to direct for an unknown name). Entries are validated even when
+# no model references them.
+providers:
+  opencode:
+    base-url: https://api.opencode.example/v1
+    transport: direct-egress
+
 models:
   # Every public model name a client may request. The request's `model`
   # field is matched against these keys and sent upstream as
-  # `upstream-model`; the upstream endpoint receives the request at
-  # `<endpoint>/chat/completions` or `<endpoint>/responses` (the endpoint
-  # base must not include the /chat/completions or /responses suffix).
+  # `upstream-model`. Exactly one of `provider` (a named providers entry
+  # carrying the base URL and egress) or `endpoint` (the legacy inline
+  # form — an implicit direct provider) is required; both, or neither, is
+  # a rejection. The upstream receives the request at
+  # `<base>/chat/completions` or `<base>/responses` (the base must not
+  # include the /chat/completions or /responses suffix).
   gpt-reviewer:
-    # Required. Base http(s) URL of the upstream provider. No credentials in
-    # the URL (userinfo is rejected); port allowed, path allowed (trailing
-    # slashes are ignored).
-    endpoint: https://api.provider.example/v1
+    provider: opencode
     # Required. The model name actually sent to the upstream provider.
     upstream-model: gpt-5-pro
     # Optional. A system-level instruction injected into EVERY request for

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"openai-compatible-injector/internal/transport"
 )
 
 // ThinkingMode selects when simulated thinking-usage synthesis applies to a
@@ -58,7 +60,14 @@ type SSEKeepAlive struct {
 type Model struct {
 	// Public is the model name clients use, i.e. the map key.
 	Public string
-	// Endpoint is the validated upstream base URL (e.g. https://h/v1).
+	// Provider names the providers-table entry this model routes through;
+	// empty for the legacy inline endpoint form. It is resolution metadata
+	// (and the identity a later provider-fallback design would key on),
+	// not a second lookup: the entry's base URL and transport are already
+	// flattened into Endpoint and Transport here.
+	Provider string
+	// Endpoint is the validated upstream base URL (e.g. https://h/v1),
+	// from the referenced provider's base-url or the model's own endpoint.
 	Endpoint *url.URL
 	// UpstreamModel is the model name sent to the upstream provider.
 	UpstreamModel string
@@ -68,6 +77,11 @@ type Model struct {
 	// ThinkingUsage is the validated simulated thinking-usage synthesis
 	// config. The zero value means the feature is off for this model.
 	ThinkingUsage ThinkingUsage
+	// Transport is the outbound path requests for this model execute
+	// through — the provider's referenced transport, or the zero value
+	// (direct) for the legacy inline endpoint form and for providers
+	// without a transport reference.
+	Transport transport.Config
 }
 
 // Snapshot is an immutable view of a validated runtime configuration. It is
@@ -79,10 +93,14 @@ type Snapshot struct {
 	// apiKey is the client bearer credential this snapshot requires. It is
 	// credential material: compared per request, never logged, never echoed
 	// in error text.
-	apiKey    string
-	models    map[string]Model
-	logLevel  zerolog.Level
-	keepAlive SSEKeepAlive
+	apiKey string
+	models map[string]Model
+	// transports is the distinct set of outbound transport configs the
+	// models reference — the retain set the transport registry reconciles
+	// to on publish.
+	transports []transport.Config
+	logLevel   zerolog.Level
+	keepAlive  SSEKeepAlive
 }
 
 // Gen returns the snapshot's generation number (0 for the initial snapshot,
@@ -104,6 +122,15 @@ func (s *Snapshot) APIKey() string { return s.apiKey }
 // They bind to the request like everything else on the snapshot, so an
 // in-flight stream keeps the interval it started with across a reload.
 func (s *Snapshot) SSEKeepAlive() SSEKeepAlive { return s.keepAlive }
+
+// Transports returns the distinct outbound transport configs this
+// snapshot's models reference. The registry retains exactly these on
+// publish; a transport absent from the new snapshot has its idle pool
+// closed while in-flight requests on it finish untouched. The slice is a
+// copy — the snapshot stays immutable.
+func (s *Snapshot) Transports() []transport.Config {
+	return append([]transport.Config(nil), s.transports...)
+}
 
 // Model resolves a public model name. The second return value reports
 // whether the model exists.

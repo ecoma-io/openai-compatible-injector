@@ -11,27 +11,28 @@ import (
 
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/proxy"
+	"openai-compatible-injector/internal/transport"
 )
 
-// Server owns the HTTP server and the shared upstream client. Its surface is
-// deliberately minimal: New + Run only, nothing else is exported, no status
-// endpoint. Lifecycle (os.Exit, signal handling) stays with the caller.
+// Server owns the HTTP server and the outbound transport registry. Its
+// surface is deliberately minimal: New + Run only, nothing else is exported,
+// no status endpoint. Lifecycle (os.Exit, signal handling) stays with the
+// caller.
 type Server struct {
-	http   *http.Server
-	client *http.Client
-	grace  time.Duration
-	log    zerolog.Logger
+	http  *http.Server
+	doers *transport.Registry
+	grace time.Duration
+	log   zerolog.Logger
 }
 
-// New builds a Server with one shared upstream client and the proxy handler
-// bound to the given store, served on addr. grace is the shutdown drain
-// deadline: after it elapses, in-flight requests are force-closed.
-func New(store *config.Store, addr string, grace time.Duration, log zerolog.Logger) *Server {
-	client := proxy.NewSharedClient()
+// New builds a Server with the proxy handler bound to the given store and
+// transport registry, served on addr. grace is the shutdown drain deadline:
+// after it elapses, in-flight requests are force-closed.
+func New(store *config.Store, doers *transport.Registry, addr string, grace time.Duration, log zerolog.Logger) *Server {
 	return &Server{
 		http: &http.Server{
 			Addr:              addr,
-			Handler:           proxy.NewHandler(store, client, log),
+			Handler:           proxy.NewHandler(store, doers, log),
 			ReadHeaderTimeout: 10 * time.Second,
 			// Without an IdleTimeout a client that opens a keep-alive
 			// connection and goes quiet pins a goroutine and a file
@@ -40,9 +41,9 @@ func New(store *config.Store, addr string, grace time.Duration, log zerolog.Logg
 			// while bounding the leak.
 			IdleTimeout: 120 * time.Second,
 		},
-		client: client,
-		grace:  grace,
-		log:    log,
+		doers: doers,
+		grace: grace,
+		log:   log,
 	}
 }
 
@@ -68,7 +69,7 @@ func (s *Server) Run(ctx context.Context) error {
 	select {
 	case err := <-serveDone:
 		// The server terminated on its own (or the listener died).
-		s.client.CloseIdleConnections()
+		s.doers.CloseIdleConnections()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -87,7 +88,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	err = <-serveDone
-	s.client.CloseIdleConnections()
+	s.doers.CloseIdleConnections()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
