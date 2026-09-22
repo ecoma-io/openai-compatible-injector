@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.5.0...v0.6.0) (2026-09-22)
+
+
+### Features
+
+* **proxy:** inject SSE keep-alive comments during upstream silence ([#32](https://github.com/ecoma-io/openai-compatible-injector/issues/32)) ([38edc95](https://github.com/ecoma-io/openai-compatible-injector/commit/38edc95826c8e64bc9121f092e029a36077ef0ba))
+
 ## [0.5.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.4.0...v0.5.0) (2026-09-22)
 
 
