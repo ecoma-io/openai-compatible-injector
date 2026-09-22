@@ -123,8 +123,9 @@ type runtimeFile struct {
 	// at entries by name; the table is validated even when unreferenced.
 	Providers map[string]runtimeProvider `yaml:"providers"`
 	// Transports mirrors the optional top-level transports table: named
-	// outbound paths (direct, or one configured proxy endpoint). Providers
-	// reference entries by name; the table is validated even when
+	// outbound paths (direct, one configured proxy endpoint, or a pool of
+	// such endpoints with scheduling, fallback, and health policy).
+	// Providers reference entries by name; the table is validated even when
 	// unreferenced.
 	Transports map[string]runtimeTransport `yaml:"transports"`
 }
@@ -136,13 +137,120 @@ type runtimeProvider struct {
 	Transport string `yaml:"transport"`
 }
 
-// runtimeTransport mirrors one transports entry. Type is direct or proxy;
-// proxy requires the proxy URL (http/https/socks5/socks5h, userinfo
-// allowed as proxy authentication, explicit port required) and direct
-// must not set one.
+// runtimeTransport mirrors one transports entry. Type is direct, proxy, or
+// pool; proxy requires the proxy URL (http/https/socks5/socks5h, userinfo
+// allowed as proxy authentication, explicit port required) and direct must
+// not set one. The pool-only fields (members, strategy, fallback, health)
+// are rejected on the other two types, and proxy is rejected on pool —
+// a pool is a set of endpoints, never an endpoint itself.
 type runtimeTransport struct {
-	Type  string `yaml:"type"`
-	Proxy string `yaml:"proxy"`
+	Type     string              `yaml:"type"`
+	Proxy    string              `yaml:"proxy"`
+	Members  []runtimePoolMember `yaml:"members"`
+	Strategy string              `yaml:"strategy"`
+	Fallback *runtimeFallback    `yaml:"fallback"`
+	Health   *runtimeHealth      `yaml:"health"`
+}
+
+// runtimePoolMember is one members entry: a transport reference, bare
+// (`- lan-egress`) or with per-member eligibility attributes
+// (`- transport: lan-egress` + optional gates). Both spellings decode
+// through the same struct; the custom unmarshal below enforces the field
+// set strictly, because a hand-parsed mapping must reject unknown and
+// duplicated keys just like the KnownFields decode does everywhere else.
+type runtimePoolMember struct {
+	Transport      string
+	MaxBodyBytes   *int64
+	MaxConcurrency *int
+	Streaming      *bool
+	Weight         *int
+}
+
+// poolMemberFields is the strict key set of the mapping member form.
+var poolMemberFields = map[string]struct{}{
+	"transport":       {},
+	"max-body-bytes":  {},
+	"max-concurrency": {},
+	"streaming":       {},
+	"weight":          {},
+}
+
+// UnmarshalYAML accepts the bare-reference scalar or the strict mapping.
+// Value-type failures are returned as *yaml.TypeError so they merge into
+// the outer decode's line-number-only redaction (a type error quotes the
+// offending scalar, which must never reach error text); every structural
+// rejection is fixed text already.
+func (m *runtimePoolMember) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		var name string
+		if err := value.Decode(&name); err != nil {
+			return errors.New("pool member: transport reference must be a name (input redacted)")
+		}
+		m.Transport = name
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return errors.New("pool member: must be a transport name or a mapping of the transport name and its eligibility limits")
+	}
+	content := value.Content
+	seen := make(map[string]struct{}, len(content)/2)
+	for i := 0; i+1 < len(content); i += 2 {
+		keyNode, valNode := content[i], content[i+1]
+		if _, dup := seen[keyNode.Value]; dup {
+			return errors.New("pool member: duplicate field (input redacted)")
+		}
+		if _, ok := poolMemberFields[keyNode.Value]; !ok {
+			return errors.New("pool member: unknown field (input redacted)")
+		}
+		seen[keyNode.Value] = struct{}{}
+		switch keyNode.Value {
+		case "transport":
+			if err := valNode.Decode(&m.Transport); err != nil {
+				return err
+			}
+		case "max-body-bytes":
+			var v int64
+			if err := valNode.Decode(&v); err != nil {
+				return err
+			}
+			m.MaxBodyBytes = &v
+		case "max-concurrency":
+			var v int
+			if err := valNode.Decode(&v); err != nil {
+				return err
+			}
+			m.MaxConcurrency = &v
+		case "streaming":
+			var v bool
+			if err := valNode.Decode(&v); err != nil {
+				return err
+			}
+			m.Streaming = &v
+		case "weight":
+			var v int
+			if err := valNode.Decode(&v); err != nil {
+				return err
+			}
+			m.Weight = &v
+		}
+	}
+	return nil
+}
+
+// runtimeFallback mirrors a pool's optional fallback block.
+type runtimeFallback struct {
+	Enabled     *bool `yaml:"enabled"`
+	MaxAttempts *int  `yaml:"max-attempts"`
+}
+
+// runtimeHealth mirrors a pool's optional health block. Cooldown stays a
+// string for the same reason as the SSE keep-alive interval: yaml.v3
+// decodes durations as bare integer nanoseconds, not the spelling
+// operators write.
+type runtimeHealth struct {
+	Enabled          *bool  `yaml:"enabled"`
+	FailureThreshold *int   `yaml:"failure-threshold"`
+	Cooldown         string `yaml:"cooldown"`
 }
 
 // runtimeSSEKeepAlive mirrors the optional top-level sse-keep-alive block.
@@ -303,19 +411,32 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, err
 	}
 
-	// The distinct outbound transports the models reference, in first-use
-	// order over sorted model names — the set the registry retains on
-	// publish. Config values compare by their proxy URL pointer, so models
-	// sharing a provider share one entry; two providers with byte-identical
-	// proxy URLs hold two entries, which the registry's content keying
-	// merges back into one pool anyway.
-	transportSeen := make(map[transport.Config]struct{}, len(models))
+	// The egress closure: the distinct outbound transports the models
+	// reference, in first-use order over sorted model names, plus — for a
+	// pool transport — every member endpoint it schedules onto. This is the
+	// set the registry retains on publish: dropping a pool must not strand
+	// its members' connection pools, and keeping one must keep its
+	// endpoints. Dedup is by content key (not pointer): models sharing a
+	// provider share one entry, byte-identical proxy URLs collapse into
+	// one, and a pool's members merge with standalone transports of the
+	// same endpoint.
+	transportSeen := make(map[string]struct{}, len(models))
 	transportSet := make([]transport.Config, 0, 1)
+	addTransport := func(tc transport.Config) {
+		k := tc.Key()
+		if _, dup := transportSeen[k]; dup {
+			return
+		}
+		transportSeen[k] = struct{}{}
+		transportSet = append(transportSet, tc)
+	}
 	for _, name := range names {
 		tc := models[name].Transport
-		if _, dup := transportSeen[tc]; !dup {
-			transportSeen[tc] = struct{}{}
-			transportSet = append(transportSet, tc)
+		addTransport(tc)
+		if tc.Kind == transport.EgressPool {
+			for _, m := range tc.Pool.Members {
+				addTransport(m.Endpoint)
+			}
 		}
 	}
 
@@ -336,6 +457,10 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 // config is not broken config. Messages never name the entry or echo its
 // values: error text reaches logs verbatim, and a proxy URL carries
 // credentials in its userinfo.
+//
+// Plain (direct/proxy) entries are built before pools so a pool's member
+// references resolve against already-built endpoints — pools may not
+// reference pools, so no deeper ordering can ever be needed.
 func buildTransports(rt map[string]runtimeTransport) (map[string]transport.Config, error) {
 	out := make(map[string]transport.Config, len(rt))
 	names := make([]string, 0, len(rt))
@@ -344,38 +469,265 @@ func buildTransports(rt map[string]runtimeTransport) (map[string]transport.Confi
 	}
 	sort.Strings(names)
 	seen := make(map[string]struct{}, len(rt))
-	for i, rawName := range names {
+	checkName := func(i int, rawName string) (string, error) {
 		name := strings.TrimSpace(rawName)
 		ordinal := i + 1
 		if name == "" {
-			return nil, fmt.Errorf("transport entry %d: name must not be empty", ordinal)
+			return "", fmt.Errorf("transport entry %d: name must not be empty", ordinal)
 		}
 		if _, dup := seen[name]; dup {
-			return nil, fmt.Errorf("transport entry %d: name collides with another entry after trimming whitespace", ordinal)
+			return "", fmt.Errorf("transport entry %d: name collides with another entry after trimming whitespace", ordinal)
 		}
 		seen[name] = struct{}{}
+		return name, nil
+	}
+
+	// Pass 1: plain endpoints.
+	for i, rawName := range names {
 		entry := rt[rawName]
-		var cfg transport.Config
+		switch entry.Type {
+		case "", "direct", "proxy":
+		case "pool":
+			continue // pass 2, after every endpoint exists
+		default:
+			return nil, fmt.Errorf("transport entry %d: type must be one of direct, proxy, pool", i+1)
+		}
+		name, err := checkName(i, rawName)
+		if err != nil {
+			return nil, err
+		}
+		ordinal := i + 1
 		switch entry.Type {
 		case "":
-			return nil, fmt.Errorf("transport entry %d: type is required (direct, proxy)", ordinal)
+			return nil, fmt.Errorf("transport entry %d: type is required (direct, proxy, pool)", ordinal)
 		case "direct":
-			if strings.TrimSpace(entry.Proxy) != "" {
-				return nil, fmt.Errorf("transport entry %d: type direct must not set a proxy URL", ordinal)
+			if err := rejectEndpointField(entry, ordinal, "direct"); err != nil {
+				return nil, err
 			}
-			cfg = transport.Config{Kind: transport.Direct}
+			out[name] = transport.Config{Kind: transport.Direct}
 		case "proxy":
+			if err := rejectEndpointField(entry, ordinal, "proxy"); err != nil {
+				return nil, err
+			}
 			u, err := parseProxyURL(entry.Proxy)
 			if err != nil {
 				return nil, fmt.Errorf("transport entry %d: %w", ordinal, err)
 			}
-			cfg = transport.Config{Kind: transport.Proxy, ProxyURL: u}
-		default:
-			return nil, fmt.Errorf("transport entry %d: type must be one of direct, proxy", ordinal)
+			out[name] = transport.Config{Kind: transport.Proxy, ProxyURL: u}
 		}
-		out[name] = cfg
+	}
+
+	// Pass 2: pools, whose member references now resolve.
+	for i, rawName := range names {
+		entry := rt[rawName]
+		if entry.Type != "pool" {
+			continue
+		}
+		name, err := checkName(i, rawName)
+		if err != nil {
+			return nil, err
+		}
+		ordinal := i + 1
+		if strings.TrimSpace(entry.Proxy) != "" {
+			return nil, fmt.Errorf("transport entry %d: type pool must not set a proxy URL", ordinal)
+		}
+		if len(entry.Members) == 0 {
+			return nil, fmt.Errorf("transport entry %d: pool requires at least one member", ordinal)
+		}
+		strategy, err := buildPoolStrategy(entry.Strategy, ordinal)
+		if err != nil {
+			return nil, err
+		}
+		fallback, err := buildPoolFallback(entry.Fallback, ordinal)
+		if err != nil {
+			return nil, err
+		}
+		health, err := buildPoolHealth(entry.Health, ordinal)
+		if err != nil {
+			return nil, err
+		}
+		members, err := buildPoolMembers(entry.Members, out, rt, ordinal)
+		if err != nil {
+			return nil, err
+		}
+		out[name] = transport.Config{
+			Kind: transport.EgressPool,
+			Pool: transport.NewPool(members, strategy, fallback, health),
+		}
 	}
 	return out, nil
+}
+
+// rejectEndpointField rejects the pool-only fields on a non-pool transport
+// and the endpoint-only proxy field on a pool — every type carries exactly
+// the fields that mean something for it, so a field in the wrong entry is
+// rejected rather than silently ignored.
+func rejectEndpointField(entry runtimeTransport, ordinal int, typ string) error {
+	if len(entry.Members) > 0 {
+		return fmt.Errorf("transport entry %d: members are only valid for type pool", ordinal)
+	}
+	if entry.Strategy != "" {
+		return fmt.Errorf("transport entry %d: strategy is only valid for type pool", ordinal)
+	}
+	if entry.Fallback != nil {
+		return fmt.Errorf("transport entry %d: fallback is only valid for type pool", ordinal)
+	}
+	if entry.Health != nil {
+		return fmt.Errorf("transport entry %d: health is only valid for type pool", ordinal)
+	}
+	if typ == "direct" && strings.TrimSpace(entry.Proxy) != "" {
+		return fmt.Errorf("transport entry %d: type direct must not set a proxy URL", ordinal)
+	}
+	return nil
+}
+
+// buildPoolStrategy normalizes the optional strategy key. Absent means
+// round_robin — the default needs no key.
+func buildPoolStrategy(raw string, ordinal int) (transport.Strategy, error) {
+	switch raw {
+	case "":
+		return transport.RoundRobin, nil
+	case "round_robin":
+		return transport.RoundRobin, nil
+	case "weighted_round_robin":
+		return transport.WeightedRoundRobin, nil
+	default:
+		return 0, fmt.Errorf("transport entry %d: strategy must be one of round_robin, weighted_round_robin", ordinal)
+	}
+}
+
+// Pool policy bounds. maxPoolAttempts keeps the fallback bound inside one
+// byte of dialing sanity (the schema repeats the check); maxPoolWeight
+// keeps the smooth weighted scheduler's counters far from any overflow
+// while allowing every operationally sane ratio.
+const (
+	defaultPoolMaxAttempts = 3
+	maxPoolAttempts        = 16
+	defaultPoolWeight      = 1
+	maxPoolWeight          = 1_000_000_000
+)
+
+// buildPoolFallback normalizes the optional fallback block: on by default,
+// at most defaultPoolMaxAttempts distinct dials.
+func buildPoolFallback(rf *runtimeFallback, ordinal int) (transport.FallbackPolicy, error) {
+	p := transport.FallbackPolicy{Enabled: true, MaxAttempts: defaultPoolMaxAttempts}
+	if rf == nil {
+		return p, nil
+	}
+	if rf.Enabled != nil {
+		p.Enabled = *rf.Enabled
+	}
+	if rf.MaxAttempts != nil {
+		p.MaxAttempts = *rf.MaxAttempts
+	}
+	if p.MaxAttempts < 1 {
+		return p, fmt.Errorf("transport entry %d: fallback max-attempts must be at least 1", ordinal)
+	}
+	if p.MaxAttempts > maxPoolAttempts {
+		return p, fmt.Errorf("transport entry %d: fallback max-attempts must be at most %d", ordinal, maxPoolAttempts)
+	}
+	return p, nil
+}
+
+// Pool health defaults: enabled, three consecutive failures trip the
+// cooldown, the cooldown itself matches the keep-alive-minded 30s the
+// org's other egress machinery uses.
+const (
+	defaultPoolFailureThreshold = 3
+	defaultPoolCooldown         = 30 * time.Second
+	minPoolCooldown             = time.Second
+)
+
+// buildPoolHealth normalizes the optional health block. A threshold of 0
+// (or enabled: false) disables strike tracking.
+func buildPoolHealth(rh *runtimeHealth, ordinal int) (transport.HealthPolicy, error) {
+	p := transport.HealthPolicy{Enabled: true, FailureThreshold: defaultPoolFailureThreshold, Cooldown: defaultPoolCooldown}
+	if rh == nil {
+		return p, nil
+	}
+	if rh.Enabled != nil {
+		p.Enabled = *rh.Enabled
+	}
+	if rh.FailureThreshold != nil {
+		p.FailureThreshold = *rh.FailureThreshold
+	}
+	if rh.Cooldown != "" {
+		d, err := time.ParseDuration(rh.Cooldown)
+		if err != nil {
+			return p, fmt.Errorf("transport entry %d: health cooldown must be a valid duration (e.g. 30s, 1m)", ordinal)
+		}
+		p.Cooldown = d
+	}
+	if p.FailureThreshold < 0 {
+		return p, fmt.Errorf("transport entry %d: health failure-threshold must not be negative", ordinal)
+	}
+	if p.Cooldown < minPoolCooldown {
+		return p, fmt.Errorf("transport entry %d: health cooldown must be at least 1s", ordinal)
+	}
+	if !p.Enabled {
+		p.FailureThreshold = 0
+	}
+	return p, nil
+}
+
+// buildPoolMembers resolves and normalizes the member list against the
+// already-built plain transports. A reference must name an existing direct
+// or proxy entry — pools do not nest, and an unknown name never falls back
+// to direct: silently rerouting egress is the quiet direction this schema
+// exists to prevent. A reference may appear only once; two members at one
+// endpoint would make scheduling and health state ambiguous.
+func buildPoolMembers(rms []runtimePoolMember, built map[string]transport.Config, rt map[string]runtimeTransport, ordinal int) ([]transport.Member, error) {
+	members := make([]transport.Member, 0, len(rms))
+	used := make(map[string]struct{}, len(rms))
+	for j, rm := range rms {
+		memberOrdinal := fmt.Sprintf("%d.%d", ordinal, j+1)
+		ref := strings.TrimSpace(rm.Transport)
+		if ref == "" {
+			return nil, fmt.Errorf("transport entry %s: pool member transport reference is required", memberOrdinal)
+		}
+		if _, dup := used[ref]; dup {
+			return nil, fmt.Errorf("transport entry %s: pool member references the same transport twice", memberOrdinal)
+		}
+		used[ref] = struct{}{}
+		// The raw-type check runs before the built lookup: pass 2 builds
+		// pools in sorted order, so a pool that sorts earlier is already in
+		// `built` when a later pool references it — the built check alone
+		// would admit pool-to-pool members half the time.
+		if raw, exists := rt[ref]; exists && raw.Type == "pool" {
+			return nil, fmt.Errorf("transport entry %s: pool member must reference a direct or proxy transport", memberOrdinal)
+		}
+		cfg, ok := built[ref]
+		if !ok {
+			return nil, fmt.Errorf("transport entry %s: pool member references an unknown transport", memberOrdinal)
+		}
+		m := transport.Member{Endpoint: cfg, Streaming: true, Weight: defaultPoolWeight}
+		if rm.Streaming != nil {
+			m.Streaming = *rm.Streaming
+		}
+		if rm.Weight != nil {
+			m.Weight = *rm.Weight
+		}
+		if m.Weight < 1 {
+			return nil, fmt.Errorf("transport entry %s: pool member weight must be at least 1", memberOrdinal)
+		}
+		if m.Weight > maxPoolWeight {
+			return nil, fmt.Errorf("transport entry %s: pool member weight is unreasonably large", memberOrdinal)
+		}
+		if rm.MaxBodyBytes != nil {
+			m.MaxBodyBytes = *rm.MaxBodyBytes
+			if m.MaxBodyBytes < 0 {
+				return nil, fmt.Errorf("transport entry %s: pool member max-body-bytes must not be negative", memberOrdinal)
+			}
+		}
+		if rm.MaxConcurrency != nil {
+			m.MaxConcurrency = *rm.MaxConcurrency
+			if m.MaxConcurrency < 0 {
+				return nil, fmt.Errorf("transport entry %s: pool member max-concurrency must not be negative", memberOrdinal)
+			}
+		}
+		members = append(members, m)
+	}
+	return members, nil
 }
 
 // providerEntry is one validated providers-table entry: the upstream base
