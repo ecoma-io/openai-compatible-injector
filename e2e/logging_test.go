@@ -425,8 +425,8 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 		t.Fatalf("dead endpoint status = %d, want 502", status)
 	}
 
-	// Upstream 500 echoing the secrets back: the response is relayed
-	// verbatim to the client by contract, but the echo must not reach logs.
+	// Upstream 500 echoing the secrets back: the error is normalized, so the
+	// echo reaches neither the client (canonical envelope) nor the logs.
 	upstream.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		body := make([]byte, r.ContentLength)
 		_, _ = readFullBody(r, body)
@@ -434,8 +434,14 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write(body) // echoes Authorization-adjacent payload verbatim
 	})
-	if status, _, respBody := postJSON(t, p.addr, "/v1/chat/completions", secretBody, headers); status != http.StatusInternalServerError {
+	status, _, respBody := postJSON(t, p.addr, "/v1/chat/completions", secretBody, headers)
+	if status != http.StatusInternalServerError {
 		t.Fatalf("echo status = %d, want 500 (got body %s)", status, respBody)
+	}
+	for _, secret := range []string{"SECRET_AUTH_VALUE", "SECRET_REQUEST_BODY", "SECRET_PROMPT_VALUE", "SECRET_API_KEY"} {
+		if strings.Contains(string(respBody), secret) {
+			t.Fatalf("provider echo reached the client: %s", respBody)
+		}
 	}
 
 	// Invalid reload: the rejected file carries the endpoint secret; the
@@ -455,7 +461,7 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 	// The scenarios above must actually have produced the log events under
 	// test — otherwise the leak assertion would pass vacuously.
 	stderr := p.stderr.String()
-	for _, msg := range []string{"upstream_request_failed", "config_reload_rejected"} {
+	for _, msg := range []string{"upstream_request_failed", "config_reload_rejected", "upstream_http_error"} {
 		if len(eventsWithMessage(parseLogEvents(t, stderr), msg)) == 0 {
 			t.Fatalf("expected %q events missing — scenario did not exercise logs", msg)
 		}

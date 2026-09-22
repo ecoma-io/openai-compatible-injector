@@ -104,10 +104,21 @@ Owned decomposition:
   and is disabled immediately when `[DONE]` or `response.completed` is
   forwarded — never pings inside/after a terminal event; pre-header silence
   remains outside its scope.
-- **Verbose verbatim, loud local.** 4xx/5xx upstream responses forward byte
-  for byte. A 200 that is not JSON becomes 502 `upstream_invalid_response`;
-  dial failure is 502 `upstream_unreachable`; unmapped model is 404
-  `model_not_found` and is NEVER forwarded.
+- **3xx/204/304 verbatim; 4xx/5xx normalized, loud local.** Non-2xx
+  non-error statuses (3xx redirects — never followed — 204, 304) forward
+  byte for byte. Upstream 4xx/5xx are normalized: status preserved, body
+  replaced by the canonical envelope, raw provider bytes relayed nowhere —
+  a bounded 64 KiB prefix is read once (`internal/proxy/upstream_error.go`)
+  to classify (`error_shape`) and fingerprint (`error_fingerprint`,
+  SHA-256 of the prefix) into one `upstream_http_error` evidence event
+  (WARN 4xx / ERROR 5xx, token-shaped `provider_error_type`/`code` only,
+  allow-listed `retry_after`/`x_ratelimit_*`, scheme+host upstream); the
+  bytes themselves reach neither client nor logs. A 200 that is not JSON
+  becomes 502 `upstream_invalid_response`; an error-body read failure is
+  WARN `upstream_body_read_failed` + 502; a client cancel during it is
+  `client_disconnected` with no envelope. Dial failure is 502
+  `upstream_unreachable`; unmapped model is 404 `model_not_found` and is
+  NEVER forwarded.
 - **Never log or leak credentials.** No `Authorization`, keys, request
   bodies, or injection prompts in logs or error text. A quote of these is
   a security defect (SECURITY.md), not a typo.
@@ -150,7 +161,12 @@ Owned decomposition:
   `code: "upstream_invalid_response"` on 200 + unparseable JSON. A client
   cancel while the upstream request is in flight is the WARN
   `client_disconnected` outcome, never this 502.
-- Anything else from upstream (any 4xx/5xx) forwards verbatim.
+- Upstream 4xx/5xx — status preserved exactly (never collapsed to 502),
+  body always the canonical envelope
+  `{"error":{"message":"upstream provider returned HTTP <S>","type":"upstream_error","param":null,"code":"upstream_http_<S>"}}`
+  with `Content-Type: application/json`; `Retry-After`/`X-RateLimit-*`/
+  request-id headers still relay through the allow-list. 3xx/204/304
+  forward verbatim.
 - No overall request timeout; upstream timeouts surface as 502.
 
 ## Testing

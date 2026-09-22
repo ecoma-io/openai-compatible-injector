@@ -148,7 +148,7 @@ func TestRelayHeaderAllowListAnd429(t *testing.T) {
 
 	status, hdr, body := postJSON(t, p.addr, "/v1/chat/completions", chatBody, nil)
 	if status != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429 forwarded verbatim", status)
+		t.Fatalf("status = %d, want 429 (status preserved through normalization)", status)
 	}
 	for name, want := range map[string]string{
 		"Retry-After":           "7",
@@ -165,8 +165,11 @@ func TestRelayHeaderAllowListAnd429(t *testing.T) {
 			t.Errorf("client received non-allow-listed header %s = %q", name, got)
 		}
 	}
-	if !strings.Contains(string(body), "quota exhausted") {
-		t.Errorf("429 body not forwarded verbatim: %q", body)
+	if want := `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}`; string(body) != want {
+		t.Errorf("429 body = %q, want the canonical envelope %q", body, want)
+	}
+	if strings.Contains(string(body), "quota exhausted") {
+		t.Errorf("provider body bytes relayed: %q", body)
 	}
 }
 

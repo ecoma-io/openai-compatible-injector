@@ -349,11 +349,13 @@ func (d *dyingRecorder) Flush()          {}
 // body that dies mid-relay is logged as an upstream read (ERROR — not a
 // client cancel), the outcome says upstream_read_failed — never "relayed",
 // which would report a truncated body as a finished one — while the
-// response status stays whatever upstream committed.
+// response status stays whatever upstream committed. 302 because the
+// verbatim branch now carries only non-2xx-non-error statuses (3xx, 204,
+// 304) — a 4xx/5xx is normalized on its own path.
 func TestRelayCopyFailureLogged(t *testing.T) {
 	buf, log := captureLog(zerolog.InfoLevel)
 	client := &http.Client{Transport: &stubTransport{resp: &http.Response{
-		StatusCode: http.StatusTeapot,
+		StatusCode: http.StatusFound,
 		Header:     http.Header{"Content-Type": {"text/plain"}},
 		Body:       &errBody{data: []byte("partial")},
 		Request:    &http.Request{Method: http.MethodPost},
@@ -362,8 +364,8 @@ func TestRelayCopyFailureLogged(t *testing.T) {
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model"}`, nil)
-	if rec.Code != http.StatusTeapot {
-		t.Fatalf("status = %d, want 418 (relayed verbatim)", rec.Code)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (relayed verbatim)", rec.Code)
 	}
 
 	evs := buf.events(t, "relay_copy_failed")
@@ -418,8 +420,10 @@ func (s *shortResponseWriter) WriteHeader(int)             {}
 func TestRelayOutcomeClassification(t *testing.T) {
 	verbatim := func(body io.ReadCloser) (buf *logBuffer, h http.Handler) {
 		buf, log := captureLog(zerolog.InfoLevel)
+		// 302: the verbatim branch's own statuses (3xx/204/304) — a 4xx/5xx
+		// takes the normalized error path instead.
 		client := &http.Client{Transport: &stubTransport{resp: &http.Response{
-			StatusCode: http.StatusTeapot,
+			StatusCode: http.StatusFound,
 			Header:     http.Header{"Content-Type": {"text/plain"}},
 			Body:       body,
 			Request:    &http.Request{Method: http.MethodPost},
@@ -481,8 +485,8 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		// client goes away.
 		buf, h := verbatim(&canceledBody{})
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
-		if rec.Code != http.StatusTeapot {
-			t.Fatalf("status = %d, want 418", rec.Code)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302", rec.Code)
 		}
 		expectDisconnected(t, buf, "relay_copy_failed")
 	})
@@ -886,6 +890,26 @@ func TestErrorEnvelopeWriteFailureOutcome(t *testing.T) {
 			},
 			body:        `{"model":"test-model"}`,
 			wantAttempt: http.StatusBadGateway,
+		},
+		{
+			// The normalized 4xx/5xx envelope is client-facing traffic too:
+			// when the client is gone before it can land, the request is
+			// accounted as its disconnect — never as upstream_http_error,
+			// which would report a normalized error as delivered.
+			name: "upstream_http_error_normalized",
+			store: func(t *testing.T) *config.Store {
+				return newTestStore(t, "http://stub.invalid/v1")
+			},
+			client: func(t *testing.T) *http.Client {
+				return &http.Client{Transport: &stubTransport{resp: &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"quota exhausted","code":"insufficient_quota"}}`)),
+					Request:    &http.Request{Method: http.MethodPost},
+				}}}
+			},
+			body:        `{"model":"test-model"}`,
+			wantAttempt: http.StatusTooManyRequests,
 		},
 	}
 	for _, tc := range cases {
