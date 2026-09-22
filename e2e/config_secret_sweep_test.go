@@ -25,25 +25,27 @@ const (
 	secretModelName   = "SECRET_MODEL_NAME_SHOULD_NOT_LEAK"
 	secretTokenQuery  = "SECRET_TOKEN_QUERY"
 	secretSchemePaste = "secretschemepaste" // lowercase, no underscore: url.Parse lowercases schemes, so the echoed form must still match the marker
+	secretAPIKey      = "SECRET_APIKEY_VALUE"
 )
 
 // allConfigSecrets is the full marker inventory the sweep asserts absent.
 var allConfigSecrets = []string{
 	secretLevelURL, secretTopKeyURL, secretModelKey, secretScalar,
 	secretSecondDoc, secretEscapePath, secretDuplicate, secretAnchorAlias,
-	secretModelName, secretTokenQuery, secretSchemePaste,
+	secretModelName, secretTokenQuery, secretSchemePaste, secretAPIKey,
 }
 
 // rejectedCaseCount is the number of echo positions rejectedYAML renders.
-const rejectedCaseCount = 12
+const rejectedCaseCount = 14
 
 // rejectedYAML renders one rejected runtime file per echo position. Every
 // case must stay driven by the reload sweep below: a marker that is declared
 // but never planted is coverage that can only ever pass.
 func rejectedYAML(i int) string {
 	switch i {
-	case 0: // secret URL as the log-level value
-		return "models:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\nlog-level: https://gw.example/v1?" + secretLevelURL + "=x\n"
+	case 0: // secret URL as the log-level value (the api-key is present so the
+		// rejection reaches the level parse, not the required-key gate first)
+		return "api-key: k\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\nlog-level: https://gw.example/v1?" + secretLevelURL + "=x\n"
 	case 1: // secret URL as a top-level key
 		return "https://gw.example/v1?" + secretTopKeyURL + "=x: true\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\n"
 	case 2: // secret URL as a key inside a model entry (strict decode)
@@ -66,6 +68,13 @@ func rejectedYAML(i int) string {
 		return "models:\n  m:\n    endpoint: \"" + secretSchemePaste + ":x\"\n    upstream-model: up\n"
 	case 11: // secret model name where a model entry value belongs (type error)
 		return "models:\n  m: " + secretModelName + "\n"
+	case 12: // secret-valued api-key as a list (type error; the yaml type
+		// message names the type, never the value)
+		return "api-key: [" + secretAPIKey + ", x]\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\n"
+	case 13: // real secret-valued api-key on a file rejected for another
+		// reason (bad endpoint scheme): the rejection names the model ordinal,
+		// never the key
+		return "api-key: " + secretAPIKey + "\nmodels:\n  m:\n    endpoint: ftp://h/v1\n    upstream-model: up\n"
 	default:
 		panic("no such rejected yaml case")
 	}
@@ -100,7 +109,7 @@ func TestBootRejectionNeverEchoesSecrets(t *testing.T) {
 // own transition WARN (a persistently failing file downgrades to debug).
 func TestReloadRejectionNeverEchoesSecrets(t *testing.T) {
 	p := startSubprocess(t, startOpts{
-		yaml:     "models:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\nlog-level: info\n",
+		yaml:     "api-key: k\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\nlog-level: info\n",
 		logLevel: "", // the YAML's log-level key governs
 	})
 
@@ -115,7 +124,7 @@ func TestReloadRejectionNeverEchoesSecrets(t *testing.T) {
 		// Heal with fresh valid content (must differ from the rejected bytes
 		// and from every earlier heal, so the hash changes and the reload
 		// event re-fires for the next round).
-		heal := fmt.Sprintf("models:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up-heal-%d\nlog-level: info\n", i)
+		heal := fmt.Sprintf("api-key: k\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up-heal-%d\nlog-level: info\n", i)
 		rewriteConfig(t, p.cfgPath, heal)
 		waitForEventCount(t, p, "config_reloaded", i+1)
 	}

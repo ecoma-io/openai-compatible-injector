@@ -20,8 +20,17 @@ func TestLoadRuntimeErrorsNeverEchoInput(t *testing.T) {
 		yaml string
 	}{
 		{
+			// The api-key is present so this rejection is still the
+			// log-level's, not the required-key check's.
 			name: "log-level value carries a credential-bearing URL",
-			yaml: "models:\n  a:\n    endpoint: http://h.example/v1\n    upstream-model: m\nlog-level: https://h.example/v1?" + marker + "=x\n",
+			yaml: "api-key: k\nmodels:\n  a:\n    endpoint: http://h.example/v1\n    upstream-model: m\nlog-level: https://h.example/v1?" + marker + "=x\n",
+		},
+		{
+			// The api-key itself is a pasteable credential position: a
+			// rejection that fires elsewhere in the file must never quote
+			// it.
+			name: "api-key value alongside a rejected model entry",
+			yaml: "api-key: " + marker + "\nmodels:\n  a:\n    upstream-model: m\n",
 		},
 		{
 			name: "URL pasted as a key inside a model entry",

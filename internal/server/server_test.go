@@ -21,9 +21,13 @@ func testLogger(t *testing.T) zerolog.Logger {
 	return zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled)
 }
 
+// serverTestAPIKey is the bearer credential the server tests configure and
+// present.
+const serverTestAPIKey = "server-test-key"
+
 func testStore(t *testing.T, endpoint string) *config.Store {
 	t.Helper()
-	yaml := fmt.Sprintf("models:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n", endpoint)
+	yaml := fmt.Sprintf("api-key: %s\nmodels:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n", serverTestAPIKey, endpoint)
 	snap, err := config.LoadRuntime([]byte(yaml))
 	if err != nil {
 		t.Fatalf("LoadRuntime: %v", err)
@@ -99,8 +103,15 @@ func TestRunDrainsInFlightRequest(t *testing.T) {
 	}
 	clientDone := make(chan clientResult, 1)
 	go func() {
-		resp, err := http.Post("http://"+addr+"/v1/chat/completions", "application/json",
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/chat/completions",
 			strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			clientDone <- clientResult{err: err}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+serverTestAPIKey)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			clientDone <- clientResult{err: err}
 			return
@@ -175,8 +186,15 @@ func TestRunForceClosesPastGrace(t *testing.T) {
 
 	clientDone := make(chan error, 1)
 	go func() {
-		resp, err := http.Post("http://"+addr+"/v1/chat/completions", "application/json",
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/chat/completions",
 			strings.NewReader(`{"model":"test-model"}`))
+		if err != nil {
+			clientDone <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+serverTestAPIKey)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			clientDone <- err // force-close terminates the client conn
 			return

@@ -50,6 +50,7 @@ func TestRedirectRelayedVerbatim(t *testing.T) {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e2eAPIKey)
 	resp, err := noFollow.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -81,9 +82,10 @@ func TestRedirectRelayedVerbatim(t *testing.T) {
 	}
 }
 
-// TestForwardHeaderAllowList: only Authorization, Content-Type, Accept and
-// OpenAI-Beta travel upstream; every other client header — including
-// credential-shaped ones — is dropped.
+// TestForwardHeaderAllowList: only Content-Type, Accept and OpenAI-Beta
+// travel upstream. Authorization authenticates the client TO the proxy and is
+// consumed there — never forwarded — and every other client header, including
+// credential-shaped ones, is dropped.
 func TestForwardHeaderAllowList(t *testing.T) {
 	up := newFakeUpstream(t)
 	up.setHandler(jsonChatHandler(chatUpstream))
@@ -93,7 +95,7 @@ func TestForwardHeaderAllowList(t *testing.T) {
 	})
 
 	hdr := map[string]string{
-		"Authorization":   "Bearer allow-me",
+		"Authorization":   "Bearer " + e2eAPIKey, // consumed by the proxy
 		"Accept":          "application/vnd.custom",
 		"OpenAI-Beta":     "assistants=v2",
 		"X-Api-Key":       "drop-me-secret",
@@ -109,15 +111,14 @@ func TestForwardHeaderAllowList(t *testing.T) {
 		t.Fatal("upstream recorded no request")
 	}
 	for name, want := range map[string]string{
-		"Authorization": "Bearer allow-me",
-		"Accept":        "application/vnd.custom",
-		"OpenAI-Beta":   "assistants=v2",
+		"Accept":      "application/vnd.custom",
+		"OpenAI-Beta": "assistants=v2",
 	} {
 		if got := req.Headers.Get(name); got != want {
 			t.Errorf("upstream %s = %q, want %q", name, got, want)
 		}
 	}
-	for _, name := range []string{"X-Api-Key", "Cookie", "Idempotency-Key", "X-Custom"} {
+	for _, name := range []string{"Authorization", "X-Api-Key", "Cookie", "Idempotency-Key", "X-Custom"} {
 		if got := req.Headers.Get(name); got != "" {
 			t.Errorf("upstream received dropped header %s = %q", name, got)
 		}

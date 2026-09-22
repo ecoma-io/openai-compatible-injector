@@ -28,7 +28,7 @@ func thinkingStore(t *testing.T, endpoint, mode, lo, hi string) *config.Store {
 			block += fmt.Sprintf("      max-ratio: %s\n", hi)
 		}
 	}
-	yaml := fmt.Sprintf("models:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n%s", endpoint, block)
+	yaml := fmt.Sprintf("api-key: %s\nmodels:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n%s", testAPIKey, endpoint, block)
 	snap, err := config.LoadRuntime([]byte(yaml))
 	if err != nil {
 		t.Fatalf("LoadRuntime: %v", err)

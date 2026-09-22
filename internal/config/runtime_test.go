@@ -7,6 +7,7 @@ import (
 
 func validRuntime() string {
 	return `
+api-key: unit-test-key
 models:
   gpt-reviewer:
     endpoint: https://api.provider.example/v1
@@ -177,11 +178,50 @@ func TestLoadRuntimeRejectsEmptyModels(t *testing.T) {
 	}
 }
 
+// TestLoadRuntimeRequiresAPIKey pins the fail-closed rule: a runtime file
+// without a usable api-key never becomes a snapshot — at boot that refuses
+// to start, on reload it keeps the last-known-good key serving. Absent,
+// null, empty, and whitespace-only are the same rejection, and the trimmed
+// value is exactly what the auth gate compares against.
+func TestLoadRuntimeRequiresAPIKey(t *testing.T) {
+	rejects := []struct {
+		name string
+		yaml string
+	}{
+		{"absent", "models:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
+		{"empty", "api-key: \"\"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
+		{"null", "api-key:\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
+		{"whitespace only", "api-key: \"   \"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if !strings.Contains(err.Error(), "api-key is required") {
+				t.Fatalf("err = %v, want containing %q", err, "api-key is required")
+			}
+		})
+	}
+
+	s := mustSnapshot(t, "api-key: \"  unit-test-key  \"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n")
+	if got := s.APIKey(); got != "unit-test-key" {
+		t.Fatalf("APIKey() = %q, want the trimmed value", got)
+	}
+	// The key is a legal top-level citizen: alongside models and log-level
+	// it loads fine.
+	if _, err := LoadRuntime([]byte("api-key: unit-test-key\nlog-level: debug\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n")); err != nil {
+		t.Fatalf("LoadRuntime rejected a well-formed api-key: %v", err)
+	}
+}
+
 func TestSnapshotImmutableBetweenPublishes(t *testing.T) {
 	// Publishers hand over fresh snapshots; a published snapshot must not
 	// alias the previous one (the map is not shared).
 	s1 := mustSnapshot(t, validRuntime())
 	s2 := mustSnapshot(t, `
+api-key: unit-test-key
 models:
   other:
     endpoint: http://localhost:9000/v1
@@ -245,6 +285,7 @@ func TestLoadRuntimePreservesModelNameCase(t *testing.T) {
 	// must reach clients exactly as configured. A configured `MyModel` is
 	// reachable as `MyModel` and nothing else.
 	s := mustSnapshot(t, `
+api-key: unit-test-key
 models:
   MyModel:
     endpoint: http://localhost:9000/v1
@@ -273,6 +314,7 @@ func TestLoadRuntimeAcceptsDottedModelName(t *testing.T) {
 	// then rejects the leftover as an unknown key; a dotted name is legal
 	// YAML and must load.
 	s := mustSnapshot(t, `
+api-key: unit-test-key
 models:
   gpt-3.5-turbo:
     endpoint: http://localhost:9000/v1
@@ -366,7 +408,7 @@ func TestLoadRuntimeThinkingUsageValidation(t *testing.T) {
 // default, one set pinned to it, both kept as the [Lo, Hi] range.
 func TestLoadRuntimeThinkingUsageNormalization(t *testing.T) {
 	entry := func(block string) string {
-		return "models:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n" + block
+		return "api-key: unit-test-key\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n" + block
 	}
 	cases := []struct {
 		name  string

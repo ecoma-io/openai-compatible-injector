@@ -124,16 +124,29 @@ func perfChatBody(model string, want int) string {
 	return fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"%s"}]}`, model, pad)
 }
 
+// perfDo issues one JSON POST carrying the suite's default bearer — the perf
+// arms must measure proxying, not 401 rejections.
+func perfDo(tb testing.TB, addr, path, body string) *http.Response {
+	tb.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+path, strings.NewReader(body))
+	if err != nil {
+		tb.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e2eAPIKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		tb.Fatalf("post: %v", err)
+	}
+	return resp
+}
+
 // perfPostAt issues one non-streaming request to the given route and returns
 // its duration; it fails the caller on any non-200.
 func perfPostAt(tb testing.TB, addr, path, body string) time.Duration {
 	tb.Helper()
 	start := time.Now()
-	resp, err := http.Post("http://"+addr+path, "application/json",
-		strings.NewReader(body))
-	if err != nil {
-		tb.Fatalf("post: %v", err)
-	}
+	resp := perfDo(tb, addr, path, body)
 	got, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
@@ -155,11 +168,7 @@ func perfPost(tb testing.TB, addr, body string) time.Duration {
 func perfStream(b *testing.B, addr, body string) time.Duration {
 	b.Helper()
 	start := time.Now()
-	resp, err := http.Post("http://"+addr+"/v1/chat/completions", "application/json",
-		strings.NewReader(body))
-	if err != nil {
-		b.Fatalf("post: %v", err)
-	}
+	resp := perfDo(b, addr, "/v1/chat/completions", body)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b.Fatalf("status = %d", resp.StatusCode)
@@ -317,11 +326,7 @@ func perfEvent(shape string, size int) string {
 func perfStreamRead(tb testing.TB, addr, path, body string) (ttfb, total time.Duration) {
 	tb.Helper()
 	start := time.Now()
-	resp, err := http.Post("http://"+addr+path, "application/json",
-		strings.NewReader(body))
-	if err != nil {
-		tb.Fatalf("post: %v", err)
-	}
+	resp := perfDo(tb, addr, path, body)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		tb.Fatalf("status = %d", resp.StatusCode)

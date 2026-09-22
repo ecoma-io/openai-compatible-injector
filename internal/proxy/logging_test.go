@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -66,10 +67,11 @@ func (b *logBuffer) events(t *testing.T, msg string) []map[string]any {
 }
 
 // promptStore is a store whose injection prompt embeds a marker: if that
-// marker ever reaches a log line, the payload rule is broken.
-func promptStore(t *testing.T, endpoint, prompt string) *config.Store {
+// marker ever reaches a log line, the payload rule is broken. The api-key is
+// a parameter so the same harness can make the key itself a swept marker.
+func promptStore(t *testing.T, endpoint, prompt, key string) *config.Store {
 	t.Helper()
-	yaml := fmt.Sprintf("models:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: %q\n", endpoint, prompt)
+	yaml := fmt.Sprintf("api-key: %s\nmodels:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: %q\n", key, endpoint, prompt)
 	snap, err := config.LoadRuntime([]byte(yaml))
 	if err != nil {
 		t.Fatalf("LoadRuntime: %v", err)
@@ -89,7 +91,7 @@ func TestRequestCompletedLogLifecycle(t *testing.T) {
 	defer upstream.Close()
 
 	buf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me"), NewSharedClient(), log)
+	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me", testAPIKey), NewSharedClient(), log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","stream":false,"messages":"SECRET_REQUEST_BODY"}`, nil)
@@ -231,6 +233,7 @@ func TestStreamTruncationPhaseLogging(t *testing.T) {
 		dying := &dyingRecorder{limit: 2}
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 			strings.NewReader(`{"model":"test-model","stream":true}`))
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
 		h.ServeHTTP(dying, req)
 
 		evs := buf.events(t, "stream_truncated")
@@ -448,6 +451,7 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		buf, h := verbatim(io.NopCloser(strings.NewReader("body bytes")))
 		dying := &dyingRecorder{limit: 0}
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
 		h.ServeHTTP(dying, req)
 		expectDisconnected(t, buf, "relay_copy_failed")
 	})
@@ -456,6 +460,7 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		buf, h := verbatim(io.NopCloser(strings.NewReader("body bytes")))
 		pipe := &pipeRecorder{}
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
 		h.ServeHTTP(pipe, req)
 		expectDisconnected(t, buf, "relay_copy_failed")
 	})
@@ -464,6 +469,7 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		buf, h := verbatim(io.NopCloser(strings.NewReader("body bytes")))
 		short := &shortResponseWriter{}
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
 		h.ServeHTTP(short, req)
 		expectDisconnected(t, buf, "relay_copy_failed")
 	})
@@ -516,9 +522,10 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		defer upstream.Close()
 
 		buf, log := captureLog(zerolog.InfoLevel)
-		h := NewHandler(promptStore(t, upstream.URL, "prompt"), NewSharedClient(), log)
+		h := NewHandler(promptStore(t, upstream.URL, "prompt", testAPIKey), NewSharedClient(), log)
 		dying := &dyingRecorder{limit: 0}
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
 		h.ServeHTTP(dying, req)
 
 		completed := buf.events(t, "request_completed")
@@ -556,6 +563,57 @@ func TestRelayOutcomeClassification(t *testing.T) {
 	})
 }
 
+// TestUnauthorizedOutcomeLogged pins the accounting of a 401: exactly one
+// request_completed, outcome unauthorized, status 401, bytes_in 0 — the gate
+// sits before the body read — and no field carries any part of the presented
+// credential.
+func TestUnauthorizedOutcomeLogged(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"upstream-name","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	buf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(promptStore(t, upstream.URL, "prompt", testAPIKey), NewSharedClient(), log)
+
+	const presented = "totally-wrong-SECRET-value"
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"test-model"}`, map[string]string{"Authorization": "Bearer " + presented})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+
+	completed := buf.events(t, "request_completed")
+	if len(completed) != 1 {
+		t.Fatalf("request_completed logged %d times, want exactly 1: %s", len(completed), buf.String())
+	}
+	ev := completed[0]
+	if ev["outcome"] != "unauthorized" {
+		t.Errorf("outcome = %v, want unauthorized", ev["outcome"])
+	}
+	if ev["status"].(float64) != 401 {
+		t.Errorf("status = %v, want 401", ev["status"])
+	}
+	if ev["bytes_in"].(float64) != 0 {
+		t.Errorf("bytes_in = %v, want 0 (auth gate sits before the body read)", ev["bytes_in"])
+	}
+	if ev["public_model"] != "" {
+		t.Errorf("public_model = %v, want empty on an auth rejection", ev["public_model"])
+	}
+	if _, ok := ev["config_generation"]; !ok {
+		t.Error("config_generation missing")
+	}
+	if hits.Load() != 0 {
+		t.Errorf("upstream hits = %d, want 0", hits.Load())
+	}
+	if strings.Contains(buf.String(), presented) {
+		t.Errorf("log output contains the presented credential — leak")
+	}
+}
+
 // TestDebugLifecycleChain pins the DEBUG checkpoint sequence for one
 // buffered request: every lifecycle checkpoint fires exactly once, in flow
 // order, and the chain carries metadata only — the planted markers (request
@@ -563,8 +621,11 @@ func TestRelayOutcomeClassification(t *testing.T) {
 // field even at maximum verbosity.
 func TestDebugLifecycleChain(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Authorization"), "SECRET") {
-			t.Errorf("upstream did not receive the forwarded Authorization — forward rule broken, audit test invalid")
+		// The client's Authorization authenticates it to the proxy and stops
+		// there: the upstream must never see it, even though it carries the
+		// configured key.
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("upstream received Authorization %q — forward rule broken, audit test invalid", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"model":"upstream-name","choices":[]}`))
@@ -572,7 +633,7 @@ func TestDebugLifecycleChain(t *testing.T) {
 	defer upstream.Close()
 
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me"), NewSharedClient(), log)
+	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me", "SECRET_AUTH_VALUE"), NewSharedClient(), log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","messages":"SECRET_REQUEST_BODY"}`,
@@ -846,6 +907,7 @@ func TestErrorEnvelopeWriteFailureOutcome(t *testing.T) {
 			dying := &dyingRecorder{limit: 0}
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 				strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+testAPIKey)
 			h.ServeHTTP(dying, req)
 
 			completed := buf.events(t, "request_completed")

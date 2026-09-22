@@ -108,6 +108,7 @@ func TestPollerReloadAndLastKnownGood(t *testing.T) {
 
 	// Valid content change -> republished with a new generation.
 	modified := `
+api-key: unit-test-key
 models:
   gpt-reviewer:
     endpoint: https://api.provider.example/v2
@@ -485,6 +486,7 @@ func TestPollerBootReadFailureDoesNotSpuriouslyRepublish(t *testing.T) {
 func TestPollerRapidEditsConvergeToFinalContent(t *testing.T) {
 	valid := func(model string) string {
 		return `
+api-key: unit-test-key
 models:
   gpt-reviewer:
     endpoint: https://api.provider.example/v2

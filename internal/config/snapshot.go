@@ -58,7 +58,11 @@ type Model struct {
 // Snapshot for its whole lifetime, so a reload mid-request cannot change the
 // endpoint, model, or prompt that request is using.
 type Snapshot struct {
-	gen      uint64
+	gen uint64
+	// apiKey is the client bearer credential this snapshot requires. It is
+	// credential material: compared per request, never logged, never echoed
+	// in error text.
+	apiKey   string
 	models   map[string]Model
 	logLevel zerolog.Level
 }
@@ -71,6 +75,12 @@ func (s *Snapshot) Gen() uint64 { return s.gen }
 // process-wide logger when the snapshot is published, making the level
 // hot-reloadable through the same content-hash poll as everything else.
 func (s *Snapshot) LogLevel() zerolog.Level { return s.logLevel }
+
+// APIKey returns the client bearer key this snapshot requires. It is read
+// per request, so a reload rotates the key for subsequent requests only —
+// an in-flight request stays bound to the snapshot it authenticated
+// against. It is never logged.
+func (s *Snapshot) APIKey() string { return s.apiKey }
 
 // Model resolves a public model name. The second return value reports
 // whether the model exists.

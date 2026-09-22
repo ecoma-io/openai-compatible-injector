@@ -78,6 +78,11 @@ func (l *lockedBuf) String() string {
 	return l.b.String()
 }
 
+// e2eAPIKey is the client bearer credential every standard config carries;
+// request helpers present it automatically unless a test sets its own
+// Authorization header.
+const e2eAPIKey = "e2e-client-key"
+
 // startOpts configures a subprocess launch.
 type startOpts struct {
 	yaml         string   // runtime config file content (used unless configPath set)
@@ -87,6 +92,8 @@ type startOpts struct {
 	logLevel     string   // runtime YAML log-level; default "error"
 	pollInterval string   // OAICR_CONFIG_POLL_INTERVAL; default "50ms"
 	extraEnv     []string // extra "K=V" entries appended to the process env
+	apiKey       string   // api-key upserted into the boot YAML; default e2eAPIKey
+	noAPIKey     bool     // write the boot YAML without an api-key (boot-rejection scenarios)
 }
 
 // proc is a running injector subprocess with captured output.
@@ -114,8 +121,16 @@ func newProc(tb testing.TB, o startOpts) *proc {
 	}
 	cfgPath := o.configPath
 	if cfgPath == "" {
+		body := withLoggingLevel(o.yaml, o.logLevel)
+		if !o.noAPIKey {
+			key := o.apiKey
+			if key == "" {
+				key = e2eAPIKey
+			}
+			body = withAPIKey(body, key)
+		}
 		cfgPath = filepath.Join(tb.TempDir(), "config.yaml")
-		if err := os.WriteFile(cfgPath, []byte(withLoggingLevel(o.yaml, o.logLevel)), 0o644); err != nil {
+		if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
 			tb.Fatalf("write config file: %v", err)
 		}
 	}
@@ -291,11 +306,13 @@ func rewriteConfig(t *testing.T, path, content string) {
 
 // runtimeYAML renders the runtime config file body for a single model entry.
 // Each extraFields line is appended verbatim under the entry (indented as a
-// member), for optional blocks such as thinking-usage.
+// member), for optional blocks such as thinking-usage. The api-key rides the
+// body itself: reload scenarios rewrite the file with a fresh runtimeYAML
+// render, so the key must survive every rewrite, not just the boot one.
 func runtimeYAML(publicName, endpoint, upstreamModel, injectionPrompt string, extraFields ...string) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "models:\n  %s:\n    endpoint: %s\n    upstream-model: %s\n",
-		publicName, endpoint, upstreamModel)
+	fmt.Fprintf(&sb, "api-key: %s\nmodels:\n  %s:\n    endpoint: %s\n    upstream-model: %s\n",
+		e2eAPIKey, publicName, endpoint, upstreamModel)
 	if injectionPrompt != "" {
 		fmt.Fprintf(&sb, "    injection-prompt: %s\n", injectionPrompt)
 	}
@@ -303,6 +320,17 @@ func runtimeYAML(publicName, endpoint, upstreamModel, injectionPrompt string, ex
 		sb.WriteString("    " + f + "\n")
 	}
 	return sb.String()
+}
+
+// withAPIKey prepends the api-key to a runtime YAML body that does not carry
+// one, mirroring withLoggingLevel. A body that already defines the key (at
+// the top or on its own line) is returned unchanged — upserting over it
+// would duplicate the key and turn a valid file into a rejection.
+func withAPIKey(yamlBody, key string) string {
+	if yamlBody == "" || strings.HasPrefix(yamlBody, "api-key:") || strings.Contains(yamlBody, "\napi-key:") {
+		return yamlBody
+	}
+	return "api-key: " + key + "\n" + yamlBody
 }
 
 // withLoggingLevel appends a top-level log-level key to a runtime YAML
@@ -414,6 +442,11 @@ func openJSON(t *testing.T, addr, path string, body any, hdr map[string]string) 
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Default to the configured bearer so the suite's traffic passes the
+	// auth gate; a test that sets its own Authorization opts out.
+	if _, ok := hdr["Authorization"]; !ok {
+		req.Header.Set("Authorization", "Bearer "+e2eAPIKey)
+	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
@@ -528,6 +561,11 @@ func postJSONRaw(addr, path, body string, hdr map[string]string) (int, http.Head
 		return 0, nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Same default-bearer rule as openJSON; goroutine-safe tests that need
+	// to vary it pass an explicit Authorization header.
+	if _, ok := hdr["Authorization"]; !ok {
+		req.Header.Set("Authorization", "Bearer "+e2eAPIKey)
+	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}

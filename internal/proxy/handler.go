@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -38,11 +40,19 @@ const (
 	envelopeUpInvalid  = `{"error":{"message":"upstream returned an invalid response","type":"upstream_error","code":"upstream_invalid_response"}}`
 	envelopeUpUnreach  = `{"error":{"message":"upstream request failed","type":"upstream_error","code":"upstream_unreachable"}}`
 	envelopeBadMethod  = `{"error":{"message":"method not allowed","type":"invalid_request_error","param":null,"code":null}}`
+	// The two 401s are static for the same reason: nothing from the client's
+	// Authorization header — presented or configured — is ever interpolated
+	// into an error body.
+	envelopeAuthMissing = `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`
+	envelopeAuthInvalid = `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`
 )
 
 // client headers forwarded upstream. Every other client header is dropped
-// deliberately: credentials must never be forwarded beyond Authorization.
-var forwardHeaderNames = []string{"Authorization", "Content-Type", "Accept", "OpenAI-Beta"}
+// deliberately, Authorization included: the client's credential
+// authenticates it to this proxy only — it is consumed by the auth gate and
+// never forwarded, and nothing is injected in its place (upstreams are
+// trusted/internal).
+var forwardHeaderNames = []string{"Content-Type", "Accept", "OpenAI-Beta"}
 
 // response headers relayed back to the client from upstream. Rate-limit and
 // retry headers are load-bearing for well-behaved client SDK backoff; a 429
@@ -181,8 +191,11 @@ func thinkingModeName(mode config.ThinkingMode) string {
 }
 
 // serve runs the full injector flow for one request. One snapshot is loaded
-// at entry and every later step (resolution, transformation, forwarding,
-// trailing rewrite) binds to it.
+// at entry and every later step (authentication, resolution, transformation,
+// forwarding, trailing rewrite) binds to it: the request is authenticated
+// against that snapshot's API key before its body is read, so a rotated key
+// applies to subsequent requests only and an unauthenticated request never
+// pins memory or reaches the upstream.
 //
 // Logging rides the same flow: the DEBUG lifecycle chain (request_received,
 // probe_completed, model_resolved, thinking_usage_resolved when the model
@@ -249,6 +262,22 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 				Int64("bytes_out", sw.bytes).Msg("client_write_failed")
 		}
 		complete()
+	}
+
+	// Client authentication, before any body is read. The presented bearer
+	// token is compared against the snapshot's key in constant time; a
+	// missing or malformed Authorization header and a wrong key share the
+	// static-envelope discipline — no fragment of the presented credential
+	// is ever echoed, and the configured key never reaches logs.
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || !keyMatches(token, snap.APIKey()) {
+		outcome = "unauthorized"
+		env := envelopeAuthInvalid
+		if !ok {
+			env = envelopeAuthMissing
+		}
+		reject(http.StatusUnauthorized, []byte(env), nil)
+		return
 	}
 
 	// Bound the request body before reading it: without a cap, a single
@@ -639,6 +668,40 @@ func copyForwardHeaders(dst, src http.Header) {
 	if dst.Get(contentTypeHeader) == "" {
 		dst.Set(contentTypeHeader, forwardJSONType)
 	}
+}
+
+// bearerToken extracts the bearer credential from an Authorization header
+// value. The scheme match is case-insensitive per RFC 9110 (clients send
+// "Bearer" and "bearer" alike); the token is used as trimmed. A missing
+// header, a non-bearer scheme, or an empty token is reported as ok=false and
+// answered like a missing header. Nothing about the header's text is echoed
+// or logged.
+func bearerToken(header string) (string, bool) {
+	scheme, rest, _ := strings.Cut(header, " ")
+	if !strings.EqualFold(scheme, "bearer") {
+		return "", false
+	}
+	token := strings.TrimSpace(rest)
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+// keyMatches compares a presented bearer token against the configured API
+// key in constant time. Both sides are hashed first: a bare bytes comparison
+// is only constant-time for equal lengths and would leak the configured
+// key's length through timing on mismatches; digests are always the same
+// length, so the comparison is constant-time for any input.
+func keyMatches(presented, configured string) bool {
+	if configured == "" {
+		// No snapshot carries an empty key (LoadRuntime rejects it); fail
+		// closed anyway rather than ever match an empty presentation.
+		return false
+	}
+	presentedSum := sha256.Sum256([]byte(presented))
+	configuredSum := sha256.Sum256([]byte(configured))
+	return subtle.ConstantTimeCompare(presentedSum[:], configuredSum[:]) == 1
 }
 
 // copyRelayHeaders copies exactly the allow-listed upstream response headers
