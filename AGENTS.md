@@ -16,14 +16,15 @@ streaming passthrough.
 
 Owned decomposition:
 
-| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                      |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), thinking-usage validation/normalization in `buildModel`, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                      |
-| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, upstream client, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis)                                                                                                                  |
-| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                   |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                           |
-| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                   |
+| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables + thinking-usage validation/normalization in `buildModel`/`buildProviders`/`buildTransports`, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
+| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                       |
+| `internal/transport`             | Outbound paths: `Doer`/`Resolver` seam, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), `Registry` (one long-lived pool per distinct transport config, retained on publish)                                                                                                                       |
+| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer`                                                                                                                             |
+| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                    |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                                                                                            |
+| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                    |
 
 ## Non-negotiables
 
@@ -35,10 +36,30 @@ Owned decomposition:
   are enforced by the runtime file's strict decoding: a runtime file
   defining them is rejected. The runtime file must be a single YAML
   document — a `---`-separated second document is a rejection (a decoder
-  reading only the first would hide what follows). Runtime model mapping,
-  the required `api-key`, and the hot-reloadable top-level
+  reading only the first would hide what follows). Runtime model mapping
+  (inline `endpoint` or `provider`+`transports`+`providers` tables), the
+  required `api-key`, and the hot-reloadable top-level
   `sse-keep-alive` block live in YAML only; the latter defaults to enabled
   at 15s and accepts a duration of at least 1s.
+- **The router decides WHICH provider; the transport decides HOW the
+  request reaches it.** The handler resolves a model's flattened
+  `transport.Config` through the `transport.Resolver` seam once per request
+  and executes on the returned `Doer` — no provider-specific branches, no
+  global `http.Client` coupling. `direct` is the tuned Go stack (ambient
+  env proxies honored, zero value of `Config`); `proxy` is exactly ONE
+  configured endpoint (`http/https/socks5/socks5h`, explicit port, userinfo
+  = proxy auth) — pools, rotation, health checks, cooldown, fallback and
+  retries do not exist. `socks5` resolves the upstream hostname locally and
+  CONNECTs the IP; `socks5h` sends the hostname (remote DNS) — never
+  collapse the two. Upstream HTTP statuses are answers (`StatusCode` set,
+  `err == nil`); only network-level failures are errors — the normalized
+  upstream-error handling in this package builds on that seam. Bodies are
+  never buffered inside
+  `Do`. One long-lived pool per distinct transport config (`Registry`,
+  content-keyed, `Retain` on publish evicts only dropped configs' idle
+  connections). An unknown transport/provider reference, a bad type, or a
+  malformed proxy URL is a whole-file rejection — never a silent fallback
+  to direct.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
   keeps the previous snapshot; its hash baseline is the boot content passed

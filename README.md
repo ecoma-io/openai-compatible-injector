@@ -101,9 +101,24 @@ truth.
 # It authenticates clients to this proxy only and is never forwarded upstream.
 api-key: replace-with-a-secret-client-key
 
+# Optional. Named outbound paths providers can share: direct (the default)
+# or exactly one proxy endpoint. See "Provider transports".
+transports:
+  egress:
+    type: proxy # direct | proxy; proxy requires the proxy URL below
+    proxy: socks5h://user:pass@10.0.0.5:1080 # http | https | socks5 | socks5h, host + explicit port, optional userinfo auth
+  lan:
+    type: direct # must not set a proxy URL
+
+# Optional. Named upstream bases, each routed through a transport.
+providers:
+  opencode:
+    base-url: https://api.opencode.example/v1 # validated like a model endpoint
+    transport: egress # optional named transport; omitted = direct
+
 models:
   gpt-reviewer:
-    endpoint: https://api.provider.example/v1 # required; no credentials, no /chat/completions suffix
+    provider: opencode # either provider or endpoint — never both, never neither
     upstream-model: gpt-5-pro # required; the model name sent upstream
     injection-prompt: | # optional; empty/omitted disables injection
       Review the following code rigorously. Report every bug you can find,
@@ -113,7 +128,7 @@ models:
       min-ratio: 0.6 # optional; finite, 0..1
       max-ratio: 0.9 # optional; finite, 0..1; min-ratio <= max-ratio
   echo-model:
-    endpoint: https://api.provider.example/v1
+    endpoint: https://api.provider.example/v1 # legacy inline form: an implicit direct provider
     upstream-model: gpt-4o-mini
 
 # Optional. Client-facing SSE heartbeat; defaults to enabled: true and
@@ -131,10 +146,17 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   to the [per-request config snapshot](#hot-reload), so rotating the YAML
   value affects subsequent requests without a restart. The key is credential
   material: it never appears in logs, error text, or reload metadata.
-- `endpoint` — base URL of the upstream provider. Scheme `http` or `https`
-  only; port and path allowed, trailing slashes ignored; URL userinfo is
-  rejected. Requests are sent to `<endpoint>/chat/completions` and
-  `<endpoint>/responses`.
+- `endpoint` — base URL of the upstream provider, legacy inline form. Scheme
+  `http` or `https` only; port and path allowed, trailing slashes ignored;
+  URL userinfo is rejected. Requests are sent to
+  `<endpoint>/chat/completions` and `<endpoint>/responses`. Exactly one of
+  `endpoint` and `provider` is required; an inline endpoint is an implicit
+  provider with the direct transport.
+- `provider` — reference to a `providers` entry whose `base-url` and
+  `transport` the model forwards through. The reference must name an entry
+  the file defines: there is no fallback to direct for an unknown name,
+  because silently rerouting egress is the failure this schema exists to
+  prevent.
 - `upstream-model` — the `model` value actually forwarded upstream.
 - `injection-prompt` — the system instruction injected into every request for
   this model. Multi-line supported; the exact text is used verbatim.
@@ -155,20 +177,32 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   unknown nested values reject the complete file — including when the block
   says `enabled: false`. It hot-reloads with the mapping, preserving the
   complete last-known-good setting on rejection. See [Streaming](#streaming).
+- `providers` — optional named table of upstream bases. Each entry carries
+  `base-url` (validated exactly like a model `endpoint`) and an optional
+  `transport` reference; a provider without a `transport` routes direct.
+  Entries are validated even when no model references them.
+- `transports` — optional named table of outbound paths. `type: direct` is
+  the plain Go HTTP stack (and must not set a proxy URL); `type: proxy`
+  requires `proxy: <url>` naming exactly one proxy endpoint — scheme `http`,
+  `https`, `socks5` or `socks5h`, a host, an explicit port, optional
+  userinfo as proxy authentication, and nothing after the authority. See
+  [Provider transports](#provider-transports).
 
 The file is validated strictly, in two layers:
 
 - **Top-level keys** are checked against the raw YAML: only `models`,
-  `api-key`, `log-level`, and `sse-keep-alive` are legal. This is the
-  bootstrap-plane rule — a file that tries to define `listen`, `config-file`,
-  `config-poll-interval` or `shutdown-grace` is rejected whatever its value's
-  shape (a strict struct decode alone misses a bootstrap key whose value is
-  an empty map).
+  `api-key`, `log-level`, `sse-keep-alive`, `providers`, and `transports`
+  are legal. This is the bootstrap-plane rule — a file that tries to define
+  `listen`, `config-file`, `config-poll-interval` or `shutdown-grace` is
+  rejected whatever its value's shape (a strict struct decode alone misses a
+  bootstrap key whose value is an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
-  with known fields): any key outside `endpoint`, `upstream-model`,
-  `injection-prompt` and `thinking-usage` (and, inside the block, outside
-  `mode`, `min-ratio`, `max-ratio`) — including a nested bootstrap key — is a
-  rejection, not a warning.
+  with known fields): any key outside `endpoint`, `provider`,
+  `upstream-model`, `injection-prompt` and `thinking-usage` (and, inside the
+  block, outside `mode`, `min-ratio`, `max-ratio`) — including a nested
+  bootstrap key — is a rejection, not a warning. The same strictness holds
+  inside `providers` entries (`base-url`, `transport`) and `transports`
+  entries (`type`, `proxy`).
 
 The `models` table itself must contain at least one model, and `api-key` must
 be a non-empty Bearer token after trimming outer spaces (only the
@@ -211,6 +245,12 @@ Semantics that hold:
   verbatim (fatal at boot, WARN on reload), and a botched paste into any
   YAML position can carry credentials — so an invalid value is reported by
   position, length, and line number, never by content.
+- **Transport pools survive reloads that keep them.** Each distinct
+  transport configuration owns one long-lived connection pool in the
+  process. A reload that leaves a transport's config byte-identical keeps
+  its warm pool; one that drops the last reference to a transport closes
+  only that pool's idle connections — in-flight requests on it finish
+  untouched.
 - **The log level hot-reloads with everything else.** The top-level
   `log-level` key rides
   the same validate-then-publish path as the model mappings: a valid reload
@@ -293,6 +333,73 @@ values are replaced inside a string-state-aware scan. Everything else — every
 whitespace byte, key order, unknown fields — is forwarded exactly as
 received. A response whose JSON cannot be parsed is forwarded byte-for-byte
 unchanged.
+
+## Provider transports
+
+Requests leave this proxy through a _transport_: the router (model mapping)
+decides **which** provider serves a request, the transport decides **how**
+the request reaches it.
+
+```
+            ┌────────────────┐   model mapping (WHICH provider)
+client ────▶│    injector    │──────────────────────────────┐
+            └────────────────┘                               ▼
+                     │ transport (HOW)              provider base URL
+                     │
+        ┌────────────┴────────────┐
+        ▼                         ▼
+     direct                    proxy
+        │                         │
+        ▼                         ▼
+   provider                 proxy endpoint ────▶ provider
+```
+
+Two kinds exist today, configured through the `transports` table and
+referenced by name from `providers`:
+
+- **`direct`** — the standard Go HTTP stack with the same tuning the service
+  always had (no overall timeout so long-lived SSE streams survive, 30s dial
+  timeout, connection pooling and eager HTTP/2). It also honors the ambient
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables, exactly like
+  deployments before this table existed. Omitting a provider's `transport`,
+  or using a model's inline `endpoint`, is this.
+- **`proxy`** — exactly one configured proxy endpoint, shared by every model
+  whose provider references the transport:
+  `http://` and `https://` (HTTP forward proxy; https targets ride CONNECT
+  tunnels, `https://` additionally TLS-encrypts the hop to the proxy),
+  `socks5://` (the upstream hostname is resolved **locally**, the proxy sees
+  only the IP), and `socks5h://` (the hostname itself is sent to the proxy —
+  **remote** DNS, the form that keeps upstream hostnames out of the local
+  resolver). The two SOCKS forms are deliberately not interchangeable.
+  Credentials in the proxy URL's userinfo (`user:pass@host`) authenticate to
+  the proxy (Basic auth for http/https, RFC 1929 for SOCKS5) and never
+  appear in logs or error text.
+
+Semantics the transports guarantee, and that the rest of the service relies
+on:
+
+- **Upstream HTTP answers are answers.** A `429` or `500` from a provider
+  arrives as a normal response with that status — never as a transport
+  error. Only network-level failures (DNS, TCP, TLS, refused or broken
+  connections, cancelled contexts) are errors.
+- **Streaming is never buffered.** A transport hands back a live body;
+  paced SSE events cross a proxy hop with their pacing intact.
+- **One pool per transport, not per request.** Identical transport
+  configurations share one long-lived connection pool, including across
+  config reloads that keep them.
+- **The request belongs to the caller.** A transport executes a request
+  without rewriting it — model renaming and prompt injection happen before
+  it, and nothing transport-side mutates the request's identity.
+
+A broken `transports` or `providers` table is a whole-file rejection at
+boot (exit 1) and a last-known-good on reload — an invalid proxy never
+silently degrades into direct egress.
+
+**Not included, by design:** transport pools with multiple egresses,
+rotation, health checks, cooldown, fallback between transports, or retries.
+A `type: proxy` transport names exactly one endpoint. The schema's shape
+(named transports referenced by named providers) is what a future `pool`
+kind would slot into; nothing of that machinery exists today.
 
 ## Simulated thinking usage
 
@@ -737,11 +844,15 @@ Decided, and not coming back without a design discussion:
 - **Per-request overrides** of prompt or upstream model — the mapping is
   static per public name; a request field that changes forwarding is a
   footgun.
-- **Proxy and TLS configuration** — upstream connections follow the standard
-  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables (inherited
-  from `net/http`'s default transport) and verify chain and host with
+- **Transport pools, rotation, health checks, fallback, retries** — a
+  `type: proxy` transport is exactly one endpoint (see
+  [Provider transports](#provider-transports)); anything that picks between
+  egresses at request time is a separate design.
+- **TLS configuration** — upstream and proxy TLS verify chain and host with
   system roots; custom TLS setup (client certificates, custom CA pools,
-  `insecure-skip-verify`) is not coming.
+  `insecure-skip-verify`) is not coming. (Ambient
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables still apply
+  to `direct` transports, inherited from `net/http`'s default transport.)
 - **Inbound identities and authorization** — `api-key` is a single shared
   client credential, not an identity system. Per-client keys, roles, tenant
   isolation, quotas, and RBAC need a separate design.
@@ -750,9 +861,10 @@ Decided, and not coming back without a design discussion:
 
 ```
 cmd/openai-compatible-injector/  entrypoint + version/healthcheck subcommands
-internal/config/                 bootstrap, runtime YAML, snapshot store, poller
+internal/config/                 bootstrap, runtime YAML (models, providers, transports), snapshot store, poller
 internal/inject/                 pure request/response transforms (probe, chat, responses, rewrite, thinking usage)
-internal/proxy/                  handler, upstream client, SSE copy, error envelopes
+internal/transport/              outbound paths: Doer seam, direct client, proxy (http/https/socks5/socks5h), pool registry
+internal/proxy/                  handler, client auth, SSE copy, error envelopes
 internal/server/                 listener + graceful shutdown
 e2e/                             black-box subprocess suite
 config.example.yaml              documented runtime config template
