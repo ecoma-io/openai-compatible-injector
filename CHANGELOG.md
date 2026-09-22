@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.4.0...v0.5.0) (2026-09-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** require client api-key and stop forwarding Authorization upstream ([#28](https://github.com/ecoma-io/openai-compatible-injector/issues/28))
+* **config:** replace logging.level section with top-level log-level key ([#25](https://github.com/ecoma-io/openai-compatible-injector/issues/25))
+
+### Features
+
+* **config:** replace logging.level section with top-level log-level key ([#25](https://github.com/ecoma-io/openai-compatible-injector/issues/25)) ([11d5715](https://github.com/ecoma-io/openai-compatible-injector/commit/11d571549a5515795a5f690a02e7fd7491d9ff33))
+* **config:** require client api-key and stop forwarding Authorization upstream ([#28](https://github.com/ecoma-io/openai-compatible-injector/issues/28)) ([f0cb1de](https://github.com/ecoma-io/openai-compatible-injector/commit/f0cb1de6521b5ef95a12b65bf7653dbf30a629a5))
+
 ## [0.4.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.3.0...v0.4.0) (2026-09-21)
 
 
