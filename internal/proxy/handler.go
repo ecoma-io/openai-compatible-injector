@@ -23,6 +23,7 @@ import (
 
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/inject"
+	"openai-compatible-injector/internal/transport"
 )
 
 // Error envelopes. The 4xx rejection envelopes carry param/code as explicit
@@ -100,9 +101,12 @@ type openAIErrorBody struct {
 
 // NewHandler assembles the injector's HTTP surface: a health endpoint and
 // the two OpenAI-compatible chat routes. Every proxied request reads the
-// store once and binds the entire request lifetime to that snapshot.
-func NewHandler(store *config.Store, client *http.Client, log zerolog.Logger) http.Handler {
-	h := &injectorHandler{store: store, client: client, log: log}
+// store once and binds the entire request lifetime to that snapshot — its
+// outbound execution included: the request resolves its provider's
+// transport through the resolver and holds the returned Doer for its whole
+// lifetime, so a reload never swaps the path under in-flight work.
+func NewHandler(store *config.Store, doers transport.Resolver, log zerolog.Logger) http.Handler {
+	h := &injectorHandler{store: store, doers: doers, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.healthz)
 	// The routes are method-agnostic patterns so that wrong methods reach
@@ -118,9 +122,9 @@ func NewHandler(store *config.Store, client *http.Client, log zerolog.Logger) ht
 }
 
 type injectorHandler struct {
-	store  *config.Store
-	client *http.Client
-	log    zerolog.Logger
+	store *config.Store
+	doers transport.Resolver
+	log   zerolog.Logger
 }
 
 func (h *injectorHandler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -383,7 +387,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	log.Debug().Str("upstream", origin(&upstream)).
 		Int64("bytes_out", int64(len(out))).Msg("upstream_request_started")
 
-	resp, err := h.client.Do(req)
+	// The outbound hop: the model's provider transport, resolved from the
+	// request's snapshot. Any HTTP status — 429, 5xx, an unexpected 3xx —
+	// is the upstream's answer and returns as a response; only
+	// transport-level failures (dial, TLS, cancellation before headers)
+	// return an error, which the handling below already classifies.
+	resp, err := h.doers.Doer(m.Transport).Do(req)
 	if err == nil {
 		log.Debug().Int("status", resp.StatusCode).
 			Str("content_type", resp.Header.Get(contentTypeHeader)).
