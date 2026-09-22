@@ -72,6 +72,21 @@ models:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
 
+# Optional. SSE keep-alive comments for client-facing Chat Completions and
+# Responses API streams. The default is enabled at 15s because a Cloudflare-
+# proxied hostname silently cuts a client HTTP/2 stream after about 125s with
+# zero bytes from origin. While the upstream is silent, the injector writes
+# and flushes the spec-compliant (and client-ignored) SSE comment `: ping\n\n`
+# once per interval; every forwarded upstream byte resets that silence clock.
+# The ticker starts after upstream response headers reach the client, so it
+# does not cover waiting for those headers. `interval` must be a Go duration
+# of at least 1s. This block hot-reloads with the model mappings; invalid
+# reloads retain the complete last-known-good setting.
+#
+# sse-keep-alive:
+#   enabled: true
+#   interval: 15s
+
 # Optional. The log level, hot-reloadable like everything else in this
 # file: change it here and the running process picks it up on the next
 # poll, no restart and no signal. One of debug | info | warn | error,

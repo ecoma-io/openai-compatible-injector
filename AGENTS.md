@@ -35,8 +35,10 @@ Owned decomposition:
   are enforced by the runtime file's strict decoding: a runtime file
   defining them is rejected. The runtime file must be a single YAML
   document — a `---`-separated second document is a rejection (a decoder
-  reading only the first would hide what follows). Runtime model mapping and
-  the required `api-key` live in YAML only.
+  reading only the first would hide what follows). Runtime model mapping,
+  the required `api-key`, and the hot-reloadable top-level
+  `sse-keep-alive` block live in YAML only; the latter defaults to enabled
+  at 15s and accepts a duration of at least 1s.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
   keeps the previous snapshot; its hash baseline is the boot content passed
@@ -94,7 +96,14 @@ Owned decomposition:
   in-flight event — breach stops the relay with outcome
   `stream_limit_exceeded`, the offending line never forwarded), and
   rewrites only `data:` lines containing a model string, with the same
-  acceptance rule as the buffered path.
+  acceptance rule as the buffered path. With `sse-keep-alive` enabled
+  (default: 15s), one request-owned ticker writes and flushes the ignorable
+  SSE comment `: ping\n\n` only after an event-boundary silence interval;
+  any forwarded byte resets it. It starts after headers commit, serializes
+  with relay writes, exits/joined on every stream end or client disconnect,
+  and is disabled immediately when `[DONE]` or `response.completed` is
+  forwarded — never pings inside/after a terminal event; pre-header silence
+  remains outside its scope.
 - **Verbose verbatim, loud local.** 4xx/5xx upstream responses forward byte
   for byte. A 200 that is not JSON becomes 502 `upstream_invalid_response`;
   dial failure is 502 `upstream_unreachable`; unmapped model is 404
