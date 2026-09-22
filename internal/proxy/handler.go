@@ -431,6 +431,17 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Streaming: stream,
 		})
 		egress = &info
+		// Per-attempt evidence, bounded by the fallback budget: one WARN per
+		// dialed-and-failed endpoint, correlated by this request's request_id.
+		// Typed class and scheme+host only — the error text, any credential
+		// material, and skipped members (no dial, no event) stay out.
+		for i, f := range info.Failures {
+			log.Warn().Str("public_model", model).
+				Str("egress_kind", f.Kind).Str("egress_target", f.Target).
+				Str("error_class", f.Class).
+				Int("attempt", i+1).
+				Msg("egress_attempt_failed")
+		}
 	} else {
 		resp, uerr = d.Do(req)
 	}

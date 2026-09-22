@@ -105,7 +105,7 @@ func newTestPool(members []Member, s Strategy, f FallbackPolicy, h HealthPolicy,
 		key:     "pool " + p.Identity(),
 		members: make([]memberState, len(members)),
 		clock:   clock,
-		cw:      make([]int, len(members)),
+		cw:      make([]int64, len(members)),
 	}
 	for i := range members {
 		st.members[i] = memberState{
@@ -535,25 +535,18 @@ func TestPoolHealthCooldownSkipsThenRecovers(t *testing.T) {
 		t.Fatalf("third: %v", err)
 	}
 
-	// Cooldown expires. The round-robin cursor sits on backup, which is
-	// healthy — it keeps serving until rotation reaches flaky on the next
-	// turn.
+	// Cooldown expires. While flaky cooled, its scheduler turn was never
+	// consumed (a skipped member is not a passed-over one), so the cursor
+	// still points at it: recovery means immediate rescheduling, not one
+	// more request through the healthy head first.
 	clk.advance(31 * time.Second)
-	resp, _, err = pd.Execute(execReq(false, "{}"))
-	if err != nil {
-		t.Fatalf("after cooldown (backup serves): %v", err)
-	}
-	_ = resp.Body.Close()
-	if flaky.hitCount() != 1 {
-		t.Errorf("healthy head displaced before its turn (%d flaky hits)", flaky.hitCount())
-	}
 	resp, info, err = pd.Execute(execReq(false, "{}"))
 	if err != nil {
 		t.Fatalf("after cooldown (flaky's turn): %v", err)
 	}
 	_ = resp.Body.Close()
 	if flaky.hitCount() != 2 {
-		t.Errorf("member not re-scheduled after cooldown (%d hits)", flaky.hitCount())
+		t.Errorf("recovered member not re-scheduled first (%d hits)", flaky.hitCount())
 	}
 	if info.Attempts != 1 {
 		t.Errorf("recovered member needed fallback: %+v", info)

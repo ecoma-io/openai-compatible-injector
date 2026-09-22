@@ -291,16 +291,34 @@ type AttemptRequest struct {
 	Streaming bool
 }
 
+// AttemptFailure is the sanitized evidence of one dialed-and-failed
+// endpoint inside one Execute: the endpoint's kind and scheme+host target
+// (the same log-safe surface AttemptInfo.Target uses — userinfo never
+// enters) and the typed failure class ("connection", "proxy_connect",
+// "proxy_auth", "timeout"). The error text never rides along: classes are
+// derived from typed errors and stdlib sentinels, not message parsing, and
+// the raw error stays inside the pool. AttemptInfo.Failures carries at most
+// the fallback budget's worth of these — one per dialed-and-failed
+// endpoint, nothing for skipped members.
+type AttemptFailure struct {
+	Kind   string
+	Target string
+	Class  string
+}
+
 // AttemptInfo reports what one Execute did: how many distinct endpoints
 // were actually dialed (skipped members consume no attempt), the kind and
-// scheme+host of the last endpoint dialed (empty when none was), and
+// scheme+host of the last endpoint dialed (empty when none was),
 // whether the loop ended without dialing anything (every member was
-// ineligible, unhealthy, or saturated).
+// ineligible, unhealthy, or saturated), and the per-attempt failure
+// evidence (one AttemptFailure per dialed endpoint that failed, in dial
+// order — bounded by the fallback budget).
 type AttemptInfo struct {
 	Attempts  int
 	Kind      string
 	Target    string
 	Exhausted bool
+	Failures  []AttemptFailure
 }
 
 // Executor is the capability of a Doer that owns multi-egress policy. The

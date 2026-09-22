@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -361,5 +362,65 @@ func TestUpstreamErrorClassTypedProxyErrors(t *testing.T) {
 	}
 	if got := upstreamErrorClass(connErr); got != "proxy_connect" {
 		t.Errorf("connect class = %q, want proxy_connect", got)
+	}
+}
+
+// TestHandlerEgressAttemptFailureEvents pins the per-attempt evidence on
+// the log: one WARN egress_attempt_failed per dialed-and-failed endpoint —
+// kind, scheme+host target, typed class, 1-based attempt number, public
+// model — emitted even when a later member serves the request, and never
+// carrying the error text or any credential material.
+func TestHandlerEgressAttemptFailureEvents(t *testing.T) {
+	store := newPoolStore(t)
+
+	// Success after two failed dials: the evidence events fire AND the
+	// request still completes 200 — the events are evidence, not outcomes.
+	ex := &stubExecutor{
+		info: transport.AttemptInfo{
+			Attempts: 3, Kind: "direct", Target: "direct",
+			Failures: []transport.AttemptFailure{
+				{Kind: "socks5h", Target: "socks5h://10.0.0.5:1080", Class: "proxy_connect"},
+				{Kind: "socks5h", Target: "socks5h://10.0.0.6:1080", Class: "proxy_auth"},
+			},
+		},
+	}
+	buf, logger := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x"}`}}, logger)
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 through the serving member", rec.Code)
+	}
+	evs := buf.events(t, "egress_attempt_failed")
+	if len(evs) != 2 {
+		t.Fatalf("egress_attempt_failed events = %d, want 2", len(evs))
+	}
+	for i, ev := range evs {
+		if ev["public_model"] != "pool-model" {
+			t.Errorf("event %d public_model = %v", i, ev["public_model"])
+		}
+		if ev["egress_kind"] != "socks5h" {
+			t.Errorf("event %d egress_kind = %v, want socks5h", i, ev["egress_kind"])
+		}
+		if ev["egress_target"] != fmt.Sprintf("socks5h://10.0.0.%d:1080", i+5) {
+			t.Errorf("event %d egress_target = %v", i, ev["egress_target"])
+		}
+	}
+	if evs[0]["error_class"] != "proxy_connect" || evs[1]["error_class"] != "proxy_auth" {
+		t.Errorf("classes = %v/%v, want proxy_connect/proxy_auth", evs[0]["error_class"], evs[1]["error_class"])
+	}
+	if evs[0]["attempt"].(float64) != 1 || evs[1]["attempt"].(float64) != 2 {
+		t.Errorf("attempts = %v/%v, want 1/2", evs[0]["attempt"], evs[1]["attempt"])
+	}
+
+	// The plain single-endpoint path emits no attempt evidence (there are
+	// no attempts to report).
+	buf.buf.Reset()
+	rec = doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"direct-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("direct status = %d", rec.Code)
+	}
+	if evs := buf.events(t, "egress_attempt_failed"); len(evs) != 0 {
+		t.Errorf("plain path emitted %d attempt events", len(evs))
 	}
 }

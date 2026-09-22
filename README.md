@@ -397,7 +397,10 @@ referenced by name from `providers`:
   resolver). The two SOCKS forms are deliberately not interchangeable.
   Credentials in the proxy URL's userinfo (`user:pass@host`) authenticate to
   the proxy (Basic auth for http/https, RFC 1929 for SOCKS5) and never
-  appear in logs or error text.
+  appear in logs or error text. SOCKS5 credentials are RFC 1929
+  single-byte-length fields, so each is bounded to 255 decoded bytes at
+  config load — a longer credential rejects the whole file instead of
+  failing one dial at a time.
 - **`pool`** — a set of endpoint members (direct or proxy transports,
   referenced by name; pools do not nest) with per-request scheduling,
   eligibility, bounded egress fallback, and passive health. Each request is
@@ -434,12 +437,23 @@ referenced by name from `providers`:
     use — `streaming: false` vs a streamed request, `max-body-bytes` below
     the outgoing body, at its concurrency cap, or in a health cooldown — is
     skipped without a dial. A 6 MB request never produces a 413 on a 4.5 MB
-    relay: it was never sent there. Skipped members consume no attempt and
-    no health strike.
+    relay: it was never sent there. Skipped members consume no attempt, no
+    health strike, and no scheduler turn — the rotation position and the
+    weighted counters only move when a member is actually taken, so a
+    recovered member is scheduled immediately rather than waiting out a
+    turn it never used.
   - **Scheduling.** `round_robin` rotates across the eligible members;
-    `weighted_round_robin` gives a member with weight 2 twice the share, in
-    a deterministic interleaving. Weight never affects eligibility or the
-    fallback order — only who is tried first.
+    `weighted_round_robin` is smooth weighted round-robin over the
+    CURRENTLY eligible members: a member with weight 5 against one with
+    weight 1 gets exactly `A A A B A A`, proportionality in a deterministic
+    interleaving. The weighting runs on the live candidate set — an
+    unavailable member accumulates no credit while it is out, a recovered
+    member re-enters with none (no catch-up burst), and a member skipped
+    for saturation has its round undone exactly (credit frozen, no tilt).
+    Weight never affects eligibility or the fallback order — only who is
+    tried first. The concurrency permit for the chosen member is acquired
+    inside the same selection step, so two concurrent requests can never
+    both take a member's last permit and both dial.
   - **Bounded fallback, transport failures only.** When a dialed member
     fails before any response arrives (connection, proxy connect, proxy
     auth, timeout), the next eligible member is tried, up to
@@ -455,6 +469,11 @@ referenced by name from `providers`:
     skips) answers the canonical 502 `upstream_unreachable` envelope — the
     access log carries `egress_attempts`, `egress_kind`, `egress_target`
     and `egress_exhausted` so the pool's decision is visible per request.
+    Each dialed-and-failed endpoint also emits one WARN
+    `egress_attempt_failed` (kind, scheme+host target, typed
+    `error_class`, attempt number) — evidence per attempt, even when a
+    later member serves the request, with no error text and no
+    credentials.
   - **Reload identity.** A pool whose policy bytes are unchanged across a
     reload keeps its scheduler position, health state and connection pools.
     A changed policy is a new identity: fresh state, and the old state
@@ -479,7 +498,11 @@ on:
 A broken `transports` or `providers` table is a whole-file rejection at
 boot (exit 1) and a last-known-good on reload — an invalid proxy never
 silently degrades into direct egress, and a member reference that names
-nothing (or names another pool) rejects the file.
+nothing (or names another pool) rejects the file. So does a pool listing
+the SAME endpoint twice under two names: scheduling, health, and
+concurrency state for one endpoint must exist exactly once, and the
+duplicate check runs on the resolved endpoint (host case and userinfo
+spelling collapse), never on the YAML name.
 
 **Not included, by design:** provider fallback and retries (a failed or
 rate-limited _provider_ is never retried elsewhere — egress fallback moves

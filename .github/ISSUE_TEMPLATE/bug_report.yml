@@ -58,6 +58,7 @@ body:
       options:
         - Config + hot reload (internal/config)
         - Injection transforms (internal/inject)
+        - Egress transports (internal/transport)
         - Proxy handlers + streaming (internal/proxy)
         - Server lifecycle + shutdown (internal/server)
         - CLI (cmd)

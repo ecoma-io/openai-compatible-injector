@@ -37,7 +37,9 @@ api-key: change-me-client-key
 #   socks5h:// hostname sent to the proxy — REMOTE DNS, keeps upstream
 #             hostnames out of the local resolver
 # The proxy URL needs a host, an explicit port, and nothing after the
-# authority (no path, query or fragment).
+# authority (no path, query or fragment). For socks5/socks5h, each
+# credential field is RFC 1929-limited to 255 decoded bytes — a longer
+# value rejects the file.
 #
 # Pool semantics: each request is scheduled onto ONE member. Members the
 # request cannot use are skipped without a dial (streaming gate, body-size
@@ -59,6 +61,8 @@ transports:
   # pool-egress:
   #   type: pool
   #   members: # ordered; fallback walks the remaining members in this order
+  #     # two members must not resolve to the SAME endpoint (checked on the
+  #     # resolved endpoint, not the name) — that rejects the whole file
   #     - transport: proxy-egress
   #       max-body-bytes: 4718592 # skip this member for larger bodies — pre-send
   #       max-concurrency: 4 # 0/unset = unlimited; held until the body closes

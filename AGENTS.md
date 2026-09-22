@@ -16,15 +16,15 @@ streaming passthrough.
 
 Owned decomposition:
 
-| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables incl. the pool schema (`buildModel`/`buildProviders`/`buildTransports` two-pass + pool policy builders, no-echo rejections), egress-closure snapshot retention, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                                                                                         |
-| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify`, egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                         |
-| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                             |
-| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables incl. the pool schema (`buildModel`/`buildProviders`/`buildTransports` two-pass + pool policy builders, no-echo rejections, duplicate resolved-endpoint member rejection via `endpointKey`, RFC 1929 credential bound in `parseProxyURL`), egress-closure snapshot retention, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
+| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                                                                                                                                                                                                       |
+| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify`, egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                                                                                                                                       |
+| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                                                                                                                                           |
+| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ## Non-negotiables
 
@@ -66,26 +66,48 @@ Owned decomposition:
   pick), bounded pre-response fallback (`fallback.enabled`, default
   true/3, cap 16 — skipped members consume no attempt), and passive health
   (`health.enabled`/`failure-threshold`/`cooldown`, defaults true/3/30s,
-  min 1s; any response resets). Eligibility precedes everything:
-  streaming gate, `max-body-bytes` vs the outgoing (post-injection) body
-  checked BEFORE any dial (a 6 MB request is never a 413 on a 4.5 MB
-  relay), `max-concurrency` permits held until the response body closes
-  (SSE holds one for the stream's lifetime). The pool owns selection via
-  the `Executor` seam — the handler hands the request facts (context, URL,
-  headers, body, probed stream flag) and gets one response or one error;
-  cancellation aborts with no strike, zero dials is the exhaustion
-  sentinel answering the canonical 502 `upstream_unreachable` with
-  `error_class: egress_exhausted`, and any HTTP status — 429/5xx included —
-  ends the loop and relays like a single-endpoint response. Proxy/SOCKS
-  failures are typed (`ProxyAuthError`/`ProxyConnectError` wrapping their
-  historical texts; classified by type, never message text) for fallback
-  decisions and `error_class` tokens; pool state (scheduler cursor, health,
-  permits, in-flight leases) is keyed by pool identity in the `Registry` —
+  min 1s; any response resets). Eligibility precedes everything — static
+  (streaming gate, `max-body-bytes` vs the outgoing post-injection body,
+  both checked BEFORE any dial: a 6 MB request is never a 413 on a 4.5 MB
+  relay), then dynamic (health cooldown, concurrency permit) — and only
+  then does the scheduler move: a skipped member consumes no scheduler
+  turn, no attempt, no strike, so recovery reschedules immediately.
+  Weighted scheduling is smooth WRR over the CURRENTLY eligible members
+  (weight sums and credit arithmetic count candidates only; unavailable
+  members bank no credit, recovered ones re-enter with none, a
+  saturated loser's round is undone exactly), and the chosen member's
+  permit is acquired inside the selection step under the scheduler lock —
+  two concurrent requests can never both observe the same last permit.
+  Permitted locks: the scheduler mutex is the only outer lock over a
+  member's health/limiter mutexes, and no network I/O happens under any of
+  them. The pool owns selection via the `Executor` seam — the handler
+  hands the request facts (context, URL, headers, body, probed stream
+  flag) and gets one response or one error; cancellation aborts with no
+  strike, zero dials is the exhaustion sentinel answering the canonical
+  502 `upstream_unreachable` with `error_class: egress_exhausted`, and any
+  HTTP status — 429/5xx included — ends the loop and relays like a
+  single-endpoint response. Every dialed-and-failed endpoint appends one
+  sanitized `AttemptFailure` (kind, scheme+host, typed class — never error
+  text, never credentials) that the handler relays as WARN
+  `egress_attempt_failed`. Proxy/SOCKS failures are typed
+  (`ProxyAuthError`/`ProxyConnectError` wrapping their historical texts;
+  classified by type, never message text) for fallback decisions and
+  `error_class` tokens; pool state (scheduler cursor, health, permits,
+  in-flight leases) is keyed by pool identity in the `Registry` —
   unchanged policy across a reload stays warm, changed policy starts
   fresh, and a leased state outlives its eviction until the last request
-  releases it. The snapshot retains the egress closure (transports + pools
-  - every member endpoint, content-deduped). NO provider fallback: egress
-    fallback moves a request between network paths, never between providers.
+  releases it. Retirement is instance-owned: a deferred teardown that
+  fires after the same identity was re-added is a verified no-op (the
+  registry checks the state INSTANCE under the map key, never just the
+  key), and re-adding a retired identity builds a fresh generation, never
+  hands back the retired state. The snapshot retains the egress closure
+  (transports + pools - every member endpoint, content-deduped). Config
+  rejects a pool whose members resolve to duplicate ENDPOINTS (identity =
+  canonical resolved endpoint with host case folded, never the YAML name)
+  and a SOCKS5 userinfo credential over 255 decoded bytes (RFC 1929 wire
+  limit; the dialer re-checks defensively as a typed auth error). NO
+  provider fallback: egress fallback moves a request between network
+  paths, never between providers.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
   keeps the previous snapshot; its hash baseline is the boot content passed

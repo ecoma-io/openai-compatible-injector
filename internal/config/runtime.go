@@ -674,11 +674,18 @@ func buildPoolHealth(rh *runtimeHealth, ordinal int) (transport.HealthPolicy, er
 // already-built plain transports. A reference must name an existing direct
 // or proxy entry — pools do not nest, and an unknown name never falls back
 // to direct: silently rerouting egress is the quiet direction this schema
-// exists to prevent. A reference may appear only once; two members at one
-// endpoint would make scheduling and health state ambiguous.
+// exists to prevent. A reference may appear only once, and so may an
+// ENDPOINT: two distinct names resolving to the same transport
+// configuration (the same direct stack, or the same proxy URL under
+// different spellings) are one endpoint, not two members — scheduling,
+// health, and concurrency state for one endpoint must exist exactly once.
+// The dedup identity is the canonical resolved endpoint (endpointKey),
+// never the YAML reference name; the rejection names no endpoint, since a
+// proxy URL carries credentials in its userinfo.
 func buildPoolMembers(rms []runtimePoolMember, built map[string]transport.Config, rt map[string]runtimeTransport, ordinal int) ([]transport.Member, error) {
 	members := make([]transport.Member, 0, len(rms))
 	used := make(map[string]struct{}, len(rms))
+	endpoints := make(map[string]struct{}, len(rms))
 	for j, rm := range rms {
 		memberOrdinal := fmt.Sprintf("%d.%d", ordinal, j+1)
 		ref := strings.TrimSpace(rm.Transport)
@@ -700,6 +707,11 @@ func buildPoolMembers(rms []runtimePoolMember, built map[string]transport.Config
 		if !ok {
 			return nil, fmt.Errorf("transport entry %s: pool member references an unknown transport", memberOrdinal)
 		}
+		ek := endpointKey(cfg)
+		if _, dup := endpoints[ek]; dup {
+			return nil, fmt.Errorf("transport entry %s: pool member resolves to an endpoint identical to an earlier member (input redacted)", memberOrdinal)
+		}
+		endpoints[ek] = struct{}{}
 		m := transport.Member{Endpoint: cfg, Streaming: true, Weight: defaultPoolWeight}
 		if rm.Streaming != nil {
 			m.Streaming = *rm.Streaming
@@ -818,7 +830,44 @@ func parseProxyURL(raw string) (*url.URL, error) {
 	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 		return nil, errors.New("proxy URL must be scheme://[user:pass@]host:port with nothing after the authority (input redacted)")
 	}
+	// SOCKS5 username/password ride RFC 1929 single-byte length fields: 255
+	// bytes is the hard wire limit for each. The values here are DECODED
+	// (percent-escapes resolved), which is what the wire carries, so the
+	// bound is bytes of decoded value, never bytes of spelling or runes.
+	// Rejecting at load — not at the first dial — keeps a statically broken
+	// transport off the wire entirely: an oversized credential rejects the
+	// whole file, the last-known-good config keeps serving, and no request
+	// ever discovers the defect one 502 at a time. The values are never
+	// echoed; the length is not even named.
+	if (u.Scheme == "socks5" || u.Scheme == "socks5h") && u.User != nil {
+		user := u.User.Username()
+		pass, _ := u.User.Password()
+		if len(user) > maxSocksCredentialBytes || len(pass) > maxSocksCredentialBytes {
+			return nil, errors.New("proxy URL userinfo exceeds the RFC 1929 credential length limit (input redacted)")
+		}
+	}
 	return u, nil
+}
+
+// maxSocksCredentialBytes is the RFC 1929 limit for one SOCKS5
+// username/password field: the protocol carries each as
+// ⟨1 length byte⟩⟨value⟩, so no value can exceed 255 bytes on the wire.
+const maxSocksCredentialBytes = 255
+
+// endpointKey renders the canonical resolved-endpoint identity a pool's
+// member list must be distinct on: the transport content key with the proxy
+// host case-folded, so two spellings of one endpoint (quoting style,
+// percent-encoding in the userinfo, host case) collapse into one identity
+// and two names for the same endpoint cannot become two pool members. The
+// result embeds userinfo and lives only as a map key — the same memory-only
+// treatment as transport.Config.Key(); it is never logged or echoed.
+func endpointKey(c transport.Config) string {
+	if c.Kind == transport.Proxy {
+		u := *c.ProxyURL
+		u.Host = strings.ToLower(u.Host)
+		return "proxy " + u.String()
+	}
+	return c.Key()
 }
 
 // defaultSSEKeepAliveInterval is the keep-alive silence threshold when the
