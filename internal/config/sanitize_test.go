@@ -33,6 +33,12 @@ func TestLoadRuntimeErrorsNeverEchoInput(t *testing.T) {
 			yaml: "api-key: " + marker + "\nmodels:\n  a:\n    upstream-model: m\n",
 		},
 		{
+			// A syntactically invalid bearer key is rejected at its own
+			// validation layer and must still never reach errors or logs.
+			name: "invalid api-key value",
+			yaml: "api-key: " + marker + ":x\nmodels:\n  a:\n    endpoint: http://h.example/v1\n    upstream-model: m\n",
+		},
+		{
 			name: "URL pasted as a key inside a model entry",
 			yaml: "models:\n  live:\n    https://h.example/v1?" + marker + "=x: \"\"\n    upstream-model: m\n",
 		},
