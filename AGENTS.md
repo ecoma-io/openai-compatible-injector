@@ -99,8 +99,9 @@ Owned decomposition:
   so a late duplicate cannot overwrite the exit code. Compose
   `stop_grace_period` (60s) > default `OAICR_SHUTDOWN_GRACE` (55s).
 - **Logging hot-reloads like config, and leaks nothing at any level.**
-  `logging.level` lives in the runtime YAML (`debug|info|warn|warning|error`,
-  `warning` is an alias, absent = `info`); there is no `LOG_LEVEL` env var.
+  A top-level `log-level` key lives in the runtime YAML
+  (`debug|info|warn|error`, exact-match — the org's other Go services share
+  the spelling; absent = `info`); there is no `LOG_LEVEL` env var.
   A valid reload applies the level process-wide via the poller's
   `onPublish` hook calling `zerolog.SetGlobalLevel` (atomic store, no locks,
   no signal, no restart) and acknowledges it with `log_level_applied`

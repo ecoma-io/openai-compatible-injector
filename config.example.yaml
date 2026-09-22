@@ -64,9 +64,8 @@ models:
 
 # Optional. The log level, hot-reloadable like everything else in this
 # file: change it here and the running process picks it up on the next
-# poll, no restart and no signal. One of debug | info | warn | warning |
-# error (warning is an alias for warn); absent selects info. There is no
-# LOG_LEVEL environment variable — this section is the single source of
-# truth.
-logging:
-  level: info
+# poll, no restart and no signal. One of debug | info | warn | error,
+# matched exactly (the same spelling the organisation's other Go services
+# use); absent selects info. There is no LOG_LEVEL environment variable —
+# this key is the single source of truth.
+log-level: info

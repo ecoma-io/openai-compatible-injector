@@ -20,8 +20,8 @@ func TestLoadRuntimeErrorsNeverEchoInput(t *testing.T) {
 		yaml string
 	}{
 		{
-			name: "logging.level value carries a credential-bearing URL",
-			yaml: "models:\n  a:\n    endpoint: http://h.example/v1\n    upstream-model: m\nlogging:\n  level: https://h.example/v1?" + marker + "=x\n",
+			name: "log-level value carries a credential-bearing URL",
+			yaml: "models:\n  a:\n    endpoint: http://h.example/v1\n    upstream-model: m\nlog-level: https://h.example/v1?" + marker + "=x\n",
 		},
 		{
 			name: "URL pasted as a key inside a model entry",

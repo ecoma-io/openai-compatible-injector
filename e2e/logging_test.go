@@ -84,8 +84,8 @@ func waitForEventCount(t *testing.T, p *proc, msg string, want int) []logEvent {
 	}
 }
 
-// loggingYAML renders a two-model runtime file with an inline logging
-// section: one live model (secret-bearing endpoint query) and one dead
+// loggingYAML renders a two-model runtime file with a top-level log-level
+// key: one live model (secret-bearing endpoint query) and one dead
 // endpoint (connection refused) for the failure-path scenarios.
 func loggingYAML(liveURL, echoURL, level string) string {
 	return fmt.Sprintf(`models:
@@ -100,8 +100,7 @@ func loggingYAML(liveURL, echoURL, level string) string {
     endpoint: %s/v1
     upstream-model: up-echo
 
-logging:
-  level: %s
+log-level: %s
 `, liveURL, echoURL, level)
 }
 
@@ -268,16 +267,16 @@ func TestLogLevelTransitionMatrix(t *testing.T) {
 		expectAck(step[0], step[1])
 	}
 
-	// The alias: `warning` publishes warn and acknowledges with the
-	// canonical name.
-	rewrite("warning")
+	// One more transition beyond the matrix — a fixed last-good generation
+	// to measure the rejection against.
+	rewrite("warn")
 	expectAck("info", "warn")
 
 	// A rejected file changes nothing: the ack generation the recovery
-	// produces must be exactly one past the alias reload's — no generation
-	// was consumed by the rejection — and DEBUG traffic must still flow
-	// while the file is broken, so first move to a level where the
-	// behavior is observable.
+	// produces must be exactly one past the last successful publish's — no
+	// generation was consumed by the rejection — and DEBUG traffic must
+	// still flow while the file is broken, so first move to a level where
+	// the behavior is observable.
 	rewrite("debug")
 	expectAck("warn", "debug")
 	postJSON(t, p.addr, "/v1/chat/completions", secretBody, nil)
@@ -302,9 +301,8 @@ func TestLogLevelTransitionMatrix(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// Recovery with the alias spelling: generation resumes one past the
-	// last successful publish.
-	rewrite("warning")
+	// Recovery: generation resumes one past the last successful publish.
+	rewrite("warn")
 	expectAck("debug", "warn")
 }
 

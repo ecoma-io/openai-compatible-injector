@@ -82,20 +82,19 @@ func FuzzLoadRuntime(f *testing.F) {
     upstream-model: m
     extra: true
 `, // unknown entry key, strict decode
-		"logging:\n  level: debug\n" + strings.TrimPrefix(validRuntime(), "\n"),
-		`logging:
-  level: banana
+		"log-level: debug\n" + strings.TrimPrefix(validRuntime(), "\n"),
+		`log-level: banana
 models:
   a:
     endpoint: https://h/v1
     upstream-model: m
 `, // invalid level
-		`logging: null
+		`log-level:
 models:
   a:
     endpoint: https://h/v1
     upstream-model: m
-`, // null logging section
+`, // null log-level
 		`{"models":{"a":{"endpoint":"https://h/v1","upstream-model":"m"}}}`,                                                                    // JSON is valid YAML
 		"models:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n    injection-prompt: |\n      " + strings.Repeat("x", 4096) + "\n", // huge prompt value
 		"\xff\xfe\x00\x01",       // binary garbage

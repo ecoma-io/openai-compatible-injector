@@ -93,7 +93,7 @@ func healthcheck() int {
 // newLogger builds the stderr JSON logger. The base logger is maximally
 // permissive (TraceLevel): zerolog consults both the logger level and the
 // global level per event, so the global level — seeded from the runtime
-// file's logging.level and re-applied on every config reload — acts as the
+// file's log-level and re-applied on every config reload — acts as the
 // single live control. LOG_LEVEL does not exist: the runtime YAML is
 // mandatory at boot, so an environment variable had no legitimate window
 // and two sources of truth for one setting.
