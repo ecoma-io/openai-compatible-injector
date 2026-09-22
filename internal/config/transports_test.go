@@ -159,7 +159,8 @@ func TestLoadRuntimeTransportValidation(t *testing.T) {
 		want string
 	}{
 		{"missing type", "    proxy: http://127.0.0.1:8080", "type is required"},
-		{"unknown type", "    type: pool", "type must be one of direct, proxy"},
+		{"unknown type", "    type: egress", "type must be one of direct, proxy, pool"},
+		{"pool without members", "    type: pool", "pool requires at least one member"},
 		{"direct with proxy", "    type: direct\n    proxy: http://127.0.0.1:8080", "must not set a proxy URL"},
 		{"proxy without url", "    type: proxy", "proxy URL is required"},
 		{"proxy blank url", "    type: proxy\n    proxy: \"  \"", "proxy URL is required"},

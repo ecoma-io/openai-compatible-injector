@@ -16,15 +16,15 @@ streaming passthrough.
 
 Owned decomposition:
 
-| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                                                                                       |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables + thinking-usage validation/normalization in `buildModel`/`buildProviders`/`buildTransports`, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                       |
-| `internal/transport`             | Outbound paths: `Doer`/`Resolver` seam, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), `Registry` (one long-lived pool per distinct transport config, retained on publish)                                                                                                                       |
-| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer`                                                                                                                             |
-| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                    |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                                                                                            |
-| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                    |
+| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables incl. the pool schema (`buildModel`/`buildProviders`/`buildTransports` two-pass + pool policy builders, no-echo rejections), egress-closure snapshot retention, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
+| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                                                                                         |
+| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify`, egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                         |
+| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                             |
+| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 ## Non-negotiables
 
@@ -48,8 +48,7 @@ Owned decomposition:
   global `http.Client` coupling. `direct` is the tuned Go stack (ambient
   env proxies honored, zero value of `Config`); `proxy` is exactly ONE
   configured endpoint (`http/https/socks5/socks5h`, explicit port, userinfo
-  = proxy auth) — pools, rotation, health checks, cooldown, fallback and
-  retries do not exist. `socks5` resolves the upstream hostname locally and
+  = proxy auth). `socks5` resolves the upstream hostname locally and
   CONNECTs the IP; `socks5h` sends the hostname (remote DNS) — never
   collapse the two. Upstream HTTP statuses are answers (`StatusCode` set,
   `err == nil`); only network-level failures are errors — the normalized
@@ -60,6 +59,33 @@ Owned decomposition:
   connections). An unknown transport/provider reference, a bad type, or a
   malformed proxy URL is a whole-file rejection — never a silent fallback
   to direct.
+- **Egress pools schedule, gate, and fall back — they never retry an
+  answer.** `pool` is the third transport kind: an ordered member list of
+  direct/proxy refs (never pools) with eligibility gates, scheduling
+  (`round_robin` / `weighted_round_robin` — weight steers only the first
+  pick), bounded pre-response fallback (`fallback.enabled`, default
+  true/3, cap 16 — skipped members consume no attempt), and passive health
+  (`health.enabled`/`failure-threshold`/`cooldown`, defaults true/3/30s,
+  min 1s; any response resets). Eligibility precedes everything:
+  streaming gate, `max-body-bytes` vs the outgoing (post-injection) body
+  checked BEFORE any dial (a 6 MB request is never a 413 on a 4.5 MB
+  relay), `max-concurrency` permits held until the response body closes
+  (SSE holds one for the stream's lifetime). The pool owns selection via
+  the `Executor` seam — the handler hands the request facts (context, URL,
+  headers, body, probed stream flag) and gets one response or one error;
+  cancellation aborts with no strike, zero dials is the exhaustion
+  sentinel answering the canonical 502 `upstream_unreachable` with
+  `error_class: egress_exhausted`, and any HTTP status — 429/5xx included —
+  ends the loop and relays like a single-endpoint response. Proxy/SOCKS
+  failures are typed (`ProxyAuthError`/`ProxyConnectError` wrapping their
+  historical texts; classified by type, never message text) for fallback
+  decisions and `error_class` tokens; pool state (scheduler cursor, health,
+  permits, in-flight leases) is keyed by pool identity in the `Registry` —
+  unchanged policy across a reload stays warm, changed policy starts
+  fresh, and a leased state outlives its eviction until the last request
+  releases it. The snapshot retains the egress closure (transports + pools
+  - every member endpoint, content-deduped). NO provider fallback: egress
+    fallback moves a request between network paths, never between providers.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
   keeps the previous snapshot; its hash baseline is the boot content passed

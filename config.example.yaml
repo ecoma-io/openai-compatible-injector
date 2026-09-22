@@ -24,11 +24,11 @@
 api-key: change-me-client-key
 
 # Optional. Named outbound paths a provider can route through: direct (the
-# default — plain egress, ambient HTTP_PROXY/HTTPS_PROXY/NO_PROXY honored)
-# or exactly ONE configured proxy endpoint. Pools with several egresses,
-# rotation, health checks, cooldown, fallback and retries do NOT exist —
-# one transport, one path. Userinfo in a proxy URL (user:pass@) is the
-# proxy's own authentication and never appears in logs or error text.
+# default — plain egress, ambient HTTP_PROXY/HTTPS_PROXY/NO_PROXY honored),
+# exactly ONE configured proxy endpoint, or a POOL of such endpoints with
+# per-request scheduling, eligibility gates, bounded egress fallback and
+# passive health. Userinfo in a proxy URL (user:pass@) is the proxy's own
+# authentication and never appears in logs or error text.
 #
 # Proxy schemes:
 #   http://   HTTP forward proxy (https targets ride CONNECT tunnels)
@@ -38,6 +38,16 @@ api-key: change-me-client-key
 #             hostnames out of the local resolver
 # The proxy URL needs a host, an explicit port, and nothing after the
 # authority (no path, query or fragment).
+#
+# Pool semantics: each request is scheduled onto ONE member. Members the
+# request cannot use are skipped without a dial (streaming gate, body-size
+# gate checked BEFORE sending, concurrency cap, health cooldown). A dialed
+# member failing before any response is retried on the next eligible member
+# up to fallback max-attempts; ANY response — 429 and 5xx included — ends
+# the attempt loop (statuses are answers, never fallback triggers). A pool
+# member must reference a direct or proxy transport by name; pools never
+# nest. An unchanged pool keeps its scheduler position, health state and
+# connection pools across reloads; a changed policy starts fresh.
 transports:
   direct-egress:
     # direct must not set a proxy URL; a provider without a transport
@@ -46,6 +56,23 @@ transports:
   # proxy-egress:
   #   type: proxy
   #   proxy: "socks5h://user:pass@10.0.0.5:1080"
+  # pool-egress:
+  #   type: pool
+  #   members: # ordered; fallback walks the remaining members in this order
+  #     - transport: proxy-egress
+  #       max-body-bytes: 4718592 # skip this member for larger bodies — pre-send
+  #       max-concurrency: 4 # 0/unset = unlimited; held until the body closes
+  #       streaming: true # default true; false = never scheduled streamed requests
+  #       weight: 1 # weighted_round_robin share; default 1, at least 1
+  #     - transport: direct-egress # bare form: all defaults
+  #   strategy: round_robin # round_robin (default) | weighted_round_robin
+  #   fallback:
+  #     enabled: true # default true; false = exactly one endpoint dialed
+  #     max-attempts: 3 # distinct endpoints dialed; default 3, cap 16
+  #   health:
+  #     enabled: true # default true
+  #     failure-threshold: 3 # consecutive transport failures trip the cooldown
+  #     cooldown: 30s # default 30s, min 1s; any response resets the count
 
 # Optional. Named upstream bases, so several models can share one endpoint
 # and one egress. base-url is validated exactly like a model endpoint;

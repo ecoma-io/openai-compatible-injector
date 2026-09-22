@@ -59,8 +59,10 @@ func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (
 	if err != nil {
 		// The proxy endpoint is scheme+host — the same class of detail the
 		// upstream's scheme+host is — and never carries the credentials
-		// (userinfo never dials).
-		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
+		// (userinfo never dials). Typed so the pool classifies the hop
+		// failure; the message is byte-identical to the historical
+		// fmt.Errorf wrap.
+		return nil, &ProxyConnectError{msg: "socks5: dial proxy", cause: err}
 	}
 	// Bound the WHOLE handshake: the net.Dialer timeout covers only the TCP
 	// connect, and a proxy that accepts then never answers would otherwise
@@ -91,6 +93,14 @@ func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (
 	return conn, nil
 }
 
+// hopErr types an I/O failure on the proxy connection itself — the proxy
+// died or went unreachable mid-handshake. Typed so both the pool's fallback
+// decision and the access log's error_class see the proxy hop, not a
+// generic dial failure; the cause rides the Unwrap chain unchanged.
+func hopErr(cause error) error {
+	return &ProxyConnectError{msg: "socks5: proxy handshake failed", cause: cause}
+}
+
 // negotiate picks the auth method (RFC 1928 §3) and, if the proxy demands
 // it, authenticates (RFC 1929 §2). Credentials come from the proxy URL
 // userinfo; nothing here ever formats them into an error or a log.
@@ -102,21 +112,21 @@ func (d *socks5Dialer) negotiate(conn net.Conn) error {
 	}
 	greet := append([]byte{0x05, byte(len(methods))}, methods...)
 	if err := writeAll(conn, greet); err != nil {
-		return err
+		return hopErr(err)
 	}
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return err
+		return hopErr(err)
 	}
 	if buf[0] != 0x05 {
-		return fmt.Errorf("socks5: proxy replied with version %d", buf[0])
+		return &ProxyConnectError{msg: fmt.Sprintf("socks5: proxy replied with version %d", buf[0])}
 	}
 	switch buf[1] {
 	case 0x00:
 		return nil
 	case 0x02:
 		if !hasAuth {
-			return fmt.Errorf("socks5: proxy demanded auth but none configured")
+			return &ProxyAuthError{msg: "socks5: proxy demanded auth but none configured"}
 		}
 		user := d.proxy.User.Username()
 		pass, _ := d.proxy.User.Password()
@@ -128,10 +138,10 @@ func (d *socks5Dialer) negotiate(conn net.Conn) error {
 		p = append(p, byte(len(pass)))
 		p = append(p, pass...)
 		if err := writeAll(conn, p); err != nil {
-			return err
+			return hopErr(err)
 		}
 		if _, err := io.ReadFull(conn, buf); err != nil {
-			return err
+			return hopErr(err)
 		}
 		// RFC 1929 §2: version 0x01 + status 0x00 is success; anything else
 		// is an auth failure. A malformed reply cannot be distinguished from
@@ -139,15 +149,15 @@ func (d *socks5Dialer) negotiate(conn net.Conn) error {
 		// machinery that would care about the difference — both are the same
 		// transport error.
 		if buf[0] != 0x01 || buf[1] != 0x00 {
-			return fmt.Errorf("socks5: proxy authentication failed")
+			return &ProxyAuthError{msg: "socks5: proxy authentication failed"}
 		}
 		return nil
 	case 0xff:
 		// NO ACCEPTABLE METHODS (RFC 1928 §3): the proxy rejected every
 		// method we offered.
-		return fmt.Errorf("socks5: no acceptable authentication method")
+		return &ProxyAuthError{msg: "socks5: no acceptable authentication method"}
 	default:
-		return fmt.Errorf("socks5: proxy chose unknown method %d", buf[1])
+		return &ProxyConnectError{msg: fmt.Sprintf("socks5: proxy chose unknown method %d", buf[1])}
 	}
 }
 
@@ -197,7 +207,7 @@ func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) 
 			if err == nil {
 				err = fmt.Errorf("no addresses")
 			}
-			return fmt.Errorf("socks5: resolve %q locally: %w", host, err)
+			return &ProxyConnectError{msg: fmt.Sprintf("socks5: resolve %q locally", host), cause: err}
 		}
 		ip := addrs[0].IP
 		if v4 := ip.To4(); v4 != nil {
@@ -210,11 +220,11 @@ func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) 
 	req = append(req, addrBytes...)
 	req = append(req, byte(port>>8), byte(port))
 	if err := writeAll(conn, req); err != nil {
-		return err
+		return hopErr(err)
 	}
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(conn, head); err != nil {
-		return err
+		return hopErr(err)
 	}
 	if head[0] != 0x05 {
 		return fmt.Errorf("socks5: bad reply version %d", head[0])
@@ -231,40 +241,46 @@ func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) 
 	case 0x03:
 		l := make([]byte, 1)
 		if _, err := io.ReadFull(conn, l); err != nil {
-			return err
+			return hopErr(err)
 		}
 		bound = int(l[0])
 	default:
-		return fmt.Errorf("socks5: bad bind address type %d", head[3])
+		return &ProxyConnectError{msg: fmt.Sprintf("socks5: bad bind address type %d", head[3])}
 	}
 	if _, err := io.CopyN(io.Discard, conn, int64(bound+2)); err != nil {
-		return err
+		return hopErr(err)
 	}
 	return nil
 }
 
-// replyErr maps a SOCKS5 reply code (RFC 1928 §6) onto its error.
+// replyErr maps a SOCKS5 reply code (RFC 1928 §6) onto its error. Every
+// reply is a failure of the proxy hop to establish the tunnel, so each is
+// typed ProxyConnectError — the pool's fallback and health machinery reads
+// the type, never the text. Texts are unchanged from their historical
+// forms.
 func replyErr(rep byte) error {
+	var e *ProxyConnectError
 	switch rep {
 	case 0x01:
-		return fmt.Errorf("socks5: general failure")
+		e = &ProxyConnectError{msg: "socks5: general failure"}
 	case 0x02:
-		return fmt.Errorf("socks5: connection not allowed by ruleset")
+		e = &ProxyConnectError{msg: "socks5: connection not allowed by ruleset"}
 	case 0x03:
-		return fmt.Errorf("socks5: network unreachable")
+		e = &ProxyConnectError{msg: "socks5: network unreachable"}
 	case 0x04:
-		return fmt.Errorf("socks5: host unreachable")
+		e = &ProxyConnectError{msg: "socks5: host unreachable"}
 	case 0x05:
-		return fmt.Errorf("socks5: connection refused")
+		e = &ProxyConnectError{msg: "socks5: connection refused"}
 	case 0x06:
-		return fmt.Errorf("socks5: ttl expired")
+		e = &ProxyConnectError{msg: "socks5: ttl expired"}
 	case 0x07:
-		return fmt.Errorf("socks5: command not supported")
+		e = &ProxyConnectError{msg: "socks5: command not supported"}
 	case 0x08:
-		return fmt.Errorf("socks5: address type not supported")
+		e = &ProxyConnectError{msg: "socks5: address type not supported"}
 	default:
-		return fmt.Errorf("socks5: unknown reply %d", rep)
+		e = &ProxyConnectError{msg: fmt.Sprintf("socks5: unknown reply %d", rep)}
 	}
+	return e
 }
 
 func writeAll(conn net.Conn, b []byte) error {
