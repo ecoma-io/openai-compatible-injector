@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/inject"
 	"openai-compatible-injector/internal/transport"
@@ -105,8 +105,17 @@ type openAIErrorBody struct {
 // outbound execution included: the request resolves its provider's
 // transport through the resolver and holds the returned Doer for its whole
 // lifetime, so a reload never swaps the path under in-flight work.
-func NewHandler(store *config.Store, doers transport.Resolver, log zerolog.Logger) http.Handler {
-	h := &injectorHandler{store: store, doers: doers, log: log}
+//
+// authProvider selects the credential model: nil keeps static mode (the
+// snapshot's own api-key authenticates every client); a non-nil provider —
+// the partner key store — resolves per-caller identities instead, and the
+// snapshot's api-key is not honored on the wire.
+func NewHandler(store *config.Store, doers transport.Resolver, authProvider auth.Provider, log zerolog.Logger) http.Handler {
+	provider := auth.Provider(auth.StaticProvider{})
+	if authProvider != nil {
+		provider = authProvider
+	}
+	h := &injectorHandler{store: store, doers: doers, auth: provider, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.healthz)
 	// The routes are method-agnostic patterns so that wrong methods reach
@@ -124,6 +133,7 @@ func NewHandler(store *config.Store, doers transport.Resolver, log zerolog.Logge
 type injectorHandler struct {
 	store *config.Store
 	doers transport.Resolver
+	auth  auth.Provider
 	log   zerolog.Logger
 }
 
@@ -305,19 +315,36 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 
 	// Client authentication, before any body is read. The presented bearer
-	// token is compared against the snapshot's key in constant time; a
-	// missing or malformed Authorization header and a wrong key share the
-	// static-envelope discipline — no fragment of the presented credential
-	// is ever echoed, and the configured key never reaches logs.
+	// token is resolved through the request's authenticator — the snapshot
+	// in static mode, the partner key store in partner mode. A missing or
+	// malformed Authorization header, a wrong key, an unknown or revoked
+	// partner key, and even an unreachable credential store all share the
+	// static-envelope discipline: the same two 401 bodies as ever, no
+	// fragment of the presented credential ever echoed, and — the
+	// fail-closed shape — a store outage denies the request instead of
+	// letting it through, with no upstream I/O either way.
 	token, ok := bearerToken(r.Header.Get("Authorization"))
-	if !ok || !keyMatches(token, snap.APIKey()) {
+	if !ok {
 		outcome = "unauthorized"
-		env := envelopeAuthInvalid
-		if !ok {
-			env = envelopeAuthMissing
-		}
-		reject(http.StatusUnauthorized, []byte(env), nil)
+		reject(http.StatusUnauthorized, []byte(envelopeAuthMissing), nil)
 		return
+	}
+	principal, reason, aerr := h.auth.For(snap).Authenticate(r.Context(), token)
+	if aerr != nil {
+		// Backend failure: infrastructure, not a key judgment. Logged for
+		// operators via its class alone — the driver's error text can
+		// embed infrastructure detail, so it never rides the event.
+		log.Warn().Str("error_class", auth.StoreErrorClass(aerr)).
+			Msg("auth_backend_failed")
+	}
+	if reason != auth.ReasonOK {
+		outcome = "unauthorized"
+		reject(http.StatusUnauthorized, []byte(envelopeAuthInvalid), nil)
+		return
+	}
+	if principal.PartnerID != "" || principal.KeyID != "" {
+		log = log.With().Str("partner_id", principal.PartnerID).
+			Str("key_id", principal.KeyID).Logger()
 	}
 
 	// Bound the request body before reading it: without a cap, a single
@@ -1055,23 +1082,6 @@ func isBearerTokenChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 		(c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
 		c == '~' || c == '+' || c == '/'
-}
-
-// keyMatches compares a presented bearer token against the configured API
-// key in constant time. Their permitted b64token syntax bounds their length;
-// pad both byte slices to the same fixed cap so the constant-time comparison
-// exposes neither a mismatch position nor the configured key's length.
-func keyMatches(presented, configured string) bool {
-	if configured == "" || len(presented) > maxBearerTokenBytes || len(configured) > maxBearerTokenBytes {
-		// No snapshot carries an empty key (LoadRuntime rejects it); fail
-		// closed anyway rather than ever match an empty presentation.
-		return false
-	}
-	var presentedBuf, configuredBuf [maxBearerTokenBytes]byte
-	copy(presentedBuf[:], presented)
-	copy(configuredBuf[:], configured)
-	return subtle.ConstantTimeCompare(presentedBuf[:], configuredBuf[:]) == 1 &&
-		subtle.ConstantTimeEq(int32(len(presented)), int32(len(configured))) == 1
 }
 
 // copyRelayHeaders copies exactly the allow-listed upstream response headers

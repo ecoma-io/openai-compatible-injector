@@ -71,23 +71,24 @@ service consumes no unprefixed names of its own.
 
 Division of responsibility:
 
-| Concern                                                                                   | Where it lives          |
-| ----------------------------------------------------------------------------------------- | ----------------------- |
-| `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE` | Environment (bootstrap) |
-| `api-key` (the shared inbound client credential)                                          | YAML file (runtime)     |
-| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,providers}`       | YAML file (runtime)     |
-| `provider-fallback.{enabled,max-attempts}`                                                | YAML file (runtime)     |
-| `sse-keep-alive.{enabled,interval}`                                                       | YAML file (runtime)     |
-| `log-level`                                                                               | YAML file (runtime)     |
+| Concern                                                                                                              | Where it lives          |
+| -------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL` | Environment (bootstrap) |
+| `api-key` (the shared inbound client credential)                                                                     | YAML file (runtime)     |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,providers}`                                  | YAML file (runtime)     |
+| `provider-fallback.{enabled,max-attempts}`                                                                           | YAML file (runtime)     |
+| `sse-keep-alive.{enabled,interval}`                                                                                  | YAML file (runtime)     |
+| `log-level`                                                                                                          | YAML file (runtime)     |
 
 ### Bootstrap environment
 
-| Variable                     | Default               | Meaning                                                                                                                                                                 |
-| ---------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OAICR_LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                        |
-| `OAICR_CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled                                                                                                                 |
-| `OAICR_CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                                                                                                                         |
-| `OAICR_SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain) |
+| Variable                     | Default                 | Meaning                                                                                                                                                                                                         |
+| ---------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OAICR_LISTEN`               | `:8080`                 | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                                                                |
+| `OAICR_CONFIG_FILE`          | `/config/config.yaml`   | Path of the runtime YAML file, read at boot then polled                                                                                                                                                         |
+| `OAICR_CONFIG_POLL_INTERVAL` | `1s`                    | How often the file's content hash is re-checked                                                                                                                                                                 |
+| `OAICR_SHUTDOWN_GRACE`       | `55s`                   | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain)                                         |
+| `OAICR_AUTH_DATABASE_URL`    | _(empty — static mode)_ | PostgreSQL/TimescaleDB connection string of the partner key store. Absent keeps static mode; set, the process boots into partner mode (see "Partner API keys"). The value is never logged — not even its length |
 
 There is no `LOG_LEVEL` environment variable — it was removed together with
 the introduction of `log-level` in the runtime file, which hot-reloads.
@@ -743,7 +744,7 @@ Upstream and client failures are classified, never fogged:
 | Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                           |
 | --------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Missing/malformed `Authorization: Bearer <key>`                                                                 | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`  |
-| Wrong bearer key                                                                                                | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
+| Wrong bearer key (partner mode: unknown **or revoked** key, or an unavailable key store — fail closed)          | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
 | Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                            |
 | Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                      |
 | Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                  |
@@ -791,13 +792,82 @@ Consequences of the table:
 Rate-limit and retry headers are load-bearing for client backoff; dropping
 them would make a 429 indistinguishable from any other upstream failure.
 
+## Partner API keys
+
+Static mode (the default) authenticates every client against the runtime
+YAML's `api-key` — one shared credential, no per-caller identity. Setting
+`OAICR_AUTH_DATABASE_URL` opts the process into **partner mode**: `/v1`
+requests authenticate against hashed per-partner keys stored in
+PostgreSQL/TimescaleDB, and each request is attributed to a `partner_id` +
+`key_id` pair that rides the structured logs (and, from the usage metering
+layer on, the usage records).
+
+What partner mode changes, precisely:
+
+- **Identity, not a boolean.** Authentication resolves a `Principal`
+  (partner + key). The YAML `api-key` is still required by the runtime file
+  contract, but in partner mode it is **not a wire credential** — presenting
+  it denies, because it was never seeded into the store. Revocation cannot
+  be bypassed through the file.
+- **High-entropy tokens, hashed at rest.** `keys create` mints
+  `oaicr_` + 32 crypto-random bytes (base64url) and stores only its SHA-256
+  digest — the plaintext is printed once on creation and is unrecoverable by
+  design. Key IDs (`pak_…`) are public and safe to log.
+- **Revocation without restart, within a documented bound.** A bounded LRU
+  decision cache (4,096 entries) fronts the store: affirmative decisions
+  live at most **60 s**, negative ones (unknown/revoked) at most **5 s**, so
+  `keys revoke` takes effect within at most a minute and a freshly created
+  key works within at most five seconds. The cache holds decisions the
+  store made — never a bypass: backend failures are never cached, and a
+  recovered store is trusted on the very next request.
+- **Every failure mode fails closed.** A store outage (or a slow one)
+  denies the request with the same static 401 as any other rejection —
+  never a fail-open — after emitting the WARN `auth_backend_failed` event
+  (error class only; driver text never reaches logs). At boot, an
+  unreachable store or a schema that fails validation is a startup failure.
+- **Wire parity with static mode.** Unknown and revoked keys get exactly
+  the same static `invalid_api_key` 401 as a wrong static key — why a
+  credential was rejected is enumeration material and never reaches the
+  client. The missing/malformed-bearer 401 is unchanged.
+- **Schema is migrated, validated, forward-only.** SQL migrations live in
+  the binary (`internal/auth/migrations/`), run inside transactions with
+  `schema_migrations` bookkeeping, and never run on the request path.
+  Startup brings the schema up and validates the column contract against
+  `information_schema`; a foreign or half-migrated table refuses to start.
+
+Managing keys (a CLI beside the proxy, deliberately not an HTTP surface on
+it; the connection string comes from `-database` or
+`OAICR_AUTH_DATABASE_URL`):
+
+```console
+$ openai-compatible-injector keys create -partner acme-corp
+key created
+  key_id:     pak_…
+  partner_id: acme-corp
+  token:      oaicr_…        # shown exactly once — store it now
+
+$ openai-compatible-injector keys list
+key_id	partner_id	status	created_at	revoked_at	last_used_at
+pak_…	acme-corp	active	2026-01-01T00:00:00Z	-	-
+
+$ openai-compatible-injector keys revoke -key-id pak_…
+key revoked: pak_…
+Requests presenting it are denied within 1m0s (the positive cache bound).
+```
+
+`keys list` cannot expose secrets: the record type structurally carries no
+hash and the table read selects no hash column. `last_used_at` is updated
+off the request path (batched, best-effort) — it is advisory metadata, and
+losing touches under load never affects a request.
+
 ## Safety and credentials
 
-- The configured `api-key` is the one shared inbound client credential.
-  Clients present it via `Authorization: Bearer <key>`; it is checked before
-  the proxy reads the request body. The header is **consumed at the proxy**
-  and never forwarded upstream. The proxy injects no replacement credential:
-  upstreams are expected to be trusted/internal.
+- Static mode: the configured `api-key` is the one shared inbound client
+  credential. Partner mode (above): per-partner hashed keys. In both, the
+  credential is presented via `Authorization: Bearer <key>` and checked
+  before the proxy reads the request body. The header is **consumed at the
+  proxy** and never forwarded upstream. The proxy injects no replacement
+  credential: upstreams are expected to be trusted/internal.
 - **Credentials never reach logs or error text** — no configured `api-key`,
   `Authorization` values, request bodies, or injection prompts in log lines,
   and no upstream URL details beyond the endpoint's scheme+host in **any**
@@ -1060,11 +1130,12 @@ Decided, and not coming back without a design discussion:
 ## Repository layout
 
 ```
-cmd/openai-compatible-injector/  entrypoint + version/healthcheck subcommands
+cmd/openai-compatible-injector/  entrypoint + version/healthcheck/keys subcommands
 internal/config/                 bootstrap, runtime YAML (models, providers, transports), snapshot store, poller
+internal/auth/                   client identity: static + partner key store, decision cache, SQL migrations
 internal/inject/                 pure request/response transforms (probe, chat, responses, rewrite, thinking usage)
 internal/transport/              outbound paths: Doer seam, direct client, proxy (http/https/socks5/socks5h), pool registry
-internal/proxy/                  handler, client auth, SSE copy, error envelopes
+internal/proxy/                  handler, client auth gate, SSE copy, error envelopes
 internal/server/                 listener + graceful shutdown
 e2e/                             black-box subprocess suite
 config.example.yaml              documented runtime config template

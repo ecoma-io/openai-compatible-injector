@@ -21,6 +21,14 @@
 # and trailing = padding only). A file without a non-empty valid api-key is
 # rejected — a keyless boot refuses to
 # start, a keyless reload keeps the last-known-good key serving.
+#
+# This key is the credential of STATIC mode — the default. When the proxy is
+# started with OAICR_AUTH_DATABASE_URL set (partner mode), /v1 requests
+# authenticate against hashed per-partner keys managed with
+# `openai-compatible-injector keys create|list|revoke` instead, and this
+# value is NOT honored on the wire (it stays required here so the file
+# schema and a static-mode fallback stay unchanged). See README
+# "Partner API keys".
 api-key: change-me-client-key
 
 # Optional. Named outbound paths a provider can route through: direct (the

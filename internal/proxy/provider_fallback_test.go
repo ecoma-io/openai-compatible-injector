@@ -16,6 +16,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/inject"
 	"openai-compatible-injector/internal/transport"
@@ -155,7 +156,7 @@ func TestProviderChainFirstCandidateSucceeds(t *testing.T) {
 	pa := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-a","choices":[]}`}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -190,7 +191,7 @@ func TestProviderChainFallsBackOnTransportFailure(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -243,7 +244,7 @@ func TestProviderChainHTTPStatusIsTerminal(t *testing.T) {
 		pa := &fakeUpstream{status: status, body: `{"error":{"message":"provider says no"}}`}
 		pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 		logBuf, log := captureLog(zerolog.InfoLevel)
-		h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, log)
+		h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
 
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 		if rec.Code != status {
@@ -278,7 +279,7 @@ func TestProviderChainExhaustion(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{err: dialError("b.example")}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -315,7 +316,7 @@ func TestProviderChainFallbackDisabled(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -342,7 +343,7 @@ func TestProviderChainTransformErrorNeverFallsBack(t *testing.T) {
 	pa := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-a","choices":[]}`}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := &injectorHandler{store: store, doers: kindResolver{direct: pa, proxied: pb}, log: log}
+	h := &injectorHandler{store: store, doers: kindResolver{direct: pa, proxied: pb}, auth: auth.StaticProvider{}, log: log}
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chainChatBody))
@@ -377,7 +378,7 @@ func TestProviderChainCancellationAbortsWalk(t *testing.T) {
 	pa := &fakeUpstream{err: context.Canceled}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -414,7 +415,7 @@ func TestProviderChainStreamingCommitment(t *testing.T) {
 	}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"chain-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -494,7 +495,7 @@ func TestProviderChainBindsToItsSnapshot(t *testing.T) {
 		}
 	}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, res, log)
+	h := NewHandler(store, res, nil, log)
 
 	type result struct {
 		code int
@@ -613,7 +614,7 @@ models:
 	reg := transport.NewRegistry()
 	reg.Retain(snap.Transports())
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, reg, log)
+	h := NewHandler(store, reg, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusBadGateway {

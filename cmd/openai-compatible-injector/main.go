@@ -16,6 +16,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/server"
 	"openai-compatible-injector/internal/transport"
@@ -33,6 +34,10 @@ func main() {
 			return
 		case "healthcheck":
 			os.Exit(healthcheck())
+		case "keys":
+			// Partner key management: a CLI beside the proxy, deliberately
+			// not an HTTP surface on it.
+			os.Exit(keysCommand(os.Args[2:]))
 		default:
 			usage()
 			os.Exit(2)
@@ -42,7 +47,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [version|healthcheck]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s [version|healthcheck|keys create|keys list|keys revoke]\n", os.Args[0])
 }
 
 // healthcheck probes the running service's /healthz endpoint without reading
@@ -127,6 +132,36 @@ func run() int {
 	// warm pool, and one that removes one drains only that pool's idle
 	// connections. Built before the poller and server so both can hold it.
 	doers := transport.NewRegistry()
+
+	// Credential model. Static (the default) authenticates every client
+	// against the runtime YAML's api-key. Partner mode (OAICR_AUTH_DATABASE_URL
+	// set) resolves per-caller identities from the hashed key store: the
+	// store is opened, migrated, and schema-validated here, at startup —
+	// any failure is fatal, because partner mode without a reachable,
+	// correct store would deny every request anyway. Fail closed at boot,
+	// not on the first unlucky request. The key store outlives the server:
+	// its final last_used_at batch flushes during shutdown.
+	var authProvider auth.Provider
+	authMode := "static"
+	if b.AuthDatabaseURL != "" {
+		initCtx, initCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		keyStore, err := auth.NewPGStore(initCtx, b.AuthDatabaseURL)
+		initCancel()
+		if err != nil {
+			// The class, never the error text: a connection failure's
+			// rendering can name hosts, users, and databases — and the
+			// DSN itself is never echoed, not even its length.
+			log.Fatal().Str("error_class", auth.StoreErrorClass(err)).Msg("auth_store_init_failed")
+		}
+		defer func() {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer closeCancel()
+			_ = keyStore.Close(closeCtx)
+		}()
+		authProvider = auth.NewPartnerProvider(keyStore)
+		authMode = "partner"
+	}
+
 	log.Info().
 		Str("version", version).
 		Str("listen", b.Listen).
@@ -134,6 +169,7 @@ func run() int {
 		Dur("poll_interval", b.PollInterval).
 		Dur("shutdown_grace", b.ShutdownGrace).
 		Int("model_count", snap.Len()).
+		Str("auth_mode", authMode).
 		Str("log_level", snap.LogLevel().String()).
 		Msg("service_started")
 
@@ -193,7 +229,7 @@ func run() int {
 	}
 	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, onPublish).Run(ctx)
 
-	err = server.New(store, doers, b.Listen, b.ShutdownGrace, log).Run(ctx)
+	err = server.New(store, doers, authProvider, b.Listen, b.ShutdownGrace, log).Run(ctx)
 	// Ignore before announcing the drain done: from the instant Run returns
 	// the process is committed to its exit code, and a duplicate signal must
 	// fall on the ignored disposition, not the default handler's 143.

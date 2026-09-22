@@ -20,19 +20,20 @@ Owned decomposition:
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables incl. the pool schema (`buildModel`/`buildProviders`/`buildTransports` two-pass + pool policy builders, no-echo rejections, duplicate resolved-endpoint member rejection via `endpointKey`, RFC 1929 credential bound in `parseProxyURL`), egress-closure snapshot retention over model CHAINS (every candidate's transport), provider candidate chains (`runtimeModelCandidate`/`buildChain`), the `provider-fallback` policy builder, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
 | `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `internal/auth`                  | Client identity: `Principal`/`Reason`/`Authenticator`/`Provider` seam, `StaticProvider` (snapshot-bound shared key, padded constant-time compare), `PartnerProvider` (store-backed, bounded positive/negative decision cache — errors never cached), crypto-random token/keyID minting + SHA-256-at-rest hashing, PostgreSQL key store (`PGStore`: lookup/create/list/revoke, off-path batched `last_used_at` flusher), embedded forward-only SQL migrations (`EnsureSchema`/`ValidateSchema` via `information_schema`)                                                                                                                                                                                                                              |
 | `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify`, egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                                                                                                                                                                                                                                                                                                 |
-| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, error envelopes, SSE copying (`CopySSE`), provider candidate walk (bounded by the snapshot's provider-fallback policy, transport-failure-only), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                                                                                                                                                                                               |
+| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping (auth delegated to the `auth.Provider` seam — static or partner), error envelopes, SSE copying (`CopySSE`), provider candidate walk (bounded by the snapshot's provider-fallback policy, transport-failure-only), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                                                                                                                              |
 | `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, `keys create/list/revoke` (partner key lifecycle; list exposes no secrets), default serve                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ## Non-negotiables
 
 - **Two config planes.** Bootstrap settings (`OAICR_LISTEN`,
   `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`,
-  `OAICR_SHUTDOWN_GRACE` — every environment variable the service reads is
-  `OAICR_`-prefixed; no unprefixed fallback exists) come from the
-  environment and
+  `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL` — every environment
+  variable the service reads is `OAICR_`-prefixed; no unprefixed fallback
+  exists) come from the environment and
   are enforced by the runtime file's strict decoding: a runtime file
   defining them is rejected. The runtime file must be a single YAML
   document — a `---`-separated second document is a rejection (a decoder
@@ -40,7 +41,10 @@ Owned decomposition:
   (inline `endpoint` or `provider`+`transports`+`providers` tables), the
   required `api-key`, and the hot-reloadable top-level
   `sse-keep-alive` block live in YAML only; the latter defaults to enabled
-  at 15s and accepts a duration of at least 1s.
+  at 15s and accepts a duration of at least 1s. The auth database URL is
+  infrastructure, not policy: empty = static mode, non-empty = partner
+  mode; it never hot-reloads and the DSN is never logged (not even its
+  length — it embeds a password).
 - **The router decides WHICH provider; the transport decides HOW the
   request reaches it.** The handler resolves a model's flattened
   `transport.Config` through the `transport.Resolver` seam once per request
@@ -144,7 +148,7 @@ Owned decomposition:
   and binds the whole request — including its `api-key` and any active stream
   — to that snapshot forever. Reloads never affect in-flight work.
 - **Client authentication is mandatory and terminal at this proxy.** Every
-  Chat/Responses request presents the configured `api-key` as
+  Chat/Responses request presents a bearer credential as
   `Authorization: Bearer <key>`; the scheme is case-insensitive, and keys
   must be RFC 6750 bearer tokens (no whitespace or other invalid characters).
   A missing/malformed key gets the static missing-key 401, while a wrong key
@@ -152,6 +156,27 @@ Owned decomposition:
   or upstream I/O; retain 405-before-401 ordering. `/healthz` and the 404
   catch-all stay unauthenticated. Consume — never forward or replace — the
   client's Authorization header; upstreams are trusted/internal.
+- **Authentication resolves an identity through one seam, and every
+  failure mode fails closed.** The handler asks the request snapshot's
+  `auth.Provider` (nil at `NewHandler` = `StaticProvider`) — static mode
+  compares against the snapshot's own `api-key` (padded constant-time, no
+  length/mismatch-position leak), so a key rotation lands on the next
+  request after the reload. Partner mode (`OAICR_AUTH_DATABASE_URL` set)
+  resolves hashed per-partner keys: the store is opened, migrated
+  (embedded, versioned, forward-only, transactional) and schema-validated
+  at startup — any failure is fatal; the request path issues queries only.
+  The YAML `api-key` is not a wire credential in partner mode (it stays
+  required only so the file contract is unchanged) and revocation cannot
+  be bypassed through it. The bounded decision cache never becomes a
+  bypass: positive decisions ≤ 60s, negative ≤ 5s, backend errors NEVER
+  cached — a store outage denies (static 401 + WARN `auth_backend_failed`
+  with `error_class` only, never driver text) and is retried on the next
+  request. Unknown and revoked are definitive negatives with the same
+  static `invalid_api_key` wire body — why a key was rejected is
+  enumeration material. Plaintext tokens exist once (`keys create` stdout),
+  are crypto-random (`oaicr_` + 32 bytes), stored only as SHA-256 digests;
+  `keys list` structurally exposes no secret material; `last_used_at`
+  flushes off the request path (drop-on-full, never blocks, never fatal).
 - **Injection must never corrupt.** Chat prepends to `messages` only when it
   is a JSON array; Responses merges into `instructions` (string, array, or
   absent) and touches nothing else. Empty prompt = no injection.
@@ -267,6 +292,11 @@ Owned decomposition:
 ## Testing
 
 - Unit tests co-located under `internal/`, stdlib only, deterministic.
+  Exception: `internal/auth`'s PostgreSQL integration tests (store
+  lifecycle, migration idempotence, foreign-schema fail-closed,
+  forward-only history) run against a real server only when
+  `OAICR_TEST_DATABASE_URL` names a dedicated disposable test database —
+  unset, they skip (and CI stays hermetic).
 - E2E (`e2e/`) is a black-box suite over the built binary with in-process
   httptest upstreams; skips under `-short`; CI runs
   `go test ./e2e/ -count=1 -timeout 25m`.
@@ -290,7 +320,8 @@ Owned decomposition:
 ## Harness-agnostic conventions
 
 - Go ≥ 1.25 (toolchain owned by `go.mod`); deps zerolog v1.35.1 +
-  gopkg.in/yaml.v3, stdlib tests only; no Makefile — commands live in
+  gopkg.in/yaml.v3 + jackc/pgx v5 (database/sql driver, partner key
+  store only), stdlib tests only; no Makefile — commands live in
   CONTRIBUTING.md and ci.yml.
 - Conventional Commits via lefthook + commitlint (scopes: inject, proxy,
   server, config, cmd, e2e, docs, deps, ci, workspace, release). Signed
