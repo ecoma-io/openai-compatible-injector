@@ -199,6 +199,7 @@ func TestLoadRuntimeRequiresAPIKey(t *testing.T) {
 		{"disallowed character", "api-key: \"unit:key\"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
 		{"padding before token end", "api-key: \"unit=test\"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
 		{"only padding", "api-key: \"===\"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
+		{"too long", "api-key: \"" + strings.Repeat("a", maxBearerTokenBytes+1) + "\"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n"},
 	}
 	for _, tc := range rejects {
 		t.Run(tc.name, func(t *testing.T) {
@@ -207,7 +208,7 @@ func TestLoadRuntimeRequiresAPIKey(t *testing.T) {
 				t.Fatal("expected rejection")
 			}
 			want := "api-key is required"
-			if tc.name == "embedded space" || tc.name == "embedded tab" || tc.name == "leading tab" || tc.name == "trailing newline" || tc.name == "disallowed character" || tc.name == "padding before token end" || tc.name == "only padding" {
+			if tc.name == "embedded space" || tc.name == "embedded tab" || tc.name == "leading tab" || tc.name == "trailing newline" || tc.name == "disallowed character" || tc.name == "padding before token end" || tc.name == "only padding" || tc.name == "too long" {
 				want = "api-key must be a valid bearer token"
 			}
 			if !strings.Contains(err.Error(), want) {

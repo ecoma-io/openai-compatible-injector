@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
@@ -689,11 +688,15 @@ func bearerToken(header string) (string, bool) {
 	return token, true
 }
 
+// maxBearerTokenBytes bounds the credential material held per request. The
+// same cap on the config plane makes constant-time comparison practical.
+const maxBearerTokenBytes = 4 << 10
+
 // validBearerToken reports whether token is an RFC 6750 b64token. Its
 // counterpart in config keeps accepted configured keys representable in a
 // valid Authorization: Bearer header.
 func validBearerToken(token string) bool {
-	if token == "" {
+	if token == "" || len(token) > maxBearerTokenBytes {
 		return false
 	}
 	padding := false
@@ -722,19 +725,20 @@ func isBearerTokenChar(c byte) bool {
 }
 
 // keyMatches compares a presented bearer token against the configured API
-// key in constant time. Both sides are hashed first: a bare bytes comparison
-// is only constant-time for equal lengths and would leak the configured
-// key's length through timing on mismatches; digests are always the same
-// length, so the comparison is constant-time for any input.
+// key in constant time. Their permitted b64token syntax bounds their length;
+// pad both byte slices to the same fixed cap so the constant-time comparison
+// exposes neither a mismatch position nor the configured key's length.
 func keyMatches(presented, configured string) bool {
-	if configured == "" {
+	if configured == "" || len(presented) > maxBearerTokenBytes || len(configured) > maxBearerTokenBytes {
 		// No snapshot carries an empty key (LoadRuntime rejects it); fail
 		// closed anyway rather than ever match an empty presentation.
 		return false
 	}
-	presentedSum := sha256.Sum256([]byte(presented))
-	configuredSum := sha256.Sum256([]byte(configured))
-	return subtle.ConstantTimeCompare(presentedSum[:], configuredSum[:]) == 1
+	var presentedBuf, configuredBuf [maxBearerTokenBytes]byte
+	copy(presentedBuf[:], presented)
+	copy(configuredBuf[:], configured)
+	return subtle.ConstantTimeCompare(presentedBuf[:], configuredBuf[:]) == 1 &&
+		subtle.ConstantTimeEq(int32(len(presented)), int32(len(configured))) == 1
 }
 
 // copyRelayHeaders copies exactly the allow-listed upstream response headers

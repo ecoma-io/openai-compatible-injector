@@ -530,6 +530,7 @@ func TestAuthRequiredExactBodies(t *testing.T) {
 				{"disallowed token character", "Bearer unit:key", http.StatusUnauthorized, envelopeAuthMissing},
 				{"padding before token end", "Bearer unit=test", http.StatusUnauthorized, envelopeAuthMissing},
 				{"only padding", "Bearer ===", http.StatusUnauthorized, envelopeAuthMissing},
+				{"too long", "Bearer " + strings.Repeat("a", maxBearerTokenBytes+1), http.StatusUnauthorized, envelopeAuthMissing},
 				{"wrong key", "Bearer wrong-key", http.StatusUnauthorized, envelopeAuthInvalid},
 				{"configured key with suffix", "Bearer " + testAPIKey + "-suffix", http.StatusUnauthorized, envelopeAuthInvalid},
 				{"lowercase scheme", "bearer " + testAPIKey, http.StatusOK, ""},

@@ -19,6 +19,10 @@ import (
 // TypeError reports — the only part of that error that is safe to surface.
 var typeErrorLine = regexp.MustCompile(`line (\d+)`)
 
+// maxBearerTokenBytes bounds credentials held in a runtime snapshot. It is
+// kept in sync with proxy authentication's fixed-size comparison buffer.
+const maxBearerTokenBytes = 4 << 10
+
 // inputEchoingPrefixes lists the yaml.v3 scanner-level failures whose
 // messages interpolate operator text rather than positions: an undefined
 // alias names its anchor, a recursive anchor names itself, an explicit tag
@@ -244,7 +248,7 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 // this validation in the config plane ensures every accepted configured key
 // can be presented legally in an Authorization: Bearer header.
 func validBearerToken(token string) bool {
-	if token == "" {
+	if token == "" || len(token) > maxBearerTokenBytes {
 		return false
 	}
 	padding := false
