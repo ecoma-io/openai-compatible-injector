@@ -88,7 +88,7 @@ func TestLoadRuntimeModelValidation(t *testing.T) {
 		yaml string
 		want string
 	}{
-		{"missing endpoint", "models:\n  a:\n    upstream-model: m\n", "endpoint is required"},
+		{"missing endpoint", "models:\n  a:\n    upstream-model: m\n", "endpoint or provider is required"},
 		{"non-http endpoint", "models:\n  a:\n    endpoint: ftp://h\n    upstream-model: m\n", "http(s) with a host"},
 		{"hostless endpoint", "models:\n  a:\n    endpoint: https://\n    upstream-model: m\n", "http(s) with a host"},
 		{"credentials in endpoint", "models:\n  a:\n    endpoint: https://user:pass@h/v1\n    upstream-model: m\n", "credentials"},

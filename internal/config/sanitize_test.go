@@ -190,7 +190,7 @@ func TestModelEntryOrdinalsAreDeterministic(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rejection")
 	}
-	if !strings.Contains(err.Error(), "model entry 1: endpoint is required") {
+	if !strings.Contains(err.Error(), "model entry 1: endpoint or provider is required") {
 		t.Fatalf("err = %v, want the first entry in sorted order (aaa) named by ordinal", err)
 	}
 }
