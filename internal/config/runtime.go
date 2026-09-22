@@ -19,6 +19,10 @@ import (
 // TypeError reports — the only part of that error that is safe to surface.
 var typeErrorLine = regexp.MustCompile(`line (\d+)`)
 
+// maxBearerTokenBytes bounds credentials held in a runtime snapshot. It is
+// kept in sync with proxy authentication's fixed-size comparison buffer.
+const maxBearerTokenBytes = 4 << 10
+
 // inputEchoingPrefixes lists the yaml.v3 scanner-level failures whose
 // messages interpolate operator text rather than positions: an undefined
 // alias names its anchor, a recursive anchor names itself, an explicit tag
@@ -79,11 +83,11 @@ func decodeConfigError(err error) error {
 }
 
 // runtime file schema. Strictness has two layers: top-level keys are
-// validated against the raw YAML (only "models" and "log-level" are legal —
-// this is what keeps the bootstrap plane out of the runtime file: listen,
-// config file, poll interval, ... any file that tries to define them fails
-// validation, whatever their value's shape), and a KnownFields strict decode
-// rejects unknown keys inside each model entry.
+// validated against the raw YAML (only "models", "api-key", and "log-level"
+// are legal — this is what keeps the bootstrap plane out of the runtime
+// file: listen, config file, poll interval, ... any file that tries to define
+// them fails validation, whatever their value's shape), and a KnownFields
+// strict decode rejects unknown keys inside each model entry.
 //
 // The models table is decoded with yaml.v3 directly, never through viper:
 // viper's map normalization lowercases every key and flattens dotted names,
@@ -94,6 +98,13 @@ func decodeConfigError(err error) error {
 
 type runtimeFile struct {
 	Models map[string]runtimeModel `yaml:"models"`
+	// APIKey mirrors the required top-level api-key — the bearer credential
+	// clients must present on both /v1 routes. Absent, null, or
+	// whitespace-only rejects the whole file, so the front door is closed by
+	// default and a bad rewrite cannot silently reopen it on reload. The
+	// value is credential material: it never reaches any log event or error
+	// text.
+	APIKey string `yaml:"api-key"`
 	// LogLevel mirrors the optional top-level log-level key — the same
 	// flat spelling the org's other Go services use, with no nested
 	// section. Absent or null selects the default; the value itself is
@@ -137,13 +148,13 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, fmt.Errorf("parse config: %w", decodeConfigError(err))
 	}
 	for k := range raw {
-		if k == "models" || k == "log-level" {
+		if k == "models" || k == "api-key" || k == "log-level" {
 			continue
 		}
 		// The key itself is not named: error text reaches logs verbatim, and
 		// a pasted credential can land in a key position just as well as a
 		// value position.
-		return nil, errors.New("unknown top-level key (only models and log-level are legal)")
+		return nil, errors.New("unknown top-level key (only models, api-key and log-level are legal)")
 	}
 	var rf runtimeFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -210,12 +221,59 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, errors.New("models: at least one model is required")
 	}
 
+	// The client API key is required — fail-closed. A file without one never
+	// becomes a snapshot: first boot refuses to start and a keyless rewrite
+	// lands on the last-known-good path instead of reopening the front door.
+	// A space-only value is the same as absent. Outer spaces are normalized, but
+	// every other character must form an RFC 6750 bearer token, or clients could
+	// not present it legally. The value is never named in the error: error text
+	// reaches logs verbatim.
+	key := strings.Trim(rf.APIKey, " ")
+	if key == "" {
+		return nil, errors.New("api-key is required")
+	}
+	if !validBearerToken(key) {
+		return nil, errors.New("api-key must be a valid bearer token")
+	}
+
 	level, err := ParseLogLevel(rf.LogLevel)
 	if err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
-	return &Snapshot{models: models, logLevel: level}, nil
+	return &Snapshot{models: models, apiKey: key, logLevel: level}, nil
+}
+
+// validBearerToken reports whether token is an RFC 6750 b64token. Keeping
+// this validation in the config plane ensures every accepted configured key
+// can be presented legally in an Authorization: Bearer header.
+func validBearerToken(token string) bool {
+	if token == "" || len(token) > maxBearerTokenBytes {
+		return false
+	}
+	padding := false
+	hasTokenChar := false
+	for i := range len(token) {
+		c := token[i]
+		if c == '=' {
+			if !hasTokenChar {
+				return false
+			}
+			padding = true
+			continue
+		}
+		if padding || !isBearerTokenChar(c) {
+			return false
+		}
+		hasTokenChar = true
+	}
+	return true
+}
+
+func isBearerTokenChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+		c == '~' || c == '+' || c == '/'
 }
 
 func buildModel(name string, rm runtimeModel) (Model, error) {

@@ -1,13 +1,14 @@
 # openai-compatible-injector
 
 A minimal OpenAI-compatible **request/response injector proxy**. Clients talk
-to it as if it were an OpenAI endpoint; it forwards to configured upstream
+to it as if it were an OpenAI endpoint — authenticating with the single
+`api-key` from the runtime config — and it forwards to configured upstream
 providers, renaming the model and injecting a per-model system prompt into
 every request. Hot-reloadable model mapping, no telemetry, one static
 binary.
 
 ```
- client ──POST /v1/chat/completions──▶ injector ──forward (model→upstream-model, prompt injected)──▶ upstream provider
+ client ──POST /v1/chat/completions (Bearer api-key)──▶ injector ──forward (model→upstream-model, prompt injected, credential consumed)──▶ upstream provider
          ◀──model rewritten to public name──●
 ```
 
@@ -39,7 +40,7 @@ there are no routes, weights, or per-request overrides.
 ## Quick start
 
 ```sh
-cp config.example.yaml config.yaml   # edit the model mapping
+cp config.example.yaml config.yaml   # edit the api-key and model mapping
 docker compose up -d                 # listens on :8080
 ```
 
@@ -49,6 +50,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-reviewer","messages":[{"role":"user","content":"optimize this"}]}'
 ```
+
+`<client-token>` must equal the `api-key` configured in `config.yaml`.
 
 The upstream receives `model: gpt-5-pro` with a
 `{"role":"system","content":"Review the following code…"}` message prepended.
@@ -71,6 +74,7 @@ Division of responsibility:
 | Concern                                                                                   | Where it lives          |
 | ----------------------------------------------------------------------------------------- | ----------------------- |
 | `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE` | Environment (bootstrap) |
+| `api-key` (the shared inbound client credential)                                          | YAML file (runtime)     |
 | `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}`                 | YAML file (runtime)     |
 | `log-level`                                                                               | YAML file (runtime)     |
 
@@ -92,6 +96,10 @@ truth.
 ### Runtime YAML
 
 ```yaml
+# Required. Clients send this exact value as Authorization: Bearer <key>.
+# It authenticates clients to this proxy only and is never forwarded upstream.
+api-key: replace-with-a-secret-client-key
+
 models:
   gpt-reviewer:
     endpoint: https://api.provider.example/v1 # required; no credentials, no /chat/completions suffix
@@ -110,6 +118,12 @@ models:
 log-level: info # optional; debug | info | warn | error (absent = info)
 ```
 
+- `api-key` — required shared [Bearer token](https://www.rfc-editor.org/rfc/rfc6750#section-2.1): non-empty ASCII letters, digits, `-`, `.`, `_`, `~`, `+`, `/`, and trailing `=` padding only. Clients present it as
+  `Authorization: Bearer <key>` on both model-serving routes; the scheme is
+  case-insensitive and outer spaces are ignored. It is bound
+  to the [per-request config snapshot](#hot-reload), so rotating the YAML
+  value affects subsequent requests without a restart. The key is credential
+  material: it never appears in logs, error text, or reload metadata.
 - `endpoint` — base URL of the upstream provider. Scheme `http` or `https`
   only; port and path allowed, trailing slashes ignored; URL userinfo is
   rejected. Requests are sent to `<endpoint>/chat/completions` and
@@ -129,8 +143,8 @@ log-level: info # optional; debug | info | warn | error (absent = info)
 
 The file is validated strictly, in two layers:
 
-- **Top-level keys** are checked against the raw YAML: only `models` and
-  `log-level` are legal. This is the bootstrap-plane rule — a file that tries
+- **Top-level keys** are checked against the raw YAML: only `models`,
+  `api-key` and `log-level` are legal. This is the bootstrap-plane rule — a file that tries
   to define `listen`, `config-file`, `config-poll-interval` or
   `shutdown-grace` is rejected whatever its value's shape (a strict struct
   decode alone misses a bootstrap key whose value is an empty map).
@@ -140,10 +154,15 @@ The file is validated strictly, in two layers:
   `mode`, `min-ratio`, `max-ratio`) — including a nested bootstrap key — is a
   rejection, not a warning.
 
-The `models` table itself must contain at least one model. An empty table is
-rejected — an empty file is what a truncate-then-write config edit looks
-like mid-write, and accepting it would silently drop every model from the
-live service; rejecting it lands the reload on the last-known-good path.
+The `models` table itself must contain at least one model, and `api-key` must
+be a non-empty Bearer token after trimming outer spaces (only the
+Bearer-token characters documented above; no embedded whitespace). Both
+failures are fail-closed: an invalid initial config exits
+`1`; an invalid reload preserves
+the complete last-known-good snapshot (including its prior client key). An
+empty model table is what a truncate-then-write config edit looks like
+mid-write, and accepting it would silently drop every model from the live
+service; a missing key would silently open it.
 
 ## Hot reload
 
@@ -384,6 +403,8 @@ Upstream and client failures are classified, never fogged:
 
 | Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                          |
 | --------------------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Missing/malformed `Authorization: Bearer <key>`                                                                 | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}` |
+| Wrong bearer key                                                                                                | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                       |
 | Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
 | Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
 | Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
@@ -421,12 +442,15 @@ them would make a 429 indistinguishable from any other upstream failure.
 
 ## Safety and credentials
 
-- The `Authorization` header is forwarded to the configured upstream
-  untouched.
-- **Credentials never reach logs or error text** — no `Authorization`
-  values, request bodies, or injection prompts in log lines, and no
-  upstream URL details beyond the endpoint's scheme+host in **any** log
-  line or error text (a query-parameter API key survives even a dial
+- The configured `api-key` is the one shared inbound client credential.
+  Clients present it via `Authorization: Bearer <key>`; it is checked before
+  the proxy reads the request body. The header is **consumed at the proxy**
+  and never forwarded upstream. The proxy injects no replacement credential:
+  upstreams are expected to be trusted/internal.
+- **Credentials never reach logs or error text** — no configured `api-key`,
+  `Authorization` values, request bodies, or injection prompts in log lines,
+  and no upstream URL details beyond the endpoint's scheme+host in **any**
+  log line or error text (a query-parameter API key survives even a dial
   failure). A quote of any of these is a security defect, not a typo
   (SECURITY.md).
 - `endpoint` URLs with userinfo are rejected at config load; fragments are
@@ -471,7 +495,8 @@ What each level carries:
   level — or at any level.
 - **INFO** — one `request_completed` per proxied request with the wire
   facts: `request_id` (16 hex chars, generated per request), `api`
-  (`chat`/`responses`), `status`, `outcome`, `public_model`, `stream`,
+  (`chat`/`responses`), `status`, `outcome` (including `unauthorized` for a
+  rejected bearer), `public_model`, `stream`,
   `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
   snapshot generation the request bound to — correlating reloads with
   behavior). The event is emitted when the request finishes, under the
@@ -642,8 +667,9 @@ Decided, and not coming back without a design discussion:
   from `net/http`'s default transport) and verify chain and host with
   system roots; custom TLS setup (client certificates, custom CA pools,
   `insecure-skip-verify`) is not coming.
-- **Authz on the inbound side** — requests are forwarded as received; the
-  service is not an identity boundary.
+- **Inbound identities and authorization** — `api-key` is a single shared
+  client credential, not an identity system. Per-client keys, roles, tenant
+  isolation, quotas, and RBAC need a separate design.
 
 ## Repository layout
 

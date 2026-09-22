@@ -16,14 +16,14 @@ streaming passthrough.
 
 Owned decomposition:
 
-| Directory                        | Owns                                                                                                                                                                                                                                                                                                           |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, log level via `ParseLogLevel`), thinking-usage validation/normalization in `buildModel`, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                           |
-| `internal/proxy`                 | HTTP handler wiring, upstream client, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis)                                                                                                                                             |
-| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                        |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                |
-| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                        |
+| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), thinking-usage validation/normalization in `buildModel`, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
+| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                      |
+| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping, upstream client, error envelopes, SSE copying (`CopySSE`), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis)                                                                                                                  |
+| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                   |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, default serve                                                                                                                                                                                                                                                                           |
+| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                   |
 
 ## Non-negotiables
 
@@ -35,8 +35,8 @@ Owned decomposition:
   are enforced by the runtime file's strict decoding: a runtime file
   defining them is rejected. The runtime file must be a single YAML
   document — a `---`-separated second document is a rejection (a decoder
-  reading only the first would hide what follows). Runtime model mapping
-  lives in YAML only.
+  reading only the first would hide what follows). Runtime model mapping and
+  the required `api-key` live in YAML only.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
   keeps the previous snapshot; its hash baseline is the boot content passed
@@ -44,8 +44,17 @@ Owned decomposition:
   operator input (position/length/line only) — error text reaches logs
   verbatim.
 - **One snapshot per request.** A handler calls `store.Load()` exactly once
-  and binds the whole request — including any active stream — to that
-  snapshot forever. Reloads never affect in-flight work.
+  and binds the whole request — including its `api-key` and any active stream
+  — to that snapshot forever. Reloads never affect in-flight work.
+- **Client authentication is mandatory and terminal at this proxy.** Every
+  Chat/Responses request presents the configured `api-key` as
+  `Authorization: Bearer <key>`; the scheme is case-insensitive, and keys
+  must be RFC 6750 bearer tokens (no whitespace or other invalid characters).
+  A missing/malformed key gets the static missing-key 401, while a wrong key
+  gets the static `invalid_api_key` 401. Authenticate before reading the body
+  or upstream I/O; retain 405-before-401 ordering. `/healthz` and the 404
+  catch-all stay unauthenticated. Consume — never forward or replace — the
+  client's Authorization header; upstreams are trusted/internal.
 - **Injection must never corrupt.** Chat prepends to `messages` only when it
   is a JSON array; Responses merges into `instructions` (string, array, or
   absent) and touches nothing else. Empty prompt = no injection.
@@ -118,6 +127,9 @@ Owned decomposition:
 
 ## Error envelope contract (public API)
 
+- 401 `invalid_request_error` — missing/malformed bearer: exact shape
+  `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`; wrong key: exact shape
+  `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`. Never interpolate credentials.
 - 400 `invalid_request_error` — body not JSON, or missing `model`.
 - 404 `model_not_found` — exact shape
   `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`.

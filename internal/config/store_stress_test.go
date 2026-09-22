@@ -23,6 +23,7 @@ func runtimeVariants() []string {
 		strings.Replace(base, "gpt-5-pro", "gpt-6-pro", 1),
 		strings.Replace(base, "gpt-reviewer", "gpt-auditor", 1),
 		`
+api-key: unit-test-key
 models:
   gpt-reviewer:
     endpoint: https://api.provider.example/v1

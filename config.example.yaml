@@ -1,10 +1,9 @@
 # Runtime configuration for openai-compatible-injector.
 # The process polls this file every second and hot-reloads validated changes
 # when its content hash changes. Copy it to config.yaml, replace the example
-# models and injection prompts, then start the service. config.yaml is
-# intentionally ignored because it may carry endpoint URLs the operator does
-# not want in the tree (and, if the upstream ever requires credentials, they
-# belong in the Authorization header the client sends, never here).
+# models, api-key and injection prompts, then start the service. config.yaml
+# is intentionally ignored because it carries the client api-key and endpoint
+# URLs the operator does not want in the tree.
 #
 # Bootstrap settings (OAICR_LISTEN, OAICR_CONFIG_FILE,
 # OAICR_CONFIG_POLL_INTERVAL, OAICR_SHUTDOWN_GRACE) come from the
@@ -12,6 +11,17 @@
 # A runtime file that tries to define them is rejected by strict decoding —
 # when a bad reload is writing, the last-known-good config keeps serving;
 # when first boot is reading, the process refuses to start.
+
+# Required. The API key clients must present as `Authorization: Bearer <key>`
+# on every /v1 request. The client's Authorization header authenticates the
+# client TO this proxy and is consumed here — it is never forwarded upstream
+# (upstreams are expected to be trusted/internal). Rotating the key is a
+# hot-reload: write the new value and clients must switch on their next
+# request. The key is an RFC 6750 Bearer token (letters, digits, - . _ ~ + /
+# and trailing = padding only). A file without a non-empty valid api-key is
+# rejected — a keyless boot refuses to
+# start, a keyless reload keeps the last-known-good key serving.
+api-key: change-me-client-key
 
 models:
   # Every public model name a client may request. The request's `model`

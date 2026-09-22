@@ -86,9 +86,12 @@ func waitForEventCount(t *testing.T, p *proc, msg string, want int) []logEvent {
 
 // loggingYAML renders a two-model runtime file with a top-level log-level
 // key: one live model (secret-bearing endpoint query) and one dead
-// endpoint (connection refused) for the failure-path scenarios.
+// endpoint (connection refused) for the failure-path scenarios. The api-key
+// rides the body itself: these files are reloaded verbatim by level-rewrite
+// scenarios, so the key must survive every rewrite, not just the boot one.
 func loggingYAML(liveURL, echoURL, level string) string {
-	return fmt.Sprintf(`models:
+	return fmt.Sprintf(`api-key: %s
+models:
   live:
     endpoint: %s/v1?api-key=SECRET_ENDPOINT_TOKEN
     upstream-model: up-live
@@ -101,7 +104,7 @@ func loggingYAML(liveURL, echoURL, level string) string {
     upstream-model: up-echo
 
 log-level: %s
-`, liveURL, echoURL, level)
+`, e2eAPIKey, liveURL, echoURL, level)
 }
 
 // secretBody carries planted markers in the client payload.
@@ -387,8 +390,13 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"c1","model":"up-live","choices":[]}`))
 	})
 
+	// The configured client api-key itself carries the credential marker: it
+	// sits in the config file, is presented on every request below, and must
+	// reach neither logs nor error text at any verbosity.
+	keyYAML := strings.Replace(loggingYAML(upstream.url(), upstream.url(), "debug"),
+		"api-key: "+e2eAPIKey, "api-key: SECRET_AUTH_VALUE", 1)
 	p := startSubprocess(t, startOpts{
-		yaml:     loggingYAML(upstream.url(), upstream.url(), "debug"),
+		yaml:     keyYAML,
 		logLevel: "",
 	})
 
@@ -406,14 +414,14 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 	// Unmapped model: the 404 envelope echoes the requested name by
 	// contract, so the name must stay free of markers.
 	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions",
-		`{"model":"ghost-model"}`, nil); status != http.StatusNotFound {
+		`{"model":"ghost-model"}`, headers); status != http.StatusNotFound {
 		t.Fatalf("unmapped status = %d, want 404", status)
 	}
 
 	// Dead endpoint: the dial failure logs the sanitized error and origin —
 	// the secret in the endpoint query must not survive sanitization.
 	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions",
-		`{"model":"dead"}`, nil); status != http.StatusBadGateway {
+		`{"model":"dead"}`, headers); status != http.StatusBadGateway {
 		t.Fatalf("dead endpoint status = %d, want 502", status)
 	}
 

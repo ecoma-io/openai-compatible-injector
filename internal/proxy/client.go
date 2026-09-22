@@ -29,11 +29,12 @@ func NewSharedClient() *http.Client {
 	return &http.Client{
 		Transport: tr,
 		// Redirects are relayed verbatim, never followed. Go's default
-		// policy would convert the POST into a body-less GET on 301/302/303,
-		// replay the transformed request body to whatever Location names on
-		// 307/308, and re-attach Authorization to any target on the same
-		// hostname. An OpenAI-compatible API does not redirect; an
-		// unexpected 3xx is the upstream's answer and the client's to judge.
+		// policy would convert the POST into a body-less GET on 301/302/303
+		// and replay the transformed request body to whatever Location names
+		// on 307/308. (No credential could leak through a followed redirect
+		// anyway — the upstream request carries no Authorization at all.)
+		// An OpenAI-compatible API does not redirect; an unexpected 3xx is
+		// the upstream's answer and the client's to judge.
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

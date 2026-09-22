@@ -21,9 +21,12 @@ import (
 	"openai-compatible-injector/internal/config"
 )
 
+// testAPIKey is the bearer credential every unit-test store configures.
+const testAPIKey = "unit-test-key"
+
 func newTestStore(t *testing.T, endpoint string) *config.Store {
 	t.Helper()
-	yaml := fmt.Sprintf("models:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n", endpoint)
+	yaml := fmt.Sprintf("api-key: %s\nmodels:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n", testAPIKey, endpoint)
 	snap, err := config.LoadRuntime([]byte(yaml))
 	if err != nil {
 		t.Fatalf("LoadRuntime: %v", err)
@@ -46,6 +49,12 @@ func doRequest(t *testing.T, h http.Handler, method, path, body string, headers 
 	req := httptest.NewRequest(method, path, r)
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	// Default to the configured bearer so the suite's traffic passes the
+	// auth gate; a test that passes its own Authorization (right, wrong, or
+	// deliberately absent as "") opts out of the default.
+	if _, ok := headers["Authorization"]; !ok {
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -228,6 +237,7 @@ func TestNonStreamRewriteBufferedSingleWrite(t *testing.T) {
 	rec := httptest.NewRecorder()
 	cw := &countingRecorder{ResponseRecorder: rec}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	h.ServeHTTP(cw, req)
 
 	if rec.Code != http.StatusOK {
@@ -262,6 +272,7 @@ func TestStreamTrueUpstreamIgnoresStreamBuffered(t *testing.T) {
 	rec := httptest.NewRecorder()
 	cw := &countingRecorder{ResponseRecorder: rec}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	h.ServeHTTP(cw, req)
 
 	if rec.Code != http.StatusOK {
@@ -292,6 +303,7 @@ func TestSSEPassthroughRewritesModel(t *testing.T) {
 	rec := httptest.NewRecorder()
 	cw := &countingRecorder{ResponseRecorder: rec}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	h.ServeHTTP(cw, req)
 
 	if rec.Code != http.StatusOK {
@@ -434,7 +446,9 @@ func TestForwardedHeadersAndUnknownFields(t *testing.T) {
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","custom_field":"abc123","messages":[{"role":"user","content":"hi"}]}`,
 		map[string]string{
-			"Authorization": "Bearer tok-123",
+			// The client's credential is the configured key — it
+			// authenticates the request and must stop there.
+			"Authorization": "Bearer " + testAPIKey,
 			"Accept":        "text/event-stream",
 			"OpenAI-Beta":   "assistants=v2",
 			"X-Internal":    "secret",
@@ -446,8 +460,8 @@ func TestForwardedHeadersAndUnknownFields(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if got := gotHdr.Get("Authorization"); got != "Bearer tok-123" {
-		t.Errorf("Authorization = %q, want Bearer tok-123", got)
+	if got := gotHdr.Get("Authorization"); got != "" {
+		t.Errorf("Authorization forwarded as %q, want never forwarded upstream", got)
 	}
 	if got := gotHdr.Get("Accept"); got != "text/event-stream" {
 		t.Errorf("Accept = %q, want text/event-stream", got)
@@ -473,6 +487,121 @@ func TestForwardedHeadersAndUnknownFields(t *testing.T) {
 	}
 	if sent["model"] != "upstream-name" {
 		t.Errorf("upstream model = %v, want upstream-name (transformed)", sent["model"])
+	}
+}
+
+// TestAuthRequiredExactBodies pins the auth gate's wire contract on both
+// routes: the two static 401 envelopes are byte-exact, the malformed
+// presentations (absent header, non-bearer scheme, empty token) share the
+// missing envelope, and the scheme match tolerates case and extra spaces per
+// RFC 9110. Every 401 lands before any upstream I/O — the upstream hit count
+// must not move.
+func TestAuthRequiredExactBodies(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"1","model":"upstream-name"}`)
+	}))
+	defer upstream.Close()
+
+	for _, route := range []struct {
+		path string
+		body string
+	}{
+		{"/v1/chat/completions", `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/responses", `{"model":"test-model","input":"hi"}`},
+	} {
+		t.Run(route.path, func(t *testing.T) {
+			h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+			cases := []struct {
+				name string
+				auth string
+				want int
+				body string
+			}{
+				{"no header", "", http.StatusUnauthorized, envelopeAuthMissing},
+				{"non-bearer scheme", "Basic abc", http.StatusUnauthorized, envelopeAuthMissing},
+				{"bearer with no token", "Bearer", http.StatusUnauthorized, envelopeAuthMissing},
+				{"empty bearer token", "Bearer ", http.StatusUnauthorized, envelopeAuthMissing},
+				{"token with embedded space", "Bearer unit test-key", http.StatusUnauthorized, envelopeAuthMissing},
+				{"token with embedded tab", "Bearer unit\ttest-key", http.StatusUnauthorized, envelopeAuthMissing},
+				{"token with trailing tab", "Bearer " + testAPIKey + "\t", http.StatusUnauthorized, envelopeAuthMissing},
+				{"disallowed token character", "Bearer unit:key", http.StatusUnauthorized, envelopeAuthMissing},
+				{"padding before token end", "Bearer unit=test", http.StatusUnauthorized, envelopeAuthMissing},
+				{"only padding", "Bearer ===", http.StatusUnauthorized, envelopeAuthMissing},
+				{"too long", "Bearer " + strings.Repeat("a", maxBearerTokenBytes+1), http.StatusUnauthorized, envelopeAuthMissing},
+				{"wrong key", "Bearer wrong-key", http.StatusUnauthorized, envelopeAuthInvalid},
+				{"configured key with suffix", "Bearer " + testAPIKey + "-suffix", http.StatusUnauthorized, envelopeAuthInvalid},
+				{"lowercase scheme", "bearer " + testAPIKey, http.StatusOK, ""},
+				{"uppercase scheme", "BEARER " + testAPIKey, http.StatusOK, ""},
+				{"extra spaces before token", "Bearer   " + testAPIKey, http.StatusOK, ""},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					before := hits.Load()
+					rec := doRequest(t, h, http.MethodPost, route.path, route.body,
+						map[string]string{"Authorization": tc.auth})
+					if rec.Code != tc.want {
+						t.Fatalf("status = %d, want %d (body %q)", rec.Code, tc.want, rec.Body.String())
+					}
+					if tc.want == http.StatusUnauthorized {
+						if got := rec.Body.String(); got != tc.body {
+							t.Errorf("401 body:\n got %s\nwant %s", got, tc.body)
+						}
+						if after := hits.Load(); after != before {
+							t.Errorf("upstream hits moved %d -> %d on an unauthorized request", before, after)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestAuthUsesSnapshotKey pins the quiet direction of key rotation: the key
+// rides the config snapshot, not a process global — publishing a rotated key
+// flips subsequent requests (old bearer 401, new 200) and nothing else, so a
+// reload can never leave auth bound to a stale key or silently disabled.
+func TestAuthUsesSnapshotKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"1","model":"upstream-name"}`)
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, upstream.URL+"/v1")
+	h := newTestHandler(t, store)
+	body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", body,
+		map[string]string{"Authorization": "Bearer " + testAPIKey})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pre-rotation status = %d, want 200", rec.Code)
+	}
+
+	next, err := config.LoadRuntime([]byte(fmt.Sprintf(
+		"api-key: rotated-key\nmodels:\n  test-model:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n",
+		upstream.URL+"/v1")))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	if err := store.Publish(next); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	rec = doRequest(t, h, http.MethodPost, "/v1/chat/completions", body,
+		map[string]string{"Authorization": "Bearer " + testAPIKey})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("post-rotation old key status = %d, want 401", rec.Code)
+	}
+	if got := rec.Body.String(); got != envelopeAuthInvalid {
+		t.Errorf("post-rotation body:\n got %s\nwant %s", got, envelopeAuthInvalid)
+	}
+	rec = doRequest(t, h, http.MethodPost, "/v1/chat/completions", body,
+		map[string]string{"Authorization": "Bearer rotated-key"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("post-rotation new key status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
 	}
 }
 
@@ -776,6 +905,7 @@ func TestClientCancelBeforeUpstreamAnswer(t *testing.T) {
 	defer cancel()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"test-model","messages":[]}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -883,7 +1013,7 @@ func TestConcurrentReloadAndTraffic(t *testing.T) {
 	}))
 	defer up.Close()
 
-	yaml := fmt.Sprintf("models:\n  model-a:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n  model-b:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n", up.URL+"/v1", up.URL+"/v1")
+	yaml := fmt.Sprintf("api-key: %s\nmodels:\n  model-a:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n  model-b:\n    endpoint: %s\n    upstream-model: upstream-name\n    injection-prompt: \"\"\n", testAPIKey, up.URL+"/v1", up.URL+"/v1")
 	snap, err := config.LoadRuntime([]byte(yaml))
 	if err != nil {
 		t.Fatalf("LoadRuntime: %v", err)

@@ -11,10 +11,10 @@ import (
 // arrive — a truncate-then-write mid-state, a hand-edited file, binary
 // garbage — LoadRuntime either returns an error or a fully usable snapshot.
 // A snapshot that parses must never be half-built: at least one model (the
-// empty table is a reject), every entry named by its own key with a usable
-// endpoint and upstream model, a resolvable lookup per entry, and a log
-// level from the accepted set. Panics are the target; any error outcome is
-// legal.
+// empty table is a reject), a non-empty client api-key, every entry named by
+// its own key with a usable endpoint and upstream model, a resolvable lookup
+// per entry, and a log level from the accepted set. Panics are the target;
+// any error outcome is legal.
 func FuzzLoadRuntime(f *testing.F) {
 	seeds := []string{
 		``,             // empty document
@@ -29,11 +29,21 @@ func FuzzLoadRuntime(f *testing.F) {
 		"listen: :8081\n" + validRuntime(),  // bootstrap key: reject
 		"shutdown-grace: 55s\nmodels: {}\n", // another bootstrap key
 		"bananas: true\n" + validRuntime(),  // unknown top-level key
-		`models:
+		// keyless variant of the baseline: the required-key reject
+		strings.Replace(validRuntime(), "api-key: unit-test-key\n", "", 1),
+		"api-key: [not, a, string]\n" + strings.TrimPrefix(validRuntime(), "\n"),                                           // wrong type in the key position
+		"api-key: \"  \"\n" + strings.TrimPrefix(strings.Replace(validRuntime(), "api-key: unit-test-key\n", "", 1), "\n"), // whitespace-only key
+		`api-key: k
+models:
   a:
     endpoint: https://h/v1
     upstream-model: m
 `, // minimal valid entry
+		`models:
+  a:
+    endpoint: https://h/v1
+    upstream-model: m
+`, // missing api-key
 		`models:
   a:
     upstream-model: m
@@ -83,7 +93,8 @@ func FuzzLoadRuntime(f *testing.F) {
     extra: true
 `, // unknown entry key, strict decode
 		"log-level: debug\n" + strings.TrimPrefix(validRuntime(), "\n"),
-		`log-level: banana
+		`api-key: k
+log-level: banana
 models:
   a:
     endpoint: https://h/v1
@@ -95,8 +106,8 @@ models:
     endpoint: https://h/v1
     upstream-model: m
 `, // null log-level
-		`{"models":{"a":{"endpoint":"https://h/v1","upstream-model":"m"}}}`,                                                                    // JSON is valid YAML
-		"models:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n    injection-prompt: |\n      " + strings.Repeat("x", 4096) + "\n", // huge prompt value
+		`{"api-key":"k","models":{"a":{"endpoint":"https://h/v1","upstream-model":"m"}}}`,                                                                  // JSON is valid YAML
+		"api-key: k\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n    injection-prompt: |\n      " + strings.Repeat("x", 4096) + "\n", // huge prompt value
 		"\xff\xfe\x00\x01",       // binary garbage
 		"\xef\xbb\xbfmodels: {}", // BOM-prefixed YAML
 		"models:\n  a:\n    endpoint: \"ht tp://h\"\n    upstream-model: m\n", // unparseable URL
@@ -112,6 +123,9 @@ models:
 		}
 		if s == nil {
 			t.Fatal("LoadRuntime returned a nil snapshot with a nil error")
+		}
+		if s.APIKey() == "" {
+			t.Fatal("accepted a snapshot without a client api-key")
 		}
 		_ = s.Gen()
 		_ = s.LogLevel()
