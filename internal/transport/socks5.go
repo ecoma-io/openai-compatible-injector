@@ -119,7 +119,7 @@ func (d *socks5Dialer) negotiate(conn net.Conn) error {
 		return hopErr(err)
 	}
 	if buf[0] != 0x05 {
-		return fmt.Errorf("socks5: proxy replied with version %d", buf[0])
+		return &ProxyConnectError{msg: fmt.Sprintf("socks5: proxy replied with version %d", buf[0])}
 	}
 	switch buf[1] {
 	case 0x00:
@@ -157,7 +157,7 @@ func (d *socks5Dialer) negotiate(conn net.Conn) error {
 		// method we offered.
 		return &ProxyAuthError{msg: "socks5: no acceptable authentication method"}
 	default:
-		return fmt.Errorf("socks5: proxy chose unknown method %d", buf[1])
+		return &ProxyConnectError{msg: fmt.Sprintf("socks5: proxy chose unknown method %d", buf[1])}
 	}
 }
 
@@ -245,7 +245,7 @@ func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) 
 		}
 		bound = int(l[0])
 	default:
-		return fmt.Errorf("socks5: bad bind address type %d", head[3])
+		return &ProxyConnectError{msg: fmt.Sprintf("socks5: bad bind address type %d", head[3])}
 	}
 	if _, err := io.CopyN(io.Discard, conn, int64(bound+2)); err != nil {
 		return hopErr(err)
