@@ -9,6 +9,10 @@ import (
 )
 
 func TestParseLogLevel(t *testing.T) {
+	// Exact-match parity with the org's other Go services: the accepted
+	// set is precisely debug|info|warn|error — the former warning alias,
+	// letter-case variants, and padded spellings are all rejects now, so
+	// the same file behaves identically across the three services.
 	cases := []struct {
 		name  string
 		in    string
@@ -19,15 +23,15 @@ func TestParseLogLevel(t *testing.T) {
 		{"debug", "debug", zerolog.DebugLevel, true},
 		{"info", "info", zerolog.InfoLevel, true},
 		{"warn", "warn", zerolog.WarnLevel, true},
-		{"warning alias", "warning", zerolog.WarnLevel, true},
 		{"error", "error", zerolog.ErrorLevel, true},
-		{"case-insensitive", "DEBUG", zerolog.DebugLevel, true},
-		{"mixed case warning", "Warning", zerolog.WarnLevel, true},
-		{"surrounding whitespace", "  error \n", zerolog.ErrorLevel, true},
+		{"warning alias is gone", "warning", DefaultLogLevel, false},
+		{"case variants are gone", "DEBUG", DefaultLogLevel, false},
+		{"mixed case", "Warning", DefaultLogLevel, false},
+		{"padded spelling", "  error \n", DefaultLogLevel, false},
+		{"spaces only", "   ", DefaultLogLevel, false},
 		{"trace is not offered", "trace", DefaultLogLevel, false},
 		{"unknown word", "verbose", DefaultLogLevel, false},
 		{"number", "3", DefaultLogLevel, false},
-		{"empty-ish spaces only", "   ", DefaultLogLevel, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -39,7 +43,7 @@ func TestParseLogLevel(t *testing.T) {
 				if err == nil {
 					t.Fatalf("ParseLogLevel(%q): expected rejection", tc.in)
 				}
-				if !strings.Contains(err.Error(), "logging.level") {
+				if !strings.Contains(err.Error(), "log-level") {
 					t.Errorf("error %v does not name the offending key", err)
 				}
 				return
@@ -51,17 +55,17 @@ func TestParseLogLevel(t *testing.T) {
 	}
 }
 
-func TestLoadRuntimeLoggingLevel(t *testing.T) {
+func TestLoadRuntimeLogLevel(t *testing.T) {
 	cases := []struct {
 		name string
 		yaml string
 		want zerolog.Level
 	}{
-		{"absent section defaults to info", validRuntime(), zerolog.InfoLevel},
-		{"null section defaults to info", "logging:\n" + validRuntime(), zerolog.InfoLevel},
-		{"debug", "logging:\n  level: debug\n" + validRuntime(), zerolog.DebugLevel},
-		{"warning alias", "logging:\n  level: warning\n" + validRuntime(), zerolog.WarnLevel},
-		{"case-insensitive", "logging:\n  level: ERROR\n" + validRuntime(), zerolog.ErrorLevel},
+		{"absent key defaults to info", validRuntime(), zerolog.InfoLevel},
+		{"null value defaults to info", "log-level:\n" + validRuntime(), zerolog.InfoLevel},
+		{"debug", "log-level: debug\n" + validRuntime(), zerolog.DebugLevel},
+		{"warn", "log-level: warn\n" + validRuntime(), zerolog.WarnLevel},
+		{"error", "log-level: error\n" + validRuntime(), zerolog.ErrorLevel},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -75,23 +79,24 @@ func TestLoadRuntimeLoggingLevel(t *testing.T) {
 func TestLoadRuntimeRejectsBadLogLevel(t *testing.T) {
 	// A mistyped level must reject the whole file — landing on the
 	// last-known-good path beats silently switching to a default.
-	_, err := LoadRuntime([]byte("logging:\n  level: trace\n" + validRuntime()))
+	_, err := LoadRuntime([]byte("log-level: trace\n" + validRuntime()))
 	if err == nil {
-		t.Fatal("expected rejection of logging.level: trace")
+		t.Fatal("expected rejection of log-level: trace")
 	}
-	if !strings.Contains(err.Error(), "logging.level") {
-		t.Errorf("error %v does not name logging.level", err)
+	if !strings.Contains(err.Error(), "log-level") {
+		t.Errorf("error %v does not name log-level", err)
 	}
 }
 
-func TestLoadRuntimeLoggingSectionStrictness(t *testing.T) {
+func TestLoadRuntimeLogLevelStrictness(t *testing.T) {
 	cases := []struct {
 		name string
 		yaml string
 	}{
-		{"unknown key inside logging", "logging:\n  format: json\n" + validRuntime()},
-		{"uppercase level key", "logging:\n  LEVEL: debug\n" + validRuntime()},
-		{"bootstrap key beside logging", "listen: :9000\nlogging:\n  level: debug\n" + validRuntime()},
+		{"old logging section", "logging:\n  level: debug\n" + validRuntime()},
+		{"underscore spelling", "log_level: debug\n" + validRuntime()},
+		{"camelCase spelling", "logLevel: debug\n" + validRuntime()},
+		{"bootstrap key beside log-level", "listen: :9000\nlog-level: debug\n" + validRuntime()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -150,7 +155,7 @@ func TestLogLevelHookObservableAtEveryLevel(t *testing.T) {
 		for toName, to := range levels {
 			t.Run(fromName+"_to_"+toName, func(t *testing.T) {
 				zerolog.SetGlobalLevel(from)
-				next := mustSnapshot(t, "logging:\n  level: "+toName+"\n"+validRuntime())
+				next := mustSnapshot(t, "log-level: "+toName+"\n"+validRuntime())
 				if next.LogLevel() != to {
 					t.Fatalf("snapshot level = %v, want %v", next.LogLevel(), to)
 				}
@@ -180,33 +185,5 @@ func TestLogLevelHookObservableAtEveryLevel(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-// TestLogLevelHookWarningAliasAcknowledgesAsWarn pins the alias's ack: a
-// file spelling `warning` publishes the warn level and the ack carries the
-// canonical name at warn severity.
-func TestLogLevelHookWarningAliasAcknowledgesAsWarn(t *testing.T) {
-	previous := zerolog.GlobalLevel()
-	defer zerolog.SetGlobalLevel(previous)
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-
-	next := mustSnapshot(t, "logging:\n  level: warning\n"+validRuntime())
-	if next.LogLevel() != zerolog.WarnLevel {
-		t.Fatalf("snapshot level = %v, want warn", next.LogLevel())
-	}
-
-	var buf syncBuffer
-	LogLevelHook(zerolog.New(&buf).Level(zerolog.TraceLevel))(next)
-
-	evs := hookEvents(t, &buf, "log_level_applied")
-	if len(evs) != 1 {
-		t.Fatalf("log_level_applied logged %d times, want 1: %s", len(evs), buf.String())
-	}
-	if evs[0]["level"] != "warn" || evs[0]["log_level"] != "warn" {
-		t.Errorf("ack = level %v / log_level %v, want warn/warn", evs[0]["level"], evs[0]["log_level"])
-	}
-	if evs[0]["previous_level"] != "info" {
-		t.Errorf("previous_level = %v, want info", evs[0]["previous_level"])
 	}
 }

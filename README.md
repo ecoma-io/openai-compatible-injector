@@ -72,7 +72,7 @@ Division of responsibility:
 | ----------------------------------------------------------------------------------------- | ----------------------- |
 | `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE` | Environment (bootstrap) |
 | `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}`                 | YAML file (runtime)     |
-| `logging.level`                                                                           | YAML file (runtime)     |
+| `log-level`                                                                               | YAML file (runtime)     |
 
 ### Bootstrap environment
 
@@ -84,7 +84,7 @@ Division of responsibility:
 | `OAICR_SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain) |
 
 There is no `LOG_LEVEL` environment variable — it was removed together with
-the introduction of `logging.level` in the runtime file, which hot-reloads.
+the introduction of `log-level` in the runtime file, which hot-reloads.
 The runtime file is mandatory at boot, so an environment override had no
 window in which it could take effect; one setting has exactly one source of
 truth.
@@ -107,8 +107,7 @@ models:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
 
-logging:
-  level: info # optional; debug | info | warn | warning | error (absent = info)
+log-level: info # optional; debug | info | warn | error (absent = info)
 ```
 
 - `endpoint` — base URL of the upstream provider. Scheme `http` or `https`
@@ -131,16 +130,15 @@ logging:
 The file is validated strictly, in two layers:
 
 - **Top-level keys** are checked against the raw YAML: only `models` and
-  `logging` are legal. This is the bootstrap-plane rule — a file that tries
+  `log-level` are legal. This is the bootstrap-plane rule — a file that tries
   to define `listen`, `config-file`, `config-poll-interval` or
   `shutdown-grace` is rejected whatever its value's shape (a strict struct
   decode alone misses a bootstrap key whose value is an empty map).
-- **Model entries and the logging section** are decoded strictly (`yaml.v3`
+- **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `upstream-model`,
   `injection-prompt` and `thinking-usage` (and, inside the block, outside
   `mode`, `min-ratio`, `max-ratio`) — including a nested bootstrap key — is a
-  rejection, not a warning, and so is any key inside `logging` other than
-  `level`.
+  rejection, not a warning.
 
 The `models` table itself must contain at least one model. An empty table is
 rejected — an empty file is what a truncate-then-write config edit looks
@@ -176,10 +174,11 @@ Semantics that hold:
   verbatim (fatal at boot, WARN on reload), and a botched paste into any
   YAML position can carry credentials — so an invalid value is reported by
   position, length, and line number, never by content.
-- **The log level hot-reloads with everything else.** `logging.level` rides
+- **The log level hot-reloads with everything else.** The top-level
+  `log-level` key rides
   the same validate-then-publish path as the model mappings: a valid reload
   applies the new level process-wide without a restart, a restart, or any
-  signal; an invalid `level` value rejects the whole file onto the
+  signal; an invalid `log-level` value rejects the whole file onto the
   last-known-good path. The level swap is an atomic store zerolog consults
   per event, so in-flight requests race only the old/new boundary and never
   block. Every successful swap is acknowledged by `log_level_applied`,
@@ -443,9 +442,10 @@ them would make a 429 indistinguishable from any other upstream failure.
 
 JSON lines on stderr only (zerolog; stdout is never written). Every line is
 machine-parseable and carries `level`, `time`, and a stable snake_case
-`message` slug. Levels are `debug`, `info`, `warn` (the runtime file also
-accepts the spelling `warning`), and `error`, defaulting to `info`; the
-level is hot-reloadable through `logging.level` (see Hot reload).
+`message` slug. Levels are `debug`, `info`, `warn`, and `error` (matched
+exactly — the same spelling and strictness as the organisation's other Go
+services), defaulting to `info`; the
+level is hot-reloadable through `log-level` (see Hot reload).
 
 What each level carries:
 
@@ -608,7 +608,7 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
 ## Operations
 
 - Logs are JSON on stderr. Every reload decision is logged: generation
-  number, applied/kept-last-known-good. `logging.level: debug` in the
+  number, applied/kept-last-known-good. `log-level: debug` in the
   runtime file (hot-reloadable) adds per-request routing lines (still never
   bodies or credentials).
 - `./openai-compatible-injector version` prints the build version (injected

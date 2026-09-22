@@ -79,12 +79,11 @@ func decodeConfigError(err error) error {
 }
 
 // runtime file schema. Strictness has two layers: top-level keys are
-// validated against the raw YAML (only "models" and "logging" are legal —
+// validated against the raw YAML (only "models" and "log-level" are legal —
 // this is what keeps the bootstrap plane out of the runtime file: listen,
 // config file, poll interval, ... any file that tries to define them fails
 // validation, whatever their value's shape), and a KnownFields strict decode
-// rejects unknown keys inside each model entry and inside the logging
-// section.
+// rejects unknown keys inside each model entry.
 //
 // The models table is decoded with yaml.v3 directly, never through viper:
 // viper's map normalization lowercases every key and flattens dotted names,
@@ -94,15 +93,12 @@ func decodeConfigError(err error) error {
 // written and matches entry fields case-sensitively.
 
 type runtimeFile struct {
-	Models  map[string]runtimeModel `yaml:"models"`
-	Logging runtimeLogging          `yaml:"logging"`
-}
-
-// runtimeLogging mirrors the optional logging section. Absent or null
-// selects the default level; the level string itself is validated by
-// ParseLogLevel.
-type runtimeLogging struct {
-	Level string `yaml:"level"`
+	Models map[string]runtimeModel `yaml:"models"`
+	// LogLevel mirrors the optional top-level log-level key — the same
+	// flat spelling the org's other Go services use, with no nested
+	// section. Absent or null selects the default; the value itself is
+	// validated by ParseLogLevel.
+	LogLevel string `yaml:"log-level"`
 }
 
 type runtimeModel struct {
@@ -141,13 +137,13 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, fmt.Errorf("parse config: %w", decodeConfigError(err))
 	}
 	for k := range raw {
-		if k == "models" || k == "logging" {
+		if k == "models" || k == "log-level" {
 			continue
 		}
 		// The key itself is not named: error text reaches logs verbatim, and
 		// a pasted credential can land in a key position just as well as a
 		// value position.
-		return nil, errors.New("unknown top-level key (only models and logging are legal)")
+		return nil, errors.New("unknown top-level key (only models and log-level are legal)")
 	}
 	var rf runtimeFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -214,7 +210,7 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, errors.New("models: at least one model is required")
 	}
 
-	level, err := ParseLogLevel(rf.Logging.Level)
+	level, err := ParseLogLevel(rf.LogLevel)
 	if err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}

@@ -84,7 +84,7 @@ type startOpts struct {
 	configPath   string   // if set, use this exact path (e.g. missing file)
 	listen       string   // OAICR_LISTEN value; empty -> ephemeral loopback port
 	grace        string   // OAICR_SHUTDOWN_GRACE; default "5s"
-	logLevel     string   // runtime YAML logging.level; default "error"
+	logLevel     string   // runtime YAML log-level; default "error"
 	pollInterval string   // OAICR_CONFIG_POLL_INTERVAL; default "50ms"
 	extraEnv     []string // extra "K=V" entries appended to the process env
 }
@@ -305,16 +305,17 @@ func runtimeYAML(publicName, endpoint, upstreamModel, injectionPrompt string, ex
 	return sb.String()
 }
 
-// withLoggingLevel appends a logging.level section to a runtime YAML body.
-// The log level travels in the runtime file — the same hot-reloadable plane
-// as model mappings — because LOG_LEVEL no longer exists: the runtime file
-// is mandatory at boot, so an env override had no legitimate window. A body
-// that already carries a logging section is returned unchanged.
+// withLoggingLevel appends a top-level log-level key to a runtime YAML
+// body. The log level travels in the runtime file — the same
+// hot-reloadable plane as model mappings — because LOG_LEVEL no longer
+// exists: the runtime file is mandatory at boot, so an env override had no
+// legitimate window. A body that already carries a log-level key is
+// returned unchanged.
 func withLoggingLevel(yamlBody, level string) string {
-	if level == "" || strings.Contains(yamlBody, "\nlogging:") {
+	if level == "" || strings.Contains(yamlBody, "\nlog-level:") {
 		return yamlBody
 	}
-	return yamlBody + "\nlogging:\n  level: " + level + "\n"
+	return yamlBody + "\nlog-level: " + level + "\n"
 }
 
 // recordedRequest is an immutable snapshot of one upstream HTTP request.
