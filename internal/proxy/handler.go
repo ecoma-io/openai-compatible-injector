@@ -239,9 +239,25 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		stream      bool
 		publicModel string
 		bytesIn     int64
+		// egress carries the pool's attempt report on requests routed through
+		// an EgressPool transport (nil on the single-endpoint paths): how many
+		// distinct endpoints were actually dialed, the kind and scheme+host of
+		// the last one, and whether the loop ended without dialing anything.
+		// The target is log-safe by construction — scheme+host only, the same
+		// surface origin() allows; userinfo never enters AttemptInfo.
+		egress *transport.AttemptInfo
 	)
+	withEgress := func(ev *zerolog.Event) *zerolog.Event {
+		if egress == nil {
+			return ev
+		}
+		return ev.Int("egress_attempts", egress.Attempts).
+			Str("egress_kind", egress.Kind).
+			Str("egress_target", egress.Target).
+			Bool("egress_exhausted", egress.Exhausted)
+	}
 	complete := func() {
-		log.Info().
+		withEgress(log.Info()).
 			Int("status", sw.status).
 			Str("outcome", outcome).
 			Str("public_model", publicModel).
@@ -392,24 +408,57 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// is the upstream's answer and returns as a response; only
 	// transport-level failures (dial, TLS, cancellation before headers)
 	// return an error, which the handling below already classifies.
-	resp, err := h.doers.Doer(m.Transport).Do(req)
-	if err == nil {
-		log.Debug().Int("status", resp.StatusCode).
+	//
+	// A pool transport owns the attempt loop past this point: the handler
+	// hands it the request facts its eligibility gates need (the outgoing
+	// body, the client-declared stream flag) and the pool returns one
+	// response or one error — selection, bounded fallback, and exhaustion
+	// are its business, and no retry exists after it returns. The
+	// single-endpoint path is exactly the historical Do(req).
+	var (
+		resp *http.Response
+		uerr error
+	)
+	d := h.doers.Doer(m.Transport)
+	if ex, ok := d.(transport.Executor); ok {
+		var info transport.AttemptInfo
+		resp, info, uerr = ex.Execute(&transport.AttemptRequest{
+			Ctx:       r.Context(),
+			Method:    http.MethodPost,
+			URL:       &upstream,
+			Header:    req.Header.Clone(),
+			Body:      out,
+			Streaming: stream,
+		})
+		egress = &info
+	} else {
+		resp, uerr = d.Do(req)
+	}
+	if uerr == nil {
+		withEgress(log.Debug()).Int("status", resp.StatusCode).
 			Str("content_type", resp.Header.Get(contentTypeHeader)).
 			Msg("upstream_response_received")
 	}
-	if err != nil {
+	if uerr != nil {
+		err := uerr
 		// The *url.Error from client.Do embeds the full request URL —
 		// query string included, which is how query-authenticated
 		// providers leak credentials. Log the sanitized error and the
 		// scheme+host origin only, per the credential rule.
-		event := log.Error()
+		event := withEgress(log.Error())
+		class := upstreamErrorClass(err)
+		if egress != nil && egress.Exhausted {
+			// Zero dials is a pool-level condition — no member was reachable
+			// for this request — and gets its own class token; the error text
+			// is the pool's static sentinel.
+			class = "egress_exhausted"
+		}
 		if errors.Is(err, context.Canceled) {
 			// The client went away before the upstream answered. The
 			// outcome is the disconnect — an upstream_unreachable 502
 			// would misreport a client-side event as an upstream
 			// failure — and there is no response left to write.
-			event = log.Warn()
+			event = withEgress(log.Warn())
 			outcome = "client_disconnected"
 			event.Err(sanitizeUpstreamError(err, &upstream)).
 				Str("public_model", model).
@@ -422,7 +471,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		event.Err(sanitizeUpstreamError(err, &upstream)).
 			Str("public_model", model).
 			Str("upstream", origin(&upstream)).
-			Str("error_class", upstreamErrorClass(err)).
+			Str("error_class", class).
 			Msg("upstream_request_failed")
 		outcome = "upstream_unreachable"
 		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
@@ -740,15 +789,29 @@ func sanitizeUpstreamError(err error, endpoint *url.URL) error {
 // the wire — addresses, syscall names, deadline markers — or upstream
 // identity (the TLS certificate chain): cancellation, deadlines, plain EOF,
 // net.Error timeouts, *net.OpError, TLS verification failures, and raw
-// errnos. Everything else (notably every net/textproto and HTTP/2 parse
-// failure, which interpolate the offending upstream bytes into their
-// message) collapses to static text in sanitizeUpstreamError; the
-// error_class token carries the classification either way.
+// errnos. The transport package's typed proxy errors are static text by
+// construction — the auth variants carry fixed messages, and a connect
+// error's message names no upstream bytes (a socks5h resolve failure names
+// the target host, the same scheme+host surface origin() allows) — though a
+// connect error's cause must itself be safe. Everything else (notably every
+// net/textproto and HTTP/2 parse failure, which interpolate the offending
+// upstream bytes into their message) collapses to static text in
+// sanitizeUpstreamError; the error_class token carries the classification
+// either way.
 func transportErrorTextSafe(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
+	}
+	var pae *transport.ProxyAuthError
+	if errors.As(err, &pae) {
+		return true
+	}
+	var pce *transport.ProxyConnectError
+	if errors.As(err, &pce) {
+		cause := pce.Unwrap()
+		return cause == nil || transportErrorTextSafe(cause)
 	}
 	var ne net.Error
 	var oe *net.OpError
@@ -759,10 +822,21 @@ func transportErrorTextSafe(err error) bool {
 }
 
 // upstreamErrorClass buckets a client.Do error for logging. The error is
-// classified in its raw form — sanitization only strips the URL text.
+// classified in its raw form — sanitization only strips the URL text. The
+// transport's typed proxy errors classify from their type: a proxy that
+// demanded or refused authentication is proxy_auth; a failed connection to
+// or through the proxy is proxy_connect.
 func upstreamErrorClass(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return "client_canceled"
+	}
+	var pae *transport.ProxyAuthError
+	if errors.As(err, &pae) {
+		return "proxy_auth"
+	}
+	var pce *transport.ProxyConnectError
+	if errors.As(err, &pce) {
+		return "proxy_connect"
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
