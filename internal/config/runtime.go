@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -83,11 +84,12 @@ func decodeConfigError(err error) error {
 }
 
 // runtime file schema. Strictness has two layers: top-level keys are
-// validated against the raw YAML (only "models", "api-key", and "log-level"
-// are legal — this is what keeps the bootstrap plane out of the runtime
-// file: listen, config file, poll interval, ... any file that tries to define
-// them fails validation, whatever their value's shape), and a KnownFields
-// strict decode rejects unknown keys inside each model entry.
+// validated against the raw YAML (only "models", "api-key", "log-level",
+// and "sse-keep-alive" are legal — this is what keeps the bootstrap plane
+// out of the runtime file: listen, config file, poll interval, ... any
+// file that tries to define them fails validation, whatever their value's
+// shape), and a KnownFields strict decode rejects unknown keys inside each
+// model entry.
 //
 // The models table is decoded with yaml.v3 directly, never through viper:
 // viper's map normalization lowercases every key and flattens dotted names,
@@ -110,6 +112,19 @@ type runtimeFile struct {
 	// section. Absent or null selects the default; the value itself is
 	// validated by ParseLogLevel.
 	LogLevel string `yaml:"log-level"`
+	// SSEKeepAlive mirrors the optional top-level sse-keep-alive block.
+	// The pointer distinguishes an absent or null block (defaults) from a
+	// present one, which is validated even when it disables the feature.
+	SSEKeepAlive *runtimeSSEKeepAlive `yaml:"sse-keep-alive"`
+}
+
+// runtimeSSEKeepAlive mirrors the optional top-level sse-keep-alive block.
+// Interval stays a string here: yaml.v3 decodes durations as bare integers
+// (nanoseconds), which is not the spelling operators write, so the value
+// parses through time.ParseDuration during validation instead.
+type runtimeSSEKeepAlive struct {
+	Enabled  *bool  `yaml:"enabled"`
+	Interval string `yaml:"interval"`
 }
 
 type runtimeModel struct {
@@ -148,13 +163,13 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, fmt.Errorf("parse config: %w", decodeConfigError(err))
 	}
 	for k := range raw {
-		if k == "models" || k == "api-key" || k == "log-level" {
+		if k == "models" || k == "api-key" || k == "log-level" || k == "sse-keep-alive" {
 			continue
 		}
 		// The key itself is not named: error text reaches logs verbatim, and
 		// a pasted credential can land in a key position just as well as a
 		// value position.
-		return nil, errors.New("unknown top-level key (only models, api-key and log-level are legal)")
+		return nil, errors.New("unknown top-level key (only models, api-key, log-level and sse-keep-alive are legal)")
 	}
 	var rf runtimeFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -241,7 +256,53 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
-	return &Snapshot{models: models, apiKey: key, logLevel: level}, nil
+	keepAlive, err := buildSSEKeepAlive(rf.SSEKeepAlive)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Snapshot{models: models, apiKey: key, logLevel: level, keepAlive: keepAlive}, nil
+}
+
+// defaultSSEKeepAliveInterval is the keep-alive silence threshold when the
+// sse-keep-alive block omits interval. 15s keeps a silent stream well
+// inside the ~125s window a Cloudflare-proxied hostname allows: measured
+// 2026-09-22, a silent HTTP/2 stream was cut at 125.06s origin-side (client
+// error at 125.39s), while a 15s comment ping held a 240s silent stream
+// open through the same path.
+const defaultSSEKeepAliveInterval = 15 * time.Second
+
+// minSSEKeepAliveInterval is the smallest accepted interval. Below one
+// second the heartbeat stops being a keep-alive and starts being traffic.
+const minSSEKeepAliveInterval = time.Second
+
+// buildSSEKeepAlive validates and normalizes the optional sse-keep-alive
+// block. Absent or null means the defaults — on at 15s, because the
+// deployment this proxy serves sits behind Cloudflare. Every message is
+// fixed text: the interval position can carry a botched paste of anything,
+// and time.ParseDuration errors quote their input, so the value is never
+// echoed. A block that disables the feature is still validated — a bad
+// interval in a disabled block is a config error like any other.
+func buildSSEKeepAlive(rk *runtimeSSEKeepAlive) (SSEKeepAlive, error) {
+	ka := SSEKeepAlive{Enabled: true, Interval: defaultSSEKeepAliveInterval}
+	if rk == nil {
+		return ka, nil
+	}
+	if rk.Enabled != nil {
+		ka.Enabled = *rk.Enabled
+	}
+	if rk.Interval == "" {
+		return ka, nil
+	}
+	d, err := time.ParseDuration(rk.Interval)
+	if err != nil {
+		return SSEKeepAlive{}, errors.New("sse-keep-alive: interval must be a valid duration (e.g. 15s, 1m)")
+	}
+	if d < minSSEKeepAliveInterval {
+		return SSEKeepAlive{}, errors.New("sse-keep-alive: interval must be at least 1s")
+	}
+	ka.Interval = d
+	return ka, nil
 }
 
 // validBearerToken reports whether token is an RFC 6750 b64token. Keeping

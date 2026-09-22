@@ -76,6 +76,7 @@ Division of responsibility:
 | `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE` | Environment (bootstrap) |
 | `api-key` (the shared inbound client credential)                                          | YAML file (runtime)     |
 | `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}`                 | YAML file (runtime)     |
+| `sse-keep-alive.{enabled,interval}`                                                       | YAML file (runtime)     |
 | `log-level`                                                                               | YAML file (runtime)     |
 
 ### Bootstrap environment
@@ -115,6 +116,12 @@ models:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
 
+# Optional. Client-facing SSE heartbeat; defaults to enabled: true and
+# interval: 15s when this block is absent. interval must be a Go duration >= 1s.
+sse-keep-alive:
+  enabled: true
+  interval: 15s
+
 log-level: info # optional; debug | info | warn | error (absent = info)
 ```
 
@@ -140,14 +147,23 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   fixed to it). An absent or null block means off — responses stay
   byte-identical to an unconfigured deployment. See
   [Simulated thinking usage](#simulated-thinking-usage).
+- `sse-keep-alive` — optional block controlling client-facing SSE heartbeat
+  comments for both streaming routes. Absent, `null`, or `{}` defaults to
+  `enabled: true`, `interval: 15s`; `enabled: false` opts out. `interval`, if
+  set, is a [Go duration](https://pkg.go.dev/time#ParseDuration) of at least
+  `1s` (for example `15s` or `1m`); zero, negative, sub-second, malformed, or
+  unknown nested values reject the complete file — including when the block
+  says `enabled: false`. It hot-reloads with the mapping, preserving the
+  complete last-known-good setting on rejection. See [Streaming](#streaming).
 
 The file is validated strictly, in two layers:
 
 - **Top-level keys** are checked against the raw YAML: only `models`,
-  `api-key` and `log-level` are legal. This is the bootstrap-plane rule — a file that tries
-  to define `listen`, `config-file`, `config-poll-interval` or
-  `shutdown-grace` is rejected whatever its value's shape (a strict struct
-  decode alone misses a bootstrap key whose value is an empty map).
+  `api-key`, `log-level`, and `sse-keep-alive` are legal. This is the
+  bootstrap-plane rule — a file that tries to define `listen`, `config-file`,
+  `config-poll-interval` or `shutdown-grace` is rejected whatever its value's
+  shape (a strict struct decode alone misses a bootstrap key whose value is
+  an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `upstream-model`,
   `injection-prompt` and `thinking-usage` (and, inside the block, outside
@@ -179,7 +195,9 @@ Semantics that hold:
 
 - **One snapshot per request.** Each request binds exactly one snapshot at
   entry — including a stream. Reload `N → N+1` never affects an in-flight
-  request or stream; a stream bound to `N` finishes naming models from `N`.
+  request or stream; a stream bound to `N` finishes naming models from `N`
+  and keeps the `sse-keep-alive` setting (enabled state and interval) it
+  started with. The new setting applies to subsequent requests only.
 - **Startup is the opposite side of the coin.** An invalid initial file is a
   **startup failure** (the process exits 1) — the last-known-good rule only
   applies to reloads, because at boot there is no last-known-good.
@@ -365,6 +383,25 @@ live stream with correct per-chunk latency. Behavior:
   cannot pin unbounded memory. Crossing a cap stops the relay cleanly — the
   offending line is never forwarded, and the request is logged with the
   `stream_limit_exceeded` outcome.
+- **Keep-alive during upstream silence.** When `sse-keep-alive.enabled` is
+  true (the default — the production deployment sits behind Cloudflare),
+  an upstream that has sent no client-visible byte for `interval` gets one
+  flushed SSE comment, exactly `: ping\n\n`, at an event boundary; every
+  forwarded upstream byte resets the silence clock. SSE comments are
+  ignored by every spec-compliant SSE parser, so the heartbeat is
+  client-compatible and invisible to application events. The heartbeat
+  stops at upstream EOF/error, on client disconnect, and as soon as the
+  Chat `[DONE]` or Responses `response.completed` terminal marker is
+  forwarded — it never injects inside a partial `data:` line, never splits
+  an event, and never appends after the terminal event. It starts only once
+  the upstream response headers are committed to the client: silence while
+  waiting for upstream headers is **not** covered (that window is bounded
+  by the upstream's response-header timeout, not this relay heartbeat).
+  Why: Cloudflare silently cuts a client HTTP/2 stream after ~125s with
+  zero bytes from origin (measured on 2026-09-22 — client
+  `stream error … INTERNAL_ERROR` at 125.39s, origin-side close at
+  125.06s), which long reasoning phases exceed; a `: ping` every 15s kept a
+  240s silent stream alive through the same path.
 - The streaming _shape_ is decided by the **URL path**, not the body:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses

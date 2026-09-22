@@ -458,21 +458,40 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		copyRelayHeaders(sw.Header(), resp.Header)
 		sw.WriteHeader(resp.StatusCode)
 		log.Debug().Str("public_model", model).Msg("stream_started")
+		// The keep-alive heartbeat binds to the request's snapshot like
+		// everything else: an in-flight stream keeps the interval it
+		// started with across a reload, and the goroutine is joined before
+		// this handler returns. When the feature is off the relay writes to
+		// the client writer directly and the path is byte-identical to an
+		// unconfigured deployment.
+		flush := flusher(sw)
+		var heartbeat *pingWriter
+		var dst io.Writer = sw
+		afterEvent := flush
+		if ka := snap.SSEKeepAlive(); ka.Enabled {
+			heartbeat = newPingWriter(sw, flush, ka.Interval, time.Now())
+			heartbeat.start()
+			dst, afterEvent = heartbeat, heartbeat.Flush
+		}
 		// Progress rides the flush: CopySSE invokes it exactly once per
 		// dispatched event, so the wrapper counts events for free and emits
 		// a periodic DEBUG heartbeat — a stuck stream shows up as a heartbeat
 		// that stops advancing. Counts only, never event payloads.
-		flush := flusher(sw)
 		events := 0
-		stats, err := CopySSE(sw, resp.Body, rewriteOut, func() {
+		stats, err := CopySSE(dst, resp.Body, rewriteOut, func() {
 			events++
 			if events%sseProgressEvery == 0 {
 				log.Debug().Str("public_model", model).
 					Int("events", events).Int64("bytes_out", sw.bytes).
 					Msg("stream_event_progress")
 			}
-			flush()
+			afterEvent()
 		})
+		var pings int
+		if heartbeat != nil {
+			heartbeat.stopAndWait()
+			pings = heartbeat.pingCount()
+		}
 		if err != nil {
 			phase := "upstream_read"
 			outcome = "stream_truncated"
@@ -496,10 +515,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			}
 			log.Warn().Err(err).Str("public_model", model).Str("phase", phase).
 				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
+				Int("keep_alive_pings", pings).
 				Msg("stream_truncated")
 		} else {
 			log.Debug().Str("public_model", model).
 				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
+				Int("keep_alive_pings", pings).
 				Msg("stream_completed")
 		}
 		complete()

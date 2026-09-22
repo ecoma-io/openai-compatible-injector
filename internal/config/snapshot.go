@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -36,6 +37,22 @@ type ThinkingUsage struct {
 	Hi   float64
 }
 
+// SSEKeepAlive is the validated SSE keep-alive heartbeat config: while a
+// client-facing SSE stream sits silent (a long model "thinking" phase), one
+// ignorable comment is written per interval so intermediary proxies do not
+// cut an idle stream — a Cloudflare-proxied hostname kills a silent HTTP/2
+// stream after ~125s. The zero value is not a usable default; snapshots are
+// built by LoadRuntime, which always fills Enabled and Interval.
+type SSEKeepAlive struct {
+	// Enabled turns the heartbeat on. The default is on: this proxy is
+	// deployed behind Cloudflare, where a silent stream dies at ~125s.
+	Enabled bool
+	// Interval is the silence threshold: after this long without a byte
+	// written to the client, one ": ping" comment is written and flushed.
+	// At least minSSEKeepAliveInterval.
+	Interval time.Duration
+}
+
 // Model is one validated public-model mapping. It is immutable after the
 // Snapshot is built.
 type Model struct {
@@ -62,9 +79,10 @@ type Snapshot struct {
 	// apiKey is the client bearer credential this snapshot requires. It is
 	// credential material: compared per request, never logged, never echoed
 	// in error text.
-	apiKey   string
-	models   map[string]Model
-	logLevel zerolog.Level
+	apiKey    string
+	models    map[string]Model
+	logLevel  zerolog.Level
+	keepAlive SSEKeepAlive
 }
 
 // Gen returns the snapshot's generation number (0 for the initial snapshot,
@@ -81,6 +99,11 @@ func (s *Snapshot) LogLevel() zerolog.Level { return s.logLevel }
 // an in-flight request stays bound to the snapshot it authenticated
 // against. It is never logged.
 func (s *Snapshot) APIKey() string { return s.apiKey }
+
+// SSEKeepAlive returns the SSE keep-alive settings this snapshot carries.
+// They bind to the request like everything else on the snapshot, so an
+// in-flight stream keeps the interval it started with across a reload.
+func (s *Snapshot) SSEKeepAlive() SSEKeepAlive { return s.keepAlive }
 
 // Model resolves a public model name. The second return value reports
 // whether the model exists.
