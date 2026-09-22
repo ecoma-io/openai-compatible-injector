@@ -87,11 +87,12 @@ func decodeConfigError(err error) error {
 
 // runtime file schema. Strictness has two layers: top-level keys are
 // validated against the raw YAML (only "models", "api-key", "log-level",
-// "sse-keep-alive", "providers", and "transports" are legal — this is what
-// keeps the bootstrap plane out of the runtime file: listen, config file,
-// poll interval, ... any file that tries to define them fails validation,
-// whatever their value's shape), and a KnownFields strict decode rejects
-// unknown keys inside each model, provider, and transport entry.
+// "sse-keep-alive", "providers", "transports", and "provider-fallback" are
+// legal — this is what keeps the bootstrap plane out of the runtime file:
+// listen, config file, poll interval, ... any file that tries to define
+// them fails validation, whatever their value's shape), and a KnownFields
+// strict decode rejects unknown keys inside each model, provider, and
+// transport entry.
 //
 // The models table is decoded with yaml.v3 directly, never through viper:
 // viper's map normalization lowercases every key and flattens dotted names,
@@ -128,6 +129,20 @@ type runtimeFile struct {
 	// Providers reference entries by name; the table is validated even when
 	// unreferenced.
 	Transports map[string]runtimeTransport `yaml:"transports"`
+	// ProviderFallback mirrors the optional top-level provider-fallback
+	// block: the policy bounding how many provider candidates one request
+	// may walk when earlier ones fail without answering. The pointer
+	// distinguishes an absent or null block (defaults) from a present one,
+	// which is validated even when it disables the feature.
+	ProviderFallback *runtimeProviderFallback `yaml:"provider-fallback"`
+}
+
+// runtimeProviderFallback mirrors the optional top-level provider-fallback
+// block. The same pointer-discriminated shape as the pool fallback block:
+// defaults live in the builder, not the YAML.
+type runtimeProviderFallback struct {
+	Enabled     *bool `yaml:"enabled"`
+	MaxAttempts *int  `yaml:"max-attempts"`
 }
 
 // runtimeProvider mirrors one providers entry: where requests go
@@ -272,6 +287,20 @@ type runtimeModel struct {
 	UpstreamModel   string                `yaml:"upstream-model"`
 	InjectionPrompt string                `yaml:"injection-prompt"`
 	ThinkingUsage   *runtimeThinkingUsage `yaml:"thinking-usage"`
+	// Providers is the optional ordered candidate chain: each entry is one
+	// provider candidate (a providers-table reference plus the upstream
+	// model name to send there). Mutually exclusive with provider and
+	// endpoint — a chain is the whole route, not an addition to one.
+	Providers []runtimeModelCandidate `yaml:"providers"`
+}
+
+// runtimeModelCandidate mirrors one entry of a model's providers chain:
+// a providers-table reference and the model name to present there. The
+// injection prompt and thinking-usage stay model-level — they are
+// properties of the public model, shared by every candidate.
+type runtimeModelCandidate struct {
+	Provider      string `yaml:"provider"`
+	UpstreamModel string `yaml:"upstream-model"`
 }
 
 // runtimeThinkingUsage mirrors the optional per-model thinking-usage block.
@@ -304,13 +333,13 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	}
 	for k := range raw {
 		if k == "models" || k == "api-key" || k == "log-level" || k == "sse-keep-alive" ||
-			k == "providers" || k == "transports" {
+			k == "providers" || k == "transports" || k == "provider-fallback" {
 			continue
 		}
 		// The key itself is not named: error text reaches logs verbatim, and
 		// a pasted credential can land in a key position just as well as a
 		// value position.
-		return nil, errors.New("unknown top-level key (only models, api-key, log-level, sse-keep-alive, providers and transports are legal)")
+		return nil, errors.New("unknown top-level key (only models, api-key, log-level, sse-keep-alive, providers, transports and provider-fallback are legal)")
 	}
 	var rf runtimeFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -411,6 +440,11 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, err
 	}
 
+	fallback, err := buildProviderFallback(rf.ProviderFallback)
+	if err != nil {
+		return nil, err
+	}
+
 	// The egress closure: the distinct outbound transports the models
 	// reference, in first-use order over sorted model names, plus — for a
 	// pool transport — every member endpoint it schedules onto. This is the
@@ -431,11 +465,16 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		transportSet = append(transportSet, tc)
 	}
 	for _, name := range names {
-		tc := models[name].Transport
-		addTransport(tc)
-		if tc.Kind == transport.EgressPool {
-			for _, m := range tc.Pool.Members {
-				addTransport(m.Endpoint)
+		// Every chain candidate's transport belongs to the closure, not
+		// just the primary's: a request that falls back must find its
+		// candidate's clients warm rather than rebuilt mid-request.
+		for _, cand := range models[name].Chain {
+			tc := cand.Transport
+			addTransport(tc)
+			if tc.Kind == transport.EgressPool {
+				for _, m := range tc.Pool.Members {
+					addTransport(m.Endpoint)
+				}
 			}
 		}
 	}
@@ -445,8 +484,46 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		apiKey:     key,
 		logLevel:   level,
 		keepAlive:  keepAlive,
+		fallback:   fallback,
 		transports: transportSet,
 	}, nil
+}
+
+// Provider-fallback bounds. The default budget lets one request walk a
+// two-candidate chain; the cap keeps a misconfigured chain from turning a
+// client timeout into a provider-fanout amplifier.
+const (
+	defaultProviderFallbackAttempts = 2
+	maxProviderFallbackAttempts     = 8
+)
+
+// buildProviderFallback validates the optional top-level provider-fallback
+// block into the policy the handler walks chains under. Absent or null
+// selects the defaults (enabled, two attempts); a present block is
+// validated even when it disables the feature, so a typo next to
+// `enabled: false` cannot slip through on the assumption nobody reads it.
+func buildProviderFallback(rf *runtimeProviderFallback) (ProviderFallbackPolicy, error) {
+	p := ProviderFallbackPolicy{
+		Enabled:     true,
+		MaxAttempts: defaultProviderFallbackAttempts,
+	}
+	if rf == nil {
+		return p, nil
+	}
+	if rf.Enabled != nil {
+		p.Enabled = *rf.Enabled
+	}
+	if rf.MaxAttempts != nil {
+		n := *rf.MaxAttempts
+		if n < 1 {
+			return ProviderFallbackPolicy{}, errors.New("provider-fallback: max-attempts must be at least 1")
+		}
+		if n > maxProviderFallbackAttempts {
+			return ProviderFallbackPolicy{}, fmt.Errorf("provider-fallback: max-attempts is unreasonably large (at most %d)", maxProviderFallbackAttempts)
+		}
+		p.MaxAttempts = n
+	}
+	return p, nil
 }
 
 // buildTransports validates the optional named-transports table. Entries
@@ -944,27 +1021,45 @@ func isBearerTokenChar(c byte) bool {
 }
 
 func buildModel(name string, rm runtimeModel, providers map[string]providerEntry) (Model, error) {
-	// Where the request goes: a providers-table reference (whose entry
-	// carries the base URL and the outbound transport) or the legacy inline
-	// endpoint. Exactly one — an endpoint next to a provider reference is
-	// an ambiguity about the upstream's identity, and neither is a model
-	// with nowhere to go.
+	// Where the request goes. Three mutually exclusive shapes:
+	//
+	//   - the providers chain (a model-level providers list) — the whole
+	//     route, one candidate per entry;
+	//   - a providers-table reference (whose entry carries the base URL and
+	//     the outbound transport);
+	//   - the legacy inline endpoint.
+	//
+	// A chain next to a provider/endpoint is an ambiguity about the
+	// upstream's identity, and a model with none of the three has nowhere
+	// to go. Both legacy forms build a one-candidate chain, so the handler
+	// walks one uniform structure and the flattened Model fields below
+	// always mirror Chain[0].
 	providerRef := strings.TrimSpace(rm.Provider)
-	var (
-		endpoint     *url.URL
-		providerName string
-		outTransport transport.Config
-	)
+	endpointSet := strings.TrimSpace(rm.Endpoint) != ""
+	var chain []Candidate
 	switch {
-	case providerRef != "" && strings.TrimSpace(rm.Endpoint) != "":
+	case rm.Providers != nil:
+		if providerRef != "" || endpointSet {
+			return Model{}, errors.New("the providers list and endpoint/provider are mutually exclusive")
+		}
+		var err error
+		chain, err = buildChain(rm.Providers, providers)
+		if err != nil {
+			return Model{}, err
+		}
+	case providerRef != "" && endpointSet:
 		return Model{}, errors.New("endpoint and provider are mutually exclusive")
 	case providerRef != "":
 		p, ok := providers[providerRef]
 		if !ok {
 			return Model{}, errors.New("provider reference is unknown")
 		}
-		endpoint, providerName, outTransport = p.endpoint, providerRef, p.transport
-	case strings.TrimSpace(rm.Endpoint) != "":
+		chain = []Candidate{{
+			Provider:  providerRef,
+			Endpoint:  p.endpoint,
+			Transport: p.transport,
+		}}
+	case endpointSet:
 		u, err := parseOperatorURL("endpoint", rm.Endpoint)
 		if err != nil {
 			return Model{}, err
@@ -972,12 +1067,17 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 		if err := validateEndpointURL(u, "endpoint"); err != nil {
 			return Model{}, err
 		}
-		endpoint = u
+		chain = []Candidate{{Endpoint: u}}
 	default:
 		return Model{}, errors.New("endpoint or provider is required")
 	}
-	if strings.TrimSpace(rm.UpstreamModel) == "" {
-		return Model{}, errors.New("upstream-model is required")
+	// Legacy form: the single upstream model is model-level and required,
+	// exactly as before chains existed. Chain candidates carry their own.
+	if len(rm.Providers) == 0 {
+		if strings.TrimSpace(rm.UpstreamModel) == "" {
+			return Model{}, errors.New("upstream-model is required")
+		}
+		chain[0].UpstreamModel = rm.UpstreamModel
 	}
 	tu, err := buildThinkingUsage(rm.ThinkingUsage)
 	if err != nil {
@@ -985,13 +1085,59 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 	}
 	return Model{
 		Public:          name,
-		Provider:        providerName,
-		Endpoint:        endpoint,
-		UpstreamModel:   rm.UpstreamModel,
+		Provider:        chain[0].Provider,
+		Endpoint:        chain[0].Endpoint,
+		UpstreamModel:   chain[0].UpstreamModel,
 		InjectionPrompt: rm.InjectionPrompt,
 		ThinkingUsage:   tu,
-		Transport:       outTransport,
+		Transport:       chain[0].Transport,
+		Chain:           chain,
 	}, nil
+}
+
+// buildChain validates a model's providers list into the candidate chain.
+// Each candidate references a providers-table entry by name — an unknown
+// reference rejects the whole file, exactly like the single-provider form,
+// because silently rerouting egress is the quiet direction this schema
+// exists to prevent. Candidates are validated in list order so the
+// rejection's ordinal is deterministic; the names themselves are never
+// echoed (error text reaches logs verbatim). A provider may appear only
+// once: retrying the same endpoint under a different upstream-model name
+// is an ambiguity about what a "provider attempt" is, not a fallback
+// route.
+func buildChain(cands []runtimeModelCandidate, providers map[string]providerEntry) ([]Candidate, error) {
+	if len(cands) == 0 {
+		// Only reachable through an explicit empty list (`providers: []`);
+		// an absent key decodes as nil and takes the legacy forms.
+		return nil, errors.New("the providers list requires at least one candidate")
+	}
+	chain := make([]Candidate, 0, len(cands))
+	seen := make(map[string]struct{}, len(cands))
+	for i, c := range cands {
+		ordinal := i + 1
+		ref := strings.TrimSpace(c.Provider)
+		if ref == "" {
+			return nil, fmt.Errorf("providers candidate %d: provider is required", ordinal)
+		}
+		if _, dup := seen[ref]; dup {
+			return nil, fmt.Errorf("providers candidate %d: provider reference is a duplicate of an earlier candidate", ordinal)
+		}
+		seen[ref] = struct{}{}
+		p, ok := providers[ref]
+		if !ok {
+			return nil, fmt.Errorf("providers candidate %d: provider reference is unknown", ordinal)
+		}
+		if strings.TrimSpace(c.UpstreamModel) == "" {
+			return nil, fmt.Errorf("providers candidate %d: upstream-model is required", ordinal)
+		}
+		chain = append(chain, Candidate{
+			Provider:      ref,
+			Endpoint:      p.endpoint,
+			UpstreamModel: strings.TrimSpace(c.UpstreamModel),
+			Transport:     p.transport,
+		})
+	}
+	return chain, nil
 }
 
 // parseOperatorURL parses an operator-supplied URL under the no-echo rule.

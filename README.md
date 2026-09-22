@@ -75,7 +75,8 @@ Division of responsibility:
 | ----------------------------------------------------------------------------------------- | ----------------------- |
 | `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE` | Environment (bootstrap) |
 | `api-key` (the shared inbound client credential)                                          | YAML file (runtime)     |
-| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}`                 | YAML file (runtime)     |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,providers}`       | YAML file (runtime)     |
+| `provider-fallback.{enabled,max-attempts}`                                                | YAML file (runtime)     |
 | `sse-keep-alive.{enabled,interval}`                                                       | YAML file (runtime)     |
 | `log-level`                                                                               | YAML file (runtime)     |
 
@@ -171,7 +172,23 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   the file defines: there is no fallback to direct for an unknown name,
   because silently rerouting egress is the failure this schema exists to
   prevent.
+- `providers` — optional ordered candidate chain, the alternative to the
+  single `provider`/`endpoint` forms (which build an implicit
+  one-candidate chain — the handler walks one uniform structure). Each
+  entry carries `provider` (a reference into the top-level providers
+  table, same rules as above) and `upstream-model` (the name sent to that
+  candidate; required per candidate). The first entry is the primary
+  route; the rest are fallbacks walked only on transport-level failure,
+  bounded by [`provider-fallback`](#provider-fallback). Both forms at once
+  — a `providers` list next to `provider` or `endpoint` — is a rejection,
+  as is the same provider referenced twice in one chain. The
+  `injection-prompt` and `thinking-usage` stay model-level: every
+  candidate receives the same prompt, because injection is a property of
+  the public model. See [Provider fallback](#provider-fallback).
 - `upstream-model` — the `model` value actually forwarded upstream.
+  Required on the single-provider and inline-endpoint forms (and per
+  candidate inside a `providers` chain, where there is no model-level
+  `upstream-model`).
 - `injection-prompt` — the system instruction injected into every request for
   this model. Multi-line supported; the exact text is used verbatim.
 - `thinking-usage` — optional block configuring simulated thinking-usage
@@ -201,21 +218,30 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   `https`, `socks5` or `socks5h`, a host, an explicit port, optional
   userinfo as proxy authentication, and nothing after the authority. See
   [Provider transports](#provider-transports).
+- `provider-fallback` — optional block bounding the provider candidate
+  walk of chain models. Absent, `null`, or `{}` defaults to
+  `enabled: true`, `max-attempts: 2`; a present block is validated even
+  when it disables the feature. `max-attempts` is the per-request
+  candidate budget (at least 1, at most 8) — the walk stops after this
+  many candidates were tried, chain length permitting. See
+  [Provider fallback](#provider-fallback).
 
 The file is validated strictly, in two layers:
 
 - **Top-level keys** are checked against the raw YAML: only `models`,
-  `api-key`, `log-level`, `sse-keep-alive`, `providers`, and `transports`
-  are legal. This is the bootstrap-plane rule — a file that tries to define
-  `listen`, `config-file`, `config-poll-interval` or `shutdown-grace` is
-  rejected whatever its value's shape (a strict struct decode alone misses a
-  bootstrap key whose value is an empty map).
+  `api-key`, `log-level`, `sse-keep-alive`, `providers`, `transports`, and
+  `provider-fallback` are legal. This is the bootstrap-plane rule — a file
+  that tries to define `listen`, `config-file`, `config-poll-interval` or
+  `shutdown-grace` is rejected whatever its value's shape (a strict struct
+  decode alone misses a bootstrap key whose value is an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `provider`,
-  `upstream-model`, `injection-prompt` and `thinking-usage` (and, inside the
-  block, outside `mode`, `min-ratio`, `max-ratio`) — including a nested
-  bootstrap key — is a rejection, not a warning. The same strictness holds
-  inside `providers` entries (`base-url`, `transport`), `transports` entries
+  `upstream-model`, `injection-prompt`, `thinking-usage` and `providers`
+  (and, inside the block, outside `mode`, `min-ratio`, `max-ratio`) —
+  including a nested bootstrap key — is a rejection, not a warning. The
+  same strictness holds inside `providers` entries (`base-url`,
+  `transport`), model-chain candidate entries (`provider`,
+  `upstream-model`), `transports` entries
   (`type`, `proxy`, and the pool fields `members`, `strategy`, `fallback`,
   `health`, each with their own strict field sets), and pool `members`
   entries (`transport`, `max-body-bytes`, `max-concurrency`, `streaming`,
@@ -504,12 +530,71 @@ concurrency state for one endpoint must exist exactly once, and the
 duplicate check runs on the resolved endpoint (host case and userinfo
 spelling collapse), never on the YAML name.
 
-**Not included, by design:** provider fallback and retries (a failed or
-rate-limited _provider_ is never retried elsewhere — egress fallback moves
-a request between network paths, never between providers), automatic
-egress rotation over time, active health probes, and any
-proxy-to-direct silent downgrade: when a pool's members are all unusable
-the request fails loudly with `upstream_unreachable`.
+## Provider fallback
+
+A model may list several **provider candidates** — a primary route plus
+fallbacks. The single `provider`/`endpoint` forms are the degenerate
+one-candidate chain, so every request walks the same structure:
+
+```yaml
+models:
+  gpt-reviewer:
+    providers: # ordered; the first entry is the primary route
+      - provider: provider-a # a top-level providers-table reference
+        upstream-model: gpt-5-pro # required per candidate
+      - provider: provider-b
+        upstream-model: standard-gpt-5
+provider-fallback: # optional; these are the defaults
+  enabled: true
+  max-attempts: 2 # per-request candidate budget, 1..8
+```
+
+Semantics, and the boundaries that keep the feature narrow:
+
+- **Only transport failure falls back.** A candidate that answers — any
+  status — ends the walk, and its answer is THE answer: a `429` or `500`
+  from the primary is relayed exactly as a single-provider deployment
+  would relay it. A candidate is skipped only when it fails before
+  answering: dial failure, TLS, proxy failure, or its egress pool
+  exhausting (`502`-class `upstream_unreachable` conditions). Egress
+  fallback (between network paths) and provider fallback (between
+  providers) compose but never blur: a pool moves a request between
+  paths to the SAME provider; the walk moves it to the NEXT candidate
+  only after that provider had no answer at all.
+- **Never retried: local validation, cancellation, commitment.** A body
+  that fails the request transform is answered `400` on the first
+  candidate — it would fail every candidate's transform. A client that
+  disconnects mid-walk gets no fallback (there is nobody left to answer).
+  And the walk happens entirely before the first response byte: a `200`
+  SSE stream from the primary is committed — no candidate switch after
+  headers, ever.
+- **Replay is fresh and identical.** Each attempt rebuilds the request
+  from the same immutable client body through that candidate's own
+  transform — its own `upstream-model`, the same injected prompt. Nothing
+  observed on a failed attempt feeds the next one.
+- **The budget is a hard product.** Worst case dials are bounded by
+  `provider-fallback.max-attempts ×` the per-candidate egress fallback
+  budget — with the defaults `2 × 3 = 6` dials for a two-candidate chain
+  on default pools. The walk also never exceeds the chain length.
+- **Observability.** Every completion event carries `provider_attempts`
+  (candidates tried) and `final_provider` (the candidate that answered,
+  or the last one that failed); exhaustion adds `provider_exhausted: true`.
+  Each failed candidate logs one WARN `provider_attempt_failed` (provider,
+  sanitized error class, attempt index), and each of its dialed-and-failed
+  egress endpoints logs the existing WARN `egress_attempt_failed`.
+- **Reload invariants hold.** The chain, its policy, and every candidate's
+  transport bind to the request's config snapshot like everything else —
+  a reload mid-walk cannot reshape the candidate list under in-flight
+  work. Every candidate's transport is part of the snapshot's egress
+  closure, so a fallback candidate's connection pool is warm even when
+  the primary answers everything.
+
+**Not included, by design:** automatic egress rotation over time, active
+health probes, weighted or scored provider selection (the chain order is
+the operator's, not computed), any provider fallback on HTTP statuses (a
+rate-limited _provider_ is answered, not retried elsewhere), and any
+proxy-to-direct silent downgrade: when a candidate's members are all
+unusable the request fails loudly with `upstream_unreachable`.
 
 ## Simulated thinking usage
 
@@ -765,7 +850,12 @@ What each level carries:
   rejected bearer), `public_model`, `stream`,
   `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
   snapshot generation the request bound to — correlating reloads with
-  behavior). The event is emitted when the request finishes, under the
+  behavior). Requests that reached the upstream also carry the egress
+  report (`egress_attempts`, `egress_kind`, `egress_target`,
+  `egress_exhausted`) and the provider walk's
+  (`provider_attempts`, `final_provider`, plus `provider_exhausted` when
+  every budgeted candidate failed without answering). The event is emitted
+  when the request finishes, under the
   level in effect at that moment — a reload mid-request can therefore
   change whether it appears. Also `config_reloaded` (`generation`,
   `model_count`, `log_level`), `config_file_recovered` (a file returned

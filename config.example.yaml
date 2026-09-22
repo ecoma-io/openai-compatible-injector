@@ -92,9 +92,10 @@ models:
   # Every public model name a client may request. The request's `model`
   # field is matched against these keys and sent upstream as
   # `upstream-model`. Exactly one of `provider` (a named providers entry
-  # carrying the base URL and egress) or `endpoint` (the legacy inline
-  # form — an implicit direct provider) is required; both, or neither, is
-  # a rejection. The upstream receives the request at
+  # carrying the base URL and egress), `endpoint` (the legacy inline
+  # form — an implicit direct provider), or `providers` (an ordered
+  # candidate chain, see below) is required; any two of the three, or
+  # none, is a rejection. The upstream receives the request at
   # `<base>/chat/completions` or `<base>/responses` (the base must not
   # include the /chat/completions or /responses suffix).
   gpt-reviewer:
@@ -136,6 +137,31 @@ models:
   echo-model:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
+
+  # A chain example: an ordered provider candidate list. The first entry
+  # is the primary route; later entries are fallbacks tried ONLY when an
+  # earlier candidate fails before answering (dial, TLS, proxy, egress
+  # exhaustion). Any HTTP status — 429 and 5xx included — is an answer and
+  # ends the walk. Each candidate carries its own upstream-model; the
+  # injection prompt and thinking-usage above stay model-level (every
+  # candidate receives the same prompt). Bounded by the provider-fallback
+  # block below.
+  # chained-model:
+  #   providers:
+  #     - provider: opencode # primary: the providers-table entry above
+  #       upstream-model: gpt-5-pro
+  #     - provider: opencode-backup # a second providers-table entry
+  #       upstream-model: gpt-5-pro
+
+# Optional. Bounds the provider candidate walk of chain models. Absent
+# selects the defaults below; a present block is validated even when it
+# disables the feature. max-attempts is the per-request candidate budget
+# (at least 1, at most 8) — the walk stops after this many candidates were
+# tried, chain length permitting. Hot-reloads with the rest of the file.
+#
+# provider-fallback:
+#   enabled: true
+#   max-attempts: 2
 
 # Optional. SSE keep-alive comments for client-facing Chat Completions and
 # Responses API streams. The default is enabled at 15s because a Cloudflare-

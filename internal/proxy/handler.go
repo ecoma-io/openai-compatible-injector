@@ -239,13 +239,22 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		stream      bool
 		publicModel string
 		bytesIn     int64
-		// egress carries the pool's attempt report on requests routed through
-		// an EgressPool transport (nil on the single-endpoint paths): how many
-		// distinct endpoints were actually dialed, the kind and scheme+host of
-		// the last one, and whether the loop ended without dialing anything.
-		// The target is log-safe by construction — scheme+host only, the same
-		// surface origin() allows; userinfo never enters AttemptInfo.
+		// egress carries the pool's attempt report of the LAST provider
+		// candidate this request executed through (nil when none of them
+		// routed through a pool): how many distinct endpoints were actually
+		// dialed, the kind and scheme+host of the last one, and whether the
+		// loop ended without dialing anything. The target is log-safe by
+		// construction — scheme+host only, the same surface origin() allows;
+		// userinfo never enters AttemptInfo.
 		egress *transport.AttemptInfo
+		// providerAttempts/finalProvider report the provider walk: how many
+		// chain candidates were tried and the identity (providers-table
+		// name, or endpoint origin) of the last one — the candidate that
+		// answered, or the last one that failed. providerExhausted marks
+		// the walk ending with no candidate answering.
+		providerAttempts  int
+		finalProvider     string
+		providerExhausted bool
 	)
 	withEgress := func(ev *zerolog.Event) *zerolog.Event {
 		if egress == nil {
@@ -256,8 +265,19 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("egress_target", egress.Target).
 			Bool("egress_exhausted", egress.Exhausted)
 	}
+	withProviders := func(ev *zerolog.Event) *zerolog.Event {
+		if providerAttempts == 0 {
+			return ev
+		}
+		ev = ev.Int("provider_attempts", providerAttempts).
+			Str("final_provider", finalProvider)
+		if providerExhausted {
+			ev = ev.Bool("provider_exhausted", true)
+		}
+		return ev
+	}
 	complete := func() {
-		withEgress(log.Info()).
+		withProviders(withEgress(log.Info())).
 			Int("status", sw.status).
 			Str("outcome", outcome).
 			Str("public_model", publicModel).
@@ -339,7 +359,8 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		return
 	}
 	log.Debug().Str("public_model", m.Public).Str("upstream_model", m.UpstreamModel).
-		Str("upstream", origin(m.Endpoint)).Msg("model_resolved")
+		Str("upstream", origin(m.Endpoint)).
+		Int("provider_count", len(m.Chain)).Msg("model_resolved")
 
 	// The thinking-usage plan is resolved once, here, from the same snapshot
 	// and the same request body — before any upstream I/O — so every usage
@@ -370,119 +391,199 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 
 	log.Debug().Int64("bytes_in", bytesIn).Msg("request_transform_started")
-	out, err := transform(body, m)
-	if err != nil {
-		outcome = "transform_error"
-		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
-		return
-	}
-	log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
 
-	upstream := *m.Endpoint
-	// Trim every trailing slash ("trailing slashes ignored" holds for any
-	// number) and clear RawPath: mutating Path can leave a RawPath that no
-	// longer matches, which makes EscapedPath silently percent-decode the
-	// endpoint path. Encoded endpoint paths are normalized, not preserved.
-	upstream.Path = strings.TrimRight(upstream.Path, "/") + suffix
-	upstream.RawPath = ""
-
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String(), bytes.NewReader(out))
-	if err != nil {
-		// Unreachable by construction (the endpoint was validated to a
-		// *url.URL at config load), but if it ever fires the raw error text
-		// must still not reach logs — it would embed the full URL.
-		log.Error().Str("model", model).
-			Str("upstream", origin(&upstream)).
-			Str("error_class", "request_build").
-			Msg("upstream_request_build_failed")
-		outcome = "upstream_unreachable"
-		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
-		return
-	}
-	copyForwardHeaders(req.Header, r.Header)
-	log.Debug().Str("upstream", origin(&upstream)).
-		Int64("bytes_out", int64(len(out))).Msg("upstream_request_started")
-
-	// The outbound hop: the model's provider transport, resolved from the
-	// request's snapshot. Any HTTP status — 429, 5xx, an unexpected 3xx —
-	// is the upstream's answer and returns as a response; only
-	// transport-level failures (dial, TLS, cancellation before headers)
-	// return an error, which the handling below already classifies.
+	// The provider walk. The model's candidate chain is tried primary
+	// first under the snapshot's provider-fallback policy. Each attempt
+	// replays the same immutable client body through the candidate's own
+	// transform (its upstream model name and endpoint differ — replay
+	// safety: nothing observed on an earlier attempt feeds the next), and
+	// every candidate's response — any status — ends the walk. Only
+	// transport-level failures (dial, TLS, proxy, egress exhaustion) move
+	// to the next candidate: a 429 or a 500 is the upstream's answer, and
+	// relaying it is the contract. Nothing is retried after the client is
+	// committed, either: the walk happens entirely before the first
+	// response byte, so streaming commitment holds by construction — the
+	// candidate that produces headers has produced THE response.
 	//
-	// A pool transport owns the attempt loop past this point: the handler
-	// hands it the request facts its eligibility gates need (the outgoing
-	// body, the client-declared stream flag) and the pool returns one
-	// response or one error — selection, bounded fallback, and exhaustion
-	// are its business, and no retry exists after it returns. The
-	// single-endpoint path is exactly the historical Do(req).
+	// Local validation never falls back: a body that fails one candidate's
+	// transform fails every candidate's transform (the transform sees only
+	// the body and model mapping, never the network), so the 400 is
+	// answered on the first attempt.
+	policy := snap.ProviderFallback()
+	budget := 1
+	if policy.Enabled {
+		budget = policy.MaxAttempts
+	}
+	if budget > len(m.Chain) {
+		budget = len(m.Chain)
+	}
+
 	var (
 		resp *http.Response
-		uerr error
+		// finalCand is the candidate that produced the response. On
+		// exhaustion it stays zero and the last-attempt fields below carry
+		// the failure report.
+		finalCand config.Candidate
+		// lastUpstream is the request URL of the most recent attempt — the
+		// answering candidate's URL on success, the last failed one's on
+		// exhaustion. Log-safe surfaces only (origin()).
+		lastUpstream *url.URL
+		// lastUerr is the most recent transport failure; the exhaustion
+		// report after the walk carries it.
+		lastUerr error
 	)
-	d := h.doers.Doer(m.Transport)
-	if ex, ok := d.(transport.Executor); ok {
-		var info transport.AttemptInfo
-		resp, info, uerr = ex.Execute(&transport.AttemptRequest{
-			Ctx:       r.Context(),
-			Method:    http.MethodPost,
-			URL:       &upstream,
-			Header:    req.Header.Clone(),
-			Body:      out,
-			Streaming: stream,
-		})
-		egress = &info
-		// Per-attempt evidence, bounded by the fallback budget: one WARN per
-		// dialed-and-failed endpoint, correlated by this request's request_id.
-		// Typed class and scheme+host only — the error text, any credential
-		// material, and skipped members (no dial, no event) stay out.
-		for i, f := range info.Failures {
-			log.Warn().Str("public_model", model).
-				Str("egress_kind", f.Kind).Str("egress_target", f.Target).
-				Str("error_class", f.Class).
-				Int("attempt", i+1).
-				Msg("egress_attempt_failed")
+	for i := range m.Chain {
+		if providerAttempts >= budget {
+			break
 		}
-	} else {
-		resp, uerr = d.Do(req)
+		cand := m.Chain[i]
+		providerAttempts++
+		finalProvider = cand.Label()
+		egress = nil
+
+		// The candidate view: same public model, same injection prompt,
+		// same thinking plan — only the upstream identity changes. m is a
+		// per-request value copy (Snapshot.Model returns a value), so
+		// mutating it cannot touch the snapshot.
+		m.Provider = cand.Provider
+		m.Endpoint = cand.Endpoint
+		m.UpstreamModel = cand.UpstreamModel
+		m.Transport = cand.Transport
+
+		out, terr := transform(body, m)
+		if terr != nil {
+			outcome = "transform_error"
+			reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+			return
+		}
+		log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
+
+		upstream := *cand.Endpoint
+		// Trim every trailing slash ("trailing slashes ignored" holds for any
+		// number) and clear RawPath: mutating Path can leave a RawPath that no
+		// longer matches, which makes EscapedPath silently percent-decode the
+		// endpoint path. Encoded endpoint paths are normalized, not preserved.
+		upstream.Path = strings.TrimRight(upstream.Path, "/") + suffix
+		upstream.RawPath = ""
+
+		req, rerr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String(), bytes.NewReader(out))
+		if rerr != nil {
+			// Unreachable by construction (the endpoint was validated to a
+			// *url.URL at config load), but if it ever fires the raw error
+			// text must still not reach logs — it would embed the full URL.
+			log.Error().Str("model", model).
+				Str("upstream", origin(&upstream)).
+				Str("error_class", "request_build").
+				Msg("upstream_request_build_failed")
+			outcome = "upstream_unreachable"
+			reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+			return
+		}
+		copyForwardHeaders(req.Header, r.Header)
+		log.Debug().Str("provider", cand.Label()).
+			Str("upstream", origin(&upstream)).
+			Int64("bytes_out", int64(len(out))).Msg("upstream_request_started")
+		lastUpstream = &upstream
+
+		// The outbound hop: the candidate's provider transport, resolved
+		// from the request's snapshot. Any HTTP status — 429, 5xx, an
+		// unexpected 3xx — is the upstream's answer and returns as a
+		// response; only transport-level failures (dial, TLS, cancellation
+		// before headers) return an error, classified below.
+		//
+		// A pool transport owns the egress attempt loop past this point:
+		// the handler hands it the request facts its eligibility gates need
+		// (the outgoing body, the client-declared stream flag) and the pool
+		// returns one response or one error — selection, bounded fallback,
+		// and exhaustion are its business, and no egress retry exists after
+		// it returns. The single-endpoint path is exactly the historical
+		// Do(req).
+		var uerr error
+		d := h.doers.Doer(cand.Transport)
+		if ex, ok := d.(transport.Executor); ok {
+			var info transport.AttemptInfo
+			resp, info, uerr = ex.Execute(&transport.AttemptRequest{
+				Ctx:       r.Context(),
+				Method:    http.MethodPost,
+				URL:       &upstream,
+				Header:    req.Header.Clone(),
+				Body:      out,
+				Streaming: stream,
+			})
+			egress = &info
+			// Per-attempt evidence, bounded by the fallback budget: one WARN per
+			// dialed-and-failed endpoint, correlated by this request's request_id.
+			// Typed class and scheme+host only — the error text, any credential
+			// material, and skipped members (no dial, no event) stay out.
+			for j, f := range info.Failures {
+				log.Warn().Str("public_model", model).
+					Str("provider", cand.Label()).
+					Str("egress_kind", f.Kind).Str("egress_target", f.Target).
+					Str("error_class", f.Class).
+					Int("attempt", j+1).
+					Msg("egress_attempt_failed")
+			}
+		} else {
+			resp, uerr = d.Do(req)
+		}
+		if uerr == nil {
+			finalCand = cand
+			withEgress(log.Debug()).Int("status", resp.StatusCode).
+				Str("content_type", resp.Header.Get(contentTypeHeader)).
+				Msg("upstream_response_received")
+			break
+		}
+		lastUerr = uerr
+		if errors.Is(uerr, context.Canceled) {
+			// The client went away before any upstream answered. No
+			// fallback — there is nobody left to answer — and the outcome
+			// is the disconnect: an upstream_unreachable 502 would
+			// misreport a client-side event as an upstream failure.
+			outcome = "client_disconnected"
+			withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
+				Str("public_model", model).
+				Str("provider", cand.Label()).
+				Str("upstream", origin(&upstream)).
+				Str("error_class", upstreamErrorClass(uerr)).
+				Msg("upstream_request_failed")
+			complete()
+			return
+		}
+		// Transport-level failure with the client still present: one WARN
+		// per failed candidate — the *url.Error from client.Do embeds the
+		// full request URL, query string included, which is how
+		// query-authenticated providers leak credentials, so the
+		// sanitized error and the scheme+host origin only — then, policy
+		// permitting, the next candidate. Exhaustion is reported after
+		// the walk.
+		withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
+			Str("public_model", model).
+			Str("provider", cand.Label()).
+			Str("upstream", origin(&upstream)).
+			Str("error_class", upstreamErrorClass(uerr)).
+			Int("provider_attempt", providerAttempts).
+			Msg("provider_attempt_failed")
 	}
-	if uerr == nil {
-		withEgress(log.Debug()).Int("status", resp.StatusCode).
-			Str("content_type", resp.Header.Get(contentTypeHeader)).
-			Msg("upstream_response_received")
-	}
-	if uerr != nil {
-		err := uerr
-		// The *url.Error from client.Do embeds the full request URL —
-		// query string included, which is how query-authenticated
-		// providers leak credentials. Log the sanitized error and the
-		// scheme+host origin only, per the credential rule.
-		event := withEgress(log.Error())
-		class := upstreamErrorClass(err)
+
+	if resp == nil {
+		// Every budgeted candidate failed without answering. The client
+		// gets the canonical unreachable envelope; the ERROR carries the
+		// last attempt's failure, sanitized, with the pool's report when
+		// that candidate routed through one.
+		providerExhausted = true
+		class := upstreamErrorClass(lastUerr)
 		if egress != nil && egress.Exhausted {
 			// Zero dials is a pool-level condition — no member was reachable
 			// for this request — and gets its own class token; the error text
 			// is the pool's static sentinel.
 			class = "egress_exhausted"
 		}
-		if errors.Is(err, context.Canceled) {
-			// The client went away before the upstream answered. The
-			// outcome is the disconnect — an upstream_unreachable 502
-			// would misreport a client-side event as an upstream
-			// failure — and there is no response left to write.
-			event = withEgress(log.Warn())
-			outcome = "client_disconnected"
-			event.Err(sanitizeUpstreamError(err, &upstream)).
-				Str("public_model", model).
-				Str("upstream", origin(&upstream)).
-				Str("error_class", upstreamErrorClass(err)).
-				Msg("upstream_request_failed")
-			complete()
-			return
-		}
-		event.Err(sanitizeUpstreamError(err, &upstream)).
+		withProviders(withEgress(log.Error())).Err(sanitizeUpstreamError(lastUerr, lastUpstream)).
 			Str("public_model", model).
-			Str("upstream", origin(&upstream)).
+			Str("provider", finalProvider).
+			Str("upstream", origin(lastUpstream)).
 			Str("error_class", class).
+			Bool("provider_exhausted", true).
 			Msg("upstream_request_failed")
 		outcome = "upstream_unreachable"
 		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
@@ -526,8 +627,8 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		if ev.status >= http.StatusInternalServerError {
 			event = log.Error()
 		}
-		event = event.Str("public_model", model).Str("upstream_model", m.UpstreamModel).
-			Str("upstream", origin(&upstream)).
+		event = event.Str("public_model", model).Str("upstream_model", finalCand.UpstreamModel).
+			Str("upstream", origin(lastUpstream)).
 			Int("upstream_status", ev.status).
 			Str("content_type", ev.contentType).
 			Str("error_class", ev.class).

@@ -55,33 +55,87 @@ type SSEKeepAlive struct {
 	Interval time.Duration
 }
 
+// ProviderFallbackPolicy bounds the provider candidate walk: how many
+// chain candidates one request may try when earlier ones fail without
+// answering (transport-level failure only — any HTTP status is an answer
+// and ends the walk). Enabled=false pins the request to the primary
+// candidate. The zero value is a usable "one attempt" policy, but
+// snapshots are built by LoadRuntime, which always materializes the
+// defaults.
+type ProviderFallbackPolicy struct {
+	// Enabled turns candidate fallback on. The default is on.
+	Enabled bool
+	// MaxAttempts is the per-request candidate budget: the walk stops
+	// after this many candidates were tried, chain length permitting.
+	// Between minProviderFallbackAttempts and maxProviderFallbackAttempts.
+	MaxAttempts int
+}
+
+// Candidate is one provider hop in a model's routing chain: where the
+// request goes, under what upstream model name, and over which outbound
+// path. Chains are built immutable at config load; the first candidate is
+// the primary route and the rest are fallbacks a request walks only when
+// an earlier one fails before answering (never on an HTTP status — statuses
+// are answers).
+type Candidate struct {
+	// Provider names the providers-table entry; empty for the legacy inline
+	// endpoint form, which builds a one-candidate chain.
+	Provider string
+	// Endpoint is the candidate's validated upstream base URL
+	// (e.g. https://h/v1), from the referenced provider's base-url.
+	Endpoint *url.URL
+	// UpstreamModel is the model name sent to this candidate's provider.
+	UpstreamModel string
+	// Transport is the outbound path this candidate executes through —
+	// the provider's referenced transport, or the zero value (direct) for
+	// a provider without a transport reference.
+	Transport transport.Config
+}
+
+// Label is the candidate's observability identity: the providers-table
+// name, or the endpoint origin for the legacy inline form. Log-safe by
+// construction — scheme+host only, the same surface every upstream URL is
+// allowed to show.
+func (c Candidate) Label() string {
+	if c.Provider != "" {
+		return c.Provider
+	}
+	return c.Endpoint.Scheme + "://" + c.Endpoint.Host
+}
+
 // Model is one validated public-model mapping. It is immutable after the
 // Snapshot is built.
 type Model struct {
 	// Public is the model name clients use, i.e. the map key.
 	Public string
 	// Provider names the providers-table entry this model routes through;
-	// empty for the legacy inline endpoint form. It is resolution metadata
-	// (and the identity a later provider-fallback design would key on),
+	// empty for the legacy inline endpoint form. It is resolution metadata,
 	// not a second lookup: the entry's base URL and transport are already
-	// flattened into Endpoint and Transport here.
+	// flattened into Endpoint and Transport here. It always mirrors
+	// Chain[0].
 	Provider string
 	// Endpoint is the validated upstream base URL (e.g. https://h/v1),
 	// from the referenced provider's base-url or the model's own endpoint.
+	// It always mirrors Chain[0].
 	Endpoint *url.URL
-	// UpstreamModel is the model name sent to the upstream provider.
+	// UpstreamModel is the model name sent to the upstream provider. It
+	// always mirrors Chain[0].
 	UpstreamModel string
 	// InjectionPrompt is the system-level instruction injected into every
-	// request. Empty means no injection.
+	// request. Empty means no injection. Injection is a property of the
+	// PUBLIC model: every candidate in the chain receives the same prompt.
 	InjectionPrompt string
 	// ThinkingUsage is the validated simulated thinking-usage synthesis
 	// config. The zero value means the feature is off for this model.
 	ThinkingUsage ThinkingUsage
 	// Transport is the outbound path requests for this model execute
-	// through — the provider's referenced transport, or the zero value
-	// (direct) for the legacy inline endpoint form and for providers
-	// without a transport reference.
+	// through — the primary candidate's path. It always mirrors Chain[0].
 	Transport transport.Config
+	// Chain is the model's provider candidate list, primary first. It
+	// always has at least one entry: the legacy provider/endpoint forms
+	// build a one-candidate chain, so the handler walks one uniform
+	// structure — there is no separate legacy code path to drift.
+	Chain []Candidate
 }
 
 // Snapshot is an immutable view of a validated runtime configuration. It is
@@ -97,10 +151,13 @@ type Snapshot struct {
 	models map[string]Model
 	// transports is the distinct set of outbound transport configs the
 	// models reference — the retain set the transport registry reconciles
-	// to on publish.
+	// to on publish. Every chain candidate's transport is part of the set,
+	// not just the primaries': a request that falls back must find its
+	// candidate's clients warm.
 	transports []transport.Config
 	logLevel   zerolog.Level
 	keepAlive  SSEKeepAlive
+	fallback   ProviderFallbackPolicy
 }
 
 // Gen returns the snapshot's generation number (0 for the initial snapshot,
@@ -122,6 +179,11 @@ func (s *Snapshot) APIKey() string { return s.apiKey }
 // They bind to the request like everything else on the snapshot, so an
 // in-flight stream keeps the interval it started with across a reload.
 func (s *Snapshot) SSEKeepAlive() SSEKeepAlive { return s.keepAlive }
+
+// ProviderFallback returns the provider candidate-walk policy this
+// snapshot carries. It binds to the request like everything else on the
+// snapshot: a request that started on one policy finishes under it.
+func (s *Snapshot) ProviderFallback() ProviderFallbackPolicy { return s.fallback }
 
 // Transports returns the distinct outbound transport configs this
 // snapshot's models reference. The registry retains exactly these on
