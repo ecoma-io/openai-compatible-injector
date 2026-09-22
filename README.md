@@ -438,34 +438,46 @@ live stream with correct per-chunk latency. Behavior:
 
 Upstream and client failures are classified, never fogged:
 
-| Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                          |
-| --------------------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Missing/malformed `Authorization: Bearer <key>`                                                                 | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}` |
-| Wrong bearer key                                                                                                | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                       |
-| Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                           |
-| Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                     |
-| Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                 |
-| Request names an unmapped model                                                                                 | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}` |
-| Request path matches no route (unknown path, trailing slash, wrong case)                                        | 404                    | `invalid_request_error` — exact body: `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`                                          |
-| Upstream unreachable (dial/network)                                                                             | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                      |
-| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap, or a body read that fails mid-answer) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                 |
-| Upstream answers 3xx/4xx/5xx                                                                                    | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                           |
+| Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                           |
+| --------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Missing/malformed `Authorization: Bearer <key>`                                                                 | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`  |
+| Wrong bearer key                                                                                                | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
+| Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                            |
+| Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                      |
+| Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                  |
+| Request names an unmapped model                                                                                 | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`  |
+| Request path matches no route (unknown path, trailing slash, wrong case)                                        | 404                    | `invalid_request_error` — exact body: `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`                                           |
+| Upstream unreachable (dial/network)                                                                             | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                       |
+| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap, or a body read that fails mid-answer) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                  |
+| Upstream answers 4xx/5xx                                                                                        | same as upstream       | `upstream_error` / `upstream_http_<status>` — canonical envelope: `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}` |
+| Upstream answers 3xx (redirect), 204, or 304                                                                    | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                            |
 
-Two consequences of the table:
+Consequences of the table:
 
 - **An unmapped model is never forwarded.** 404 is local; the upstream never
   sees that request. This is a hard boundary (SECURITY.md treats its breach
   as a vulnerability).
-- **Upstream errors are the upstream's shape.** Any 3xx/4xx/5xx — JSON, text,
-  whatever the provider sent — is relayed byte-for-byte. Redirects are
-  **never followed**: following one would silently convert the POST into a
-  body-less GET (301/302/303) and replay the transformed request body to
-  whatever the `Location` names (307/308). An unexpected 3xx is the
-  upstream's answer, and the client's to judge. We only synthesize errors
-  for what the upstream _did not_ deliver.
-- **Error bodies can name the upstream model.** Verbatim means verbatim: an
-  upstream error that quotes its own model name discloses the alias target.
-  That is the price of honest passthrough; we do not rewrite error bodies.
+- **Redirects are relayed, never followed.** A 3xx passes through verbatim:
+  following one would silently convert the POST into a body-less GET
+  (301/302/303) and replay the transformed request body to whatever the
+  `Location` names (307/308). An unexpected 3xx is the upstream's answer,
+  and the client's to judge. 204 and 304 relay the same way.
+- **Upstream 4xx/5xx errors are normalized.** The status is preserved
+  exactly (401 stays 401, 429 stays 429, 500 stays 500 — never collapsed
+  into a 502; 502 is reserved for the upstream delivering nothing usable at
+  all), but the body is always the canonical envelope above and
+  `Content-Type` is always `application/json`. The provider's raw body —
+  its message text, its HTML, even its model names — never reaches the
+  client: an upstream error that quotes the alias target discloses nothing.
+  A bounded prefix (64 KiB) of the error body is read once, solely to
+  classify its shape and fingerprint it for the log evidence event (see
+  Logging); those bytes go nowhere else — not to the client, not into any
+  log line. `Retry-After` and the `X-RateLimit-*` headers still ride the
+  allow-list below, so a 429 remains distinguishable and backoff-able.
+  This holds for every request shape: an upstream 5xx answered as
+  `text/event-stream` is normalized too (never streamed to the client),
+  while a 200 SSE stream that has already committed headers is never
+  converted into an error mid-flight.
 - There is **no overall request timeout**. A slow upstream is a slow
   response, not a timeout race. Dial and TLS handshake timeouts bound the
   connection phase only.
@@ -557,27 +569,53 @@ What each level carries:
   that cancels mid-request — including while the upstream request is in
   flight (`upstream_request_failed` with `error_class` `client_canceled`,
   outcome `client_disconnected`, and no error envelope, since the client is
-  gone) — one warning per transition into a failed config
+  gone), and an upstream 4xx — the `upstream_http_error` evidence event
+  described below — one warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —
   plus `second_signal_forced_exit` and drain overflow.
 - **ERROR** — upstream connection failures (`upstream_request_failed` with
   an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial` —
-  never `client_canceled`, which is the WARN disconnect above) and an
+  never `client_canceled`, which is the WARN disconnect above), an
   upstream that died mid-relay on the verbatim path (`relay_copy_failed`
   with phase `upstream_read` — the one relay failure that is not a
-  disconnect), plus anything fatal at startup. A 200 that is not
+  disconnect), and an upstream 5xx (`upstream_http_error` at error
+  severity — 5xx is our outage even when the provider owns the cause),
+  plus anything fatal at startup. A 200 that is not
   parseable JSON is not an event of its own: it surfaces only as the
   `upstream_invalid_response` outcome on the INFO completion line, with
   the 502 envelope on the wire.
+
+**The upstream 4xx/5xx evidence event.** Every normalized upstream error
+emits one `upstream_http_error` event (WARN for 4xx, ERROR for 5xx) bound
+to the request's `request_id`: `api`, `public_model`, `upstream_model`,
+`upstream` (scheme+host only), `upstream_status`, `content_type`,
+`error_class` (`upstream_http_4xx`/`upstream_http_5xx`), `error_shape`
+(`empty`, `json_error_object`, `json`, `text`, `malformed_json`,
+`truncated`), `body_bytes` (the size of the captured prefix — the whole
+body when it fit under the 64 KiB cap), `body_truncated`, and
+`error_fingerprint` — the SHA-256 hex digest of that bounded prefix, the
+join key for correlating repeated provider errors without keeping any of
+their bytes. When the provider's error object carries its own
+token-shaped `type`/`code` (`rate_limit_error`, `insufficient_quota`, …)
+they appear as `provider_error_type`/`provider_error_code` — only when the
+value is short printable ASCII, never the free-text `message`. The
+allow-listed `Retry-After`/`X-RateLimit-*` headers ride along as
+`retry_after`/`x_ratelimit_*` fields when present (values longer than 128
+bytes are dropped from the log — nothing an upstream controls can balloon a
+log line; the client-side relay is unaffected). The raw error body
+itself never appears at any level: it exists only as the count, the shape,
+and the fingerprint.
 
 The credential rule is absolute: no log line, at any level, ever contains
 an `Authorization` value, a request or response body, an injection prompt,
 or upstream URL detail beyond scheme+host. Endpoint query strings (which
 providers use for API keys) survive even a dial failure's error text —
-errors are sanitized before logging. The planted-secret E2E suite
+errors are sanitized before logging — and upstream error bodies are no
+exception: the raw bytes of a 4xx/5xx never reach a log line at any level,
+only their count, shape, and fingerprint. The planted-secret E2E suite
 (`TestLoggingNeverLeaksSecrets`) holds this rule under success, streaming,
-rejection, dial-failure, and verbatim-echo traffic at maximum verbosity.
+rejection, dial-failure, and provider-echo traffic at maximum verbosity.
 
 ## Healthcheck
 

@@ -3,9 +3,13 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -337,16 +342,31 @@ func TestSSEPassthroughRewritesModel(t *testing.T) {
 	}
 }
 
-func TestUpstreamErrorVerbatimPassthrough(t *testing.T) {
+// TestUpstreamHTTPErrorNormalized pins the new 4xx/5xx contract: the
+// upstream's status survives, but the client body is always the canonical
+// OpenAI-compatible JSON envelope — never the provider's raw body, whatever
+// its shape — with Content-Type application/json and the relay allow-list
+// still applying to the operational headers.
+func TestUpstreamHTTPErrorNormalized(t *testing.T) {
 	cases := []struct {
 		name        string
 		status      int
 		contentType string
 		body        string
+		// banned is a distinctive fragment of the raw upstream body that
+		// must not survive into the client answer.
+		banned string
 	}{
-		{"html 503", http.StatusServiceUnavailable, "text/html", "<html>Service Unavailable</html>"},
-		{"json 429", http.StatusTooManyRequests, "application/json", `{"error":{"message":"rate limited","type":"rate_limit_error"}}`},
-		{"plain 500", http.StatusInternalServerError, "text/plain", "internal error"},
+		{"json 400", http.StatusBadRequest, "application/json", `{"error":{"message":"bad request","type":"invalid_request_error","code":"bad_request"}}`, "bad request"},
+		{"text 401", http.StatusUnauthorized, "text/plain", "denied.", "denied."},
+		{"json 403", http.StatusForbidden, "application/json", `{"error":{"message":"forbidden"}}`, "forbidden"},
+		{"json 404", http.StatusNotFound, "application/json", `{"error":{"message":"no such model","code":"model_not_found"}}`, "no such model"},
+		{"json 429", http.StatusTooManyRequests, "application/json", `{"error":{"message":"rate limited","type":"rate_limit_error"}}`, "rate limited"},
+		{"json 500", http.StatusInternalServerError, "application/json", `{"error":{"message":"internal"}}`, "internal"},
+		{"html 503", http.StatusServiceUnavailable, "text/html", "<html>Service Unavailable</html>", "Service Unavailable"},
+		{"arbitrary text 502", http.StatusBadGateway, "text/plain", "internal gateway failure", "gateway failure"},
+		{"malformed json 500", http.StatusInternalServerError, "application/json", `{"broken_json_marker":`, "broken_json_marker"},
+		{"empty body 500", http.StatusInternalServerError, "application/json", "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -361,19 +381,27 @@ func TestUpstreamErrorVerbatimPassthrough(t *testing.T) {
 			defer upstream.Close()
 
 			h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
-			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+				`{"model":"test-model","messages":[]}`, nil)
 
 			if rec.Code != tc.status {
-				t.Fatalf("status = %d, want %d", rec.Code, tc.status)
+				t.Fatalf("status = %d, want %d (upstream status must survive)", rec.Code, tc.status)
 			}
-			if body := rec.Body.String(); body != tc.body {
-				t.Errorf("body not verbatim:\n got %q\nwant %q", body, tc.body)
+			want := fmt.Sprintf(`{"error":{"message":"upstream provider returned HTTP %d","type":"upstream_error","param":null,"code":"upstream_http_%d"}}`,
+				tc.status, tc.status)
+			if body := rec.Body.String(); body != want {
+				t.Errorf("body not the canonical envelope:\n got %s\nwant %s", body, want)
 			}
-			if ct := rec.Header().Get("Content-Type"); ct != tc.contentType {
-				t.Errorf("Content-Type = %q, want %q", ct, tc.contentType)
+			// The raw provider body must not survive anywhere in the client
+			// answer — not even as a fragment.
+			if tc.banned != "" && strings.Contains(rec.Body.String(), tc.banned) {
+				t.Errorf("canonical body carries the raw upstream fragment %q: %q", tc.banned, rec.Body.String())
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json (the client body is canonical JSON)", ct)
 			}
 			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-				t.Errorf("Cache-Control = %q, want no-store", got)
+				t.Errorf("Cache-Control = %q, want no-store (relay allow-list still applies)", got)
 			}
 			if got := rec.Header().Get("X-Request-Id"); got != "req-1" {
 				t.Errorf("X-Request-Id = %q, want req-1", got)
@@ -382,6 +410,38 @@ func TestUpstreamErrorVerbatimPassthrough(t *testing.T) {
 				t.Errorf("X-Secret = %q, want empty (not allow-listed)", got)
 			}
 		})
+	}
+}
+
+// TestUpstream5xxEventStreamNormalizedNotRelayed pins the branch order: an
+// upstream 5xx carrying an SSE content type is an HTTP error, not a stream —
+// the canonical envelope wins, and no SSE relay begins. A committed 2xx SSE
+// stream is never converted the other way (that contract lives in
+// TestStreamLineLimitOutcome).
+func TestUpstream5xxEventStreamNormalizedNotRelayed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "data: {\"error\":\"dying\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, newTestStore(t, upstream.URL+"/v1"))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"test-model","stream":true}`, nil)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (normalized error, not an SSE 2xx)", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	want := `{"error":{"message":"upstream provider returned HTTP 500","type":"upstream_error","param":null,"code":"upstream_http_500"}}`
+	if body := rec.Body.String(); body != want {
+		t.Errorf("body:\n got %s\nwant %s", body, want)
+	}
+	if strings.Contains(rec.Body.String(), "data:") {
+		t.Errorf("SSE framing relayed on an error path: %q", rec.Body.String())
 	}
 }
 
@@ -685,6 +745,8 @@ func TestUpstreamRedirectRelayedVerbatim(t *testing.T) {
 func TestUpstreamRateLimitHeadersRelayed(t *testing.T) {
 	// Operational headers drive client backoff; dropping them makes a 429
 	// indistinguishable from any other upstream error to a well-behaved SDK.
+	// The body itself is normalized — the headers speak for the response the
+	// raw body no longer does.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "30")
@@ -716,6 +778,16 @@ func TestUpstreamRateLimitHeadersRelayed(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Secret"); got != "" {
 		t.Errorf("X-Secret = %q, want empty (allow-list still holds)", got)
+	}
+	want := `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}`
+	if body := rec.Body.String(); body != want {
+		t.Errorf("body:\n got %s\nwant %s", body, want)
+	}
+	if strings.Contains(rec.Body.String(), "rate limited") {
+		t.Errorf("raw provider message relayed: %q", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 }
 
@@ -1112,6 +1184,43 @@ func TestSanitizeUpstreamErrorRedactsNestedURLBytes(t *testing.T) {
 	}
 }
 
+// TestSanitizeUpstreamErrorParseFailuresStatic pins the #37 branch: an error
+// the transport raised while parsing upstream bytes (a malformed MIME header
+// line, and anything else off the text-safe allow-list) is replaced
+// wholesale — its text quotes the upstream's own bytes — while the wire-state
+// errors (dial/refused, timeouts) keep theirs, since addresses and errno
+// names are ours, not the upstream's to echo.
+func TestSanitizeUpstreamErrorParseFailuresStatic(t *testing.T) {
+	endpoint := &url.URL{Scheme: "http", Host: "up.example:1"}
+
+	parse := sanitizeUpstreamError(&url.Error{
+		Op:  "Post",
+		URL: "http://up.example:1/v1?api-key=S",
+		Err: fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w",
+			errors.New(`malformed MIME header line: "X-Bad\x01: SECRET_RAW_MARKER"`)),
+	}, endpoint)
+	if msg := parse.Error(); strings.Contains(msg, "SECRET_RAW_MARKER") || strings.Contains(msg, "malformed") {
+		t.Errorf("sanitized parse error echoes upstream bytes: %q", msg)
+	}
+	if !strings.Contains(parse.Error(), "upstream transport error") {
+		t.Errorf("sanitized parse error = %q, want static transport text", parse.Error())
+	}
+
+	dial := sanitizeUpstreamError(&url.Error{
+		Op:  "Post",
+		URL: "http://up.example:1/v1",
+		Err: &net.OpError{
+			Op:   "dial",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+			Err:  syscall.ECONNREFUSED,
+		},
+	}, endpoint)
+	if !strings.Contains(dial.Error(), "connection refused") {
+		t.Errorf("sanitized dial error = %q, want the errno text kept", dial.Error())
+	}
+}
+
 // TestUpstreamTimeoutClassified pins the timeout branch of the upstream
 // failure taxonomy: an upstream that accepts the connection and then goes
 // quiet past the header deadline surfaces as the 502 upstream_unreachable
@@ -1215,5 +1324,485 @@ func TestUpstreamTLSFailureClassified(t *testing.T) {
 	}
 	if !sawClass {
 		t.Fatalf("upstream_request_failed not logged:\n%s", logs.String())
+	}
+}
+
+// parseLogLines decodes a zerolog buffer into per-line maps for the
+// evidence tests below.
+func parseLogLines(t *testing.T, s string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, line)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// findLogEvent returns the first event carrying the message slug.
+func findLogEvent(t *testing.T, logs string, slug string) map[string]any {
+	t.Helper()
+	for _, m := range parseLogLines(t, logs) {
+		if m["message"] == slug {
+			return m
+		}
+	}
+	t.Fatalf("no %q event in logs:\n%s", slug, logs)
+	return nil
+}
+
+// TestUpstreamHTTPErrorLogEvidence pins the structured evidence event: one
+// upstream_http_error per normalized 4xx, carrying everything an
+// investigation needs (status, class, shape, bounded byte count, truncation
+// flag, fingerprint, allow-listed rate-limit headers, the provider's own
+// token-shaped type/code) and nothing the credential rule forbids. The
+// upstream endpoint carries a planted query secret, the error body a planted
+// message marker, and the request a planted prompt marker — none may reach
+// the log stream; the endpoint appears as scheme+host only.
+func TestUpstreamHTTPErrorLogEvidence(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.Header().Set("X-RateLimit-Limit", "100")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset-Tokens", "1.5s")
+		w.Header().Set("OpenAI-Request-Id", "req_abc")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"SECRET_ERROR_BODY rate limited","type":"rate_limit_error","code":"rate_limited"}}`)
+	}))
+	defer upstream.Close()
+
+	// The endpoint's query string carries a planted credential marker.
+	store := newTestStore(t, upstream.URL+"/v1?api-key=SECRET_ENDPOINT_TOKEN&deployment=x")
+	var logs bytes.Buffer
+	h := NewHandler(store, NewSharedClient(), zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"test-model","messages":[{"role":"user","content":"SECRET_REQUEST_BODY"}]}`, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+
+	ev := findLogEvent(t, logs.String(), "upstream_http_error")
+	if lvl, _ := ev["level"].(string); lvl != "warn" {
+		t.Errorf("4xx level = %v, want warn", ev["level"])
+	}
+	if ev["upstream_status"] != float64(http.StatusTooManyRequests) {
+		t.Errorf("upstream_status = %v, want 429", ev["upstream_status"])
+	}
+	if ev["error_class"] != "upstream_http_4xx" {
+		t.Errorf("error_class = %v, want upstream_http_4xx", ev["error_class"])
+	}
+	if ev["error_shape"] != "json_error_object" {
+		t.Errorf("error_shape = %v, want json_error_object", ev["error_shape"])
+	}
+	if ev["content_type"] != "application/json" {
+		t.Errorf("content_type = %v, want application/json", ev["content_type"])
+	}
+	const rawBody = `{"error":{"message":"SECRET_ERROR_BODY rate limited","type":"rate_limit_error","code":"rate_limited"}}`
+	if ev["body_bytes"] != float64(len(rawBody)) {
+		t.Errorf("body_bytes = %v, want %d", ev["body_bytes"], len(rawBody))
+	}
+	if ev["body_truncated"] != false {
+		t.Errorf("body_truncated = %v, want false", ev["body_truncated"])
+	}
+	fp, _ := ev["error_fingerprint"].(string)
+	if len(fp) != 64 {
+		t.Errorf("error_fingerprint = %q, want 64 hex chars", fp)
+	}
+	if ev["retry_after"] != "30" {
+		t.Errorf("retry_after = %v, want 30", ev["retry_after"])
+	}
+	if ev["x_ratelimit_limit"] != "100" || ev["x_ratelimit_remaining"] != "0" || ev["x_ratelimit_reset_tokens"] != "1.5s" {
+		t.Errorf("rate-limit fields = %v/%v/%v", ev["x_ratelimit_limit"], ev["x_ratelimit_remaining"], ev["x_ratelimit_reset_tokens"])
+	}
+	if ev["provider_error_type"] != "rate_limit_error" {
+		t.Errorf("provider_error_type = %v, want rate_limit_error", ev["provider_error_type"])
+	}
+	if ev["provider_error_code"] != "rate_limited" {
+		t.Errorf("provider_error_code = %v, want rate_limited", ev["provider_error_code"])
+	}
+	if ev["public_model"] != "test-model" || ev["upstream_model"] != "upstream-name" {
+		t.Errorf("model fields = %v/%v", ev["public_model"], ev["upstream_model"])
+	}
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	if ev["upstream"] != "http://"+host {
+		t.Errorf("upstream = %v, want the scheme+host origin only", ev["upstream"])
+	}
+	if rid, _ := ev["request_id"].(string); rid == "" {
+		t.Errorf("request_id missing from the evidence event")
+	}
+
+	completed := findLogEvent(t, logs.String(), "request_completed")
+	if completed["outcome"] != "upstream_http_error" {
+		t.Errorf("outcome = %v, want upstream_http_error", completed["outcome"])
+	}
+	if completed["status"] != float64(http.StatusTooManyRequests) {
+		t.Errorf("status = %v, want 429 (the upstream status survives)", completed["status"])
+	}
+
+	// The credential rule, planted-marker edition: raw error body, provider
+	// message, endpoint query, and request prompt never reach the stream.
+	out := logs.String()
+	for _, banned := range []string{
+		"SECRET_ERROR_BODY", "SECRET_ENDPOINT_TOKEN", "SECRET_REQUEST_BODY",
+		"rate limited", "deployment", "api-key",
+	} {
+		if strings.Contains(out, banned) {
+			t.Errorf("logs contain %q:\n%s", banned, out)
+		}
+	}
+}
+
+// TestUpstreamHTTPError5xxSeverity pins the phase split: a 5xx is the
+// provider failing — ERROR, the same severity the transport failures use —
+// while 4xx stays WARN (pinned above).
+func TestUpstreamHTTPError5xxSeverity(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "<html>boom</html>")
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+
+	ev := findLogEvent(t, logs.String(), "upstream_http_error")
+	if lvl, _ := ev["level"].(string); lvl != "error" {
+		t.Errorf("5xx level = %v, want error", ev["level"])
+	}
+	if ev["error_class"] != "upstream_http_5xx" {
+		t.Errorf("error_class = %v, want upstream_http_5xx", ev["error_class"])
+	}
+	if ev["error_shape"] != "text" {
+		t.Errorf("error_shape = %v, want text", ev["error_shape"])
+	}
+}
+
+// TestUpstreamHTTPErrorBodyBounded pins the capture cap: an error body past
+// maxUpstreamErrorBodyBytes is truncated, not pinned — the client still gets
+// the canonical envelope at the upstream's status, the evidence reports
+// body_truncated with the capped byte count, and the fingerprint is over the
+// bounded prefix (documented convention), so no raw bytes need surviving
+// anywhere to correlate.
+func TestUpstreamHTTPErrorBodyBounded(t *testing.T) {
+	old := maxUpstreamErrorBodyBytes
+	maxUpstreamErrorBodyBytes = 1 << 20 // 1 MiB for the test
+	defer func() { maxUpstreamErrorBodyBytes = old }()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, strings.Repeat("x", 2<<20))
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (truncation is evidence, not a client answer)", rec.Code)
+	}
+	want := `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}`
+	if body := rec.Body.String(); body != want {
+		t.Errorf("body:\n got %s\nwant %s", body, want)
+	}
+
+	ev := findLogEvent(t, logs.String(), "upstream_http_error")
+	if ev["body_truncated"] != true {
+		t.Errorf("body_truncated = %v, want true", ev["body_truncated"])
+	}
+	if ev["body_bytes"] != float64(1<<20) {
+		t.Errorf("body_bytes = %v, want %d (the capped prefix)", ev["body_bytes"], 1<<20)
+	}
+	if ev["error_shape"] != "truncated" {
+		t.Errorf("error_shape = %v, want truncated", ev["error_shape"])
+	}
+	prefix := sha256.Sum256([]byte(strings.Repeat("x", 1<<20)))
+	if fp, _ := ev["error_fingerprint"].(string); fp != hex.EncodeToString(prefix[:]) {
+		t.Errorf("error_fingerprint = %v, want sha256 of the bounded prefix", ev["error_fingerprint"])
+	}
+	if strings.Contains(logs.String(), strings.Repeat("x", 64)) {
+		t.Errorf("logs carry raw error-body bytes:\n%.200s…", logs.String())
+	}
+}
+
+// TestUpstreamHTTPErrorBodyReadFailure502 pins the read-failure edge: the
+// upstream commits a 503 and dies mid-body. There is no readable error body
+// to normalize, so the answer is the synthetic 502 upstream_invalid_response
+// — never half a provider body — with the upstream_read_failed outcome and
+// its WARN.
+func TestUpstreamHTTPErrorBodyReadFailure502(t *testing.T) {
+	// The handler panics after flushing a partial body; the server's panic
+	// recovery aborts the connection mid-chunk. Its panic log is silenced so
+	// the expected failure does not noise up the test output.
+	s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = io.WriteString(w, `{"error":{"message":"SECRET_PARTIAL_BODY`)
+		panic("upstream died mid-body")
+	}))
+	s.Config.ErrorLog = log.New(io.Discard, "", 0)
+	s.Start()
+	defer s.Close()
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, s.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body read failed)", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpInvalid {
+		t.Errorf("body:\n got %s\nwant %s", body, envelopeUpInvalid)
+	}
+	if strings.Contains(rec.Body.String(), "SECRET_PARTIAL_BODY") {
+		t.Errorf("partial provider body relayed: %q", rec.Body.String())
+	}
+
+	readFailed := findLogEvent(t, logs.String(), "upstream_body_read_failed")
+	if lvl, _ := readFailed["level"].(string); lvl != "warn" {
+		t.Errorf("level = %v, want warn", readFailed["level"])
+	}
+	completed := findLogEvent(t, logs.String(), "request_completed")
+	if completed["outcome"] != "upstream_read_failed" {
+		t.Errorf("outcome = %v, want upstream_read_failed", completed["outcome"])
+	}
+	if completed["status"] != float64(http.StatusBadGateway) {
+		t.Errorf("status = %v, want 502", completed["status"])
+	}
+}
+
+// TestUpstreamHTTPErrorClientDisconnectDuringBodyRead pins the disconnect
+// classification on the error path: a client that cancels while the proxy is
+// reading the upstream error body gets client_disconnected — no envelope is
+// written for a connection that is already gone, and the event is never
+// misreported as an upstream failure.
+func TestUpstreamHTTPErrorClientDisconnectDuringBodyRead(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"mess`) // partial body, then silence
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		close(entered)
+		<-release
+	}))
+	defer up.Close()
+	defer close(release)
+
+	// logBuffer (mutex-guarded): the poll below reads from the test goroutine
+	// while ServeHTTP logs on its own, and -race runs in CI.
+	logs := &logBuffer{}
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), NewSharedClient(), zerolog.New(logs))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[]}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	// Wait until the upstream has committed its error headers (the proxy
+	// logs upstream_response_received the moment client.Do returns), then
+	// cancel: the capture read blocks on the silent remainder and dies on
+	// the canceled context — deterministically the mid-body path.
+	<-entered
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "upstream_response_received") {
+		if time.Now().After(deadline) {
+			t.Fatal("proxy never received the upstream error headers")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := rec.Body.String(); got != "" {
+		t.Errorf("envelope written for a gone client: %q", got)
+	}
+	relay := findLogEvent(t, logs.String(), "relay_copy_failed")
+	if lvl, _ := relay["level"].(string); lvl != "warn" {
+		t.Errorf("level = %v, want warn", relay["level"])
+	}
+	if relay["phase"] != "client_write" {
+		t.Errorf("phase = %v, want client_write", relay["phase"])
+	}
+	completed := findLogEvent(t, logs.String(), "request_completed")
+	if completed["outcome"] != "client_disconnected" {
+		t.Errorf("outcome = %v, want client_disconnected", completed["outcome"])
+	}
+	if completed["status"] != float64(0) {
+		t.Errorf("status = %v, want 0 (no response committed)", completed["status"])
+	}
+}
+
+// TestUpstreamErrorProviderTokensBounded pins the provider-token gate: the
+// error object's own type/code reach the log event only when they are
+// token-shaped (short printable ASCII) — a value past the bound or outside
+// it is dropped wholesale, and the provider's message never appears at all.
+func TestUpstreamErrorProviderTokensBounded(t *testing.T) {
+	longCode := strings.Repeat("c", maxProviderTokenBytes+1)
+	cases := []struct {
+		name     string
+		body     string
+		wantType any // nil = field absent
+		wantCode any
+	}{
+		{"token shaped", `{"error":{"message":"SECRET_MESSAGE_TOKEN","type":"rate_limit_error","code":"insufficient_quota"}}`, "rate_limit_error", "insufficient_quota"},
+		{"code past the bound", `{"error":{"message":"SECRET_MESSAGE_TOKEN","type":"rate_limit_error","code":"` + longCode + `"}}`, "rate_limit_error", nil},
+		{"code with a space", `{"error":{"message":"SECRET_MESSAGE_TOKEN","type":"rate_limit_error","code":"invalid code"}}`, "rate_limit_error", nil},
+		{"type with a newline", `{"error":{"message":"SECRET_MESSAGE_TOKEN","type":"bad\ntype","code":"x"}}`, nil, "x"},
+		{"numeric code", `{"error":{"message":"SECRET_MESSAGE_TOKEN","type":"rate_limit_error","code":429}}`, "rate_limit_error", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer upstream.Close()
+
+			var logs bytes.Buffer
+			h := NewHandler(newTestStore(t, upstream.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", rec.Code)
+			}
+
+			ev := findLogEvent(t, logs.String(), "upstream_http_error")
+			if got := ev["provider_error_type"]; got != tc.wantType {
+				t.Errorf("provider_error_type = %v, want %v", got, tc.wantType)
+			}
+			if got := ev["provider_error_code"]; got != tc.wantCode {
+				t.Errorf("provider_error_code = %v, want %v", got, tc.wantCode)
+			}
+			if strings.Contains(logs.String(), "SECRET_MESSAGE_TOKEN") {
+				t.Errorf("provider message reached logs:\n%s", logs.String())
+			}
+			if strings.Contains(logs.String(), longCode) {
+				t.Errorf("over-long provider code reached logs:\n%.200s…", logs.String())
+			}
+		})
+	}
+}
+
+// TestUpstreamMalformedHeaderLineSanitized pins #37 end to end over a real
+// transport: an upstream response whose header block fails to parse makes
+// client.Do fail with an error whose nested text quotes the raw upstream
+// line. Those bytes reach no log line — the sanitized error is static text
+// plus the origin — and the client gets the 502 upstream_unreachable
+// envelope.
+func TestUpstreamMalformedHeaderLineSanitized(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		// Best-effort drain of the request head; the response is refused on
+		// parse regardless of the body.
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 4096)
+		_, _ = c.Read(buf)
+		_, _ = c.Write([]byte("HTTP/1.1 500 Internal Server Error\r\nX-Bad\x01: SECRET_RAW_MARKER\r\nContent-Length: 0\r\n\r\n"))
+		time.Sleep(50 * time.Millisecond) // let the client read before the close
+	}()
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, "http://"+ln.Addr().String()+"/v1"), NewSharedClient(), zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (transport gave up on the malformed head)", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpUnreach {
+		t.Errorf("body = %s, want the upstream_unreachable envelope", body)
+	}
+
+	failed := findLogEvent(t, logs.String(), "upstream_request_failed")
+	if msg, _ := failed["error"].(string); !strings.Contains(msg, "upstream transport error") {
+		t.Errorf("sanitized error = %q, want static transport text (no nested parse text)", msg)
+	}
+	if strings.Contains(logs.String(), "SECRET_RAW_MARKER") {
+		t.Errorf("malformed header bytes reached logs:\n%s", logs.String())
+	}
+	<-served
+}
+
+// TestUpstreamHTTPErrorHostileHeaderValuesJSONSafe pins the log pipeline for
+// header values an upstream fully controls: tabs, quotes, backslashes, and
+// obs-text bytes ride into the evidence event's fields and every log line
+// stays valid JSON — nothing an upstream writes into a header value can
+// forge or break the JSON-lines contract.
+func TestUpstreamHTTPErrorHostileHeaderValuesJSONSafe(t *testing.T) {
+	// The equality-checked values stick to bytes that round-trip JSON
+	// escaping exactly (tab, quote, backslash); the obs-text byte (0x80,
+	// invalid UTF-8) is decoded to U+FFFD by the encoder and is only checked
+	// for log-line validity.
+	hostileCT := "application/json; x=\"q\\z\ty"
+	hostileRA := "30; \"x\\y\tz\x80\""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", hostileCT)
+		w.Header().Set("Retry-After", hostileRA)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), NewSharedClient(), zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+
+	// parseLogLines fails the test if any stderr line is not valid JSON.
+	var ev map[string]any
+	for _, m := range parseLogLines(t, logs.String()) {
+		if m["message"] == "upstream_http_error" {
+			ev = m
+		}
+	}
+	if ev == nil {
+		t.Fatalf("no upstream_http_error event:\n%s", logs.String())
+	}
+	if got, _ := ev["content_type"].(string); got != hostileCT {
+		t.Errorf("content_type = %q, want the hostile value carried intact (encoder-escaped)", got)
+	}
+	if got, _ := ev["retry_after"].(string); got != "30; \"x\\y\tz�\"" {
+		t.Errorf("retry_after = %q, want the hostile value with obs-text replaced by U+FFFD", got)
 	}
 }

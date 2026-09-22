@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -420,13 +421,101 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if isUpstreamHTTPError(resp.StatusCode) {
+		// Upstream HTTP errors are normalized, never relayed raw: the
+		// provider's status survives (a 429 answers 429 — collapsing it into
+		// a 502 would fog the root cause the same way it would for a 3xx),
+		// but the client body is always the canonical JSON envelope. HTML,
+		// text, or provider JSON — none of it passes through: an error body
+		// can echo request material and break SDK error decoding alike.
+		ev, err := captureUpstreamErrorEvidence(resp)
+		if err != nil {
+			// The same body-read vocabulary the buffered path applies: a
+			// read that died on the client side is a disconnect — no
+			// envelope is attempted for a connection that is already gone —
+			// and anything else is the upstream dying mid-answer, answered
+			// with the synthetic 502 rather than half a provider body.
+			if clientSide(err) {
+				outcome = "client_disconnected"
+				log.Warn().Err(err).Str("public_model", model).
+					Str("phase", "client_write").Msg("relay_copy_failed")
+				complete()
+				return
+			}
+			outcome = "upstream_read_failed"
+			log.Warn().Err(err).Str("public_model", model).Msg("upstream_body_read_failed")
+			reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
+			return
+		}
+		// Structured evidence at the phase split the transport failures
+		// already use: a 4xx is the provider answering (WARN), a 5xx is the
+		// provider failing (ERROR). Metadata only — the bounded body was
+		// reduced to shape + fingerprint inside the capture, the provider's
+		// own message never leaves it, and the endpoint appears as its
+		// scheme+host origin.
+		event := log.Warn()
+		if ev.status >= http.StatusInternalServerError {
+			event = log.Error()
+		}
+		event = event.Str("public_model", model).Str("upstream_model", m.UpstreamModel).
+			Str("upstream", origin(&upstream)).
+			Int("upstream_status", ev.status).
+			Str("content_type", ev.contentType).
+			Str("error_class", ev.class).
+			Str("error_shape", ev.shape).
+			Int64("body_bytes", ev.bodyBytes).
+			Bool("body_truncated", ev.truncated).
+			Str("error_fingerprint", ev.fingerprint)
+		for _, f := range evidenceRateLimitFields {
+			if v := ev.rateLimit[f.header]; v != "" {
+				event = event.Str(f.field, v)
+			}
+		}
+		if ev.providerType != "" {
+			event = event.Str("provider_error_type", ev.providerType)
+		}
+		if ev.providerCode != "" {
+			event = event.Str("provider_error_code", ev.providerCode)
+		}
+		event.Msg("upstream_http_error")
+
+		// The client answer: the upstream's own status, the operational
+		// headers from the relay allow-list, and a Content-Type that
+		// describes the body the client actually receives.
+		body, berr := ev.envelopeBytes()
+		if berr != nil {
+			// Unreachable for an all-string envelope, but the fallback must
+			// still be a canonical body — never raw upstream bytes.
+			body = []byte(envelopeUpInvalid)
+		}
+		copyRelayHeaders(sw.Header(), resp.Header)
+		sw.Header().Set(contentTypeHeader, envelopeJSONType)
+		sw.WriteHeader(ev.status)
+		if _, werr := sw.Write(body); werr != nil {
+			// The status committed and the envelope is canonical; a failed
+			// write means the client went away — a disconnect, not an
+			// upstream error.
+			outcome = "client_disconnected"
+			log.Warn().Err(werr).Str("public_model", model).
+				Int64("bytes_out", sw.bytes).Msg("client_write_failed")
+			complete()
+			return
+		}
+		outcome = "upstream_http_error"
+		log.Debug().Int64("bytes_out", sw.bytes).Msg("client_write_completed")
+		complete()
+		return
+	}
+
 	if resp.StatusCode >= http.StatusMultipleChoices || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
-		// Verbatim relay: anything outside a body-bearing 2xx — upstream
-		// errors (any 4xx/5xx), redirects (3xx, which CheckRedirect never
-		// follows), and the two body-less statuses, which are valid upstream
-		// answers. A 204 or an unexpected 3xx is the upstream's answer;
-		// turning it into a 502 would fog the root cause. Status and body
-		// relayed byte for byte, whatever the content type.
+		// Verbatim relay: redirects (3xx, which CheckRedirect never follows)
+		// and the two body-less statuses, which are valid upstream answers.
+		// A 204 or an unexpected 3xx is the upstream's answer; turning it
+		// into a 502 would fog the root cause. Status and body relayed byte
+		// for byte, whatever the content type. (4xx/5xx no longer reach this
+		// branch — the normalized-error branch above owns them. A status
+		// above 599, which no spec defines but a broken peer can emit, stays
+		// here: it is not ours to reshape either.)
 		copyRelayHeaders(sw.Header(), resp.Header)
 		sw.WriteHeader(resp.StatusCode)
 		if _, err := copyVerbatim(sw, resp.Body); err != nil {
@@ -614,22 +703,50 @@ func origin(u *url.URL) string {
 // URL: *url.Error.Error() quotes it verbatim, query string included. The
 // nested url parse/escape errors quote raw bytes too (the offending escape
 // sequence, the rejected host), so they are replaced with static text under
-// the same no-echo rule.
+// the same no-echo rule — and so is every nested error whose text is not
+// known to be echo-free: the transport's response-parsing failures (a
+// malformed MIME header line, a bad chunk size) quote the upstream's own
+// bytes verbatim, and those reach no log line at any level (#37).
 func sanitizeUpstreamError(err error, endpoint *url.URL) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		inner := ue.Err
 		var ee url.EscapeError
-		if errors.As(inner, &ee) {
-			inner = errors.New("invalid URL escape")
-		}
 		var he url.InvalidHostError
-		if errors.As(inner, &he) {
+		switch {
+		case errors.As(inner, &ee):
+			inner = errors.New("invalid URL escape")
+		case errors.As(inner, &he):
 			inner = errors.New("invalid host")
+		case !transportErrorTextSafe(inner):
+			inner = errors.New("upstream transport error")
 		}
 		return &url.Error{Op: ue.Op, URL: origin(endpoint), Err: inner}
 	}
 	return err
+}
+
+// transportErrorTextSafe reports whether an error's text is known to quote
+// nothing the upstream sent. The allow-listed shapes carry only our side of
+// the wire — addresses, syscall names, deadline markers — or upstream
+// identity (the TLS certificate chain): cancellation, deadlines, plain EOF,
+// net.Error timeouts, *net.OpError, TLS verification failures, and raw
+// errnos. Everything else (notably every net/textproto and HTTP/2 parse
+// failure, which interpolate the offending upstream bytes into their
+// message) collapses to static text in sanitizeUpstreamError; the
+// error_class token carries the classification either way.
+func transportErrorTextSafe(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ne net.Error
+	var oe *net.OpError
+	var te *tls.CertificateVerificationError
+	var errno syscall.Errno
+	return errors.As(err, &ne) || errors.As(err, &oe) ||
+		errors.As(err, &te) || errors.As(err, &errno)
 }
 
 // upstreamErrorClass buckets a client.Do error for logging. The error is

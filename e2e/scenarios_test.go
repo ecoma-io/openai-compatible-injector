@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -226,9 +227,10 @@ func TestChatMissingModel400(t *testing.T) {
 	}
 }
 
-// Scenario 7: upstream 4xx (401 text/plain) is forwarded verbatim: status,
-// bytes, and content-type.
-func TestUpstream4xxForwardedVerbatum(t *testing.T) {
+// Scenario 7: upstream 4xx (401 text/plain) is normalized: the status is
+// preserved, the body is the canonical envelope, and the provider's own
+// bytes never reach the client.
+func TestUpstream4xxNormalized(t *testing.T) {
 	up := newFakeUpstream(t)
 	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -243,16 +245,21 @@ func TestUpstream4xxForwardedVerbatum(t *testing.T) {
 	if status != http.StatusUnauthorized {
 		t.Fatalf("upstream 401 -> client status %d, want 401", status)
 	}
-	if string(body) != "denied." {
-		t.Fatalf("upstream 401 body %q, want %q forwarded verbatim", body, "denied.")
+	want := `{"error":{"message":"upstream provider returned HTTP 401","type":"upstream_error","param":null,"code":"upstream_http_401"}}`
+	if string(body) != want {
+		t.Fatalf("upstream 401 body %s, want canonical envelope %s", body, want)
 	}
-	if ct := hdr.Get("Content-Type"); ct != "text/plain" {
-		t.Fatalf("upstream 401 content-type %q, want %q", ct, "text/plain")
+	if strings.Contains(string(body), "denied.") {
+		t.Fatalf("provider body bytes relayed: %s", body)
+	}
+	if ct := hdr.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("upstream 401 content-type %q, want application/json", ct)
 	}
 }
 
-// Scenario 8: upstream 5xx (503 JSON) is forwarded verbatim.
-func TestUpstream5xxForwardedVerbatum(t *testing.T) {
+// Scenario 8: upstream 5xx (503 JSON) is normalized like a 4xx: status
+// preserved, canonical body, provider JSON replaced.
+func TestUpstream5xxNormalized(t *testing.T) {
 	up := newFakeUpstream(t)
 	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -267,11 +274,70 @@ func TestUpstream5xxForwardedVerbatum(t *testing.T) {
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("upstream 503 -> client status %d, want 503", status)
 	}
-	if string(body) != `{"error":"busy"}` {
-		t.Fatalf("upstream 503 body %q, want forwarded verbatim", body)
+	want := `{"error":{"message":"upstream provider returned HTTP 503","type":"upstream_error","param":null,"code":"upstream_http_503"}}`
+	if string(body) != want {
+		t.Fatalf("upstream 503 body %s, want canonical envelope %s", body, want)
+	}
+	if strings.Contains(string(body), "busy") {
+		t.Fatalf("provider body bytes relayed: %s", body)
 	}
 	if ct := hdr.Get("Content-Type"); ct != "application/json" {
-		t.Fatalf("upstream 503 content-type %q, want %q", ct, "application/json")
+		t.Fatalf("upstream 503 content-type %q, want application/json", ct)
+	}
+}
+
+// Scenario 8b: the error matrix end to end — every shape an upstream error
+// body can take (JSON, HTML, plain text) lands as the same canonical
+// envelope under its own status, and none of the provider's bytes pass
+// through in any of them. Retry-After rides along through the allow-list.
+func TestUpstreamErrorMatrix(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		banned      string
+	}{
+		{"429 json", http.StatusTooManyRequests, "application/json",
+			`{"error":{"message":"rate limited","type":"rate_limit_error"}}`, "rate limited"},
+		{"503 html", http.StatusServiceUnavailable, "text/html",
+			"<html>Service Unavailable</html>", "Service Unavailable"},
+		{"500 text", http.StatusInternalServerError, "text/plain",
+			"internal gateway failure", "gateway failure"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFakeUpstream(t)
+			up.setHandler(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.Header().Set("Retry-After", "30")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			p := startSubprocess(t, startOpts{
+				yaml: runtimeYAML(chatPublic, up.url()+"/v1", chatUpstream, ""),
+			})
+
+			status, hdr, body := postJSON(t, p.addr, "/v1/chat/completions", chatBody, nil)
+			if status != tc.status {
+				t.Fatalf("upstream %d -> client status %d, want %d", tc.status, status, tc.status)
+			}
+			want := `{"error":{"message":"upstream provider returned HTTP ` +
+				strconv.Itoa(tc.status) + `","type":"upstream_error","param":null,"code":"upstream_http_` +
+				strconv.Itoa(tc.status) + `"}}`
+			if string(body) != want {
+				t.Fatalf("body %s, want canonical envelope %s", body, want)
+			}
+			if strings.Contains(string(body), tc.banned) {
+				t.Fatalf("provider body bytes relayed: %s", body)
+			}
+			if ct := hdr.Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("content-type %q, want application/json", ct)
+			}
+			if ra := hdr.Get("Retry-After"); ra != "30" {
+				t.Fatalf("Retry-After %q, want 30 relayed through the allow-list", ra)
+			}
+		})
 	}
 }
 

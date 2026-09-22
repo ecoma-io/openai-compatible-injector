@@ -1,0 +1,203 @@
+package proxy
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// Pure-function coverage for the upstream error machinery: classification,
+// the provider-token gate, fingerprint determinism, and the envelope shape.
+// The handler-level behavior (status preservation, header relay, outcomes,
+// log evidence) lives in handler_test.go.
+
+func TestIsUpstreamHTTPError(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   bool
+	}{
+		{199, false}, {200, false}, {204, false}, {299, false}, {302, false}, {304, false},
+		{400, true}, {401, true}, {404, true}, {429, true}, {499, true},
+		{500, true}, {503, true}, {599, true},
+		{600, false}, // no spec defines it; the verbatim branch keeps it
+	} {
+		if got := isUpstreamHTTPError(tc.status); got != tc.want {
+			t.Errorf("isUpstreamHTTPError(%d) = %v, want %v", tc.status, got, tc.want)
+		}
+	}
+}
+
+func TestClassifyErrorBody(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantShape string
+		wantType  string
+		wantCode  string
+	}{
+		{"empty", "", shapeEmpty, "", ""},
+		{"openai shaped", `{"error":{"message":"m","type":"rate_limit_error","code":"insufficient_quota"}}`, shapeJSONObject, "rate_limit_error", "insufficient_quota"},
+		{"error member is a string", `{"error":"busy"}`, shapeJSON, "", ""},
+		{"error member is null", `{"error":null}`, shapeJSONObject, "", ""},
+		{"json without error member", `{"detail":"nope"}`, shapeJSON, "", ""},
+		{"json array", `[1,2,3]`, shapeJSON, "", ""},
+		{"json string", `"oops"`, shapeJSON, "", ""},
+		{"json number", `42`, shapeJSON, "", ""},
+		{"text", "internal gateway failure", shapeText, "", ""},
+		{"html text", "<html>Service Unavailable</html>", shapeText, "", ""},
+		{"malformed object", `{"error":`, shapeMalformed, "", ""},
+		{"malformed array", `["unclosed`, shapeMalformed, "", ""},
+		{"malformed with leading space", "  {\"error\":", shapeMalformed, "", ""},
+		{"non-token type kept out", `{"error":{"type":"not a token","code":"ok"}}`, shapeJSONObject, "", "ok"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shape, ptype, pcode := classifyErrorBody([]byte(tc.body))
+			if shape != tc.wantShape || ptype != tc.wantType || pcode != tc.wantCode {
+				t.Errorf("classifyErrorBody(%q) = (%q, %q, %q), want (%q, %q, %q)",
+					tc.body, shape, ptype, pcode, tc.wantShape, tc.wantType, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestPrintableToken(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"rate_limit_error", "rate_limit_error"},
+		{"429", "429"},
+		{strings.Repeat("c", maxProviderTokenBytes), strings.Repeat("c", maxProviderTokenBytes)},
+		{strings.Repeat("c", maxProviderTokenBytes+1), ""},
+		{"has space", ""},
+		{"has\ttab", ""},
+		{"has\nnewline", ""},
+		{"hög", ""}, // non-ASCII (multibyte) is not a token
+	} {
+		if got := printableToken(tc.in); got != tc.want {
+			t.Errorf("printableToken(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestCaptureUpstreamErrorEvidence pins the capture contract on a synthetic
+// response: cap+1 read (never a full body), truncation flag, fingerprint
+// over the bounded prefix, class bucketing, and the allow-listed rate-limit
+// harvest.
+func TestCaptureUpstreamErrorEvidence(t *testing.T) {
+	body := `{"error":{"message":"m","type":"server_error"}}`
+	// Header.Set canonicalizes the keys — a map literal with as-written
+	// spellings ("X-RateLimit-…") would store non-canonical keys that
+	// Header.Get never finds, and real responses always arrive canonical.
+	hdr := http.Header{}
+	hdr.Set("Content-Type", "application/json")
+	hdr.Set("Retry-After", "30")
+	hdr.Set("X-RateLimit-Reset-Tokens", "1.5s")
+	hdr.Set("X-Session", "dropped")
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     hdr,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	ev, err := captureUpstreamErrorEvidence(resp)
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if ev.status != http.StatusServiceUnavailable || ev.class != "upstream_http_5xx" {
+		t.Errorf("status/class = %d/%q", ev.status, ev.class)
+	}
+	if ev.shape != shapeJSONObject || ev.providerType != "server_error" {
+		t.Errorf("shape/providerType = %q/%q", ev.shape, ev.providerType)
+	}
+	if ev.bodyBytes != int64(len(body)) || ev.truncated {
+		t.Errorf("bodyBytes/truncated = %d/%v, want %d/false", ev.bodyBytes, ev.truncated, len(body))
+	}
+	sum := sha256.Sum256([]byte(body))
+	if ev.fingerprint != hex.EncodeToString(sum[:]) {
+		t.Errorf("fingerprint = %q, want sha256 of the whole body", ev.fingerprint)
+	}
+	if ev.rateLimit["Retry-After"] != "30" || ev.rateLimit["X-RateLimit-Reset-Tokens"] != "1.5s" {
+		t.Errorf("rateLimit = %v", ev.rateLimit)
+	}
+	if _, ok := ev.rateLimit["X-Session"]; ok {
+		t.Errorf("non-allow-listed header harvested into evidence: %v", ev.rateLimit)
+	}
+}
+
+// TestCaptureUpstreamErrorEvidenceTruncated pins the cap arithmetic: reading
+// cap+1 bytes, clamping the capture to the cap, and fingerprinting only the
+// prefix.
+func TestCaptureUpstreamErrorEvidenceTruncated(t *testing.T) {
+	old := maxUpstreamErrorBodyBytes
+	maxUpstreamErrorBodyBytes = 8
+	defer func() { maxUpstreamErrorBodyBytes = old }()
+
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader("0123456789abcdef")),
+	}
+	ev, err := captureUpstreamErrorEvidence(resp)
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if !ev.truncated {
+		t.Error("truncated = false, want true (body crossed the cap)")
+	}
+	if ev.bodyBytes != 8 {
+		t.Errorf("bodyBytes = %d, want 8 (the capped prefix)", ev.bodyBytes)
+	}
+	if ev.shape != shapeTruncated {
+		t.Errorf("shape = %q, want truncated", ev.shape)
+	}
+	sum := sha256.Sum256([]byte("01234567"))
+	if ev.fingerprint != hex.EncodeToString(sum[:]) {
+		t.Errorf("fingerprint = %q, want sha256 of the 8-byte prefix", ev.fingerprint)
+	}
+}
+
+func TestUpstreamErrorEnvelopeBytes(t *testing.T) {
+	for _, status := range []int{400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504} {
+		ev := upstreamErrorEvidence{status: status}
+		got, err := ev.envelopeBytes()
+		if err != nil {
+			t.Fatalf("envelope(%d): %v", status, err)
+		}
+		want := `{"error":{"message":"upstream provider returned HTTP ` + strconv.Itoa(status) +
+			`","type":"upstream_error","param":null,"code":"upstream_http_` + strconv.Itoa(status) + `"}}`
+		if string(got) != want {
+			t.Errorf("status %d envelope:\n got %s\nwant %s", status, got, want)
+		}
+	}
+}
+
+// TestCaptureUpstreamErrorRateLimitBound pins the harvest bound: an oversized
+// allow-listed header value is dropped wholesale from the evidence — a
+// hostile peer cannot balloon one log line per request — while a real-sized
+// value rides along. The client-side relay is a separate allow-list and is
+// deliberately untouched.
+func TestCaptureUpstreamErrorRateLimitBound(t *testing.T) {
+	hdr := http.Header{}
+	hdr.Set("Retry-After", strings.Repeat("9", maxRateLimitHeaderBytes+1))
+	hdr.Set("X-RateLimit-Limit", "100")
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     hdr,
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+	}
+	ev, err := captureUpstreamErrorEvidence(resp)
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if _, ok := ev.rateLimit["Retry-After"]; ok {
+		t.Errorf("oversized Retry-After harvested into evidence: %d bytes", maxRateLimitHeaderBytes+1)
+	}
+	if ev.rateLimit["X-RateLimit-Limit"] != "100" {
+		t.Errorf("X-RateLimit-Limit = %v, want 100 (under the bound)", ev.rateLimit["X-RateLimit-Limit"])
+	}
+}
