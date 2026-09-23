@@ -275,6 +275,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// (whose upstream_model the usage record then carries — no answer
 		// arrived, so there are no usage tokens to report either).
 		lastCand config.Candidate
+		// ansEgressKind is the RELAYED answer's own egress mode, captured
+		// when its candidate was left behind and its answer retained: the
+		// last-attempt candidate's egress report would name the one that
+		// failed, not the one the client's response came from. Empty when
+		// the answer came from the walk's final candidate.
+		ansEgressKind string
 		// egress carries the pool's attempt report of the LAST provider
 		// candidate this request executed through (nil when none of them
 		// routed through a pool): how many distinct endpoints were actually
@@ -299,14 +305,22 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// upstream answered non-SSE is relayed buffered, and the record says
 		// what happened, not what was asked.
 		streamed bool
-		// providerAttempts/finalProvider report the provider walk: how many
-		// chain candidates were tried and the identity (providers-table
-		// name, or endpoint origin) of the last one — the candidate that
-		// answered, or the last one that failed. providerExhausted marks
-		// the walk ending with no candidate answering.
+		// providerAttempts counts the walk's upstream EXCHANGES — each
+		// candidate's initial attempt plus its same-candidate retries —
+		// and finalProvider is the identity (providers-table name, or
+		// endpoint origin) of the candidate whose answer was committed or,
+		// on exhaustion/disconnect, of the last one attempted.
+		// providerExhausted marks the walk ending with no candidate
+		// answering. retriesTotal counts the same-candidate status retries
+		// the walk performed; lastCandIndex is the one-based chain position
+		// of the most recent candidate — the answering one whenever an
+		// answer was committed (an answer is always committed for the
+		// current candidate), else the last attempted one.
 		providerAttempts  int
 		finalProvider     string
 		providerExhausted bool
+		retriesTotal      int
+		lastCandIndex     int
 	)
 	withEgress := func(ev *zerolog.Event) *zerolog.Event {
 		if egress == nil {
@@ -322,6 +336,8 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			return ev
 		}
 		ev = ev.Int("provider_attempts", providerAttempts).
+			Int("retries_total", retriesTotal).
+			Int("final_candidate", lastCandIndex).
 			Str("final_provider", finalProvider)
 		if providerExhausted {
 			ev = ev.Bool("provider_exhausted", true)
@@ -355,6 +371,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			egressKind := "direct"
 			if egress != nil {
 				egressKind = egress.Kind
+			}
+			if ansEgressKind != "" {
+				// The relayed answer was retained from a candidate the walk
+				// later left: its own egress mode names where the client's
+				// response came from, not where the last dial failed.
+				egressKind = ansEgressKind
 			}
 			h.meter.Record(usage.Event{
 				EventID:          usage.NewEventID(),
@@ -516,17 +538,33 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	log.Debug().Int64("bytes_in", bytesIn).Msg("request_transform_started")
 
 	// The provider walk. The model's candidate chain is tried primary
-	// first under the snapshot's provider-fallback policy. Each attempt
-	// replays the same immutable client body through the candidate's own
-	// transform (its upstream model name and endpoint differ — replay
-	// safety: nothing observed on an earlier attempt feeds the next), and
-	// every candidate's response — any status — ends the walk. Only
-	// transport-level failures (dial, TLS, proxy, egress exhaustion) move
-	// to the next candidate: a 429 or a 500 is the upstream's answer, and
-	// relaying it is the contract. Nothing is retried after the client is
-	// committed, either: the walk happens entirely before the first
-	// response byte, so streaming commitment holds by construction — the
-	// candidate that produces headers has produced THE response.
+	// first under the snapshot's provider-fallback policy, and the
+	// snapshot-bound status matrix (retry.go) decides what one upstream
+	// result means for the walk:
+	//
+	//   - retryable results — 408/425/429, every 5xx except 501/505, and
+	//     a malformed or incomplete response received before commitment —
+	//     re-ask the SAME candidate while its retry budget lasts (bounded
+	//     count, bounded elapsed window, capped backoff, capped
+	//     Retry-After), then move to the next candidate;
+	//   - fallback-only results — 401/403/404/405/409/422 — move to the
+	//     next candidate immediately, never re-asking the same one;
+	//   - terminal results (every other 4xx/5xx) and answers (2xx/3xx/
+	//     204/304) end the walk;
+	//   - transport-level failures (dial, TLS, proxy, egress exhaustion)
+	//     never re-ask the same candidate — they move to the next one
+	//     directly.
+	//
+	// Each attempt replays the same immutable client body through the
+	// candidate's own transform (its upstream model name and endpoint
+	// differ — replay safety: nothing observed on an earlier attempt feeds
+	// the next). Nothing is ever written to the client until the walk
+	// commits one final result — the walk happens entirely before the
+	// first response byte, so streaming commitment holds by construction:
+	// the candidate that produces headers has produced THE response, and
+	// no retry follows commitment. A caller cancellation or deadline is
+	// terminal everywhere: it ends the attempt, the walk, and any pending
+	// retry wait.
 	//
 	// Local validation never falls back: a body that fails one candidate's
 	// transform fails every candidate's transform (the transform sees only
@@ -540,13 +578,63 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	if budget > len(m.Chain) {
 		budget = len(m.Chain)
 	}
+	// Caller deadline, read once: the retry decisions cap their waits to
+	// the caller's remaining time, and the walk never outlives it.
+	callerDeadline, _ := r.Context().Deadline()
+
+	// answerKind is the committed result's shape, chosen by the post-walk
+	// relay branches. answerSSE and answerVerbatim hold the live response;
+	// every other kind was fully consumed (or synthesized) inside the walk
+	// and carries only retained facts.
+	type answerKind int
+	const (
+		answerSSE answerKind = iota
+		answerVerbatim
+		answerBuffered
+		answerHTTPError
+		answerInvalid
+	)
+	// walkAnswer is the one result the walk commits — or none, on
+	// exhaustion, disconnect, or local rejection. Discarded attempts
+	// retain no bytes: by the time the next attempt starts, the failed
+	// one's evidence is already reduced to the bounded evidence struct
+	// (or the closed tokens) and its body is closed.
+	type walkAnswer struct {
+		kind      answerKind
+		resp      *http.Response // live response (answerSSE, answerVerbatim)
+		body      []byte         // validated 2xx body (answerBuffered)
+		header    http.Header    // the committed answer's upstream headers
+		status    int
+		ev        upstreamErrorEvidence // answerHTTPError
+		invalid   int                   // answerInvalid flavor (invalid*)
+		cand      config.Candidate
+		candIndex int // one-based chain position
+		// egressKind is this attempt's own egress mode — the pool's last
+		// dialed member's kind, or direct. It rides along so a retained
+		// answer's usage record names ITS egress, not the last failed
+		// candidate's.
+		egressKind string
+	}
+	// answerInvalid flavors: what made a 200-shaped response unusable.
+	// They share the 502 upstream_invalid_response envelope but not the
+	// outcome token.
+	const (
+		invalidBody        = iota + 1 // unparseable or over-cap 2xx body
+		invalidReadFailed             // the 2xx body read failed mid-answer
+		invalidBodyTimeout            // an error body's capture stalled past its deadline
+	)
 
 	var (
-		resp *http.Response
-		// finalCand is the candidate that produced the response. On
-		// exhaustion it stays zero and the last-attempt fields below carry
-		// the failure report.
-		finalCand config.Candidate
+		answer *walkAnswer
+		// retained is the walk's last received HTTP answer that did NOT end
+		// the walk (its candidate's retry budget ran out and the walk moved
+		// on). If every remaining candidate then fails before answering,
+		// this answer — not a synthesized 502 — is the client's response:
+		// the final error is the last received HTTP answer, and the
+		// unreachable synthesis is reserved for walks that never received
+		// one. Only the retained facts survive: evidence struct, envelope,
+		// relay headers. One slot, replaced per newer answer.
+		retained *walkAnswer
 		// lastUpstream is the request URL of the most recent attempt — the
 		// answering candidate's URL on success, the last failed one's on
 		// exhaustion. Log-safe surfaces only (origin()).
@@ -555,7 +643,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// report after the walk carries it.
 		lastUerr error
 		// lastEgressAttempt is the final egress dial index of the most
-		// recent candidate — 1 on the single-endpoint path, the pool's dial
+		// recent attempt — 1 on the single-endpoint path, the pool's dial
 		// count on a pooled one, 0 when a pool dialed nothing. It feeds the
 		// attempt indexes on the events after the walk, and is never
 		// invented for a zero-dial exhaustion.
@@ -565,16 +653,81 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// failure happened: re-classifying after the walk could let a client
 		// disconnect that raced the loop's end re-own an endpoint failure.
 		lastFailureCause string
+		// candidatesTried is how many chain candidates this walk has
+		// entered — the provider-fallback budget's denominator.
+		candidatesTried int
+		// retryStart is the current candidate's first-attempt timestamp;
+		// its elapsed window (retries.max-elapsed) measures from here.
+		retryStart time.Time
 	)
+
+	// decide evaluates one failed attempt against the snapshot-bound retry
+	// policy — the walk's only decision point. It feeds facts (which kind
+	// of failure, the candidate's own budget state, whether a next
+	// candidate is still reachable, the parsed Retry-After) and gets back
+	// a flow, never I/O.
+	decide := func(disp statusDisposition, attempt, i, tried int, ra time.Duration) retryDecision {
+		return evaluateRetry(retryInput{
+			Disp:           disp,
+			Attempts:       attempt,
+			HasNext:        i+1 < len(m.Chain) && tried < budget,
+			Start:          retryStart,
+			Now:            retryNow(),
+			Policy:         m.Retries,
+			CallerDeadline: callerDeadline,
+			RetryAfter:     ra,
+		})
+	}
+	// waitOut sleeps a same-candidate retry's bounded delay, cancellable.
+	// False means the caller went away during the wait: the request is
+	// done — no further attempt, no envelope, only the completion record.
+	waitOut := func(dec retryDecision) bool {
+		if dec.Action != retrySameCandidate {
+			return true
+		}
+		// retryWait is the only sleep site and reports the context's
+		// liveness. A delay capped to zero has nothing to sleep for, but the
+		// context is still consulted — jitter can floor a backoff at zero,
+		// and a caller already gone must not get another dial.
+		var live bool
+		if dec.Delay > 0 {
+			live = retryWait(r.Context(), dec.Delay)
+		} else {
+			live = r.Context().Err() == nil
+		}
+		if !live {
+			outcome = "client_disconnected"
+			complete()
+			return false
+		}
+		return true
+	}
+	// answerFor reduces one captured 4xx/5xx answer to the facts the walk
+	// retains: the evidence struct and relay headers on a complete capture,
+	// or the typed invalid flavor when the capture itself failed or
+	// stalled. Both the finalize and the retention routes go through it, so
+	// the answer the client sees is the same shape however the walk ends.
+	answerFor := func(cerr captureError, ev upstreamErrorEvidence, resp *http.Response, status int, cand config.Candidate, i int, egressKind string) *walkAnswer {
+		if cerr == captureOK {
+			return &walkAnswer{kind: answerHTTPError, ev: ev, header: resp.Header, status: status, cand: cand, candIndex: i + 1, egressKind: egressKind}
+		}
+		if cerr == captureDeadline {
+			return &walkAnswer{kind: answerInvalid, invalid: invalidBodyTimeout, cand: cand, candIndex: i + 1, egressKind: egressKind}
+		}
+		return &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, egressKind: egressKind}
+	}
+walk:
 	for i := range m.Chain {
-		if providerAttempts >= budget {
+		if candidatesTried >= budget {
 			break
 		}
 		cand := m.Chain[i]
-		providerAttempts++
+		candidatesTried++
+		lastCandIndex = i + 1
 		finalProvider = cand.Label()
 		lastCand = cand
 		egress = nil
+		retryStart = retryNow()
 
 		// The candidate view: same public model, same injection prompt,
 		// same thinking plan — only the upstream identity changes. m is a
@@ -585,176 +738,449 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		m.UpstreamModel = cand.UpstreamModel
 		m.Transport = cand.Transport
 
-		out, terr := transform(body, m)
-		if terr != nil {
-			outcome = "transform_error"
-			reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
-			return
-		}
-		log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
+		attempt := 0
+		for {
+			attemptStart := retryNow()
+			// A next candidate is reachable only when the chain has one
+			// AND the fallback budget still covers it.
+			hasNext := i+1 < len(m.Chain) && candidatesTried < budget
 
-		upstream := *cand.Endpoint
-		// Trim every trailing slash ("trailing slashes ignored" holds for any
-		// number) and clear RawPath: mutating Path can leave a RawPath that no
-		// longer matches, which makes EscapedPath silently percent-decode the
-		// endpoint path. Encoded endpoint paths are normalized, not preserved.
-		upstream.Path = strings.TrimRight(upstream.Path, "/") + suffix
-		upstream.RawPath = ""
-
-		req, rerr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String(), bytes.NewReader(out))
-		if rerr != nil {
-			// Unreachable by construction (the endpoint was validated to a
-			// *url.URL at config load), but if it ever fires the raw error
-			// text must still not reach logs — it would embed the full URL.
-			log.Error().Str("model", model).
-				Str("upstream", origin(&upstream)).
-				Str("error_class", "request_build").
-				Msg("upstream_request_build_failed")
-			outcome = "upstream_unreachable"
-			reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
-			return
-		}
-		copyForwardHeaders(req.Header, r.Header)
-		// This request has now reached the provider path. Any subsequent
-		// dial failure still yields one event with the walk's final facts.
-		meterEvent = true
-		log.Debug().Str("provider", cand.Label()).
-			Str("upstream", origin(&upstream)).
-			Int64("bytes_out", int64(len(out))).
-			Int("provider_attempt", providerAttempts).
-			Msg("upstream_request_started")
-		lastUpstream = &upstream
-
-		// The outbound hop: the candidate's provider transport, resolved
-		// from the request's snapshot. Any HTTP status — 429, 5xx, an
-		// unexpected 3xx — is the upstream's answer and returns as a
-		// response; only transport-level failures (dial, TLS, cancellation
-		// before headers) return an error, classified below.
-		//
-		// A pool transport owns the egress attempt loop past this point:
-		// the handler hands it the request facts its eligibility gates need
-		// (the outgoing body, the client-declared stream flag) and the pool
-		// returns one response or one error — selection, bounded fallback,
-		// and exhaustion are its business, and no egress retry exists after
-		// it returns. The single-endpoint path is exactly the historical
-		// Do(req).
-		var uerr error
-		d := h.doers.Doer(cand.Transport)
-		ex, pooled := d.(transport.Executor)
-		if pooled {
-			var info transport.AttemptInfo
-			resp, info, uerr = ex.Execute(&transport.AttemptRequest{
-				Ctx:       r.Context(),
-				Method:    http.MethodPost,
-				URL:       &upstream,
-				Header:    req.Header.Clone(),
-				Body:      out,
-				Streaming: stream,
-			})
-			egress = &info
-			egressAttemptsTotal += info.Attempts
-			lastEgressAttempt = info.Attempts
-			// Per-attempt evidence, bounded by the fallback budget: one WARN
-			// per dialed-and-failed endpoint, correlated by this request's
-			// request_id and its one-based provider/egress attempt indexes.
-			// Typed class, closed-set cause, and scheme+host only — the error
-			// text, any credential material, and skipped members (no dial, no
-			// event) stay out. attempt rides along as the pre-existing alias
-			// for egress_attempt; the new field is authoritative.
-			for j, fl := range info.Failures {
-				log.Warn().Str("public_model", model).
-					Str("provider", cand.Label()).
-					Str("egress_kind", fl.Kind).Str("egress_target", fl.Target).
-					Str("error_class", fl.Class).Str("error_cause", fl.Cause).
-					Int("provider_attempt", providerAttempts).
-					Int("egress_attempt", j+1).
-					Int("attempt", j+1).
-					Msg("egress_attempt_failed")
+			out, terr := transform(body, m)
+			if terr != nil {
+				outcome = "transform_error"
+				reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+				return
 			}
-		} else {
-			resp, uerr = d.Do(req)
-			// One exchange, dialed or failed — the attempt happened either way.
-			egressAttemptsTotal++
-			lastEgressAttempt = 1
-		}
-		if uerr == nil {
-			finalCand = cand
+			log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
+
+			upstream := *cand.Endpoint
+			// Trim every trailing slash ("trailing slashes ignored" holds for any
+			// number) and clear RawPath: mutating Path can leave a RawPath that no
+			// longer matches, which makes EscapedPath silently percent-decode the
+			// endpoint path. Encoded endpoint paths are normalized, not preserved.
+			upstream.Path = strings.TrimRight(upstream.Path, "/") + suffix
+			upstream.RawPath = ""
+
+			req, rerr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.String(), bytes.NewReader(out))
+			if rerr != nil {
+				// Unreachable by construction (the endpoint was validated to a
+				// *url.URL at config load), but if it ever fires the raw error
+				// text must still not reach logs — it would embed the full URL.
+				log.Error().Str("model", model).
+					Str("upstream", origin(&upstream)).
+					Str("error_class", "request_build").
+					Msg("upstream_request_build_failed")
+				outcome = "upstream_unreachable"
+				reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+				return
+			}
+			copyForwardHeaders(req.Header, r.Header)
+			// Counted here, not at the loop head: these count upstream
+			// EXCHANGES, so a transform or request-build failure above — which
+			// never reaches a provider — must not report an attempt that never
+			// happened. attempt is candidate-local (its own retries included);
+			// providerAttempts is the walk's global exchange index.
+			attempt++
+			providerAttempts++
+			retryIndex := attempt - 1
+			if retryIndex > 0 {
+				retriesTotal++
+			}
+			// This request has now reached the provider path. Any subsequent
+			// dial failure still yields one event with the walk's final facts.
+			meterEvent = true
+			log.Debug().Str("provider", cand.Label()).
+				Str("upstream", origin(&upstream)).
+				Int64("bytes_out", int64(len(out))).
+				Int("provider_attempt", providerAttempts).
+				Int("candidate_index", i+1).
+				Int("candidate_attempt", attempt).
+				Int("retry_index", retryIndex).
+				Msg("upstream_request_started")
+			lastUpstream = &upstream
+
+			// The outbound hop: the candidate's provider transport, resolved
+			// from the request's snapshot. Any HTTP status — 429, 5xx, an
+			// unexpected 3xx — is the upstream's answer and returns as a
+			// response; only transport-level failures (dial, TLS, cancellation
+			// before headers) return an error, classified below.
+			//
+			// A pool transport owns the egress attempt loop past this point:
+			// the handler hands it the request facts its eligibility gates need
+			// (the outgoing body, the client-declared stream flag) and the pool
+			// returns one response or one error — selection, bounded fallback,
+			// and exhaustion are its business, and no egress retry exists after
+			// it returns. The single-endpoint path is exactly the historical
+			// Do(req).
+			var uerr error
+			var resp *http.Response
+			d := h.doers.Doer(cand.Transport)
+			ex, pooled := d.(transport.Executor)
+			if pooled {
+				var info transport.AttemptInfo
+				resp, info, uerr = ex.Execute(&transport.AttemptRequest{
+					Ctx:       r.Context(),
+					Method:    http.MethodPost,
+					URL:       &upstream,
+					Header:    req.Header.Clone(),
+					Body:      out,
+					Streaming: stream,
+				})
+				egress = &info
+				egressAttemptsTotal += info.Attempts
+				lastEgressAttempt = info.Attempts
+				// Per-attempt evidence, bounded by the fallback budget: one WARN
+				// per dialed-and-failed endpoint, correlated by this request's
+				// request_id and its one-based provider/egress attempt indexes.
+				// Typed class, closed-set cause, and scheme+host only — the error
+				// text, any credential material, and skipped members (no dial, no
+				// event) stay out. attempt rides along as the pre-existing alias
+				// for egress_attempt; the new field is authoritative.
+				for j, fl := range info.Failures {
+					event := withAttemptFields(log.Warn().Str("public_model", model).
+						Str("provider", cand.Label()).
+						Str("egress_kind", fl.Kind).Str("egress_target", fl.Target).
+						Str("error_class", fl.Class).Str("error_cause", fl.Cause).
+						Int("egress_attempt", j+1).
+						Int("attempt", j+1),
+						providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+					event.Msg("egress_attempt_failed")
+				}
+			} else {
+				resp, uerr = d.Do(req)
+				// One exchange, dialed or failed — the attempt happened either way.
+				egressAttemptsTotal++
+				lastEgressAttempt = 1
+			}
+			// This attempt's own egress mode — the pool's last dialed
+			// member's kind, or direct. It rides with any answer the attempt
+			// leaves behind, so a retained answer's records name ITS egress.
+			kindHere := "direct"
+			if pooled {
+				kindHere = egress.Kind
+			}
+
+			// Transport-level failure. One classification, one owner: the
+			// context the attempt ran under decides whether the client's own
+			// cancellation or deadline ended the request — terminal, no
+			// fallback, no envelope, no retry — or the failure is the
+			// endpoint's and moves the walk to its next candidate. A caller
+			// deadline must never read as a provider-local timeout, and a
+			// transport failure never re-asks the same endpoint: the retry
+			// budgets are for answers, not for dead sockets.
+			if uerr != nil {
+				lastUerr = uerr
+				f := transport.ClassifyAttempt(r.Context(), uerr)
+				class, cause := f.Class.String(), f.Cause
+				if !f.CallerTerminated && pooled && egress.Exhausted {
+					// Zero dials is a pool-level condition — no member was
+					// blamed — so the endpoint vocabulary would be an
+					// invention.
+					class, cause = "egress_exhausted", "no_eligible_endpoint"
+				}
+				lastFailureCause = cause
+				if f.CallerTerminated {
+					// The client went away — canceled, or done waiting —
+					// before any upstream answered. No fallback: there is
+					// nobody left to answer. The outcome is the disconnect
+					// either way; an upstream_unreachable 502 would misreport
+					// a client-side event as an upstream failure.
+					outcome = "client_disconnected"
+					event := withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
+						Str("public_model", model).
+						Str("provider", cand.Label()).
+						Str("upstream", origin(&upstream)).
+						Str("error_class", class).
+						Str("error_cause", cause).
+						Str("disposition", "terminal").
+						Str("reason", cause)
+					if lastEgressAttempt > 0 {
+						event = event.Int("egress_attempt", lastEgressAttempt)
+					}
+					event = withAttemptFields(event, providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+					event.Msg("upstream_request_failed")
+					complete()
+					return
+				}
+				// Uniform egress evidence on the single-endpoint path: a
+				// direct failure gets the same per-dial record a pool
+				// member's failure gets (kind direct, first egress attempt),
+				// so downstream queries need no knowledge of which transport
+				// served the candidate.
+				if !pooled {
+					event := withAttemptFields(log.Warn().Str("public_model", model).
+						Str("provider", cand.Label()).
+						Str("egress_kind", "direct").Str("egress_target", "direct").
+						Str("error_class", class).Str("error_cause", cause).
+						Int("egress_attempt", 1),
+						providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+					event.Msg("egress_attempt_failed")
+				}
+				// Transport-level failure with the client still present: one
+				// WARN per failed attempt — the *url.Error from client.Do
+				// embeds the full request URL, query string included, which
+				// is how query-authenticated providers leak credentials, so
+				// the sanitized error and the scheme+host origin only — then
+				// the next candidate (or the exhaustion report after the
+				// walk, when the budget is spent).
+				event := withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
+					Str("public_model", model).
+					Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Str("error_class", class).
+					Str("error_cause", cause).
+					Str("disposition", dispositionName(moveOrFinalize(hasNext).Action)).
+					Str("reason", cause)
+				if lastEgressAttempt > 0 {
+					event = event.Int("egress_attempt", lastEgressAttempt)
+				}
+				event = withAttemptFields(event, providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+				event.Msg("provider_attempt_failed")
+				break
+			}
+
+			// An HTTP answer arrived. Logged per exchange (discarded
+			// retries included), then classified by shape BEFORE any body
+			// read, in the same precedence the relay branches have always
+			// used: normalized error, verbatim status, SSE, buffered 2xx.
 			withEgress(log.Debug()).Int("status", resp.StatusCode).
 				Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))).
 				Int("provider_attempt", providerAttempts).
 				Int("egress_attempt", lastEgressAttempt).
+				Int("candidate_index", i+1).
+				Int("candidate_attempt", attempt).
+				Int("retry_index", retryIndex).
 				Msg("upstream_response_received")
-			break
-		}
-		lastUerr = uerr
-		// One classification, one owner: the context the attempt ran under
-		// decides whether the client's own cancellation or deadline ended the
-		// request — terminal, no fallback, no envelope — or the failure is
-		// the endpoint's and keeps its bounded fallback eligibility. A caller
-		// deadline must never read as a provider-local timeout.
-		f := transport.ClassifyAttempt(r.Context(), uerr)
-		class, cause := f.Class.String(), f.Cause
-		if !f.CallerTerminated && pooled && egress.Exhausted {
-			// Zero dials is a pool-level condition — no member was blamed —
-			// so the endpoint vocabulary would be an invention.
-			class, cause = "egress_exhausted", "no_eligible_endpoint"
-		}
-		lastFailureCause = cause
-		if f.CallerTerminated {
-			// The client went away — canceled, or done waiting — before any
-			// upstream answered. No fallback: there is nobody left to
-			// answer. The outcome is the disconnect either way; an
-			// upstream_unreachable 502 would misreport a client-side event
-			// as an upstream failure.
-			outcome = "client_disconnected"
-			event := withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
-				Str("public_model", model).
-				Str("provider", cand.Label()).
-				Str("upstream", origin(&upstream)).
-				Str("error_class", class).
-				Str("error_cause", cause).
-				Int("provider_attempt", providerAttempts)
-			if lastEgressAttempt > 0 {
-				event = event.Int("egress_attempt", lastEgressAttempt)
+			status := resp.StatusCode
+
+			if isUpstreamHTTPError(status) {
+				// The evidence capture is reused unchanged: one bounded read
+				// reduces the error body to shape + fingerprint before any
+				// decision, and the capture's own failure modes are
+				// retryable results — the candidate has not produced a
+				// usable answer.
+				ev, cerr := captureUpstreamErrorEvidence(r.Context(), resp)
+				_ = resp.Body.Close()
+				if cerr == captureCallerEnded {
+					// The caller's context ended mid-capture — canceled, or
+					// done waiting. Ownership stays with the caller: no
+					// envelope for a client that is gone, and no retry burns
+					// budget for nobody.
+					outcome = "client_disconnected"
+					log.Warn().Str("public_model", model).
+						Str("phase", "client_write").Msg("relay_copy_failed")
+					complete()
+					return
+				}
+				var (
+					disp   statusDisposition
+					reason string
+					ra     time.Duration
+				)
+				switch cerr {
+				case captureOK:
+					disp = classifyStatus(status)
+					reason = statusReason(status)
+				case captureDeadline:
+					// An error body whose bounded capture stalled: the status
+					// never really arrived, so its own row in the matrix does
+					// not apply — an unusable answer is retryable whatever
+					// code it was carrying.
+					disp = dispRetryable
+					reason = reasonBodyTimeout
+				default:
+					disp = dispRetryable
+					reason = reasonBodyReadFailed
+				}
+				if disp == dispRetryable {
+					// A bounded directive, honored only for same-candidate
+					// retries and always re-capped by the policy before any
+					// sleep. It rides the response, not the body: a stalled
+					// capture still read the headers.
+					ra = parseRetryAfter(resp.Header.Get("Retry-After"), retryNow())
+				}
+				dec := decide(disp, attempt, i, candidatesTried, ra)
+				// One evidence event per received error response — the
+				// discarded attempts included; the canonical envelope write
+				// happens after the walk, from the retained evidence.
+				elapsed := retryNow().Sub(attemptStart)
+				if cerr == captureOK {
+					event := log.Warn()
+					if status >= http.StatusInternalServerError {
+						event = log.Error()
+					}
+					event = withAttemptFields(event.Str("public_model", model).
+						Str("upstream_model", cand.UpstreamModel).
+						Str("upstream", origin(&upstream)).
+						Int("upstream_status", ev.status).
+						Str("content_type", ev.contentType).
+						Str("error_class", "upstream_error").
+						Str("error_cause", ev.class).
+						Str("error_shape", ev.shape).
+						Int64("body_bytes", ev.bodyBytes).
+						Bool("body_truncated", ev.truncated).
+						Str("error_fingerprint", ev.fingerprint).
+						Int("egress_attempt", lastEgressAttempt),
+						providerAttempts, i+1, attempt, elapsed).
+						Str("disposition", dispositionName(dec.Action)).
+						Str("reason", reason)
+					for _, f := range evidenceRateLimitFields {
+						if v := ev.rateLimit[f.header]; v != "" {
+							event = event.Str(f.field, v)
+						}
+					}
+					if ev.providerType != "" {
+						event = event.Str("provider_error_type", ev.providerType)
+					}
+					if ev.providerCode != "" {
+						event = event.Str("provider_error_code", ev.providerCode)
+					}
+					event.Msg("upstream_http_error")
+				} else {
+					w := log.Warn().Str("public_model", model)
+					if cerr == captureDeadline {
+						w = w.Str("error_class", "upstream_error_body_timeout").
+							Str("error_cause", "capture_deadline_exceeded")
+					} else {
+						w = w.Str("error_class", "upstream_error").
+							Str("error_cause", "body_read_failed")
+					}
+					w = withAttemptFields(w, providerAttempts, i+1, attempt, elapsed).
+						Str("disposition", dispositionName(dec.Action)).
+						Str("reason", reason).
+						Int("upstream_status", status)
+					w.Msg("upstream_body_read_failed")
+				}
+				if !waitOut(dec) {
+					return
+				}
+				if dec.Action == retrySameCandidate {
+					continue
+				}
+				if dec.Action == retryNextCandidate {
+					// The candidate's budget is spent, but it DID answer —
+					// remember that answer: if every remaining candidate
+					// then fails before answering, this one becomes the
+					// client's response.
+					retained = answerFor(cerr, ev, resp, status, cand, i, kindHere)
+					break
+				}
+				// Finalize: the last received HTTP answer wins. Only the
+				// retained facts survive the walk — the evidence struct and
+				// the relay headers, never the raw bytes.
+				answer = answerFor(cerr, ev, resp, status, cand, i, kindHere)
+				break walk
 			}
-			event.Msg("upstream_request_failed")
-			complete()
-			return
+
+			if status >= http.StatusMultipleChoices || status == http.StatusNoContent || status == http.StatusNotModified {
+				// Verbatim answer: redirects (3xx, never followed) and the
+				// two body-less statuses. Committed as-is, body untouched.
+				answer = &walkAnswer{kind: answerVerbatim, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+				break walk
+			}
+
+			if stream && strings.Contains(strings.ToLower(resp.Header.Get(contentTypeHeader)), eventStreamType) {
+				// SSE answer: the headers are the commitment. The body is
+				// not read here — it streams after the walk, and anything
+				// that kills it later truncates the committed stream.
+				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+				break walk
+			}
+
+			// Buffered 2xx: read and validated INSIDE the walk, so a
+			// malformed or incomplete answer is a retryable result before
+			// commitment instead of a 502 after it.
+			bodyBytes, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
+			_ = resp.Body.Close()
+			if rerr != nil {
+				// Ownership is the request context's, never the error chain's:
+				// a canceled OR expired caller surfaces through the upstream
+				// read as its own sentinel, and neither may be reported as an
+				// upstream failure or spend the retry budget.
+				if r.Context().Err() != nil || clientSide(rerr) {
+					// The client is gone mid-answer and the upstream may be
+					// fine. No envelope write is attempted.
+					outcome = "client_disconnected"
+					log.Warn().Err(rerr).Str("public_model", model).
+						Str("phase", "client_write").Msg("relay_copy_failed")
+					complete()
+					return
+				}
+				elapsed := retryNow().Sub(attemptStart)
+				dec := decide(dispRetryable, attempt, i, candidatesTried, 0)
+				event := withAttemptFields(log.Warn().Err(rerr).Str("public_model", model).
+					Str("upstream", origin(&upstream)).
+					Int("upstream_status", status),
+					providerAttempts, i+1, attempt, elapsed).
+					Str("disposition", dispositionName(dec.Action)).
+					Str("reason", reasonBodyReadFailed)
+				event.Msg("upstream_body_read_failed")
+				if !waitOut(dec) {
+					return
+				}
+				if dec.Action == retrySameCandidate {
+					continue
+				}
+				if dec.Action == retryNextCandidate {
+					// The read failed, but the upstream answered 2xx — keep
+					// the shape: later candidates failing before answering
+					// fall back to this answer over a synthesized 502.
+					retained = &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, egressKind: kindHere}
+					break
+				}
+				answer = &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1}
+				break walk
+			}
+			if len(bodyBytes) > int(maxBufferedResponseBytes) || !json.Valid(bodyBytes) {
+				elapsed := retryNow().Sub(attemptStart)
+				dec := decide(dispRetryable, attempt, i, candidatesTried, 0)
+				event := withAttemptFields(log.Warn().Str("public_model", model).
+					Str("upstream", origin(&upstream)).
+					Int("upstream_status", status).
+					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))),
+					providerAttempts, i+1, attempt, elapsed).
+					Str("disposition", dispositionName(dec.Action)).
+					Str("reason", reasonInvalidBody)
+				event.Msg("upstream_invalid_response")
+				if !waitOut(dec) {
+					return
+				}
+				if dec.Action == retrySameCandidate {
+					continue
+				}
+				if dec.Action == retryNextCandidate {
+					// Same as the read failure: a 2xx arrived, only the body
+					// is unusable — the shape stays the retained answer.
+					retained = &walkAnswer{kind: answerInvalid, invalid: invalidBody, cand: cand, candIndex: i + 1, egressKind: kindHere}
+					break
+				}
+				answer = &walkAnswer{kind: answerInvalid, invalid: invalidBody, cand: cand, candIndex: i + 1}
+				break walk
+			}
+			// A valid 2xx answer: committed. The body rides the answer
+			// struct to the rewrite; no retry follows commitment.
+			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+			break walk
 		}
-		// Uniform egress evidence on the single-endpoint path: a direct
-		// failure gets the same per-dial record a pool member's failure gets
-		// (kind direct, first egress attempt), so downstream queries need no
-		// knowledge of which transport served the candidate.
-		if !pooled {
-			log.Warn().Str("public_model", model).
-				Str("provider", cand.Label()).
-				Str("egress_kind", "direct").Str("egress_target", "direct").
-				Str("error_class", class).Str("error_cause", cause).
-				Int("provider_attempt", providerAttempts).
-				Int("egress_attempt", 1).
-				Msg("egress_attempt_failed")
-		}
-		// Transport-level failure with the client still present: one WARN
-		// per failed candidate — the *url.Error from client.Do embeds the
-		// full request URL, query string included, which is how
-		// query-authenticated providers leak credentials, so the
-		// sanitized error and the scheme+host origin only — then, policy
-		// permitting, the next candidate. Exhaustion is reported after
-		// the walk.
-		event := withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
-			Str("public_model", model).
-			Str("provider", cand.Label()).
-			Str("upstream", origin(&upstream)).
-			Str("error_class", class).
-			Str("error_cause", cause).
-			Int("provider_attempt", providerAttempts)
-		if lastEgressAttempt > 0 {
-			event = event.Int("egress_attempt", lastEgressAttempt)
-		}
-		event.Msg("provider_attempt_failed")
 	}
 
-	if resp == nil {
+	if answer == nil && retained != nil {
+		// The last answering candidate's budget ran out, the walk moved on,
+		// and every remaining candidate failed before answering (transport
+		// error, exhausted pool). The client's answer is the last received
+		// HTTP answer — the retained one — not a synthesized 502: the walk
+		// never went unreachable, a provider answered and this proxy hands
+		// it through. The retained answer's candidate becomes the final
+		// provider for the completion record, and provider_exhausted stays
+		// false — the exhaustion vocabulary names walks that received no
+		// answer at all.
+		answer = retained
+		finalProvider = answer.cand.Label()
+		lastCand = answer.cand
+		lastCandIndex = answer.candIndex
+		ansEgressKind = answer.egressKind
+	}
+	if answer == nil {
 		// Every budgeted candidate failed without answering. The client
 		// gets the canonical unreachable envelope; the ERROR carries the
 		// last attempt's failure, sanitized, with the pool's report when
@@ -783,101 +1209,43 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
+	if answer.resp != nil {
+		defer func() { _ = answer.resp.Body.Close() }()
+	}
 
-	if isUpstreamHTTPError(resp.StatusCode) {
+	if answer.kind == answerInvalid {
+		// The final retained answer was a 200-shaped response nobody can
+		// use — unparseable, over-cap, a read that failed mid-answer, or
+		// an error body whose capture stalled. Its evidence event already
+		// fired in-walk with the terminal disposition; the client answer
+		// is the canonical 502, never half a provider body.
+		if answer.invalid == invalidBody {
+			outcome = "upstream_invalid_response"
+		} else {
+			outcome = "upstream_read_failed"
+		}
+		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
+		return
+	}
+
+	if answer.kind == answerHTTPError {
 		// Upstream HTTP errors are normalized, never relayed raw: the
-		// provider's status survives (a 429 answers 429 — collapsing it into
-		// a 502 would fog the root cause the same way it would for a 3xx),
-		// but the client body is always the canonical JSON envelope. HTML,
-		// text, or provider JSON — none of it passes through: an error body
-		// can echo request material and break SDK error decoding alike.
-		ev, cerr := captureUpstreamErrorEvidence(r.Context(), resp)
-		switch cerr {
-		case captureOK:
-			// The prefix is captured; the evidence below is complete
-			// (truncation is a field on it, not a failure).
-		case captureCallerEnded:
-			// The caller's context ended mid-capture — canceled, or done
-			// waiting. Ownership stays with the caller: no envelope is
-			// written for a client that is gone, and the outcome is the
-			// disconnect, not the upstream's half-read error.
-			outcome = "client_disconnected"
-			log.Warn().Str("public_model", model).
-				Str("phase", "client_write").Msg("relay_copy_failed")
-			complete()
-			return
-		case captureDeadline:
-			// The capture's own deadline fired on a body that never
-			// finished. The candidate already answered — no fallback — and
-			// the answer is the synthetic 502, never half a provider body.
-			outcome = "upstream_read_failed"
-			log.Warn().Str("public_model", model).
-				Str("error_class", "upstream_error_body_timeout").
-				Str("error_cause", "capture_deadline_exceeded").
-				Msg("upstream_body_read_failed")
-			reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
-			return
-		case captureReadFailed:
-			// The upstream died mid-body. The raw read error never reaches
-			// the log — its text can quote upstream bytes — so the typed
-			// outcome is the evidence.
-			outcome = "upstream_read_failed"
-			log.Warn().Str("public_model", model).
-				Str("error_class", "upstream_error").
-				Str("error_cause", "body_read_failed").
-				Msg("upstream_body_read_failed")
-			reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
-			return
-		}
-		// Structured evidence at the phase split the transport failures
-		// already use: a 4xx is the provider answering (WARN), a 5xx is the
-		// provider failing (ERROR). Metadata only — the bounded body was
-		// reduced to shape + fingerprint inside the capture, the provider's
-		// own message never leaves it, and the endpoint appears as its
-		// scheme+host origin. The canonical class names the layer
-		// (upstream_error); the status bucket rides as the cause.
-		event := log.Warn()
-		if ev.status >= http.StatusInternalServerError {
-			event = log.Error()
-		}
-		event = event.Str("public_model", model).Str("upstream_model", finalCand.UpstreamModel).
-			Str("upstream", origin(lastUpstream)).
-			Int("upstream_status", ev.status).
-			Str("content_type", ev.contentType).
-			Str("error_class", "upstream_error").
-			Str("error_cause", ev.class).
-			Str("error_shape", ev.shape).
-			Int64("body_bytes", ev.bodyBytes).
-			Bool("body_truncated", ev.truncated).
-			Str("error_fingerprint", ev.fingerprint).
-			Int("provider_attempt", providerAttempts).
-			Int("egress_attempt", lastEgressAttempt)
-		for _, f := range evidenceRateLimitFields {
-			if v := ev.rateLimit[f.header]; v != "" {
-				event = event.Str(f.field, v)
-			}
-		}
-		if ev.providerType != "" {
-			event = event.Str("provider_error_type", ev.providerType)
-		}
-		if ev.providerCode != "" {
-			event = event.Str("provider_error_code", ev.providerCode)
-		}
-		event.Msg("upstream_http_error")
-
-		// The client answer: the upstream's own status, the operational
+		// provider's status survives (a 429 answers 429 — collapsing it
+		// into a 502 would fog the root cause), but the client body is
+		// always the canonical JSON envelope. The evidence event with the
+		// terminal disposition already fired in-walk; what remains is the
+		// client answer: the upstream's own status, the operational
 		// headers from the relay allow-list, and a Content-Type that
 		// describes the body the client actually receives.
-		body, berr := ev.envelopeBytes()
+		body, berr := answer.ev.envelopeBytes()
 		if berr != nil {
 			// Unreachable for an all-string envelope, but the fallback must
 			// still be a canonical body — never raw upstream bytes.
 			body = []byte(envelopeUpInvalid)
 		}
-		copyRelayHeaders(sw.Header(), resp.Header)
+		copyRelayHeaders(sw.Header(), answer.header)
 		sw.Header().Set(contentTypeHeader, envelopeJSONType)
-		sw.WriteHeader(ev.status)
+		sw.WriteHeader(answer.status)
 		if _, werr := sw.Write(body); werr != nil {
 			// The status committed and the envelope is canonical; a failed
 			// write means the client went away — a disconnect, not an
@@ -894,18 +1262,18 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		return
 	}
 
-	if resp.StatusCode >= http.StatusMultipleChoices || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+	if answer.kind == answerVerbatim {
 		// Verbatim relay: redirects (3xx, which CheckRedirect never follows)
 		// and the two body-less statuses, which are valid upstream answers.
 		// A 204 or an unexpected 3xx is the upstream's answer; turning it
 		// into a 502 would fog the root cause. Status and body relayed byte
 		// for byte, whatever the content type. (4xx/5xx no longer reach this
-		// branch — the normalized-error branch above owns them. A status
-		// above 599, which no spec defines but a broken peer can emit, stays
-		// here: it is not ours to reshape either.)
-		copyRelayHeaders(sw.Header(), resp.Header)
-		sw.WriteHeader(resp.StatusCode)
-		if _, err := copyVerbatim(sw, resp.Body); err != nil {
+		// branch — the normalized-error path owns them. A status above 599,
+		// which no spec defines but a broken peer can emit, stays here: it
+		// is not ours to reshape either.)
+		copyRelayHeaders(sw.Header(), answer.resp.Header)
+		sw.WriteHeader(answer.resp.StatusCode)
+		if _, err := copyVerbatim(sw, answer.resp.Body); err != nil {
 			// The relay did not finish — the outcome says so. A failure on
 			// the client side (write error, or the canceled request context
 			// surfacing through the upstream read) is a disconnect; anything
@@ -927,12 +1295,13 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		return
 	}
 
-	if stream && strings.Contains(strings.ToLower(resp.Header.Get(contentTypeHeader)), eventStreamType) {
-		// Incremental SSE passthrough. The 2xx status is committed here; any
-		// subsequent failure only truncates the stream, never switches the
-		// response to an error body.
-		copyRelayHeaders(sw.Header(), resp.Header)
-		sw.WriteHeader(resp.StatusCode)
+	if answer.kind == answerSSE {
+		// Incremental SSE passthrough. The candidate was committed in-walk
+		// (headers selected, no retry follows); the 2xx status is written
+		// here, and any subsequent failure only truncates the stream,
+		// never switches the response to an error body.
+		copyRelayHeaders(sw.Header(), answer.resp.Header)
+		sw.WriteHeader(answer.resp.StatusCode)
 		streamed = true
 		log.Debug().Str("public_model", model).Msg("stream_started")
 		// The keep-alive heartbeat binds to the request's snapshot like
@@ -969,7 +1338,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			}
 		}
 		events := 0
-		stats, err := CopySSE(dst, resp.Body, relayRewrite, func() {
+		stats, err := CopySSE(dst, answer.resp.Body, relayRewrite, func() {
 			events++
 			if events%sseProgressEvery == 0 {
 				log.Debug().Str("public_model", model).
@@ -1018,48 +1387,21 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		return
 	}
 
-	// Buffered non-stream path (client stream=false, or upstream ignored the
-	// stream flag): read the whole body, validate it, rewrite the model, and
-	// emit a single buffered response. The read is bounded — an over-cap
-	// body is treated like any other unparseable upstream answer, while a
-	// read that fails mid-body is the upstream dying mid-answer and gets
-	// its own outcome; the client-visible 502 envelope is the same either
-	// way.
-	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
-	if err != nil {
-		if clientSide(err) {
-			// The canceled request context surfaced through the upstream
-			// read: the client is gone mid-answer and the upstream may be
-			// fine. No envelope write is attempted — nobody is left to
-			// receive it — and the WARN keeps the relay's phase vocabulary
-			// instead of blaming the upstream.
-			outcome = "client_disconnected"
-			log.Warn().Err(err).Str("public_model", model).
-				Str("phase", "client_write").Msg("relay_copy_failed")
-			complete()
-			return
-		}
-		outcome = "upstream_read_failed"
-		log.Warn().Err(err).Str("public_model", model).Msg("upstream_body_read_failed")
-		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
-		return
-	}
-	if len(upstreamBody) > int(maxBufferedResponseBytes) || !json.Valid(upstreamBody) {
-		outcome = "upstream_invalid_response"
-		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
-		return
-	}
-	log.Debug().Int64("bytes_in", int64(len(upstreamBody))).Msg("response_transform_started")
+	// Buffered answer (answerBuffered): the committed 2xx body was already
+	// read and validated inside the walk — that is what made a malformed
+	// answer retryable before commitment. What remains is the meter
+	// observation, the rewrite, and the single buffered write.
+	log.Debug().Int64("bytes_in", int64(len(answer.body))).Msg("response_transform_started")
 	// The meter reads the upstream's own usage object from the raw body,
 	// before any rewrite: what the client sees after the synthesized
 	// reasoning tokens are spliced in is never what the meter records.
 	if usageCapture != nil {
-		usageCapture.Observe(upstreamBody)
+		usageCapture.Observe(answer.body)
 	}
-	rewritten := rewriteOut(upstreamBody)
+	rewritten := rewriteOut(answer.body)
 	log.Debug().Int64("bytes_out", int64(len(rewritten))).Msg("response_transform_completed")
-	copyRelayHeaders(sw.Header(), resp.Header)
-	sw.WriteHeader(resp.StatusCode)
+	copyRelayHeaders(sw.Header(), answer.header)
+	sw.WriteHeader(answer.status)
 	if _, err := sw.Write(rewritten); err != nil {
 		// The status committed and the rewrite is done; the client went
 		// away before the body could land. A disconnect, not a completion.
@@ -1071,6 +1413,34 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 	log.Debug().Int64("bytes_out", sw.bytes).Msg("client_write_completed")
 	complete()
+}
+
+// dispositionName renders a retry decision as the evidence events' closed
+// disposition token: retry (same candidate, after the bounded wait),
+// fallback (next candidate), terminal (the walk ends — this attempt's
+// result, or the absence of one, is final).
+func dispositionName(a retryAction) string {
+	switch a {
+	case retrySameCandidate:
+		return "retry"
+	case retryNextCandidate:
+		return "fallback"
+	default:
+		return "terminal"
+	}
+}
+
+// withAttemptFields adds the per-attempt identity every evidence event
+// carries: the one-based global exchange index (provider_attempt), the
+// candidate's one-based chain position, the attempt's place in that
+// candidate's own budget (retry_index = candidate_attempt−1), and how long
+// the attempt took to reach its outcome.
+func withAttemptFields(ev *zerolog.Event, global, candIndex, candAttempt int, elapsed time.Duration) *zerolog.Event {
+	return ev.Int("provider_attempt", global).
+		Int("candidate_index", candIndex).
+		Int("candidate_attempt", candAttempt).
+		Int("retry_index", candAttempt-1).
+		Int64("elapsed_ms", elapsed.Milliseconds())
 }
 
 // modelNotFoundEnvelope builds the 404 envelope whose message interpolates

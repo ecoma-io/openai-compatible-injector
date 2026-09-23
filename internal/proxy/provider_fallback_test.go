@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -59,6 +60,41 @@ providers:
 models:
   chain-model:
     injection-prompt: "CHAIN-PROMPT-MARKER"
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	return config.NewStore(snap)
+}
+
+// newChainStoreRetries is newChainStore with a retries block under the
+// model ("" = no block: the built-in defaults apply). It is how retry
+// tests size the budgets their assertions count against.
+func newChainStoreRetries(t *testing.T, fallbackBlock, retriesBlock string) *config.Store {
+	t.Helper()
+	snap, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + "\n" + fallbackBlock + `
+transports:
+  t1:
+    type: direct
+  t2:
+    type: proxy
+    proxy: http://127.0.0.1:9090
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t1
+  pb:
+    base-url: https://b.example/v1
+    transport: t2
+models:
+  chain-model:
+    injection-prompt: "CHAIN-PROMPT-MARKER"
+` + retriesBlock + `
     providers:
       - provider: pa
         upstream-model: up-a
@@ -133,6 +169,74 @@ func (f *fakeUpstream) lastBody() string {
 		return ""
 	}
 	return f.bodies[len(f.bodies)-1]
+}
+
+// scriptStep is one scripted answer: status/body/content-type, optional
+// extra headers (Retry-After), or a transport-level error. The zero
+// content type means application/json, the zero status 200.
+type scriptStep struct {
+	status int
+	body   string
+	ct     string
+	header http.Header
+	err    error
+}
+
+// scriptUpstream answers from a fixed script — step 0 to the first call,
+// step 1 to the second, and the LAST step repeats once the script runs
+// out — recording every request's URL and body like fakeUpstream. The
+// sequence is what the retry matrix needs: the same candidate answering
+// differently per attempt.
+type scriptUpstream struct {
+	mu     sync.Mutex
+	steps  []scriptStep
+	urls   []string
+	bodies []string
+}
+
+func newScript(steps ...scriptStep) *scriptUpstream { return &scriptUpstream{steps: steps} }
+
+func (s *scriptUpstream) Do(req *http.Request) (*http.Response, error) {
+	b, _ := io.ReadAll(req.Body)
+	s.mu.Lock()
+	i := len(s.urls)
+	s.urls = append(s.urls, req.URL.String())
+	s.bodies = append(s.bodies, string(b))
+	step := s.steps[len(s.steps)-1]
+	if i < len(s.steps) {
+		step = s.steps[i]
+	}
+	s.mu.Unlock()
+	if step.err != nil {
+		return nil, step.err
+	}
+	h := step.header.Clone()
+	if h == nil {
+		h = http.Header{}
+	}
+	ct := step.ct
+	if ct == "" {
+		ct = "application/json"
+	}
+	h.Set("Content-Type", ct)
+	return &http.Response{
+		StatusCode: step.status,
+		Header:     h,
+		Body:       io.NopCloser(strings.NewReader(step.body)),
+		Request:    req,
+	}, nil
+}
+
+func (s *scriptUpstream) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.urls)
+}
+
+func (s *scriptUpstream) allBodies() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.bodies...)
 }
 
 // dialError builds the *url.Error shape a real dial failure produces —
@@ -252,38 +356,487 @@ func TestProviderChainFallsBackOnTransportFailure(t *testing.T) {
 	}
 }
 
-// TestProviderChainHTTPStatusIsTerminal pins the boundary the whole design
-// rests on: an HTTP status — 429 included — is an ANSWER. No fallback, no
-// second provider; the status is preserved and the body normalized.
-func TestProviderChainHTTPStatusIsTerminal(t *testing.T) {
-	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
-		store := newChainStore(t, "")
-		pa := &fakeUpstream{status: status, body: `{"error":{"message":"provider says no"}}`}
-		pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
-		logBuf, log := captureLog(zerolog.InfoLevel)
-		h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+// TestProviderChainStatusMatrix walks the closed status matrix at the
+// handler level, with no retries block declared (the defaults apply):
+// terminal statuses answer once and relay as a single-provider deployment
+// would; fallback-only statuses move straight to the next candidate — no
+// same-candidate retry; retryable statuses spend the default one retry on
+// the candidate first, then fall back. Every received error answers one
+// evidence event, its disposition naming what the walk did about it.
+func TestProviderChainStatusMatrix(t *testing.T) {
+	okB := `{"model":"up-b","choices":[]}`
+	for _, tc := range []struct {
+		name       string
+		status     int
+		wantStatus int
+		wantPa     int
+		wantPb     int
+		wantDisp   string // the LAST pa evidence event's disposition
+	}{
+		// Terminal — including the unlisted 418: answered once, relayed.
+		{"terminal 400", http.StatusBadRequest, http.StatusBadRequest, 1, 0, "terminal"},
+		{"terminal 418", http.StatusTeapot, http.StatusTeapot, 1, 0, "terminal"},
+		{"terminal 451", http.StatusUnavailableForLegalReasons, http.StatusUnavailableForLegalReasons, 1, 0, "terminal"},
+		{"terminal 501", http.StatusNotImplemented, http.StatusNotImplemented, 1, 0, "terminal"},
+		{"terminal 505", http.StatusHTTPVersionNotSupported, http.StatusHTTPVersionNotSupported, 1, 0, "terminal"},
+		// Fallback-only: one exchange on pa, straight to pb.
+		{"fallback 401", http.StatusUnauthorized, http.StatusOK, 1, 1, "fallback"},
+		{"fallback 403", http.StatusForbidden, http.StatusOK, 1, 1, "fallback"},
+		{"fallback 404", http.StatusNotFound, http.StatusOK, 1, 1, "fallback"},
+		{"fallback 405", http.StatusMethodNotAllowed, http.StatusOK, 1, 1, "fallback"},
+		{"fallback 409", http.StatusConflict, http.StatusOK, 1, 1, "fallback"},
+		{"fallback 422", http.StatusUnprocessableEntity, http.StatusOK, 1, 1, "fallback"},
+		// Retry-then-fallback: the default budget retries pa once, then pb.
+		{"retry 408", http.StatusRequestTimeout, http.StatusOK, 2, 1, "fallback"},
+		{"retry 425", http.StatusTooEarly, http.StatusOK, 2, 1, "fallback"},
+		{"retry 429", http.StatusTooManyRequests, http.StatusOK, 2, 1, "fallback"},
+		{"retry 500", http.StatusInternalServerError, http.StatusOK, 2, 1, "fallback"},
+		{"retry 503", http.StatusServiceUnavailable, http.StatusOK, 2, 1, "fallback"},
+		{"retry unknown 529", 529, http.StatusOK, 2, 1, "fallback"},
+		{"retry edge 599", 599, http.StatusOK, 2, 1, "fallback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubRetryTiming(t)
+			store := newChainStore(t, "")
+			pa := newScript(scriptStep{status: tc.status, body: `{"error":{"message":"provider says no"}}`})
+			pb := newScript(scriptStep{status: http.StatusOK, body: okB})
+			logBuf, log := captureLog(zerolog.InfoLevel)
+			h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
-		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
-		if rec.Code != status {
-			t.Errorf("status %d: client status = %d, want %d", status, rec.Code, status)
+			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("client status = %d, want %d (body %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if pa.calls() != tc.wantPa || pb.calls() != tc.wantPb {
+				t.Fatalf("exchanges pa/pb = %d/%d, want %d/%d", pa.calls(), pb.calls(), tc.wantPa, tc.wantPb)
+			}
+			done := logBuf.events(t, "request_completed")
+			// Terminal rows finalize on the answering pa; every row that
+			// moves ends on pb.
+			wantFinal, wantCand := "pb", float64(2)
+			if tc.status == tc.wantStatus {
+				wantFinal, wantCand = "pa", float64(1)
+			}
+			if len(done) != 1 || done[0]["provider_attempts"] != float64(tc.wantPa+tc.wantPb) ||
+				done[0]["retries_total"] != float64(tc.wantPa-1) || done[0]["final_provider"] != wantFinal ||
+				done[0]["final_candidate"] != wantCand {
+				t.Fatalf("request_completed = %v, want %d attempts, %d retries, final %v/%v", done, tc.wantPa+tc.wantPb, tc.wantPa-1, wantFinal, wantCand)
+			}
+			// One evidence event per received error, the last one carrying
+			// the disposition the walk acted on.
+			evs := logBuf.events(t, "upstream_http_error")
+			if len(evs) != tc.wantPa {
+				t.Fatalf("upstream_http_error events = %d, want %d", len(evs), tc.wantPa)
+			}
+			if evs[len(evs)-1]["disposition"] != tc.wantDisp || evs[len(evs)-1]["upstream_status"] != float64(tc.status) {
+				t.Errorf("last evidence disposition/status = %v/%v, want %v/%d",
+					evs[len(evs)-1]["disposition"], evs[len(evs)-1]["upstream_status"], tc.wantDisp, tc.status)
+			}
+			if len(evs) == 2 && evs[0]["disposition"] != "retry" {
+				t.Errorf("first evidence disposition = %v, want retry", evs[0]["disposition"])
+			}
+			if n := len(logBuf.events(t, "provider_attempt_failed")); n != 0 {
+				t.Errorf("%d provider_attempt_failed events, want 0 (statuses are answers)", n)
+			}
+			if tc.status == tc.wantStatus {
+				// The terminal direction: canonical envelope, status exact,
+				// provider bytes relayed nowhere.
+				want := fmt.Sprintf(`"code":"upstream_http_%d"`, tc.status)
+				if !strings.Contains(rec.Body.String(), want) {
+					t.Errorf("body %s, want canonical envelope with %s", rec.Body.String(), want)
+				}
+				if strings.Contains(rec.Body.String(), "provider says no") {
+					t.Errorf("provider error body relayed raw")
+				}
+			}
+		})
+	}
+}
+
+// TestProviderChainRetryBudgetExact pins the budget semantics: max-retries
+// counts the retries AFTER a candidate's initial attempt — a policy of N
+// gives every candidate exactly N+1 exchanges before the walk moves on.
+// provider_attempts counts exchanges, retries_total only retries.
+func TestProviderChainRetryBudgetExact(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		retries      string
+		wantPa       int
+		wantAttempts float64
+		wantRetries  float64
+	}{
+		{"zero retries", "    retries:\n      max-retries: 0\n", 1, 2, 0},
+		{"default one retry", "", 2, 3, 1},
+		{"two retries", "    retries:\n      max-retries: 2\n", 3, 4, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubRetryTiming(t)
+			store := newChainStoreRetries(t, "", tc.retries)
+			pa := newScript(scriptStep{status: http.StatusTooManyRequests, body: `{"error":{"message":"rate limited"}}`})
+			pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+			logBuf, log := captureLog(zerolog.InfoLevel)
+			h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+			}
+			if pa.calls() != tc.wantPa || pb.calls() != 1 {
+				t.Fatalf("exchanges pa/pb = %d/%d, want %d/1", pa.calls(), pb.calls(), tc.wantPa)
+			}
+			done := logBuf.events(t, "request_completed")
+			if len(done) != 1 || done[0]["provider_attempts"] != tc.wantAttempts ||
+				done[0]["retries_total"] != tc.wantRetries || done[0]["final_provider"] != "pb" ||
+				done[0]["final_candidate"] != float64(2) {
+				t.Fatalf("request_completed = %v, want %v attempts, %v retries, final pb/2", done, tc.wantAttempts, tc.wantRetries)
+			}
+		})
+	}
+}
+
+// TestProviderChainRetryBudgetIsPerCandidate pins the non-shared budget: a
+// candidate's retry allowance is its own, never a pool the chain draws down.
+// Both candidates answer a retryable status, so the walk performs the full
+// allowance against EACH of them — (max-retries+1) exchanges per candidate,
+// and the client still gets the last received answer.
+func TestProviderChainRetryBudgetIsPerCandidate(t *testing.T) {
+	stubRetryTiming(t)
+	store := newChainStore(t, "")
+	pa := newScript(scriptStep{status: http.StatusTooManyRequests, body: `{"error":{"message":"rate limited"}}`})
+	pb := newScript(scriptStep{status: http.StatusServiceUnavailable, body: `{"error":{"message":"overloaded"}}`})
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want the last received answer 503 (body %s)", rec.Code, rec.Body.String())
+	}
+	if pa.calls() != 2 || pb.calls() != 2 {
+		t.Fatalf("exchanges pa/pb = %d/%d, want 2/2 — the budget is per candidate", pa.calls(), pb.calls())
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["provider_attempts"] != float64(4) ||
+		done[0]["retries_total"] != float64(2) || done[0]["final_provider"] != "pb" ||
+		done[0]["final_candidate"] != float64(2) {
+		t.Fatalf("request_completed = %v, want 4 attempts / 2 retries / final pb", done)
+	}
+}
+
+// TestProviderChainRetainedAnswerOverTransportFailure pins the final-error
+// rule: the last received HTTP answer is the client's answer even when a
+// LATER candidate then fails at the transport level. A provider answered,
+// so there is no unreachable 502 to synthesize and provider_exhausted
+// stays false — that vocabulary names walks that received no answer at
+// all. The answering candidate becomes the final provider.
+func TestProviderChainRetainedAnswerOverTransportFailure(t *testing.T) {
+	stubRetryTiming(t)
+	store := newChainStore(t, "")
+	pa := newScript(scriptStep{status: http.StatusTooManyRequests, body: `{"error":{"message":"rate limited"}}`})
+	pb := newScript(scriptStep{err: dialError("b.example")})
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want the retained 429 (body %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"upstream_http_429"`) {
+		t.Errorf("body %s, want the canonical 429 envelope", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "rate limited") {
+		t.Errorf("provider body relayed raw: %s", rec.Body.String())
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["provider_attempts"] != float64(3) || done[0]["retries_total"] != float64(1) ||
+		done[0]["final_provider"] != "pa" || done[0]["final_candidate"] != float64(1) {
+		t.Fatalf("request_completed = %v, want 3 exchanges, 1 retry, final pa/1", done)
+	}
+	if _, exhausted := done[0]["provider_exhausted"]; exhausted {
+		t.Errorf("provider_exhausted set although a provider answered")
+	}
+	evs := logBuf.events(t, "upstream_http_error")
+	// The second 429's disposition is fallback: the walk moved on to pb —
+	// which then failed before answering, and only then did the retained
+	// 429 become the client's answer.
+	if len(evs) != 2 || evs[0]["disposition"] != "retry" || evs[1]["disposition"] != "fallback" {
+		t.Errorf("evidence events = %v, want two with dispositions retry then fallback", evs)
+	}
+	if n := len(logBuf.events(t, "provider_attempt_failed")); n != 1 {
+		t.Errorf("provider_attempt_failed events = %d, want 1 (pb's dial failure)", n)
+	}
+}
+
+// TestProviderChainRetryAfterFloorAndCap pins the directive's bounds at
+// the handler level: Retry-After sizes a same-candidate retry's wait as a
+// floor over the backoff, and backoff.max caps it — a hostile
+// Retry-After: 3600 cannot stretch the sleep past the configured ceiling.
+func TestProviderChainRetryAfterFloorAndCap(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ra        string
+		wantDelay time.Duration
+	}{
+		{"seconds floor over backoff", "1", time.Second},
+		{"hours capped at backoff max", "3600", 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubRetryTiming(t)
+			var waited time.Duration
+			retryWait = func(_ context.Context, d time.Duration) bool { waited = d; return true }
+			store := newChainStoreRetries(t, "", "    retries:\n      backoff:\n        initial: 100ms\n        max: 2s\n        jitter: 0\n")
+			pa := newScript(
+				scriptStep{status: http.StatusTooManyRequests, body: `{}`, header: http.Header{"Retry-After": []string{tc.ra}}},
+				scriptStep{status: http.StatusOK, body: `{"model":"up-a","choices":[]}`},
+			)
+			pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+			logBuf, log := captureLog(zerolog.InfoLevel)
+			h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+			}
+			if waited != tc.wantDelay {
+				t.Errorf("retry wait = %v, want %v", waited, tc.wantDelay)
+			}
+			if pa.calls() != 2 || pb.calls() != 0 {
+				t.Errorf("exchanges pa/pb = %d/%d, want 2/0 (recovered on the same candidate)", pa.calls(), pb.calls())
+			}
+			if n := len(logBuf.events(t, "provider_attempt_failed")); n != 0 {
+				t.Errorf("%d provider_attempt_failed events, want 0 (the recovery was status-driven)", n)
+			}
+		})
+	}
+}
+
+// TestProviderChainCallerGoneDuringRetryWait pins the wait boundary: when
+// the caller's context ends during a same-candidate retry sleep, the
+// request ends as a disconnect — no second attempt, no fallback, no
+// envelope, only the completion record.
+func TestProviderChainCallerGoneDuringRetryWait(t *testing.T) {
+	stubRetryTiming(t)
+	retryWait = func(context.Context, time.Duration) bool { return false }
+	store := newChainStore(t, "")
+	pa := newScript(scriptStep{status: http.StatusTooManyRequests, body: `{}`})
+	pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Body.Len() != 0 {
+		t.Errorf("body = %q, want nothing written for a gone caller", rec.Body.String())
+	}
+	if pa.calls() != 1 || pb.calls() != 0 {
+		t.Errorf("exchanges pa/pb = %d/%d, want 1/0 (the walk died in the wait)", pa.calls(), pb.calls())
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" || done[0]["provider_attempts"] != float64(1) {
+		t.Fatalf("request_completed = %v, want disconnected after one attempt", done)
+	}
+}
+
+// TestProviderChainMalformed200RetriesThenFallsBack pins the
+// pre-commitment direction of the retryable set: an unparseable 200 body
+// is an attempt failure, not a commitment — the candidate is retried,
+// then the walk falls back, and the client sees the healthy candidate's
+// rewritten answer. Each discarded answer fires one
+// upstream_invalid_response WARN with its disposition.
+func TestProviderChainMalformed200RetriesThenFallsBack(t *testing.T) {
+	stubRetryTiming(t)
+	store := newChainStore(t, "")
+	pa := newScript(scriptStep{status: http.StatusOK, body: `not json at all`})
+	pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"model":"chain-model"`) {
+		t.Errorf("response not rewritten to the public name: %s", rec.Body.String())
+	}
+	if pa.calls() != 2 || pb.calls() != 1 {
+		t.Fatalf("exchanges pa/pb = %d/%d, want 2/1", pa.calls(), pb.calls())
+	}
+	evs := logBuf.events(t, "upstream_invalid_response")
+	if len(evs) != 2 || evs[0]["disposition"] != "retry" || evs[1]["disposition"] != "fallback" {
+		t.Fatalf("evidence events = %v, want two with dispositions retry then fallback", evs)
+	}
+	if evs[1]["reason"] != "upstream_invalid_response" {
+		t.Errorf("reason = %v, want the typed token", evs[1]["reason"])
+	}
+}
+
+// TestProviderChainMalformed200Exhausted pins the exhaustion direction of
+// the same shape: with fallback disabled the spent budget finalizes the
+// walk on the unusable answer — the canonical 502, never half a provider
+// body, with the dedicated outcome.
+func TestProviderChainMalformed200Exhausted(t *testing.T) {
+	stubRetryTiming(t)
+	store := newChainStore(t, "provider-fallback:\n  enabled: false\n")
+	pa := newScript(scriptStep{status: http.StatusOK, body: `not json at all`})
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: nil}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if rec.Body.String() != envelopeUpInvalid {
+		t.Errorf("body = %s, want the canonical invalid-upstream envelope", rec.Body.String())
+	}
+	if pa.calls() != 2 {
+		t.Errorf("pa calls = %d, want 2 (initial + the default one retry)", pa.calls())
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "upstream_invalid_response" {
+		t.Fatalf("request_completed = %v, want outcome upstream_invalid_response", done)
+	}
+}
+
+// TestProviderChainRetryReplaysIdenticalBody pins transform isolation:
+// every retry attempt transforms the SAME immutable client body again —
+// no accumulation across attempts, each request carrying the candidate's
+// own upstream model and the same injected prompt.
+func TestProviderChainRetryReplaysIdenticalBody(t *testing.T) {
+	stubRetryTiming(t)
+	store := newChainStoreRetries(t, "", "    retries:\n      max-retries: 2\n")
+	pa := newScript(
+		scriptStep{status: http.StatusServiceUnavailable, body: `{}`},
+		scriptStep{status: http.StatusServiceUnavailable, body: `{}`},
+		scriptStep{status: http.StatusOK, body: `{"model":"up-a","choices":[]}`},
+	)
+	pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if pa.calls() != 3 || pb.calls() != 0 {
+		t.Fatalf("exchanges pa/pb = %d/%d, want 3/0 (recovered on the third attempt)", pa.calls(), pb.calls())
+	}
+	bodies := pa.allBodies()
+	for i, b := range bodies {
+		if b != bodies[0] {
+			t.Errorf("attempt %d body differs from attempt 1: %s vs %s", i+1, b, bodies[0])
 		}
-		want := fmt.Sprintf(`"code":"upstream_http_%d"`, status)
-		if !strings.Contains(rec.Body.String(), want) {
-			t.Errorf("status %d: body %s, want canonical envelope with %s", status, rec.Body.String(), want)
+		if !strings.Contains(b, `"model":"up-a"`) || !strings.Contains(b, "CHAIN-PROMPT-MARKER") {
+			t.Errorf("attempt %d lost the candidate transform: %s", i+1, b)
 		}
-		if strings.Contains(rec.Body.String(), "provider says no") {
-			t.Errorf("status %d: provider error body relayed raw", status)
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["provider_attempts"] != float64(3) || done[0]["retries_total"] != float64(2) {
+		t.Errorf("request_completed = %v, want 3 attempts, 2 retries", done)
+	}
+}
+
+// TestProviderChainReloadMidRetryKeepsSnapshotPolicy pins snapshot
+// binding: a reload that lands while a request sleeps between retries
+// cannot change the policy that request walks under — its budget was
+// decided against its own snapshot, and its completion record still names
+// that snapshot's generation. The next request walks under the new one.
+func TestProviderChainReloadMidRetryKeepsSnapshotPolicy(t *testing.T) {
+	store := newChainStoreRetries(t, "", "    retries:\n      max-retries: 2\n      backoff:\n        initial: 5ms\n        max: 10ms\n        jitter: 0\n")
+	pa := newScript(scriptStep{status: http.StatusServiceUnavailable, body: `{}`})
+	pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	// The FIRST retry sleep holds until the reload has landed, then lets
+	// the request continue under the OLD policy (two retries). Later waits
+	// of the same request pass straight through — the hold is armed once.
+	inWait := make(chan struct{})
+	release := make(chan struct{})
+	armed := atomic.Bool{}
+	armed.Store(true)
+	origWait := retryWait
+	retryWait = func(ctx context.Context, d time.Duration) bool {
+		if !origWait(ctx, d) {
+			return false
 		}
-		if pb.calls() != 0 {
-			t.Errorf("status %d: fallback dialed after an HTTP answer: %d calls", status, pb.calls())
+		if !armed.CompareAndSwap(true, false) {
+			return true
 		}
-		done := logBuf.events(t, "request_completed")
-		if len(done) != 1 || done[0]["provider_attempts"] != float64(1) || done[0]["final_provider"] != "pa" {
-			t.Errorf("status %d: provider fields = %v, want one attempt on pa", status, done)
+		select {
+		case inWait <- struct{}{}:
+		case <-ctx.Done():
+			return false
 		}
-		if n := len(logBuf.events(t, "provider_attempt_failed")); n != 0 {
-			t.Errorf("status %d: %d provider_attempt_failed events, want 0 (statuses are answers)", status, n)
-		}
+		<-release
+		return true
+	}
+	defer func() { retryWait = origWait }()
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chainChatBody))
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		h.ServeHTTP(rec, req)
+		done <- rec
+	}()
+	<-inWait
+	// Reload: the same chain, the retry budget cut to zero.
+	next, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + "\n" + `
+transports:
+  t1:
+    type: direct
+  t2:
+    type: proxy
+    proxy: http://127.0.0.1:9090
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t1
+  pb:
+    base-url: https://b.example/v1
+    transport: t2
+models:
+  chain-model:
+    injection-prompt: "CHAIN-PROMPT-MARKER"
+    retries:
+      max-retries: 0
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+`))
+	if err != nil {
+		t.Fatalf("reload LoadRuntime: %v", err)
+	}
+	if err := store.Publish(next); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	close(release)
+	rec := <-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	// The OLD policy walked: three pa exchanges (initial + two retries)
+	// then pb — the zero-retry policy would have moved on after one.
+	if pa.calls() != 3 || pb.calls() != 1 {
+		t.Fatalf("exchanges pa/pb = %d/%d, want 3/1 (the old policy, not the reloaded one)", pa.calls(), pb.calls())
+	}
+	completed := logBuf.events(t, "request_completed")
+	if len(completed) != 1 || completed[0]["config_generation"] != float64(0) || completed[0]["provider_attempts"] != float64(4) {
+		t.Fatalf("request_completed = %v, want generation 0 with 4 attempts", completed)
+	}
+
+	// The next request is bound to the reloaded snapshot and walks the
+	// new budget: one pa exchange, straight to pb.
+	pa2 := newScript(scriptStep{status: http.StatusServiceUnavailable, body: `{}`})
+	pb2 := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+	h2 := NewHandler(store, kindResolver{direct: pa2, proxied: pb2}, nil, nil, log)
+	rec2 := doRequest(t, h2, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request status = %d", rec2.Code)
+	}
+	if pa2.calls() != 1 || pb2.calls() != 1 {
+		t.Errorf("second request exchanges pa/pb = %d/%d, want 1/1 (the new policy)", pa2.calls(), pb2.calls())
 	}
 }
 
@@ -456,6 +1009,58 @@ func TestProviderChainStreamingCommitment(t *testing.T) {
 		t.Errorf("provider fields = %v, want one attempt", done)
 	}
 }
+
+// TestProviderChainStreamDeathAfterCommitment pins the streaming half of
+// the no-retry-after-commitment rule: a 200 SSE answer commits the walk at
+// its HEADERS — the body is not read in-walk — so an upstream that dies
+// before (or between) events truncates a committed stream. No same-
+// candidate retry, no candidate switch, no error envelope: the client's
+// response was already the 200 stream.
+func TestProviderChainStreamDeathAfterCommitment(t *testing.T) {
+	stubRetryTiming(t)
+	store := newChainStore(t, "")
+	// errBody (logging_test.go) yields the one event, then errors — an
+	// upstream that dies mid-stream after its headers committed the walk.
+	pa := doerFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&errBody{data: []byte("data: {\"model\":\"up-a\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")}),
+		}, nil
+	})
+	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"chain-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"model":"chain-model"`) {
+		t.Errorf("relayed events wrong: %s", body)
+	}
+	if strings.Contains(body, "data: [DONE]") {
+		t.Errorf("truncated stream somehow terminated cleanly: %s", body)
+	}
+	if pb.calls() != 0 {
+		t.Errorf("fallback dialed after commitment: %d calls", pb.calls())
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["stream"] != true || done[0]["provider_attempts"] != float64(1) {
+		t.Errorf("request_completed = %v, want one streamed attempt", done)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 || trunc[0]["phase"] != "upstream_read" {
+		t.Errorf("stream_truncated = %v, want one upstream_read truncation", trunc)
+	}
+}
+
+// doerFunc adapts a function to the Doer seam.
+type doerFunc func(*http.Request) (*http.Response, error)
+
+func (f doerFunc) Do(req *http.Request) (*http.Response, error) { return f(req) }
 
 // keyResolver answers each transport config by its content key — the
 // reload test's way to give two snapshots' different transports distinct

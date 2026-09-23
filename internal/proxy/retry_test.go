@@ -62,11 +62,23 @@ func TestClassifyStatusMatrix(t *testing.T) {
 		{"431", http.StatusRequestHeaderFieldsTooLarge, dispTerminal},
 		{"451", http.StatusUnavailableForLegalReasons, dispTerminal},
 		{"unlisted 418", http.StatusTeapot, dispTerminal},
+		{"unlisted 402", http.StatusPaymentRequired, dispTerminal},
+		{"unlisted 407", http.StatusProxyAuthRequired, dispTerminal},
+		{"unlisted 412", http.StatusPreconditionFailed, dispTerminal},
+		{"unlisted 414", http.StatusRequestURITooLong, dispTerminal},
+		{"unlisted 417", http.StatusExpectationFailed, dispTerminal},
 		{"unlisted 426", http.StatusUpgradeRequired, dispTerminal},
+		{"unlisted 449", 449, dispTerminal},
+		{"unlisted 450", 450, dispTerminal},
 		{"edge 499", 499, dispTerminal},
 		{"501", http.StatusNotImplemented, dispTerminal},
 		{"505", http.StatusHTTPVersionNotSupported, dispTerminal},
-		// Answers: committed as-is, never classified for retry.
+		// Answers: committed as-is, never classified for retry. The 1xx band
+		// is outside the 400..599 error range, so the function is total there
+		// too — the handler never sends one here, and if it ever did the walk
+		// would relay rather than re-ask.
+		{"100", http.StatusContinue, dispAnswer},
+		{"199", 199, dispAnswer},
 		{"200", http.StatusOK, dispAnswer},
 		{"204", http.StatusNoContent, dispAnswer},
 		{"301", http.StatusMovedPermanently, dispAnswer},
@@ -332,11 +344,30 @@ func TestParseRetryAfter(t *testing.T) {
 		{"empty", "", 0},
 		{"garbage", "soon", 0},
 		{"overflow", "99999999999999999999", 0},
+		// Parseable as an int but far past what a duration holds: the
+		// multiply would wrap negative, so it is discarded explicitly.
+		{"wrapping delta", "10000000000", 0},
 	} {
 		if got := parseRetryAfter(tc.value, now); got != tc.want {
 			t.Errorf("%s: parseRetryAfter(%q) = %v, want %v", tc.name, tc.value, got, tc.want)
 		}
 	}
+}
+
+// stubRetryTiming pins the retry seams for a handler test: a clock frozen
+// at a fixed instant (every elapsed_ms reads 0), jitter zeroed, and a wait
+// that never sleeps — it reports only the context's liveness. The
+// originals are restored on cleanup. A test that needs the wait to
+// misbehave (simulated cancellation, a blocked sleep, a captured delay)
+// overrides retryWait again after calling this.
+func stubRetryTiming(t *testing.T) {
+	t.Helper()
+	origNow, origDraw, origWait := retryNow, retryJitterDraw, retryWait
+	t.Cleanup(func() { retryNow, retryJitterDraw, retryWait = origNow, origDraw, origWait })
+	frozen := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	retryNow = func() time.Time { return frozen }
+	retryJitterDraw = func() float64 { return 0 }
+	retryWait = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
 }
 
 // TestRetryWaitDefaultRespectsContext pins the production wait seam: a

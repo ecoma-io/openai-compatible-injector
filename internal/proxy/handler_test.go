@@ -402,6 +402,7 @@ func TestSSEPassthroughRewritesModel(t *testing.T) {
 // its shape — with Content-Type application/json and the relay allow-list
 // still applying to the operational headers.
 func TestUpstreamHTTPErrorNormalized(t *testing.T) {
+	stubRetryTiming(t)
 	cases := []struct {
 		name        string
 		status      int
@@ -519,6 +520,7 @@ func TestUpstreamRefusedReturns502(t *testing.T) {
 }
 
 func TestUpstreamInvalidResponseReturns502(t *testing.T) {
+	stubRetryTiming(t)
 	for _, body := range []string{"definitely not json", ""} {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -797,6 +799,7 @@ func TestUpstreamRedirectRelayedVerbatim(t *testing.T) {
 }
 
 func TestUpstreamRateLimitHeadersRelayed(t *testing.T) {
+	stubRetryTiming(t)
 	// Operational headers drive client backoff; dropping them makes a 429
 	// indistinguishable from any other upstream error to a well-behaved SDK.
 	// The body itself is normalized — the headers speak for the response the
@@ -904,6 +907,7 @@ func TestRequestBodyOverCapRejected413(t *testing.T) {
 }
 
 func TestUpstreamResponseOverCapRejected502(t *testing.T) {
+	stubRetryTiming(t)
 	old := maxBufferedResponseBytes
 	maxBufferedResponseBytes = 1 << 20 // 1 MiB for the test
 	defer func() { maxBufferedResponseBytes = old }()
@@ -1432,6 +1436,7 @@ func findLogEvent(t *testing.T, logs string, slug string) map[string]any {
 // message marker, and the request a planted prompt marker — none may reach
 // the log stream; the endpoint appears as scheme+host only.
 func TestUpstreamHTTPErrorLogEvidence(t *testing.T) {
+	stubRetryTiming(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "30")
@@ -1569,6 +1574,7 @@ func TestUpstreamHTTPError5xxSeverity(t *testing.T) {
 // bounded prefix (documented convention), so no raw bytes need surviving
 // anywhere to correlate.
 func TestUpstreamHTTPErrorBodyBounded(t *testing.T) {
+	stubRetryTiming(t)
 	old := maxUpstreamErrorBodyBytes
 	maxUpstreamErrorBodyBytes = 1 << 20 // 1 MiB for the test
 	defer func() { maxUpstreamErrorBodyBytes = old }()
@@ -1694,20 +1700,104 @@ func newStalledErrorBody(t *testing.T, status int) *stalledUpstream {
 
 func (s *stalledUpstream) Do(*http.Request) (*http.Response, error) { return s.resp, nil }
 
-// TestUpstreamHTTPErrorStalledCaptureTimesOut pins the capture deadline end
-// to end: a candidate answers 503 and then never sends another body byte,
-// the capture's own deadline closes the body, and the answer is the
-// canonical 502 — with the walk NOT continuing to the next candidate, since
-// the candidate that produced headers has produced THE response. The WARN
-// carries the dedicated class/cause pair, never the raw read error.
-func TestUpstreamHTTPErrorStalledCaptureTimesOut(t *testing.T) {
+// stallingErrorUpstream answers EVERY exchange with a fresh stalled error
+// response — the peer-committed-then-stalled shape the capture deadline
+// exists for, per attempt, so a retry can meet the same stall again.
+type stallingErrorUpstream struct {
+	t      *testing.T
+	status int
+	mu     sync.Mutex
+	n      int
+}
+
+func (s *stallingErrorUpstream) Do(*http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	s.n++
+	s.mu.Unlock()
+	return newStalledErrorBody(s.t, s.status).resp, nil
+}
+
+func (s *stallingErrorUpstream) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
+}
+
+// TestUpstreamHTTPErrorStalledCaptureRetriesThenFallsBack pins the capture
+// deadline end to end: a candidate answers 503 and then never sends another
+// body byte. The capture's own deadline closes the body, and that unusable
+// answer — like an unparseable 200 — is a RETRYABLE result, not the
+// candidate's final word: the walk re-asks the same candidate while its
+// retry budget lasts and then falls back. Here the second candidate answers,
+// so the stall never reaches the client. The WARN carries the dedicated
+// class/cause pair, never the raw read error.
+func TestUpstreamHTTPErrorStalledCaptureRetriesThenFallsBack(t *testing.T) {
+	stubRetryTiming(t)
 	old := upstreamErrorCaptureTimeout
-	upstreamErrorCaptureTimeout = 150 * time.Millisecond
+	upstreamErrorCaptureTimeout = 50 * time.Millisecond
 	defer func() { upstreamErrorCaptureTimeout = old }()
 
 	store := newChainStore(t, "")
-	pa := newStalledErrorBody(t, http.StatusServiceUnavailable)
+	pa := &stallingErrorUpstream{t: t, status: http.StatusServiceUnavailable}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	var logs bytes.Buffer
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the fallback candidate's 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	// The default budget: the initial attempt plus its one retry, then the
+	// next candidate.
+	if pa.calls() != 2 || pb.calls() != 1 {
+		t.Fatalf("calls pa/pb = %d/%d, want 2/1", pa.calls(), pb.calls())
+	}
+
+	var stalls []map[string]any
+	for _, m := range parseLogLines(t, logs.String()) {
+		if m["message"] == "upstream_body_read_failed" {
+			stalls = append(stalls, m)
+		}
+	}
+	if len(stalls) != 2 {
+		t.Fatalf("upstream_body_read_failed events = %d, want one per stalled exchange", len(stalls))
+	}
+	if stalls[0]["disposition"] != "retry" || stalls[1]["disposition"] != "fallback" {
+		t.Errorf("dispositions = %v/%v, want retry/fallback", stalls[0]["disposition"], stalls[1]["disposition"])
+	}
+	first := stalls[0]
+	if first["error_class"] != "upstream_error_body_timeout" {
+		t.Errorf("error_class = %v, want upstream_error_body_timeout", first["error_class"])
+	}
+	if first["error_cause"] != "capture_deadline_exceeded" {
+		t.Errorf("error_cause = %v, want capture_deadline_exceeded", first["error_cause"])
+	}
+	if first["error"] != nil {
+		t.Errorf("raw read error reached the log: %v", first["error"])
+	}
+	completed := findLogEvent(t, logs.String(), "request_completed")
+	if completed["outcome"] != "completed" || completed["final_provider"] != "pb" {
+		t.Errorf("outcome/final_provider = %v/%v, want completed/pb", completed["outcome"], completed["final_provider"])
+	}
+	if completed["retries_total"] != float64(1) {
+		t.Errorf("retries_total = %v, want 1", completed["retries_total"])
+	}
+}
+
+// TestUpstreamHTTPErrorStalledCaptureRetainedAnswersInvalid pins the other
+// end of the same contract: when no remaining candidate can answer either,
+// the retained stalled answer is what the client gets — the canonical 502
+// for an unusable body, with the answering candidate named and
+// provider_exhausted left unset, because a provider DID answer.
+func TestUpstreamHTTPErrorStalledCaptureRetainedAnswersInvalid(t *testing.T) {
+	stubRetryTiming(t)
+	old := upstreamErrorCaptureTimeout
+	upstreamErrorCaptureTimeout = 50 * time.Millisecond
+	defer func() { upstreamErrorCaptureTimeout = old }()
+
+	store := newChainStore(t, "")
+	pa := &stallingErrorUpstream{t: t, status: http.StatusServiceUnavailable}
+	pb := &fakeUpstream{err: dialError("b.example")}
 	var logs bytes.Buffer
 	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, zerolog.New(&logs))
 
@@ -1718,21 +1808,15 @@ func TestUpstreamHTTPErrorStalledCaptureTimesOut(t *testing.T) {
 	if body := rec.Body.String(); body != envelopeUpInvalid {
 		t.Errorf("body:\n got %s\nwant %s", body, envelopeUpInvalid)
 	}
-	if pb.calls() != 0 {
-		t.Errorf("fallback dialed after the answering candidate stalled its body: %d calls", pb.calls())
-	}
-	ev := findLogEvent(t, logs.String(), "upstream_body_read_failed")
-	if ev["error_class"] != "upstream_error_body_timeout" {
-		t.Errorf("error_class = %v, want upstream_error_body_timeout", ev["error_class"])
-	}
-	if ev["error_cause"] != "capture_deadline_exceeded" {
-		t.Errorf("error_cause = %v, want capture_deadline_exceeded", ev["error_cause"])
-	}
-	if ev["error"] != nil {
-		t.Errorf("raw read error reached the log: %v", ev["error"])
-	}
-	if completed := findLogEvent(t, logs.String(), "request_completed"); completed["outcome"] != "upstream_read_failed" {
+	completed := findLogEvent(t, logs.String(), "request_completed")
+	if completed["outcome"] != "upstream_read_failed" {
 		t.Errorf("outcome = %v, want upstream_read_failed", completed["outcome"])
+	}
+	if completed["final_provider"] != "pa" || completed["final_candidate"] != float64(1) {
+		t.Errorf("final = %v/%v, want pa/1", completed["final_provider"], completed["final_candidate"])
+	}
+	if completed["provider_exhausted"] != nil {
+		t.Errorf("provider_exhausted set although a provider answered: %v", completed["provider_exhausted"])
 	}
 }
 
@@ -1855,6 +1939,7 @@ func TestUpstreamHTTPErrorClientDisconnectDuringBodyRead(t *testing.T) {
 // token-shaped (short printable ASCII) — a value past the bound or outside
 // it is dropped wholesale, and the provider's message never appears at all.
 func TestUpstreamErrorProviderTokensBounded(t *testing.T) {
+	stubRetryTiming(t)
 	longCode := strings.Repeat("c", maxProviderTokenBytes+1)
 	cases := []struct {
 		name     string

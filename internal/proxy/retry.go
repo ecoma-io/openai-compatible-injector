@@ -201,8 +201,10 @@ func evaluateRetry(in retryInput) retryDecision {
 	// The caps, in order: the configured ceiling (an upstream can never
 	// stretch a sleep past backoff.max — Retry-After: 3600 stays a 2s
 	// nap by default), then the remaining window, then the caller's
-	// remaining deadline. A capped-to-zero delay means no room to wait:
-	// the candidate's retries are over.
+	// remaining deadline. A cap can floor the delay at zero — a full
+	// negative jitter draw, or a window/deadline narrower than the
+	// backoff — and the retry then proceeds with no sleep at all, still
+	// bounded by the attempt budget the caller checked above.
 	if delay > in.Policy.Backoff.Max {
 		delay = in.Policy.Backoff.Max
 	}
@@ -272,8 +274,8 @@ func jitteredBackoff(b config.BackoffPolicy, attempts int) time.Duration {
 // an HTTP-date — into a delay. Invalid, negative, zero, unparseable, or
 // already-past values return 0 (no directive): an upstream cannot make the
 // proxy misbehave with a hostile header, and everything it does return is
-// re-capped by the policy before any sleep. Overflowing integers fail the
-// Atoi and fall through to the date parse, which fails too — still 0.
+// re-capped by the policy before any sleep. Integers Atoi rejects fall
+// through to the date parse, which fails too — still 0.
 func parseRetryAfter(v string, now time.Time) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -283,7 +285,14 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 		if secs <= 0 {
 			return 0
 		}
-		return time.Duration(secs) * time.Second
+		d := time.Duration(secs) * time.Second
+		if d <= 0 {
+			// A delta large enough to wrap the multiply is discarded here
+			// rather than carried as a negative duration for a later
+			// comparison to reject by accident.
+			return 0
+		}
+		return d
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		d := t.Sub(now)
