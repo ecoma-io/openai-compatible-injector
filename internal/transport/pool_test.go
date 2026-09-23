@@ -607,12 +607,15 @@ func TestPoolNilBudgetDialsTheWholeChain(t *testing.T) {
 	}
 }
 
-// TestPoolBudgetRefusedBeforeAnyDialIsExhaustion pins the zero-dial edge: an
-// envelope with no room left refuses the very first dial, so the request
-// reports the exhaustion sentinel WITH the budget flag — the caller tells the
-// two apart — and the permit the selection took for that dial comes back, so
-// the member is not left saturated behind a dial that never happened.
-func TestPoolBudgetRefusedBeforeAnyDialIsExhaustion(t *testing.T) {
+// TestPoolBudgetRefusedBeforeAnyDialIsNotEndpointExhaustion pins the
+// zero-dial edge: an envelope with no room left refuses the very first dial,
+// so the request reports the budget flag WITHOUT the exhaustion sentinel —
+// no endpoint was tried and failed, so no member may be blamed — and the
+// permit the selection took for that dial comes back, so the member is not
+// left saturated behind a dial that never happened. The distinction matters
+// upstream: egress exhaustion is an endpoint verdict, a refused exchange is
+// the request's own envelope.
+func TestPoolBudgetRefusedBeforeAnyDialIsNotEndpointExhaustion(t *testing.T) {
 	solo := &stubEndpoint{script: []stubResult{okResult("{}")}}
 	members := []Member{{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1}}
 	pd, _ := newTestPool(members, RoundRobin,
@@ -620,14 +623,14 @@ func TestPoolBudgetRefusedBeforeAnyDialIsExhaustion(t *testing.T) {
 
 	budget := &stubBudget{allowance: 0}
 	resp, info, err := pd.Execute(withBudget(execReq(false, "{}"), budget))
-	if !errors.Is(err, errExhausted) {
-		t.Fatalf("err = %v, want the exhaustion sentinel", err)
+	if err != nil {
+		t.Fatalf("err = %v, want no transport error for a refused dial", err)
 	}
 	if resp != nil {
 		t.Errorf("a refused dial returned a response")
 	}
-	if info.Attempts != 0 || !info.Exhausted || !info.BudgetExhausted {
-		t.Errorf("info = %+v, want zero attempts, exhausted and budget-exhausted", info)
+	if info.Attempts != 0 || info.Exhausted || !info.BudgetExhausted {
+		t.Errorf("info = %+v, want zero attempts, budget-exhausted, not endpoint-exhausted", info)
 	}
 	if solo.hitCount() != 0 || budget.grants() != 0 {
 		t.Errorf("refused dial happened anyway: hits=%d grants=%d", solo.hitCount(), budget.grants())
