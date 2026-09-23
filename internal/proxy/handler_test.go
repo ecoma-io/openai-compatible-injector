@@ -96,6 +96,24 @@ func doDisconnectedRequest(t *testing.T, h http.Handler, method, path, body stri
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	return doRequestWithContext(t, h, ctx, method, path, body, headers)
+}
+
+// doDeadlineRequest runs the handler with an already-expired request
+// deadline — the done-waiting caller shape. Under the ownership rule it is
+// terminal exactly like a vanished client: a caller deadline must never read
+// as a provider-local timeout.
+func doDeadlineRequest(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 1))
+	cancel()
+	return doRequestWithContext(t, h, ctx, method, path, body, headers)
+}
+
+// doRequestWithContext serves a pre-built context — the ownership tests'
+// entry point.
+func doRequestWithContext(t *testing.T, h http.Handler, ctx context.Context, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := buildRequest(t, method, path, body, headers).WithContext(ctx)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -1633,12 +1651,130 @@ func TestUpstreamHTTPErrorBodyReadFailure502(t *testing.T) {
 	if lvl, _ := readFailed["level"].(string); lvl != "warn" {
 		t.Errorf("level = %v, want warn", readFailed["level"])
 	}
+	if readFailed["error_class"] != "upstream_error" {
+		t.Errorf("error_class = %v, want upstream_error", readFailed["error_class"])
+	}
+	if readFailed["error_cause"] != "body_read_failed" {
+		t.Errorf("error_cause = %v, want body_read_failed", readFailed["error_cause"])
+	}
+	if ev := readFailed["error"]; ev != nil {
+		t.Errorf("raw read error reached the log: %v", ev)
+	}
 	completed := findLogEvent(t, logs.String(), "request_completed")
 	if completed["outcome"] != "upstream_read_failed" {
 		t.Errorf("outcome = %v, want upstream_read_failed", completed["outcome"])
 	}
 	if completed["status"] != float64(http.StatusBadGateway) {
 		t.Errorf("status = %v, want 502", completed["status"])
+	}
+}
+
+// stalledUpstream is a Doer stand-in that answers with one canned response
+// whose body never delivers another byte — the peer-committed-then-stalled
+// shape the capture deadline exists for. The write end is closed on test
+// cleanup so the pipe goroutines never outlive the test.
+type stalledUpstream struct {
+	resp *http.Response
+	pw   *io.PipeWriter
+}
+
+func newStalledErrorBody(t *testing.T, status int) *stalledUpstream {
+	t.Helper()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	return &stalledUpstream{
+		resp: &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       pr,
+		},
+		pw: pw,
+	}
+}
+
+func (s *stalledUpstream) Do(*http.Request) (*http.Response, error) { return s.resp, nil }
+
+// TestUpstreamHTTPErrorStalledCaptureTimesOut pins the capture deadline end
+// to end: a candidate answers 503 and then never sends another body byte,
+// the capture's own deadline closes the body, and the answer is the
+// canonical 502 — with the walk NOT continuing to the next candidate, since
+// the candidate that produced headers has produced THE response. The WARN
+// carries the dedicated class/cause pair, never the raw read error.
+func TestUpstreamHTTPErrorStalledCaptureTimesOut(t *testing.T) {
+	old := upstreamErrorCaptureTimeout
+	upstreamErrorCaptureTimeout = 150 * time.Millisecond
+	defer func() { upstreamErrorCaptureTimeout = old }()
+
+	store := newChainStore(t, "")
+	pa := newStalledErrorBody(t, http.StatusServiceUnavailable)
+	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	var logs bytes.Buffer
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); body != envelopeUpInvalid {
+		t.Errorf("body:\n got %s\nwant %s", body, envelopeUpInvalid)
+	}
+	if pb.calls() != 0 {
+		t.Errorf("fallback dialed after the answering candidate stalled its body: %d calls", pb.calls())
+	}
+	ev := findLogEvent(t, logs.String(), "upstream_body_read_failed")
+	if ev["error_class"] != "upstream_error_body_timeout" {
+		t.Errorf("error_class = %v, want upstream_error_body_timeout", ev["error_class"])
+	}
+	if ev["error_cause"] != "capture_deadline_exceeded" {
+		t.Errorf("error_cause = %v, want capture_deadline_exceeded", ev["error_cause"])
+	}
+	if ev["error"] != nil {
+		t.Errorf("raw read error reached the log: %v", ev["error"])
+	}
+	if completed := findLogEvent(t, logs.String(), "request_completed"); completed["outcome"] != "upstream_read_failed" {
+		t.Errorf("outcome = %v, want upstream_read_failed", completed["outcome"])
+	}
+}
+
+// TestUpstreamHTTPErrorCallerEndedDuringCapture pins the ownership edge of
+// the capture: the caller's context ending while the stalled error body is
+// being read is the client's event — no envelope, no fallback, outcome
+// client_disconnected — never a 502 blaming the upstream.
+func TestUpstreamHTTPErrorCallerEndedDuringCapture(t *testing.T) {
+	store := newChainStore(t, "")
+	pa := newStalledErrorBody(t, http.StatusServiceUnavailable)
+	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	var logs bytes.Buffer
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, zerolog.New(&logs))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		do := buildRequest(t, http.MethodPost, "/v1/chat/completions", chainChatBody, nil).WithContext(ctx)
+		h.ServeHTTP(rec, do)
+		close(done)
+	}()
+	// The candidate has answered its 503 and the capture is parked on the
+	// stalled body; ending the caller's context must surface as the
+	// disconnect.
+	<-time.After(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if got := rec.Body.String(); got != "" {
+		t.Errorf("envelope written for a done caller: %q", got)
+	}
+	if pb.calls() != 0 {
+		t.Errorf("fallback dialed after the caller ended: %d calls", pb.calls())
+	}
+	if completed := findLogEvent(t, logs.String(), "request_completed"); completed["outcome"] != "client_disconnected" {
+		t.Errorf("outcome = %v, want client_disconnected", completed["outcome"])
+	}
+	for _, m := range parseLogLines(t, logs.String()) {
+		if m["message"] == "upstream_request_failed" || m["message"] == "upstream_body_read_failed" {
+			t.Errorf("caller-end during capture misreported as %v", m["message"])
+		}
 	}
 }
 

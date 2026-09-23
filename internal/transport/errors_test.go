@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/url"
@@ -70,6 +71,45 @@ func TestTypedErrorTextsUnchanged(t *testing.T) {
 
 func wrapped(err error) error {
 	return &urlErrorShim{err: err}
+}
+
+// TestClassifyAttemptCauseTokens pins the context-aware classification the
+// handler and pool both read: a LIVE context classifies the error on its own
+// terms (canonical class + bounded cause), while a DONE context owns the
+// failure whatever the error chain says — caller_canceled or
+// caller_deadline_exceeded, always CallerTerminated. Deadline ownership is
+// the point: a caller deadline and a transport timer both surface as
+// context.DeadlineExceeded, and only the context can tell them apart.
+func TestClassifyAttemptCauseTokens(t *testing.T) {
+	live := context.Background()
+	refused := &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want Failure
+	}{
+		{"nil error", live, nil, Failure{Class: ClassNone}},
+		{"refused", live, refused, Failure{Class: ClassConnection, Cause: CauseConnectionRefused}},
+		{"refused through url.Error", live, &url.Error{Op: "Post", URL: "http://x", Err: refused}, Failure{Class: ClassConnection, Cause: CauseConnectionRefused}},
+		{"plain dial failure", live, errors.New("dial tcp: i/o timeout"), Failure{Class: ClassConnection, Cause: CauseDial}},
+		{"tls verification", live, &tls.CertificateVerificationError{Err: errors.New("x509: unknown authority")}, Failure{Class: ClassConnection, Cause: CauseTLS}},
+		{"net timeout", live, &fakeNetError{timeout: true}, Failure{Class: ClassTimeout, Cause: CauseNetworkTimeout}},
+		{"context deadline in chain", live, context.DeadlineExceeded, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded}},
+		{"os deadline in chain", live, os.ErrDeadlineExceeded, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded}},
+		{"proxy auth", live, &ProxyAuthError{msg: "socks5: proxy authentication failed"}, Failure{Class: ClassProxyAuth, Cause: "proxy_auth"}},
+		{"proxy connect", live, &ProxyConnectError{msg: "socks5: general failure"}, Failure{Class: ClassProxyConnect, Cause: CauseProxyConnect}},
+		{"proxy connect timeout", live, &ProxyConnectError{msg: "socks5: dial proxy", cause: &fakeNetError{timeout: true}}, Failure{Class: ClassProxyConnect, Cause: CauseProxyTimeout}},
+		{"canceled shape, live context", live, context.Canceled, Failure{Class: ClassCanceled}},
+		{"caller canceled", canceledCtx(t), errors.New("dial tcp: connection refused"), Failure{Class: ClassCanceled, Cause: CauseCallerCanceled, CallerTerminated: true}},
+		{"caller deadline beats timeout shape", deadlineCtx(t), context.DeadlineExceeded, Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true}},
+		{"caller deadline beats refused", deadlineCtx(t), refused, Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true}},
+	} {
+		got := ClassifyAttempt(tc.ctx, tc.err)
+		if got != tc.want {
+			t.Errorf("%s: ClassifyAttempt = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
 }
 
 // urlErrorShim mimics how net/http wraps transport errors (a wrapper with
