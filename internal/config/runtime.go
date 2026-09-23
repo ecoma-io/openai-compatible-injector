@@ -159,6 +159,11 @@ type runtimeProvider struct {
 	BaseURL   string           `yaml:"base-url"`
 	Transport string           `yaml:"transport"`
 	Recovery  *runtimeRecovery `yaml:"recovery"`
+	// StripFields is the optional list of response paths excised from any
+	// answer routed through this provider before it is relayed. A model
+	// referencing this provider inherits the list unless the model states its
+	// own, which then replaces it (model overrides provider).
+	StripFields []string `yaml:"strip-fields"`
 }
 
 // runtimeTransport mirrors one transports entry. Type is direct, proxy, or
@@ -310,6 +315,10 @@ type runtimeModel struct {
 	// model name to send there). Mutually exclusive with provider and
 	// endpoint — a chain is the whole route, not an addition to one.
 	Providers []runtimeModelCandidate `yaml:"providers"`
+	// StripFields is the optional model-level response strip list. A model
+	// that states one uses it instead of its providers' lists (override);
+	// a model without one inherits each candidate's provider list per hop.
+	StripFields []string `yaml:"strip-fields"`
 }
 
 // runtimeModelCandidate mirrors one entry of a model's providers chain:
@@ -846,6 +855,10 @@ type providerEntry struct {
 	// field, including for an unreferenced entry — so a broken override can
 	// never wait for a model to reference it.
 	recovery *recovery.Partial
+	// strip is the provider's response-strip list, parsed at load and
+	// inherited by every model that references this provider without stating
+	// its own.
+	strip []StripPath
 }
 
 // buildProviders validates the optional providers table against the
@@ -901,7 +914,11 @@ func buildProviders(rp map[string]runtimeProvider, transports map[string]transpo
 			}
 			rp = &partial
 		}
-		out[name] = providerEntry{endpoint: u, transport: tc, recovery: rp}
+		strip, err := buildStripFields(entry.StripFields)
+		if err != nil {
+			return nil, fmt.Errorf("provider entry %d: %w", ordinal, err)
+		}
+		out[name] = providerEntry{endpoint: u, transport: tc, recovery: rp, strip: strip}
 	}
 	return out, nil
 }
@@ -1113,6 +1130,10 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 	if err != nil {
 		return Model{}, err
 	}
+	modelStrip, err := buildStripFields(rm.StripFields)
+	if err != nil {
+		return Model{}, err
+	}
 	modelRecovery, err := buildModelRecovery(rm)
 	if err != nil {
 		return Model{}, err
@@ -1143,6 +1164,14 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 				providerRecovery = p.recovery
 			}
 		}
+		// The candidate's strip list rides on the provider's list: a chain
+		// may route through several providers, and each hop answers under
+		// its own provider's list unless the model overrides it below.
+		if ref := chain[i].Provider; ref != "" {
+			if p, ok := providers[ref]; ok {
+				chain[i].Strip = p.strip
+			}
+		}
 		policy, err := resolveCandidateRecovery(globalRecovery, providerRecovery, modelRecovery, candidateRecovery[i])
 		if err != nil {
 			return Model{}, fmt.Errorf("provider candidate %d: %w", i+1, err)
@@ -1155,6 +1184,17 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 		// the snapshot lives.
 		chain[i].RecoveryHash = policy.Hash()
 	}
+	// A model-level strip list replaces every candidate's provider list:
+	// strip describes the PUBLIC model's client-facing shape, so when the
+	// model states one, the same list applies uniformly to every hop. When
+	// it does not, each candidate keeps its provider's list (set in the
+	// candidate loop above) and Model.Strip stays nil, telling the handler
+	// to read per-hop.
+	if modelStrip != nil {
+		for i := range chain {
+			chain[i].Strip = modelStrip
+		}
+	}
 	return Model{
 		Public:          name,
 		Provider:        chain[0].Provider,
@@ -1162,6 +1202,7 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 		UpstreamModel:   chain[0].UpstreamModel,
 		InjectionPrompt: rm.InjectionPrompt,
 		ThinkingUsage:   tu,
+		Strip:           modelStrip,
 		Recovery:        chain[0].Recovery,
 		RecoveryHash:    chain[0].RecoveryHash,
 		Transport:       chain[0].Transport,
@@ -1273,6 +1314,157 @@ func validateEndpointURL(u *url.URL, field string) error {
 // when a thinking-usage block configures no ratio bounds (both absent). One
 // bound set pins the share to it; both set leave the [Lo, Hi] range intact.
 const defaultThinkingShare = 0.75
+
+// maxStripPaths bounds a strip-fields list. It caps the per-SSE-line key
+// prefilter cost (one memchr per path) and bound the pathological list.
+const maxStripPaths = 16
+
+// maxStripDepth bounds how deep one strip path may descend. It is a
+// backstop against a path that walks arbitrarily deep object nesting on
+// every response; real provider shapes stay shallow.
+const maxStripDepth = 8
+
+// buildStripFields validates one strip-fields list (provider- or
+// model-level) into parsed strip paths. The zero value (absent or null
+// block) means the feature is off. An explicit empty list is a reject — the
+// off spelling is absent, and an explicit-but-empty list smells like a
+// mistake. Every message is fixed text: the paths are operator input and
+// error text reaches logs verbatim.
+func buildStripFields(raw []string) ([]StripPath, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if len(raw) == 0 {
+		return nil, errors.New("strip-fields: requires at least one path")
+	}
+	if len(raw) > maxStripPaths {
+		return nil, errors.New("strip-fields: too many paths (maximum 16)")
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]StripPath, 0, len(raw))
+	for _, entry := range raw {
+		path := strings.TrimSpace(entry)
+		if path == "" {
+			return nil, errors.New("strip-fields: path must not be empty")
+		}
+		if _, dup := seen[path]; dup {
+			return nil, errors.New("strip-fields: duplicate path")
+		}
+		seen[path] = struct{}{}
+		segments, err := ParseStripPath(path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, StripPath{Segments: segments})
+	}
+	return out, nil
+}
+
+// ParseStripPath parses one dotted strip path into its object-key segments,
+// honoring the single-quoted segment spelling: a segment wrapped in single
+// quotes carries literal dots, spaces, or quote characters and is decoded
+// with the JSON unquoting rules (`'a”b'` → `a'b`). Unquoted segments split
+// on the dot. Every message is fixed text and never echoes the path.
+//
+// The reserved keys model and usage are rejected outright: stripping either
+// would delete data the proxy itself applies (the model rename here, and
+// the thinking-usage synthesis and metering), silently changing what a
+// client sees or what usage is attributed. A segment that contains a double
+// quote is rejected — it can never appear in the canonical key bytes the
+// byte-preserving scan matches, so it is dead config.
+func ParseStripPath(s string) ([]string, error) {
+	var segments []string
+	i := 0
+	for i < len(s) {
+		switch {
+		case s[i] == '.':
+			return nil, errors.New("strip-fields: path must not contain an empty segment")
+		case s[i] == '\'':
+			// A single-quoted segment: find the closing quote. A doubled
+			// quote is an escaped quote; a lone quote starts the next
+			// segment only after the closing one.
+			j := i + 1
+			var b strings.Builder
+			for {
+				if j >= len(s) {
+					return nil, errors.New("strip-fields: path must not contain an unterminated quoted segment")
+				}
+				if s[j] == '\'' {
+					if j+1 < len(s) && s[j+1] == '\'' {
+						b.WriteByte('\'')
+						j += 2
+						continue
+					}
+					break
+				}
+				b.WriteByte(s[j])
+				j++
+			}
+			seg := b.String()
+			if err := validateStripSegment(seg); err != nil {
+				return nil, err
+			}
+			segments = append(segments, seg)
+			i = j + 1
+			if i < len(s) {
+				if s[i] != '.' {
+					return nil, errors.New("strip-fields: path must separate segments with a dot")
+				}
+				i++
+				if i == len(s) {
+					return nil, errors.New("strip-fields: path must not contain an empty segment")
+				}
+			}
+		default:
+			// An unquoted segment runs to the next dot.
+			j := i
+			for j < len(s) && s[j] != '.' && s[j] != '\'' {
+				j++
+			}
+			if j < len(s) && s[j] == '\'' {
+				return nil, errors.New("strip-fields: segment must be quoted before the first quote character")
+			}
+			seg := s[i:j]
+			if err := validateStripSegment(seg); err != nil {
+				return nil, err
+			}
+			segments = append(segments, seg)
+			i = j
+			if i < len(s) {
+				// i points at '.' — the quote case was rejected above.
+				i++
+				if i == len(s) {
+					return nil, errors.New("strip-fields: path must not contain an empty segment")
+				}
+			}
+		}
+	}
+	if len(segments) == 0 {
+		return nil, errors.New("strip-fields: path must not be empty")
+	}
+	if len(segments) > maxStripDepth {
+		return nil, errors.New("strip-fields: path descends too deep (maximum 8 segments)")
+	}
+	return segments, nil
+}
+
+// validateStripSegment rejects a segment that could never match the
+// byte-level key scan or that would strip proxy-applied data.
+func validateStripSegment(seg string) error {
+	if seg == "" {
+		return errors.New("strip-fields: path must not contain an empty segment")
+	}
+	if strings.ContainsRune(seg, '"') {
+		return errors.New("strip-fields: segment must not contain a double quote")
+	}
+	switch seg {
+	case "model":
+		return errors.New(`strip-fields: must not include "model"`)
+	case "usage":
+		return errors.New(`strip-fields: must not include "usage"`)
+	}
+	return nil
+}
 
 // buildThinkingUsage validates and normalizes the optional thinking-usage
 // block. Every message is fixed text: value positions can carry a botched

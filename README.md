@@ -247,6 +247,20 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   fixed to it). An absent or null block means off — responses stay
   byte-identical to an unconfigured deployment. See
   [Simulated thinking usage](#simulated-thinking-usage).
+- `strip-fields` — optional list of response paths excised from this model's
+  upstream 2xx responses before relay and from the model's whole candidate
+  chain. Each entry is a dotted JSON path (`parent.child`); a segment
+  containing a dot, space, or quote is wrapped in single quotes and decoded
+  with JSON unquoting rules (`'parent name'.child`, `'a.b'.c`, `'a''b'.c`).
+  The traversal is object-only (a path never descends through an array), the
+  scope follows the API (chat: top-level object; responses: top-level plus one
+  `response`-object descent), and stripping is byte-preserving — everything
+  outside an excised member is untouched. The reserved keys `model` and
+  `usage` are rejected at any depth (the proxy itself writes those). An absent
+  or null list means no stripping — responses stay byte-identical. A model
+  that states a list replaces its provider's list; a model without one
+  inherits each candidate's provider list per hop.
+  See [Response field stripping](#response-field-stripping).
 - `recovery` — optional block carrying the model recovery policy: the
   `matrix` (which failure retries, falls back, or terminates), `retries`,
   `fallback`, `budget`, and `retry-after`. The same block is accepted at the
@@ -318,8 +332,8 @@ The file is validated strictly, in two layers:
   key whose value is an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `provider`,
-  `upstream-model`, `injection-prompt`, `thinking-usage`, `retries`,
-  `recovery` and
+  `upstream-model`, `injection-prompt`, `thinking-usage`, `strip-fields`,
+  `retries`, `recovery` and
   `providers` (and, inside the thinking-usage block, outside `mode`,
   `min-ratio`, `max-ratio`; inside `retries`, outside `max-retries`,
   `max-elapsed` and `backoff` — itself limited to `initial`, `max` and
@@ -328,7 +342,7 @@ The file is validated strictly, in two layers:
   a nested bootstrap key — is a rejection, not a
   warning. The
   same strictness holds inside `providers` entries (`base-url`,
-  `transport`, `recovery`), model-chain candidate entries (`provider`,
+  `transport`, `recovery`, `strip-fields`), model-chain candidate entries (`provider`,
   `upstream-model`, `recovery`), `transports` entries
   (`type`, `proxy`, and the pool fields `members`, `strategy`, `fallback`,
   `health`, each with their own strict field sets), and pool `members`
