@@ -13,24 +13,36 @@ import (
 )
 
 // The provider fallback contract, black-box: a chain model's candidate list
-// is walked primary-first under the provider-fallback policy, moving to the
-// next candidate only when one fails BEFORE answering (transport-level
-// failure); any HTTP status is the answer, relayed as a single-provider
-// deployment would relay it. These scenarios drive the real binary with two
-// providers — one unreachable (a closed port: connection refused is a
-// transport failure, not a status) and one live — over real HTTP.
+// is walked primary-first under the provider-fallback policy. Received HTTP
+// statuses classify against the closed retry matrix — terminal statuses
+// relay as a single-provider deployment would relay them, fallback-only
+// statuses move straight to the next candidate, retryable statuses spend
+// the model's same-candidate retry budget first — and only a failure
+// BEFORE answering (transport-level) moves a request that never received
+// an answer. These scenarios drive the real binary with two providers —
+// one unreachable (a closed port: connection refused is a transport
+// failure, not a status) and one live — over real HTTP.
 
 // chainYAML renders a runtime file whose chain-model lists the given
 // provider candidates in order (base URLs), plus an optional
 // provider-fallback block.
 func chainYAML(t *testing.T, candidates []string, fallbackBlock string) string {
 	t.Helper()
+	return chainYAMLRetries(t, candidates, fallbackBlock, "")
+}
+
+// chainYAMLRetries is chainYAML with a pre-indented per-model retries block
+// ("" = the built-in defaults apply).
+func chainYAMLRetries(t *testing.T, candidates []string, fallbackBlock, retriesBlock string) string {
+	t.Helper()
 	var sb strings.Builder
 	sb.WriteString("api-key: " + e2eAPIKey + "\nproviders:\n")
 	for i, base := range candidates {
 		fmt.Fprintf(&sb, "  chain-p%d:\n    base-url: %s/v1\n", i+1, base)
 	}
-	sb.WriteString("models:\n  chain-model:\n    providers:\n")
+	sb.WriteString("models:\n  chain-model:\n")
+	sb.WriteString(retriesBlock)
+	sb.WriteString("    providers:\n")
 	for i := range candidates {
 		fmt.Fprintf(&sb, "      - provider: chain-p%d\n        upstream-model: chain-up-%d\n", i+1, i+1)
 	}
@@ -90,10 +102,107 @@ func TestE2EProviderChainFallsBackToSecondProvider(t *testing.T) {
 	}
 }
 
-// TestE2EProviderChainStatusIsTerminal pins the boundary over the real
-// wire: a 429 from the primary is THE answer — status preserved, canonical
-// envelope, and the second candidate is never dialed.
+// TestE2EProviderChainStatusIsTerminal pins the terminal direction of the
+// status matrix over the real wire: a 400 from the primary is THE answer —
+// status preserved, canonical envelope, and the second candidate is never
+// dialed. A body the primary rejects this way fails every candidate, so
+// the walk relays it exactly as a single-provider deployment would.
 func TestE2EProviderChainStatusIsTerminal(t *testing.T) {
+	badRequest := newFakeUpstream(t)
+	badRequest.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"bad shape"}}`)
+	})
+	second := newFakeUpstream(t)
+	second.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("the second candidate was dialed after the primary answered 400")
+	})
+
+	body := chainYAML(t, []string{badRequest.url(), second.url()}, "")
+	p := startSubprocess(t, startOpts{yaml: body, logLevel: "info"})
+
+	code, _, respBody := postJSON(t, p.addr, "/v1/chat/completions",
+		poolChatBody("chain-model", "hi"), nil)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	if !strings.Contains(string(respBody), `"code":"upstream_http_400"`) {
+		t.Errorf("body = %s, want the canonical upstream_http_400 envelope", respBody)
+	}
+	if strings.Contains(string(respBody), "bad shape") {
+		t.Errorf("provider error body relayed raw: %s", respBody)
+	}
+
+	ev := waitForEventCount(t, p, "request_completed", 1)[0]
+	if ev["provider_attempts"] != float64(1) || ev["final_provider"] != "chain-p1" ||
+		ev["retries_total"] != float64(0) {
+		t.Errorf("provider fields = %v/%v/%v, want one attempt, no retries on chain-p1",
+			ev["provider_attempts"], ev["final_provider"], ev["retries_total"])
+	}
+}
+
+// TestE2EProviderChain429RetriesThenFallsBack pins the retry-then-fallback
+// half of the matrix over the real wire: a 429 from the primary spends the
+// default one same-candidate retry (a real bounded wait) and then the walk
+// moves to the second candidate, whose answer is the client's.
+func TestE2EProviderChain429RetriesThenFallsBack(t *testing.T) {
+	rateLimited := newFakeUpstream(t)
+	rateLimited.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"slow down"}}`)
+	})
+	second := newFakeUpstream(t)
+	second.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"c2","object":"chat.completion","model":"chain-up-2","choices":[{"index":0,"message":{"role":"assistant","content":"from-second"}}]}`)
+	})
+
+	body := chainYAML(t, []string{rateLimited.url(), second.url()}, "")
+	p := startSubprocess(t, startOpts{yaml: body, logLevel: "info"})
+
+	code, _, respBody := postJSON(t, p.addr, "/v1/chat/completions",
+		poolChatBody("chain-model", "hi"), nil)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body %s — the retried 429 must fall back to the second candidate", code, respBody)
+	}
+	if !strings.Contains(string(respBody), `"model":"chain-model"`) {
+		t.Errorf("response model not rewritten to the public name: %s", respBody)
+	}
+	// The primary saw the initial attempt plus the default one retry; the
+	// second candidate answered.
+	if rateLimited.count() != 2 {
+		t.Errorf("primary hits = %d, want 2 (initial + one retry)", rateLimited.count())
+	}
+	if second.count() != 1 {
+		t.Errorf("second candidate hits = %d, want 1", second.count())
+	}
+
+	ev := waitForEventCount(t, p, "request_completed", 1)[0]
+	if ev["provider_attempts"] != float64(3) || ev["retries_total"] != float64(1) ||
+		ev["final_provider"] != "chain-p2" || ev["final_candidate"] != float64(2) {
+		t.Errorf("provider fields = %v/%v/%v/%v, want 3 attempts, 1 retry, final chain-p2/2",
+			ev["provider_attempts"], ev["retries_total"], ev["final_provider"], ev["final_candidate"])
+	}
+	// Both discarded 429s answered an evidence event; neither was retried
+	// raw into a provider_attempt_failed (statuses are answers). The
+	// completion event is the sync point — anything it would follow is
+	// already in the buffer.
+	if evs := waitForEventCount(t, p, "upstream_http_error", 2); len(evs) != 2 {
+		t.Errorf("upstream_http_error events = %d, want 2", len(evs))
+	}
+	if n := len(eventsWithMessage(parseLogEvents(t, p.stderr.String()), "provider_attempt_failed")); n != 0 {
+		t.Errorf("provider_attempt_failed events = %d, want 0 (statuses are answers)", n)
+	}
+}
+
+// TestE2EProviderChainRetained429OverDeadSecond pins the final-error rule
+// over the real wire: the primary's 429 exhausts a zero-retry budget, the
+// second candidate is unreachable, and the client still receives the
+// RETAINED 429 — its relayed Retry-After included — with the answering
+// candidate as final_provider and no provider_exhausted.
+func TestE2EProviderChainRetained429OverDeadSecond(t *testing.T) {
 	rateLimited := newFakeUpstream(t)
 	rateLimited.setHandler(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -101,21 +210,18 @@ func TestE2EProviderChainStatusIsTerminal(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"message":"slow down"}}`)
 	})
-	second := newFakeUpstream(t)
-	second.setHandler(func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("the second candidate was dialed after the primary answered 429")
-	})
 
-	body := chainYAML(t, []string{rateLimited.url(), second.url()}, "")
+	body := chainYAMLRetries(t, []string{rateLimited.url(), "http://127.0.0.1:1"}, "",
+		"    retries:\n      max-retries: 0\n")
 	p := startSubprocess(t, startOpts{yaml: body, logLevel: "info"})
 
 	code, hdrs, respBody := postJSON(t, p.addr, "/v1/chat/completions",
 		poolChatBody("chain-model", "hi"), nil)
 	if code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", code)
+		t.Fatalf("status = %d, want the retained 429", code)
 	}
 	if got := hdrs.Get("Retry-After"); got != "7" {
-		t.Errorf("Retry-After = %q, want the relayed 7", got)
+		t.Errorf("Retry-After = %q, want the retained answer's relayed 7", got)
 	}
 	if !strings.Contains(string(respBody), `"code":"upstream_http_429"`) {
 		t.Errorf("body = %s, want the canonical upstream_http_429 envelope", respBody)
@@ -125,9 +231,18 @@ func TestE2EProviderChainStatusIsTerminal(t *testing.T) {
 	}
 
 	ev := waitForEventCount(t, p, "request_completed", 1)[0]
-	if ev["provider_attempts"] != float64(1) || ev["final_provider"] != "chain-p1" {
-		t.Errorf("provider fields = %v/%v, want one attempt on chain-p1",
-			ev["provider_attempts"], ev["final_provider"])
+	if ev["provider_attempts"] != float64(2) || ev["retries_total"] != float64(0) ||
+		ev["final_provider"] != "chain-p1" || ev["final_candidate"] != float64(1) {
+		t.Errorf("provider fields = %v/%v/%v/%v, want 2 attempts, no retries, final chain-p1/1",
+			ev["provider_attempts"], ev["retries_total"], ev["final_provider"], ev["final_candidate"])
+	}
+	if _, exhausted := ev["provider_exhausted"]; exhausted {
+		t.Errorf("provider_exhausted set although a provider answered")
+	}
+	// The second candidate's dial failure is still one sanitized WARN.
+	failed := waitForEventCount(t, p, "provider_attempt_failed", 1)[0]
+	if failed["provider"] != "chain-p2" {
+		t.Errorf("provider_attempt_failed = %v, want chain-p2's dial failure", failed["provider"])
 	}
 }
 

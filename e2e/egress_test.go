@@ -578,6 +578,14 @@ func TestEgressPoolUpstreamStatusIsAnAnswer(t *testing.T) {
 		nil,
 		map[string]string{"pool-egress": poolMembersLine("relay-a", "relay-b")},
 		up.url(), "bystander-up")
+	// The provider retry layer is off for this model: the dial-count
+	// assertions below pin the POOL seam — one Execute, one member, and a
+	// status never moves a request between members INSIDE that Execute.
+	// (With the default policy the handler would legitimately re-execute,
+	// a second pool dial included.)
+	body = strings.Replace(body,
+		"  pool-egress-model:\n",
+		"  pool-egress-model:\n    retries:\n      max-retries: 0\n", 1)
 	p := startSubprocess(t, startOpts{yaml: body, logLevel: "info"})
 
 	code, hdrs, respBody := postJSON(t, p.addr, "/v1/chat/completions",
@@ -593,7 +601,7 @@ func TestEgressPoolUpstreamStatusIsAnAnswer(t *testing.T) {
 		t.Errorf("Retry-After = %q, want the relayed upstream header", hdrs.Get("Retry-After"))
 	}
 	if fpA.count() != 1 || fpB.count() != 0 {
-		t.Errorf("member hits = %d/%d, want 1/0 — a 429 must never fall back", fpA.count(), fpB.count())
+		t.Errorf("member hits = %d/%d, want 1/0 — a status must never fall back inside the pool", fpA.count(), fpB.count())
 	}
 	if up.count() != 1 {
 		t.Errorf("upstream requests = %d, want 1", up.count())
