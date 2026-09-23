@@ -23,7 +23,7 @@ Owned decomposition:
 | `internal/auth`                  | Client identity: `Principal`/`Reason`/`Authenticator`/`Provider` seam, `StaticProvider` (snapshot-bound shared key, padded constant-time compare), `PartnerProvider` (store-backed, bounded positive/negative decision cache — errors never cached), crypto-random token/keyID minting + SHA-256-at-rest hashing, PostgreSQL key store (`PGStore`: lookup/create/list/revoke, off-path batched `last_used_at` flusher)                                                                                                                                                                                                                                                                                                                               |
 | `internal/migrate`               | Shared SQL-first module-scoped migration runner: embedded-set parsing, legacy auth-ledger adoption, advisory-lock serialization, `information_schema` column-contract validation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `internal/usage`                 | Factual upstream usage capture (pre-rewrite), durable PostgreSQL event repository and reporting query seam, bounded asynchronous batch pipeline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify`, egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                                                                                                                                                                                                                                                                                                 |
+| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify` and the context-aware `ClassifyAttempt` (`Failure`: canonical class, closed-set cause, caller-terminated flag), egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                                                                                                                                                                                  |
 | `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping (auth delegated to the `auth.Provider` seam — static or partner), error envelopes, SSE copying (`CopySSE`), provider candidate walk (bounded by the snapshot's provider-fallback policy, transport-failure-only), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                                                                                                                              |
 | `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, `keys create/list/revoke` (partner key lifecycle; list exposes no secrets), default serve                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -92,14 +92,17 @@ Owned decomposition:
   member's health/limiter mutexes, and no network I/O happens under any of
   them. The pool owns selection via the `Executor` seam — the handler
   hands the request facts (context, URL, headers, body, probed stream
-  flag) and gets one response or one error; cancellation aborts with no
-  strike, zero dials is the exhaustion sentinel answering the canonical
+  flag) and gets one response or one error; a caller cancellation or
+  deadline (the attempt context done — ownership is decided by the
+  context, never by the error chain, so an expired deadline can never
+  masquerade as a provider-local timeout) aborts with no strike, zero
+  dials is the exhaustion sentinel answering the canonical
   502 `upstream_unreachable` with `error_class: egress_exhausted`, and any
   HTTP status — 429/5xx included — ends the loop and relays like a
   single-endpoint response. Every dialed-and-failed endpoint appends one
-  sanitized `AttemptFailure` (kind, scheme+host, typed class — never error
-  text, never credentials) that the handler relays as WARN
-  `egress_attempt_failed`. Proxy/SOCKS failures are typed
+  sanitized `AttemptFailure` (kind, scheme+host, canonical class +
+  closed-set cause — never error text, never credentials) that the handler
+  relays as WARN `egress_attempt_failed`. Proxy/SOCKS failures are typed
   (`ProxyAuthError`/`ProxyConnectError` wrapping their historical texts;
   classified by type, never message text) for fallback decisions and
   `error_class` tokens; pool state (scheduler cursor, health, permits,
@@ -129,11 +132,14 @@ Owned decomposition:
   `min(max-attempts, len(chain))` candidates; it composes with egress
   fallback multiplicatively (worst-case dials = provider budget × egress
   budget). A candidate is skipped only when it fails BEFORE answering
-  (dial/TLS/proxy/egress exhaustion — non-cancellation transport errors);
+  (dial/TLS/proxy/egress exhaustion — transport errors owned by the
+  endpoint under a still-live request context);
   ANY HTTP status ends the walk and is relayed as a single-provider
   answer. Never retried: local transform errors (a body failing one
-  candidate's transform fails all — answer 400 immediately), client
-  cancellation (client_disconnected, walk aborted), and commitment (the
+  candidate's transform fails all — answer 400 immediately), a caller
+  cancellation or expired deadline (client_disconnected, walk aborted —
+  the request context decides ownership, so a dead caller never spends
+  the fallback budget), and commitment (the
   walk completes before the first response byte — the candidate that
   produces headers has produced THE response, so streaming commitment
   holds by construction). Each attempt replays the immutable client body
@@ -142,8 +148,22 @@ Owned decomposition:
   transports bind to the request's snapshot; the egress closure covers
   every candidate's transport. Observability: `provider_attempts`,
   `final_provider` on every completion that reached the walk,
-  `provider_exhausted` on exhaustion; one WARN `provider_attempt_failed`
-  per failed candidate.
+  `provider_exhausted` on exhaustion (terminal `error_class:
+provider_exhausted` over the final cause; a zero-dial pool reports
+  `egress_exhausted`/`no_eligible_endpoint`); one WARN
+  `provider_attempt_failed` per failed candidate and one WARN
+  `egress_attempt_failed` per dialed-and-failed endpoint — pooled or
+  direct (`egress_kind`/`egress_target` `direct`, egress attempt 1), so
+  both egress shapes emit the same record. Failure evidence carries the
+  canonical `error_class` plus a closed-set `error_cause` token
+  (`connection_refused`, `tls`, `dial`, `network_timeout`,
+  `deadline_exceeded`, `proxy_connect`, `proxy_auth`, `proxy_timeout`,
+  `caller_canceled`, `caller_deadline_exceeded`, …) mapped from typed
+  error shapes only, never message text, and one-based nested indexes
+  `provider_attempt`/`egress_attempt` (egress index omitted when nothing
+  was dialed); pooled records also carry the legacy `attempt` field as an
+  alias equal to `egress_attempt` — compatibility only,
+  `egress_attempt` is authoritative.
 - **Invalid initial config = startup failure; invalid reload = last-known-good.**
   `LoadRuntime` failure at boot exits 1. `Poller.Run` on any failure logs and
   keeps the previous snapshot; its hash baseline is the boot content passed
@@ -234,17 +254,25 @@ Owned decomposition:
   non-error statuses (3xx redirects — never followed — 204, 304) forward
   byte for byte. Upstream 4xx/5xx are normalized: status preserved, body
   replaced by the canonical envelope, raw provider bytes relayed nowhere —
-  a bounded 64 KiB prefix is read once (`internal/proxy/upstream_error.go`)
-  to classify (`error_shape`) and fingerprint (`error_fingerprint`,
-  SHA-256 of the prefix) into one `upstream_http_error` evidence event
-  (WARN 4xx / ERROR 5xx, token-shaped `provider_error_type`/`code` only,
-  allow-listed `retry_after`/`x_ratelimit_*`, scheme+host upstream); the
+  a bounded 64 KiB prefix is read once under a short fixed internal
+  capture timeout (test-overridable package var; never runtime
+  configuration, and a `context.AfterFunc` closes the stalled body on the
+  caller's or the timer's firing) to classify (`error_shape`) and
+  fingerprint (`error_fingerprint`, SHA-256 of the prefix) into one
+  `upstream_http_error` evidence event (WARN 4xx / ERROR 5xx,
+  `error_class: upstream_error` with `error_cause:
+upstream_http_4xx`/`upstream_http_5xx`, token-shaped
+  `provider_error_type`/`code` only, log-normalized media-type-only
+  `content_type` with static `invalid`/`oversized` markers, allow-listed
+  `retry_after`/`x_ratelimit_*`, scheme+host upstream); the
   bytes themselves reach neither client nor logs. A 200 that is not JSON
-  becomes 502 `upstream_invalid_response`; an error-body read failure is
-  WARN `upstream_body_read_failed` + 502; a client cancel during it is
-  `client_disconnected` with no envelope. Dial failure is 502
-  `upstream_unreachable`; unmapped model is 404 `model_not_found` and is
-  NEVER forwarded.
+  becomes 502 `upstream_invalid_response`; an error-body read failure or
+  a stalled body past the capture timeout is WARN
+  `upstream_body_read_failed` + 502 — terminal for the
+  already-answering candidate, never a fallback trigger; a caller
+  cancel/deadline during it is `client_disconnected` with no envelope.
+  Dial failure is 502 `upstream_unreachable`; unmapped model is 404
+  `model_not_found` and is NEVER forwarded.
 - **Usage metering is optional, factual, and off the critical path.** With
   `OAICR_USAGE_DATABASE_URL` empty there is no connection or event. When set,
   startup migrates/validates the PostgreSQL store; each request that reaches
