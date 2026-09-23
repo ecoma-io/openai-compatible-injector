@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.9.0...v0.10.0) (2026-09-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** align recovery ownership, override scope and failure evidence ([#59](https://github.com/ecoma-io/openai-compatible-injector/issues/59))
+
+### Features
+
+* **config:** align recovery ownership, override scope and failure evidence ([#59](https://github.com/ecoma-io/openai-compatible-injector/issues/59)) ([49cad18](https://github.com/ecoma-io/openai-compatible-injector/commit/49cad189eb6a0cff47efdc6aace86bc4f9401f27))
+
 ## [0.9.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.8.0...v0.9.0) (2026-09-23)
 
 
