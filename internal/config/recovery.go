@@ -218,15 +218,25 @@ func buildRecoveryPartial(block *runtimeRecovery) (recovery.Partial, error) {
 // belongs to, and never the value.
 //
 // `recovery.fallback` is rejected here — at every call-in — because the
-// walk's reach is a property of the REQUEST's primary policy, not of any
-// candidate: the engine's EnterCandidate gate reads only the primary
-// policy's Fallback (engine.go canEnter), so a fallback block on a provider
-// or candidate override would merge, validate, hash, and then do nothing.
-// Accepting it would leave an operator believing a lower-level block steers
-// chain reach it cannot. The global position owns the walk bound; the model
-// position states it through buildModelRecovery, which applies the model's
-// override to that model's own primary candidate and therefore genuinely
-// steers that model's walk.
+// walk's reach is a property of the REQUEST's chain, not of any candidate:
+// the engine's enter-candidate gate reads only the primary policy's Fallback
+// (engine.go canEnter), and the primary is chain[0]. Accepting the block
+// below that layer would be misleading in BOTH directions, which is why this
+// is a rejection rather than a narrowing:
+//
+//   - on a non-primary candidate (or on a provider that is not the primary's)
+//     it would merge, validate, hash, and then do nothing at all;
+//   - on the primary's own provider or on candidate 1 it would steer — but
+//     only for as long as that provider stays the primary, which is a
+//     property of the requesting model, not of the provider. The same
+//     provider entry used as a fallback for a second model would carry a
+//     block that silently does nothing there.
+//
+// Neither reading is one an operator can hold while paged, so the walk bound
+// lives where chain reach is a real concept: the global position owns it, and
+// the model position states it through buildModelRecovery — which applies the
+// model's override to that model's own primary candidate and therefore
+// genuinely steers that model's walk.
 func buildRecoveryOverride(block *runtimeRecovery) (recovery.Partial, error) {
 	if block.Budget != nil && block.Budget.Request != nil {
 		return recovery.Partial{}, errors.New("recovery.budget.request is request-scoped and only valid in the top-level recovery block")

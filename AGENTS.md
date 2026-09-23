@@ -77,10 +77,9 @@ Owned decomposition:
   pick), bounded provably-unsent fallback (`fallback.enabled`, default
   true/3, cap 16 — skipped members consume no attempt; only a
   `definitely_not_sent` failure may move to another member, because a
-  failure that might have reached the member — any timeout on an
-  established connection — is `send_unknown` and must not be replayed
-  below the layer that owns retry policy, so the pool stops the loop
-  without a strike and hands it up), and passive health
+  failure that might have reached the member is `send_unknown` and must not
+  be replayed below the layer that owns retry policy, so the pool stops the
+  loop without a strike and hands it up), and passive health
   (`health.enabled`/`failure-threshold`/`cooldown`, defaults true/3/30s,
   min 1s; any response resets, and only `definitely_not_sent` failures
   count toward the threshold). Eligibility precedes everything — static
@@ -149,7 +148,16 @@ Owned decomposition:
   chain resolved — global → provider → model → candidate, deep-merged and
   re-validated at each step, so an override states only what changes and
   inherits everything else, and a layer that contradicts the one below it
-  is rejected rather than quietly winning. What a failure MEANS is that
+  is rejected rather than quietly winning. Two members are position-scoped
+  and rejected outside their layers, because a block that cannot be
+  honoured reads like a setting and is not one: `fallback` (the walk's
+  reach, which is a property of the request's CHAIN, not of a hop) is legal
+  at the global and model layers and rejected on a provider entry or a
+  candidate — on a non-primary hop it could never matter, and on the
+  primary's own provider it would steer only until that provider is used as
+  a fallback for another model, so neither reading is one an operator can
+  hold — while `budget.request` (the whole request's envelope) is legal
+  only in the top-level block. What a failure MEANS is that
   policy's matrix, never a table in the handler: typed observations (exact
   status, status class, provider error type/code, transport class and
   cause, protocol cause, caller cause) map onto `retry`/`fallback`/
@@ -315,8 +323,21 @@ provider_exhausted` over the final cause; a zero-dial pool reports
   pool's fallback gate: only a `definitely_not_sent` failure may move the
   request to another egress member, because a `send_unknown` request may
   already have reached the upstream and replaying it would duplicate it.
+  That state is derived from the failing WIRE OPERATION — the classifier's
+  class is a catch-all and reads an established-connection reset the same
+  way it reads a refused connect, so `ClassConnection` must never be read as
+  "never connected"; a `dial`/`proxyconnect` op, a typed proxy-tunnel
+  failure, a TLS handshake failure and a bare refused syscall prove no
+  request byte left, and everything else (a read/write op, a bare EOF, a
+  timeout on an established connection) is `send_unknown`. It is evidence
+  about a DIALED attempt, so a zero-dial pool exhaustion reports none. The
+  pool's refusal is inside one provider path only: the walk above it is the
+  replay authority, so a chain whose candidates share a base-url does re-send
+  by the matrix's own transport rows.
   `provider_attempt_started` fires before the attempt's first dial on both
-  paths, so a dial's own egress evidence follows the marker it belongs to, and one-based nested indexes
+  paths — so it announces an intent, and its `provider_attempt` is the index
+  the attempt WILL carry, which an envelope refusal can leave unrealized —
+  and a dial's own egress evidence follows the marker it belongs to, and one-based nested indexes
   `provider_attempt`/`egress_attempt` (egress index omitted when nothing
   was dialed); pooled records also carry the legacy `attempt` field as an
   alias equal to `egress_attempt` — compatibility only,

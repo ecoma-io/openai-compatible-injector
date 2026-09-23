@@ -131,7 +131,9 @@ transports:
 # fall back, or terminate, how the same candidate is re-asked, how far the
 # candidate walk reaches, and how many real upstream exchanges one request may
 # spend. Overrides of the same shape sit on a providers entry, a models entry,
-# and one chain candidate; each layer merges onto the one before it.
+# and one chain candidate; each layer merges onto the one before it. Two
+# members are position-scoped and rejected elsewhere — `budget.request` only
+# here, `fallback` only here or on a model entry.
 recovery:
   matrix:
     http:
@@ -248,13 +250,19 @@ log-level: info # optional; debug | info | warn | error (absent = info)
 - `recovery` — optional block carrying the model recovery policy: the
   `matrix` (which failure retries, falls back, or terminates), `retries`,
   `fallback`, `budget`, and `retry-after`. The same block is accepted at the
-  top level (the global layer, and the only position that may state the
-  request-scoped `budget.request`), on a `providers` entry, here, and on one
+  top level (the global layer), on a `providers` entry, here, and on one
   chain candidate. The layers merge in the order global → provider → model →
   candidate, so an override states only what changes; an invalid, ambiguous,
   or over-cap block rejects the complete file. Absent, `null`, or `{}`
   inherits the layer beneath — the built-in default policy at the global
-  position. See [Provider recovery policy](#provider-recovery-policy).
+  position.
+  Two members are confined to the layers whose scope they describe, and
+  stating one anywhere else rejects the file rather than loading a block that
+  could not mean what it says: `budget.request` is the whole request's
+  envelope and belongs to the top-level block only, and `fallback` (the
+  candidate walk's reach) belongs to the layers that describe a whole chain —
+  the top level and a model entry. See
+  [Provider recovery policy](#provider-recovery-policy).
 - `retries` — the **legacy** spelling of the model layer's retry mechanics,
   normalized into the same policy engine as `recovery.retries`; stating both
   in one model entry is rejected rather than leaving the effective behavior
@@ -561,14 +569,19 @@ referenced by name from `providers`:
     inside the same selection step, so two concurrent requests can never
     both take a member's last permit and both dial.
   - **Bounded fallback, provably-unsent failures only.** When a dialed
-    member fails before a connection ever carried the request — refused,
-    TLS handshake, dial, proxy CONNECT or proxy auth — the next eligible
-    member is tried, up to `max-attempts` distinct endpoints. A failure
-    that may have reached the member stops the loop instead: a timeout on
-    an established connection is `send_unknown`, because the upstream may
-    already be processing a request whose answer never came back, and
-    replaying it on another egress would silently duplicate it. That
-    failure travels up to the recovery policy, which owns replay. A client
+    member fails with positive evidence that no request byte ever left this
+    process — a refused or unreachable dial, a failed TLS handshake, a
+    proxy CONNECT or proxy-auth failure — the next eligible member is
+    tried, up to `max-attempts` distinct endpoints. Evidence, not
+    classification, is what decides it: the failure's _wire operation_ is
+    read, so a connect that timed out against a blackholed path counts as
+    unsent (nothing was written), while a reset, a bare EOF, or a timeout on
+    an established connection reads `send_unknown` — the peer may already
+    be processing a request whose answer never came back, and replaying it
+    on another egress would silently duplicate it. Send-unknown stops the
+    loop and travels up to the recovery policy, which owns replay; the
+    per-dial evidence line carries `send_state`, so "the pool stopped short
+    of its remaining members, and why" is one field away. A client
     cancellation — or an expired caller deadline, which the request context
     reports the same way — aborts everything: no fallback, no strike, no
     penalty. The request context, not the error chain, decides ownership.
@@ -577,7 +590,7 @@ referenced by name from `providers`:
     never a health strike.
   - **Passive health.** `failure-threshold` consecutive
     `definitely_not_sent` failures open a `cooldown` during which the
-    member is skipped — a `send_unknown` timeout proves nothing about the
+    member is skipped — a `send_unknown` failure proves nothing about the
     endpoint and never strikes. Recovery
     needs no probe: any response proves the path delivered and resets the
     count.
@@ -645,6 +658,29 @@ something different in each:
 | a `providers` entry's `recovery`                    | provider  | every model whose candidate routes through that provider |
 | a `models` entry's `recovery`                       | model     | that model                                               |
 | one entry of a model's `providers` chain `recovery` | candidate | that single hop                                          |
+
+Not every member is legal in every position. A member whose meaning is wider
+than the layer it would sit on is **rejected**, not silently ignored, because
+a block that cannot be honoured is worse than no block: it reads like a
+setting. Two members are scoped this way.
+
+`fallback` decides how far the request's candidate walk reaches — a property
+of the chain, not of any one hop. The walk's reach comes from the primary
+candidate's policy alone, so:
+
+- in the **global** and **model** positions it genuinely steers;
+- on a **candidate** (or on a provider that is not the primary's) it could
+  never matter at all;
+- on the **primary's own provider** it would steer today and stop steering the
+  moment that provider is used as a fallback for another model — the same
+  block, two behaviours, decided by a chain position the operator cannot see
+  from the provider entry.
+
+So `fallback` is accepted at the top level and on a model entry, and stating
+it on a `providers` entry or a chain candidate rejects the file.
+
+`budget.request` bounds the whole request, which is wider than any single
+layer beneath it; it is accepted in the top-level block only.
 
 Resolution runs once, at config load, in the order **global → provider → model
 → candidate** — narrowest last, so an override always beats what it overrides.
@@ -1671,11 +1707,23 @@ answers, which ride the unusable-answer events rather than
 `provider_attempt_failed`), `failure_origin` (`upstream_http` | `transport` |
 `protocol` | `caller` | `envelope` — the layer the failure belongs to) and
 `elapsed_ms`. Transport failures additionally carry `send_state`
-(`definitely_not_sent` | `send_unknown`): whether the request provably never
-left the client. The evidence and body-read/invalid events carry
+(`definitely_not_sent` | `send_unknown`): whether this dialed attempt
+provably never carried a request byte. It is evidence about a **dialed**
+attempt, so a pool that skipped every member reports none — that line says
+`egress_exhausted`, which is the whole truth about it. The evidence and
+body-read/invalid events carry
 the received HTTP status as `upstream_status` — a transport failure has no
 status to carry — so failures correlate by
 `request_id + candidate_index + candidate_attempt + egress_attempt`.
+
+Two naming notes, so a dashboard is not built on the wrong reading.
+`provider_attempt_started` replaced the former `upstream_request_started`
+(the slug now names what it announces), and it is emitted **before** the
+dial, so its `provider_attempt` is the index the attempt _will_ carry: an
+attempt the exchange envelope refuses emits the marker and then no matching
+attempt record. It is a marker for correlating a wait, not a count — the
+counts are `provider_attempts` and `upstream_exchanges` on the records that
+follow an actual dial.
 
 The credential rule is absolute: no log line, at any level, ever contains
 an `Authorization` value, a request or response body, an injection prompt,

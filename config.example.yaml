@@ -53,8 +53,14 @@ api-key: change-me-client-key
 # Pool semantics: each request is scheduled onto ONE member. Members the
 # request cannot use are skipped without a dial (streaming gate, body-size
 # gate checked BEFORE sending, concurrency cap, health cooldown). A dialed
-# member failing before any response is retried on the next eligible member
-# up to fallback max-attempts; ANY response — 429 and 5xx included — ends
+# member failing with positive evidence that nothing was sent — refused,
+# unreachable, TLS handshake, proxy CONNECT or proxy auth — is retried on
+# the next eligible member up to fallback max-attempts. A failure that may
+# have carried the request (a reset, a bare EOF, or a timeout on an
+# established connection — an HTTP forward proxy that accepts the connection
+# and dies without answering included) stops the loop and travels up to the
+# request's recovery policy, which owns replay: a pool never re-sends a
+# request the upstream might already be processing. ANY response — 429 and 5xx included — ends
 # the attempt loop (statuses are answers, never fallback triggers). A pool
 # member must reference a direct or proxy transport by name; pools never
 # nest. An unchanged pool keeps its scheduler position, health state and
@@ -99,6 +105,15 @@ transports:
 # releases. Every value is validated: ranges, contradictions between
 # envelopes, and over-cap values REJECT the whole file rather than being
 # clamped to something the operator did not write.
+#
+# Two members are scoped to the layers that can honor them, and writing
+# them anywhere else REJECTS the file instead of loading a block that would
+# never be consulted:
+#   - `fallback` steers how far the candidate walk reaches, which is a
+#     property of the request's chain — so it is legal at the GLOBAL and
+#     MODEL layers, and rejected on a provider or a single candidate.
+#   - `budget.request` bounds the whole request's exchanges — so it is legal
+#     only in the top-level GLOBAL block.
 recovery:
   # Which failure takes which action. The shorthand forms expand into
   # stable, ID-identified rules under a deterministic precedence (exact
