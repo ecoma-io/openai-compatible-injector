@@ -6,7 +6,8 @@
 # URLs the operator does not want in the tree.
 #
 # Bootstrap settings (OAICR_LISTEN, OAICR_CONFIG_FILE,
-# OAICR_CONFIG_POLL_INTERVAL, OAICR_SHUTDOWN_GRACE) come from the
+# OAICR_CONFIG_POLL_INTERVAL, OAICR_SHUTDOWN_GRACE,
+# OAICR_AUTH_DATABASE_URL, OAICR_USAGE_DATABASE_URL) come from the
 # environment and do NOT belong in this file.
 # A runtime file that tries to define them is rejected by strict decoding —
 # when a bad reload is writing, the last-known-good config keeps serving;
@@ -21,6 +22,14 @@
 # and trailing = padding only). A file without a non-empty valid api-key is
 # rejected — a keyless boot refuses to
 # start, a keyless reload keeps the last-known-good key serving.
+#
+# This key is the credential of STATIC mode — the default. When the proxy is
+# started with OAICR_AUTH_DATABASE_URL set (partner mode), /v1 requests
+# authenticate against hashed per-partner keys managed with
+# `openai-compatible-injector keys create|list|revoke` instead, and this
+# value is NOT honored on the wire (it stays required here so the file
+# schema and a static-mode fallback stay unchanged). See README
+# "Partner API keys".
 api-key: change-me-client-key
 
 # Optional. Named outbound paths a provider can route through: direct (the
@@ -37,7 +46,9 @@ api-key: change-me-client-key
 #   socks5h:// hostname sent to the proxy — REMOTE DNS, keeps upstream
 #             hostnames out of the local resolver
 # The proxy URL needs a host, an explicit port, and nothing after the
-# authority (no path, query or fragment).
+# authority (no path, query or fragment). For socks5/socks5h, each
+# credential field is RFC 1929-limited to 255 decoded bytes — a longer
+# value rejects the file.
 #
 # Pool semantics: each request is scheduled onto ONE member. Members the
 # request cannot use are skipped without a dial (streaming gate, body-size
@@ -59,6 +70,8 @@ transports:
   # pool-egress:
   #   type: pool
   #   members: # ordered; fallback walks the remaining members in this order
+  #     # two members must not resolve to the SAME endpoint (checked on the
+  #     # resolved endpoint, not the name) — that rejects the whole file
   #     - transport: proxy-egress
   #       max-body-bytes: 4718592 # skip this member for larger bodies — pre-send
   #       max-concurrency: 4 # 0/unset = unlimited; held until the body closes
@@ -88,9 +101,10 @@ models:
   # Every public model name a client may request. The request's `model`
   # field is matched against these keys and sent upstream as
   # `upstream-model`. Exactly one of `provider` (a named providers entry
-  # carrying the base URL and egress) or `endpoint` (the legacy inline
-  # form — an implicit direct provider) is required; both, or neither, is
-  # a rejection. The upstream receives the request at
+  # carrying the base URL and egress), `endpoint` (the legacy inline
+  # form — an implicit direct provider), or `providers` (an ordered
+  # candidate chain, see below) is required; any two of the three, or
+  # none, is a rejection. The upstream receives the request at
   # `<base>/chat/completions` or `<base>/responses` (the base must not
   # include the /chat/completions or /responses suffix).
   gpt-reviewer:
@@ -132,6 +146,31 @@ models:
   echo-model:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
+
+  # A chain example: an ordered provider candidate list. The first entry
+  # is the primary route; later entries are fallbacks tried ONLY when an
+  # earlier candidate fails before answering (dial, TLS, proxy, egress
+  # exhaustion). Any HTTP status — 429 and 5xx included — is an answer and
+  # ends the walk. Each candidate carries its own upstream-model; the
+  # injection prompt and thinking-usage above stay model-level (every
+  # candidate receives the same prompt). Bounded by the provider-fallback
+  # block below.
+  # chained-model:
+  #   providers:
+  #     - provider: opencode # primary: the providers-table entry above
+  #       upstream-model: gpt-5-pro
+  #     - provider: opencode-backup # a second providers-table entry
+  #       upstream-model: gpt-5-pro
+
+# Optional. Bounds the provider candidate walk of chain models. Absent
+# selects the defaults below; a present block is validated even when it
+# disables the feature. max-attempts is the per-request candidate budget
+# (at least 1, at most 8) — the walk stops after this many candidates were
+# tried, chain length permitting. Hot-reloads with the rest of the file.
+#
+# provider-fallback:
+#   enabled: true
+#   max-attempts: 2
 
 # Optional. SSE keep-alive comments for client-facing Chat Completions and
 # Responses API streams. The default is enabled at 15s because a Cloudflare-

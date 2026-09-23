@@ -130,8 +130,13 @@ func (d *socks5Dialer) negotiate(conn net.Conn) error {
 		}
 		user := d.proxy.User.Username()
 		pass, _ := d.proxy.User.Password()
+		// Defensive duplicate of the config plane's RFC 1929 length bound
+		// (255 bytes per field): a value that slipped past LoadRuntime must
+		// still fail as a typed proxy error — classified by type for the
+		// pool's fallback decision and the log's error_class, never as a
+		// bare fmt.Errorf — with static text, no credential material in it.
 		if len(user) > 255 || len(pass) > 255 {
-			return fmt.Errorf("socks5: credentials exceed RFC 1929 length limit")
+			return &ProxyAuthError{msg: "socks5: credentials exceed the RFC 1929 length limit"}
 		}
 		p := []byte{0x01, byte(len(user))}
 		p = append(p, user...)

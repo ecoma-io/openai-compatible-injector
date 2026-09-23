@@ -16,9 +16,11 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/server"
 	"openai-compatible-injector/internal/transport"
+	"openai-compatible-injector/internal/usage"
 )
 
 // version is the build version, overridable at link time with
@@ -33,16 +35,20 @@ func main() {
 			return
 		case "healthcheck":
 			os.Exit(healthcheck())
+		case "keys":
+			// Partner key management: a CLI beside the proxy, deliberately
+			// not an HTTP surface on it.
+			os.Exit(keysCommand(os.Args[2:]))
 		default:
-			usage()
+			printUsage()
 			os.Exit(2)
 		}
 	}
 	os.Exit(run())
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [version|healthcheck]\n", os.Args[0])
+func printUsage() {
+	fmt.Fprintf(os.Stderr, "usage: %s [version|healthcheck|keys create|keys list|keys revoke]\n", os.Args[0])
 }
 
 // healthcheck probes the running service's /healthz endpoint without reading
@@ -127,6 +133,83 @@ func run() int {
 	// warm pool, and one that removes one drains only that pool's idle
 	// connections. Built before the poller and server so both can hold it.
 	doers := transport.NewRegistry()
+
+	// Credential model. Static (the default) authenticates every client
+	// against the runtime YAML's api-key. Partner mode (OAICR_AUTH_DATABASE_URL
+	// set) resolves per-caller identities from the hashed key store: the
+	// store is opened, migrated, and schema-validated here, at startup —
+	// any failure is fatal, because partner mode without a reachable,
+	// correct store would deny every request anyway. Fail closed at boot,
+	// not on the first unlucky request. The key store outlives the server:
+	// its final last_used_at batch flushes during shutdown.
+	var authProvider auth.Provider
+	authMode := "static"
+	if b.AuthDatabaseURL != "" {
+		initCtx, initCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		keyStore, err := auth.NewPGStore(initCtx, b.AuthDatabaseURL)
+		initCancel()
+		if err != nil {
+			// The class, never the error text: a connection failure's
+			// rendering can name hosts, users, and databases — and the
+			// DSN itself is never echoed, not even its length.
+			log.Fatal().Str("error_class", auth.StoreErrorClass(err)).Msg("auth_store_init_failed")
+		}
+		defer func() {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer closeCancel()
+			_ = keyStore.Close(closeCtx)
+		}()
+		authProvider = auth.NewPartnerProvider(keyStore)
+		authMode = "partner"
+	}
+
+	// Usage metering (OAICR_USAGE_DATABASE_URL set): the event store is
+	// opened, migrated, and schema-validated at startup — same fail-closed
+	// shape as the key store, because metering configured into a database
+	// that is not there would be silent loss from the first request. The
+	// pipeline between the request path and the store is bounded and async:
+	// after boot, no metering failure can reach a client response, and the
+	// final drain below lands the events of requests that finished within
+	// the shutdown grace.
+	var meter usage.Ingest
+	var pipeline *usage.Pipeline
+	usageMode := "off"
+	if b.UsageDatabaseURL != "" {
+		initCtx, initCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		repo, err := usage.NewPGRepository(initCtx, b.UsageDatabaseURL)
+		initCancel()
+		if err != nil {
+			// The class, never the error text: the DSN is never echoed, not
+			// even its length.
+			log.Fatal().Str("error_class", usage.StoreErrorClass(err)).Msg("usage_store_init_failed")
+		}
+		pipeline = usage.NewPipeline(repo, log)
+		meter = pipeline
+		usageMode = "postgres"
+		defer func() {
+			// Drain after the server has shut down. The window is best-effort:
+			// an in-flight request storm can consume much of the shutdown
+			// grace before this starts, so Close either lands the backlog or
+			// resolves it into counted drops — and whatever happened is
+			// reported in usage_meter_final below, after the repository is
+			// gone. (A second forced signal skips defers entirely and ends
+			// the process without this accounting; that abandonment is the
+			// operator's explicit choice.)
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer closeCancel()
+			pipeline.Close(closeCtx)
+			_ = repo.Close()
+			stats := pipeline.Stats()
+			log.Info().
+				Int64("inserted", stats.Inserted).
+				Int64("dropped", stats.Dropped).
+				Int64("insert_failures", stats.InsertFailures).
+				Int64("retries", stats.Retries).
+				Int64("flushes", stats.Flushes).
+				Msg("usage_meter_final")
+		}()
+	}
+
 	log.Info().
 		Str("version", version).
 		Str("listen", b.Listen).
@@ -134,6 +217,8 @@ func run() int {
 		Dur("poll_interval", b.PollInterval).
 		Dur("shutdown_grace", b.ShutdownGrace).
 		Int("model_count", snap.Len()).
+		Str("auth_mode", authMode).
+		Str("usage_mode", usageMode).
 		Str("log_level", snap.LogLevel().String()).
 		Msg("service_started")
 
@@ -193,7 +278,7 @@ func run() int {
 	}
 	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, onPublish).Run(ctx)
 
-	err = server.New(store, doers, b.Listen, b.ShutdownGrace, log).Run(ctx)
+	err = server.New(store, doers, authProvider, meter, b.Listen, b.ShutdownGrace, log).Run(ctx)
 	// Ignore before announcing the drain done: from the instant Run returns
 	// the process is committed to its exit code, and a duplicate signal must
 	// fall on the ignored disposition, not the default handler's 143.

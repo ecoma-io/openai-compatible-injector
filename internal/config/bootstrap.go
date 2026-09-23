@@ -28,6 +28,21 @@ type Bootstrap struct {
 	// ShutdownGrace is how long http.Server.Shutdown waits for in-flight
 	// requests (including active SSE streams) before force-closing them.
 	ShutdownGrace time.Duration
+	// AuthDatabaseURL is the PostgreSQL/TimescaleDB connection string of
+	// the partner key store. Empty (the default) keeps static mode: the
+	// runtime YAML's api-key authenticates every client. Non-empty opts the
+	// process into partner mode, where /v1 requests authenticate against
+	// hashed per-partner keys and the YAML api-key is not honored on the
+	// wire. Infrastructure, not policy: it never hot-reloads, and the
+	// connection string itself is never logged.
+	AuthDatabaseURL string
+	// UsageDatabaseURL is the PostgreSQL/TimescaleDB connection string of
+	// the usage-event store. Empty (the default) turns metering off
+	// entirely: no events, no connection, byte-identical traffic. Non-empty
+	// opts into async usage metering — one factual row per request that
+	// reaches the provider path, written off the response path. Like the
+	// auth DSN: infrastructure, never hot-reloads, never logged.
+	UsageDatabaseURL string
 }
 
 // Default bootstrap values.
@@ -86,6 +101,15 @@ func LoadBootstrap(env func(string) string) (Bootstrap, error) {
 	} else {
 		b.ShutdownGrace = DefaultShutdownGrace
 	}
+
+	// No format validation here: a malformed connection string fails at
+	// store open during startup — the one place a broken auth backend can
+	// stop the process instead of silently degrading it. The value itself
+	// is never echoed, not even its length: a DSN embeds a password, and
+	// the credential rule is level-independent. The usage DSN follows the
+	// same discipline.
+	b.AuthDatabaseURL = env("OAICR_AUTH_DATABASE_URL")
+	b.UsageDatabaseURL = env("OAICR_USAGE_DATABASE_URL")
 
 	return b, errors.Join(errs...)
 }

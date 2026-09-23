@@ -35,8 +35,15 @@ type memberState struct {
 
 // poolState is the mutable runtime of one pool identity. Fields split into
 // three lock domains: mu owns leases/retirement (registry-facing), schedMu
-// owns the scheduler cursor/weights, and each member owns its health and
-// limiter mutexes. members is immutable after construction.
+// owns the scheduler cursor/weights AND the permit acquisition that turns a
+// candidate into a selection, and each member owns its health and limiter
+// mutexes. members is immutable after construction.
+//
+// Lock order (one direction only, so no path can deadlock): schedMu is
+// always the outer lock when a member's health or limiter mutex is taken —
+// selection reads health and acquires permits under it — and nothing ever
+// takes schedMu while holding either of those. mu (leases) and r.mu
+// (registry) never nest with schedMu at all.
 type poolState struct {
 	pool    *Pool
 	key     string // the registry's doer-map key for this identity
@@ -50,7 +57,7 @@ type poolState struct {
 
 	schedMu sync.Mutex
 	cursor  int
-	cw      []int
+	cw      []int64
 }
 
 // endpointHealth tracks one member's consecutive fallback-eligible
@@ -124,40 +131,108 @@ func (l *limiter) release() {
 	}
 }
 
-// pick schedules the initial endpoint over the statically eligible set and
-// advances the scheduler. Both strategies advance at pick: a member that is
-// later skipped (unhealthy, saturated) has had its turn — the next request
-// rotates onward instead of hammering the same head.
-func (st *poolState) pick(eligible []bool) int {
+// selectInitial chooses the request's first endpoint and returns its index
+// with the member's concurrency permit already held, or -1 when no member
+// is currently usable. The scheduling contract is
+//
+//	static eligibility → dynamic eligibility → scheduler → permit → dial
+//
+// so a member in a health cooldown or at its concurrency cap is never
+// selected: it consumes no scheduler turn (the cursor and the weighted
+// counters move only when a member is actually taken), receives no strike,
+// and costs no attempt. Because the permit is acquired inside the same
+// schedMu critical section that decides the pick, two concurrent requests
+// can never both observe the same last available permit and both dial —
+// the loser sees a full member and moves on. No network I/O happens under
+// the lock: health checks and permit attempts are in-memory operations.
+func (st *poolState) selectInitial(eligible []bool) int {
 	st.schedMu.Lock()
 	defer st.schedMu.Unlock()
-	n := len(eligible)
 	if st.pool.Strategy == WeightedRoundRobin {
-		total := 0
-		for _, m := range st.pool.Members {
-			total += m.Weight
+		return st.selectWeightedLocked(eligible)
+	}
+	n := len(eligible)
+	for i := 0; i < n; i++ {
+		j := (st.cursor + i) % n
+		if !eligible[j] {
+			continue
 		}
+		ms := &st.members[j]
+		if !ms.health.usable() {
+			continue
+		}
+		if !ms.lim.tryAcquire() {
+			continue
+		}
+		// The turn is consumed by the member that was taken, not by the
+		// ones passed over: an unhealthy or saturated head did not have
+		// "its turn" — it was not in the running.
+		st.cursor = (j + 1) % n
+		return j
+	}
+	return -1
+}
+
+// selectWeightedLocked is the WeightedRoundRobin half of selectInitial:
+// smooth weighted round-robin (nginx-style) restricted to the CURRENTLY
+// eligible set. r.schedMu must be held.
+//
+// Per selection, candidates gain their weight, the leader pays the sum of
+// the CANDIDATES' weights (never the whole pool's — an unavailable member
+// must not inflate the price the winner pays), and the member taken keeps
+// its paid-down credit while the others carry theirs forward. A member
+// excluded from the candidate set has its credit reset to zero: unavailability
+// cannot accumulate credit, so a recovered member re-enters with none and
+// cannot burst ahead on stale balance.
+//
+// A candidate that turns out saturated (permit refused) has its round's
+// step undone and is excluded from the retry — its turn is not consumed,
+// and the smooth step reruns over the shrunken candidate set. At most one
+// member is excluded per round, so the loop ends within n rounds.
+func (st *poolState) selectWeightedLocked(eligible []bool) int {
+	n := len(eligible)
+	cand := make([]bool, n)
+	remaining := 0
+	for i := range eligible {
+		// Statically eligible plus healthy decides the candidate set; the
+		// permit gate runs per round below. Everyone else's credit zeroes:
+		// no accumulation while unavailable, no burst on recovery.
+		cand[i] = eligible[i] && st.members[i].health.usable()
+		if cand[i] {
+			remaining++
+		} else {
+			st.cw[i] = 0
+		}
+	}
+	for remaining > 0 {
+		total := int64(0)
 		best := -1
-		for i, e := range eligible {
-			if !e {
+		for i := 0; i < n; i++ {
+			if !cand[i] {
 				continue
 			}
-			st.cw[i] += st.pool.Members[i].Weight
+			st.cw[i] += int64(st.pool.Members[i].Weight)
+			total += int64(st.pool.Members[i].Weight)
 			if best == -1 || st.cw[i] > st.cw[best] {
 				best = i
 			}
 		}
-		if best != -1 {
-			st.cw[best] -= total
+		st.cw[best] -= total
+		if st.members[best].lim.tryAcquire() {
+			return best
 		}
-		return best
-	}
-	for i := 0; i < n; i++ {
-		j := (st.cursor + i) % n
-		if eligible[j] {
-			st.cursor = (j + 1) % n
-			return j
+		// Saturated, not taken: undo this round's step exactly, drop the
+		// member, and rerun. The undo keeps the counters byte-identical to
+		// a world where the round never ran, so saturation cannot tilt
+		// future balance in anyone's favor.
+		for i := 0; i < n; i++ {
+			if cand[i] {
+				st.cw[i] -= int64(st.pool.Members[i].Weight)
+			}
 		}
+		st.cw[best] += total
+		cand[best] = false
+		remaining--
 	}
 	return -1
 }
@@ -215,14 +290,17 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 	// The dial order: the scheduler's initial pick, then the remaining
 	// members in declaration order (cyclic) — fallback order is
 	// deterministic and weight-free. Dynamic gates (health, concurrency)
-	// re-check per step: a skipped member consumes no attempt.
+	// gate every dial: the initial selection holds its member's permit by
+	// construction; each fallback step re-checks health and acquires its
+	// own permit. A member failing a gate consumes no attempt, no strike,
+	// and no scheduler turn.
 	maxAttempts := 1
 	if p.pool.Fallback.Enabled {
 		maxAttempts = p.pool.Fallback.MaxAttempts
 	}
 	first := -1
 	if any {
-		first = st.pick(eligible)
+		first = st.selectInitial(eligible)
 	}
 	attempts := 0
 	var lastErr error
@@ -235,11 +313,13 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			continue
 		}
 		ms := &st.members[idx]
-		if !ms.health.usable() {
-			continue
-		}
-		if !ms.lim.tryAcquire() {
-			continue
+		if off > 0 {
+			if !ms.health.usable() {
+				continue
+			}
+			if !ms.lim.tryAcquire() {
+				continue
+			}
 		}
 		resp, err := p.dial(ms, ar)
 		attempts++
@@ -258,13 +338,22 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			return resp, info, nil
 		}
 		ms.lim.release()
-		if Classify(err) == ClassCanceled {
+		class := Classify(err)
+		if class == ClassCanceled {
 			// The caller went away: no fallback, no strike, no envelope —
 			// nothing here is the endpoint's fault.
 			st.end()
 			return nil, info, err
 		}
 		ms.health.strike()
+		// Bounded per-attempt evidence for the access log: one record per
+		// actually dialed-and-failed endpoint, typed class only — never the
+		// error text, never more than maxAttempts records per request.
+		info.Failures = append(info.Failures, AttemptFailure{
+			Kind:   info.Kind,
+			Target: info.Target,
+			Class:  class.String(),
+		})
 		lastErr = err
 	}
 	st.end()

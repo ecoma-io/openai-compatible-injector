@@ -105,7 +105,7 @@ func TestHandlerExecutesOnTheModelsResolvedTransport(t *testing.T) {
 	store := newTransportStore(t, "http://127.0.0.1:8080", "https://api.opencode.example/v1")
 	doer := &stubDoer{code: http.StatusOK, body: `{"id":"x","choices":[]}`}
 	res := &recordingResolver{doer: doer}
-	h := NewHandler(store, res, zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled))
+	h := NewHandler(store, res, nil, nil, zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"proxied-model","messages":[{"role":"user","content":"hi"}]}`, nil)

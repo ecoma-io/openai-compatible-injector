@@ -35,6 +35,8 @@ func TestLoadBootstrapOverrides(t *testing.T) {
 		"OAICR_CONFIG_FILE":          "/tmp/cfg.yaml",
 		"OAICR_CONFIG_POLL_INTERVAL": "250ms",
 		"OAICR_SHUTDOWN_GRACE":       "5s",
+		"OAICR_AUTH_DATABASE_URL":    "postgres://user:pass@127.0.0.1:5432/keys",
+		"OAICR_USAGE_DATABASE_URL":   "postgres://user:pass@127.0.0.1:5432/usage",
 	}))
 	if err != nil {
 		t.Fatalf("LoadBootstrap: %v", err)
@@ -47,6 +49,30 @@ func TestLoadBootstrapOverrides(t *testing.T) {
 	}
 	if b.ShutdownGrace != 5*time.Second {
 		t.Errorf("ShutdownGrace = %v", b.ShutdownGrace)
+	}
+	if b.AuthDatabaseURL == "" {
+		t.Error("AuthDatabaseURL empty; the env value must be carried through")
+	}
+	if b.UsageDatabaseURL == "" {
+		t.Error("UsageDatabaseURL empty; the env value must be carried through")
+	}
+}
+
+// Auth mode is off by default: absent OAICR_AUTH_DATABASE_URL keeps static
+// mode, where the runtime YAML api-key authenticates every client.
+func TestLoadBootstrapDefaultsToStaticAuth(t *testing.T) {
+	b, err := LoadBootstrap(envOf(map[string]string{
+		"OAICR_AUTH_DATABASE_URL":  "",
+		"OAICR_USAGE_DATABASE_URL": "",
+	}))
+	if err != nil {
+		t.Fatalf("LoadBootstrap: %v", err)
+	}
+	if b.AuthDatabaseURL != "" {
+		t.Errorf("AuthDatabaseURL = non-empty; static mode must remain the default")
+	}
+	if b.UsageDatabaseURL != "" {
+		t.Errorf("UsageDatabaseURL = non-empty; metering must remain off by default")
 	}
 }
 
@@ -97,6 +123,7 @@ func TestLoadBootstrapIgnoresUnprefixedNames(t *testing.T) {
 		"CONFIG_FILE":          "/elsewhere/config.yaml",
 		"CONFIG_POLL_INTERVAL": "9s",
 		"SHUTDOWN_GRACE":       "9s",
+		"USAGE_DATABASE_URL":   "postgres://ignored",
 	}))
 	if err != nil {
 		t.Fatalf("LoadBootstrap: %v", err)
@@ -112,6 +139,9 @@ func TestLoadBootstrapIgnoresUnprefixedNames(t *testing.T) {
 	}
 	if b.ShutdownGrace != DefaultShutdownGrace {
 		t.Errorf("ShutdownGrace = %v, unprefixed name was honored", b.ShutdownGrace)
+	}
+	if b.UsageDatabaseURL != "" {
+		t.Error("UsageDatabaseURL non-empty; unprefixed name was honored")
 	}
 }
 

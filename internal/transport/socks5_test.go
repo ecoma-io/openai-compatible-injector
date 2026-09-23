@@ -508,3 +508,41 @@ func TestSocks5DeadlineClearsAfterHandshake(t *testing.T) {
 		t.Fatalf("tunnel answer = %q", resp)
 	}
 }
+
+// TestSocks5OversizedCredentialsAreTypedAuthErrors pins the dialer's
+// defensive duplicate of the config plane's RFC 1929 bound: a Config
+// carrying >255-byte credentials (built directly, bypassing LoadRuntime)
+// fails the dial as a typed ProxyAuthError with static text — classified
+// proxy_auth for the pool's fallback decision, and the credential bytes
+// never enter the error.
+func TestSocks5OversizedCredentialsAreTypedAuthErrors(t *testing.T) {
+	stub := newSocks5Stub(t, func(s *socks5Stub) { s.auth = true })
+	const marker = "SUP3R-S3CRET-MARKER"
+	userinfo := strings.Repeat(marker, 8) + ":" + strings.Repeat("p", 300)
+	_, _, err := roundTrip(t, stub.config(t, "socks5", userinfo), 1)
+	if err == nil {
+		t.Fatal("oversized credentials tunneled; want a typed auth error")
+	}
+	if Classify(err) != ClassProxyAuth {
+		t.Errorf("Classify = %v, want proxy_auth", Classify(err))
+	}
+	var pa *ProxyAuthError
+	if !errors.As(err, &pa) {
+		t.Fatalf("err = %T, want *ProxyAuthError", err)
+	}
+	if !strings.Contains(err.Error(), "RFC 1929") {
+		t.Errorf("err = %v, want the static length-limit text", err)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Error("error text echoes the credential material")
+	}
+	// The bound fires where credentials are consumed — during negotiate,
+	// before the auth payload or any CONNECT: the stub never reached the
+	// tunneling stage.
+	stub.mu.Lock()
+	target, port := stub.target, stub.port
+	stub.mu.Unlock()
+	if target != "" || port != 0 {
+		t.Errorf("stub advanced to CONNECT for %s:%d despite the local bound", target, port)
+	}
+}

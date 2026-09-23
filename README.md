@@ -4,8 +4,8 @@ A minimal OpenAI-compatible **request/response injector proxy**. Clients talk
 to it as if it were an OpenAI endpoint — authenticating with the single
 `api-key` from the runtime config — and it forwards to configured upstream
 providers, renaming the model and injecting a per-model system prompt into
-every request. Hot-reloadable model mapping, no telemetry, one static
-binary.
+every request. Hot-reloadable model mapping, optional durable factual usage
+metering, one static binary.
 
 ```
  client ──POST /v1/chat/completions (Bearer api-key)──▶ injector ──forward (model→upstream-model, prompt injected, credential consumed)──▶ upstream provider
@@ -71,22 +71,25 @@ service consumes no unprefixed names of its own.
 
 Division of responsibility:
 
-| Concern                                                                                   | Where it lives          |
-| ----------------------------------------------------------------------------------------- | ----------------------- |
-| `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE` | Environment (bootstrap) |
-| `api-key` (the shared inbound client credential)                                          | YAML file (runtime)     |
-| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage}`                 | YAML file (runtime)     |
-| `sse-keep-alive.{enabled,interval}`                                                       | YAML file (runtime)     |
-| `log-level`                                                                               | YAML file (runtime)     |
+| Concern                                                                                                                                          | Where it lives          |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- |
+| `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL`, `OAICR_USAGE_DATABASE_URL` | Environment (bootstrap) |
+| `api-key` (the shared inbound client credential)                                                                                                 | YAML file (runtime)     |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,providers}`                                                              | YAML file (runtime)     |
+| `provider-fallback.{enabled,max-attempts}`                                                                                                       | YAML file (runtime)     |
+| `sse-keep-alive.{enabled,interval}`                                                                                                              | YAML file (runtime)     |
+| `log-level`                                                                                                                                      | YAML file (runtime)     |
 
 ### Bootstrap environment
 
-| Variable                     | Default               | Meaning                                                                                                                                                                 |
-| ---------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OAICR_LISTEN`               | `:8080`               | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                        |
-| `OAICR_CONFIG_FILE`          | `/config/config.yaml` | Path of the runtime YAML file, read at boot then polled                                                                                                                 |
-| `OAICR_CONFIG_POLL_INTERVAL` | `1s`                  | How often the file's content hash is re-checked                                                                                                                         |
-| `OAICR_SHUTDOWN_GRACE`       | `55s`                 | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain) |
+| Variable                     | Default                  | Meaning                                                                                                                                                                                                                                                                                |
+| ---------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OAICR_LISTEN`               | `:8080`                  | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                                                                                                                                       |
+| `OAICR_CONFIG_FILE`          | `/config/config.yaml`    | Path of the runtime YAML file, read at boot then polled                                                                                                                                                                                                                                |
+| `OAICR_CONFIG_POLL_INTERVAL` | `1s`                     | How often the file's content hash is re-checked                                                                                                                                                                                                                                        |
+| `OAICR_SHUTDOWN_GRACE`       | `55s`                    | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain)                                                                                                                |
+| `OAICR_AUTH_DATABASE_URL`    | _(empty — static mode)_  | PostgreSQL/TimescaleDB connection string of the partner key store. Absent keeps static mode; set, the process boots into partner mode (see "Partner API keys"). The value is never logged — not even its length                                                                        |
+| `OAICR_USAGE_DATABASE_URL`   | _(empty — metering off)_ | PostgreSQL/TimescaleDB connection string of the durable usage-event store. Empty makes no database connection and preserves normal proxy traffic; set, startup migrates and validates the store before serving (see "Usage metering"). The value is never logged — not even its length |
 
 There is no `LOG_LEVEL` environment variable — it was removed together with
 the introduction of `log-level` in the runtime file, which hot-reloads.
@@ -171,7 +174,23 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   the file defines: there is no fallback to direct for an unknown name,
   because silently rerouting egress is the failure this schema exists to
   prevent.
+- `providers` — optional ordered candidate chain, the alternative to the
+  single `provider`/`endpoint` forms (which build an implicit
+  one-candidate chain — the handler walks one uniform structure). Each
+  entry carries `provider` (a reference into the top-level providers
+  table, same rules as above) and `upstream-model` (the name sent to that
+  candidate; required per candidate). The first entry is the primary
+  route; the rest are fallbacks walked only on transport-level failure,
+  bounded by [`provider-fallback`](#provider-fallback). Both forms at once
+  — a `providers` list next to `provider` or `endpoint` — is a rejection,
+  as is the same provider referenced twice in one chain. The
+  `injection-prompt` and `thinking-usage` stay model-level: every
+  candidate receives the same prompt, because injection is a property of
+  the public model. See [Provider fallback](#provider-fallback).
 - `upstream-model` — the `model` value actually forwarded upstream.
+  Required on the single-provider and inline-endpoint forms (and per
+  candidate inside a `providers` chain, where there is no model-level
+  `upstream-model`).
 - `injection-prompt` — the system instruction injected into every request for
   this model. Multi-line supported; the exact text is used verbatim.
 - `thinking-usage` — optional block configuring simulated thinking-usage
@@ -201,21 +220,31 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   `https`, `socks5` or `socks5h`, a host, an explicit port, optional
   userinfo as proxy authentication, and nothing after the authority. See
   [Provider transports](#provider-transports).
+- `provider-fallback` — optional block bounding the provider candidate
+  walk of chain models. Absent, `null`, or `{}` defaults to
+  `enabled: true`, `max-attempts: 2`; a present block is validated even
+  when it disables the feature. `max-attempts` is the per-request
+  candidate budget (at least 1, at most 8) — the walk stops after this
+  many candidates were tried, chain length permitting. See
+  [Provider fallback](#provider-fallback).
 
 The file is validated strictly, in two layers:
 
 - **Top-level keys** are checked against the raw YAML: only `models`,
-  `api-key`, `log-level`, `sse-keep-alive`, `providers`, and `transports`
-  are legal. This is the bootstrap-plane rule — a file that tries to define
-  `listen`, `config-file`, `config-poll-interval` or `shutdown-grace` is
-  rejected whatever its value's shape (a strict struct decode alone misses a
-  bootstrap key whose value is an empty map).
+  `api-key`, `log-level`, `sse-keep-alive`, `providers`, `transports`, and
+  `provider-fallback` are legal. This is the bootstrap-plane rule — a file
+  that tries to define `listen`, `config-file`, `config-poll-interval` or
+  `shutdown-grace`, `auth-database-url`, or `usage-database-url` is rejected
+  whatever its value's shape (a strict struct decode alone misses a bootstrap
+  key whose value is an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `provider`,
-  `upstream-model`, `injection-prompt` and `thinking-usage` (and, inside the
-  block, outside `mode`, `min-ratio`, `max-ratio`) — including a nested
-  bootstrap key — is a rejection, not a warning. The same strictness holds
-  inside `providers` entries (`base-url`, `transport`), `transports` entries
+  `upstream-model`, `injection-prompt`, `thinking-usage` and `providers`
+  (and, inside the block, outside `mode`, `min-ratio`, `max-ratio`) —
+  including a nested bootstrap key — is a rejection, not a warning. The
+  same strictness holds inside `providers` entries (`base-url`,
+  `transport`), model-chain candidate entries (`provider`,
+  `upstream-model`), `transports` entries
   (`type`, `proxy`, and the pool fields `members`, `strategy`, `fallback`,
   `health`, each with their own strict field sets), and pool `members`
   entries (`transport`, `max-body-bytes`, `max-concurrency`, `streaming`,
@@ -397,7 +426,10 @@ referenced by name from `providers`:
   resolver). The two SOCKS forms are deliberately not interchangeable.
   Credentials in the proxy URL's userinfo (`user:pass@host`) authenticate to
   the proxy (Basic auth for http/https, RFC 1929 for SOCKS5) and never
-  appear in logs or error text.
+  appear in logs or error text. SOCKS5 credentials are RFC 1929
+  single-byte-length fields, so each is bounded to 255 decoded bytes at
+  config load — a longer credential rejects the whole file instead of
+  failing one dial at a time.
 - **`pool`** — a set of endpoint members (direct or proxy transports,
   referenced by name; pools do not nest) with per-request scheduling,
   eligibility, bounded egress fallback, and passive health. Each request is
@@ -434,12 +466,23 @@ referenced by name from `providers`:
     use — `streaming: false` vs a streamed request, `max-body-bytes` below
     the outgoing body, at its concurrency cap, or in a health cooldown — is
     skipped without a dial. A 6 MB request never produces a 413 on a 4.5 MB
-    relay: it was never sent there. Skipped members consume no attempt and
-    no health strike.
+    relay: it was never sent there. Skipped members consume no attempt, no
+    health strike, and no scheduler turn — the rotation position and the
+    weighted counters only move when a member is actually taken, so a
+    recovered member is scheduled immediately rather than waiting out a
+    turn it never used.
   - **Scheduling.** `round_robin` rotates across the eligible members;
-    `weighted_round_robin` gives a member with weight 2 twice the share, in
-    a deterministic interleaving. Weight never affects eligibility or the
-    fallback order — only who is tried first.
+    `weighted_round_robin` is smooth weighted round-robin over the
+    CURRENTLY eligible members: a member with weight 5 against one with
+    weight 1 gets exactly `A A A B A A`, proportionality in a deterministic
+    interleaving. The weighting runs on the live candidate set — an
+    unavailable member accumulates no credit while it is out, a recovered
+    member re-enters with none (no catch-up burst), and a member skipped
+    for saturation has its round undone exactly (credit frozen, no tilt).
+    Weight never affects eligibility or the fallback order — only who is
+    tried first. The concurrency permit for the chosen member is acquired
+    inside the same selection step, so two concurrent requests can never
+    both take a member's last permit and both dial.
   - **Bounded fallback, transport failures only.** When a dialed member
     fails before any response arrives (connection, proxy connect, proxy
     auth, timeout), the next eligible member is tried, up to
@@ -455,6 +498,11 @@ referenced by name from `providers`:
     skips) answers the canonical 502 `upstream_unreachable` envelope — the
     access log carries `egress_attempts`, `egress_kind`, `egress_target`
     and `egress_exhausted` so the pool's decision is visible per request.
+    Each dialed-and-failed endpoint also emits one WARN
+    `egress_attempt_failed` (kind, scheme+host target, typed
+    `error_class`, attempt number) — evidence per attempt, even when a
+    later member serves the request, with no error text and no
+    credentials.
   - **Reload identity.** A pool whose policy bytes are unchanged across a
     reload keeps its scheduler position, health state and connection pools.
     A changed policy is a new identity: fresh state, and the old state
@@ -479,14 +527,77 @@ on:
 A broken `transports` or `providers` table is a whole-file rejection at
 boot (exit 1) and a last-known-good on reload — an invalid proxy never
 silently degrades into direct egress, and a member reference that names
-nothing (or names another pool) rejects the file.
+nothing (or names another pool) rejects the file. So does a pool listing
+the SAME endpoint twice under two names: scheduling, health, and
+concurrency state for one endpoint must exist exactly once, and the
+duplicate check runs on the resolved endpoint (host case and userinfo
+spelling collapse), never on the YAML name.
 
-**Not included, by design:** provider fallback and retries (a failed or
-rate-limited _provider_ is never retried elsewhere — egress fallback moves
-a request between network paths, never between providers), automatic
-egress rotation over time, active health probes, and any
-proxy-to-direct silent downgrade: when a pool's members are all unusable
-the request fails loudly with `upstream_unreachable`.
+## Provider fallback
+
+A model may list several **provider candidates** — a primary route plus
+fallbacks. The single `provider`/`endpoint` forms are the degenerate
+one-candidate chain, so every request walks the same structure:
+
+```yaml
+models:
+  gpt-reviewer:
+    providers: # ordered; the first entry is the primary route
+      - provider: provider-a # a top-level providers-table reference
+        upstream-model: gpt-5-pro # required per candidate
+      - provider: provider-b
+        upstream-model: standard-gpt-5
+provider-fallback: # optional; these are the defaults
+  enabled: true
+  max-attempts: 2 # per-request candidate budget, 1..8
+```
+
+Semantics, and the boundaries that keep the feature narrow:
+
+- **Only transport failure falls back.** A candidate that answers — any
+  status — ends the walk, and its answer is THE answer: a `429` or `500`
+  from the primary is relayed exactly as a single-provider deployment
+  would relay it. A candidate is skipped only when it fails before
+  answering: dial failure, TLS, proxy failure, or its egress pool
+  exhausting (`502`-class `upstream_unreachable` conditions). Egress
+  fallback (between network paths) and provider fallback (between
+  providers) compose but never blur: a pool moves a request between
+  paths to the SAME provider; the walk moves it to the NEXT candidate
+  only after that provider had no answer at all.
+- **Never retried: local validation, cancellation, commitment.** A body
+  that fails the request transform is answered `400` on the first
+  candidate — it would fail every candidate's transform. A client that
+  disconnects mid-walk gets no fallback (there is nobody left to answer).
+  And the walk happens entirely before the first response byte: a `200`
+  SSE stream from the primary is committed — no candidate switch after
+  headers, ever.
+- **Replay is fresh and identical.** Each attempt rebuilds the request
+  from the same immutable client body through that candidate's own
+  transform — its own `upstream-model`, the same injected prompt. Nothing
+  observed on a failed attempt feeds the next one.
+- **The budget is a hard product.** Worst case dials are bounded by
+  `provider-fallback.max-attempts ×` the per-candidate egress fallback
+  budget — with the defaults `2 × 3 = 6` dials for a two-candidate chain
+  on default pools. The walk also never exceeds the chain length.
+- **Observability.** Every completion event carries `provider_attempts`
+  (candidates tried) and `final_provider` (the candidate that answered,
+  or the last one that failed); exhaustion adds `provider_exhausted: true`.
+  Each failed candidate logs one WARN `provider_attempt_failed` (provider,
+  sanitized error class, attempt index), and each of its dialed-and-failed
+  egress endpoints logs the existing WARN `egress_attempt_failed`.
+- **Reload invariants hold.** The chain, its policy, and every candidate's
+  transport bind to the request's config snapshot like everything else —
+  a reload mid-walk cannot reshape the candidate list under in-flight
+  work. Every candidate's transport is part of the snapshot's egress
+  closure, so a fallback candidate's connection pool is warm even when
+  the primary answers everything.
+
+**Not included, by design:** automatic egress rotation over time, active
+health probes, weighted or scored provider selection (the chain order is
+the operator's, not computed), any provider fallback on HTTP statuses (a
+rate-limited _provider_ is answered, not retried elsewhere), and any
+proxy-to-direct silent downgrade: when a candidate's members are all
+unusable the request fails loudly with `upstream_unreachable`.
 
 ## Simulated thinking usage
 
@@ -635,7 +746,7 @@ Upstream and client failures are classified, never fogged:
 | Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                           |
 | --------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Missing/malformed `Authorization: Bearer <key>`                                                                 | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`  |
-| Wrong bearer key                                                                                                | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
+| Wrong bearer key (partner mode: unknown **or revoked** key, or an unavailable key store — fail closed)          | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
 | Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                            |
 | Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                      |
 | Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                  |
@@ -683,13 +794,135 @@ Consequences of the table:
 Rate-limit and retry headers are load-bearing for client backoff; dropping
 them would make a 429 indistinguishable from any other upstream failure.
 
+## Partner API keys
+
+Static mode (the default) authenticates every client against the runtime
+YAML's `api-key` — one shared credential, no per-caller identity. Setting
+`OAICR_AUTH_DATABASE_URL` opts the process into **partner mode**: `/v1`
+requests authenticate against hashed per-partner keys stored in
+PostgreSQL/TimescaleDB, and each request is attributed to a `partner_id` +
+`key_id` pair that rides the structured logs (and, from the usage metering
+layer on, the usage records).
+
+What partner mode changes, precisely:
+
+- **Identity, not a boolean.** Authentication resolves a `Principal`
+  (partner + key). The YAML `api-key` is still required by the runtime file
+  contract, but in partner mode it is **not a wire credential** — presenting
+  it denies, because it was never seeded into the store. Revocation cannot
+  be bypassed through the file.
+- **High-entropy tokens, hashed at rest.** `keys create` mints
+  `oaicr_` + 32 crypto-random bytes (base64url) and stores only its SHA-256
+  digest — the plaintext is printed once on creation and is unrecoverable by
+  design. Key IDs (`pak_…`) are public and safe to log.
+- **Revocation without restart, within a documented bound.** A bounded LRU
+  decision cache (4,096 entries) fronts the store: affirmative decisions
+  live at most **60 s**, negative ones (unknown/revoked) at most **5 s**, so
+  `keys revoke` takes effect within at most a minute and a freshly created
+  key works within at most five seconds. The cache holds decisions the
+  store made — never a bypass: backend failures are never cached, and a
+  recovered store is trusted on the very next request.
+- **Every failure mode fails closed.** A store outage (or a slow one)
+  denies the request with the same static 401 as any other rejection —
+  never a fail-open — after emitting the WARN `auth_backend_failed` event
+  (error class only; driver text never reaches logs). At boot, an
+  unreachable store or a schema that fails validation is a startup failure.
+- **Wire parity with static mode.** Unknown and revoked keys get exactly
+  the same static `invalid_api_key` 401 as a wrong static key — why a
+  credential was rejected is enumeration material and never reaches the
+  client. The missing/malformed-bearer 401 is unchanged.
+- **Schema is migrated, validated, forward-only.** SQL migrations live in
+  the binary (`internal/auth/migrations/`), run inside transactions with
+  `schema_migrations` bookkeeping, and never run on the request path.
+  Startup brings the schema up and validates the column contract against
+  `information_schema`; a foreign or half-migrated table refuses to start.
+
+Managing keys (a CLI beside the proxy, deliberately not an HTTP surface on
+it; the connection string comes from `-database` or
+`OAICR_AUTH_DATABASE_URL`):
+
+```console
+$ openai-compatible-injector keys create -partner acme-corp
+key created
+  key_id:     pak_…
+  partner_id: acme-corp
+  token:      oaicr_…        # shown exactly once — store it now
+
+$ openai-compatible-injector keys list
+key_id	partner_id	status	created_at	revoked_at	last_used_at
+pak_…	acme-corp	active	2026-01-01T00:00:00Z	-	-
+
+$ openai-compatible-injector keys revoke -key-id pak_…
+key revoked: pak_…
+Requests presenting it are denied within 1m0s (the positive cache bound).
+```
+
+`keys list` cannot expose secrets: the record type structurally carries no
+hash and the table read selects no hash column. `last_used_at` is updated
+off the request path (batched, best-effort) — it is advisory metadata, and
+losing touches under load never affects a request.
+
+## Usage metering
+
+Usage metering is deliberately **optional** and fact-only. Set
+`OAICR_USAGE_DATABASE_URL` to a PostgreSQL or TimescaleDB connection string to
+enable it. Startup connects, applies the embedded forward-only migration, and
+validates the `usage_events` table before accepting traffic. Empty (the
+default) means no database connection, no event records, and unchanged proxy
+behavior. The DSN is bootstrap infrastructure: it does not hot-reload and is
+never logged, including its length.
+
+Each request that reaches the provider path produces at most one durable event
+asynchronously, with an event ID, request time and request ID, partner/key
+identity (when partner auth is enabled), bound config generation, public model,
+provider and upstream model, API surface, the relayed stream mode (what the
+response actually was — a `stream: true` request whose upstream answered
+non-SSE is recorded buffered), final client status and outcome,
+upstream-reported token counts, client wire byte counts, cumulative provider
+and egress attempt counters (summed across every candidate of a fallback
+walk), the final candidate's egress kind (`direct`, or the last dialed pool
+member's kind; empty when a pool exhausted without dialing anything), and full
+request latency. Provider fallback still emits **one** event: it describes the
+candidate that answered, or the final attempted candidate if all paths failed.
+Failed attempts are represented only by the attempt counters.
+
+The request handler only makes a non-blocking handoff to a bounded in-memory
+queue. A dedicated batch writer inserts rows using parameterized SQL; it
+retries a bounded number of times within a per-flush deadline, then explicitly
+drops and reports a batch if the store remains unavailable — every accepted
+event resolves into inserted-or-dropped, never a silent remainder. Metering
+loss never delays, fails, or modifies a client response. Shutdown stops intake
+after the HTTP drain and flushes the accepted backlog within its bounded close
+window, then reports the totals as an INFO `usage_meter_final`; an expired
+window waits a bounded extra grace for an in-flight insert before the pool
+closes. Operators can observe `usage_flush_completed`, `usage_flush_failed`,
+and `usage_events_dropped`, and read pipeline stats for queue depth, inserts,
+drops, failures, retries, flushes, and last successful flush timing. (A
+second forced signal exits without running defers — that abandonment of the
+drain, and of this accounting, is the operator's explicit choice.)
+
+Token facts come only from the raw upstream response before the proxy rewrites
+model aliases or simulates thinking usage. Missing upstream `usage` remains
+SQL `NULL`, not zero. For streams, the last readable API-scoped usage object
+wins; chunks are never summed. One wrongly typed count makes that member
+unstored (a stringified `"128"` or integral `1e3` still reads) — it never
+discards the members that did decode. Consequently, synthesized
+`reasoning_tokens` are never stored as provider usage. This layer intentionally
+has no pricing, currency, invoicing, or quota enforcement.
+
+Auth and usage schemas share a module-scoped `schema_migrations` ledger. An
+existing partner-key deployment with the former global-version ledger upgrades
+in place: its historical rows are retained as the `auth` module before the
+`usage` module records its own migrations. No request-path DDL exists.
+
 ## Safety and credentials
 
-- The configured `api-key` is the one shared inbound client credential.
-  Clients present it via `Authorization: Bearer <key>`; it is checked before
-  the proxy reads the request body. The header is **consumed at the proxy**
-  and never forwarded upstream. The proxy injects no replacement credential:
-  upstreams are expected to be trusted/internal.
+- Static mode: the configured `api-key` is the one shared inbound client
+  credential. Partner mode (above): per-partner hashed keys. In both, the
+  credential is presented via `Authorization: Bearer <key>` and checked
+  before the proxy reads the request body. The header is **consumed at the
+  proxy** and never forwarded upstream. The proxy injects no replacement
+  credential: upstreams are expected to be trusted/internal.
 - **Credentials never reach logs or error text** — no configured `api-key`,
   `Authorization` values, request bodies, or injection prompts in log lines,
   and no upstream URL details beyond the endpoint's scheme+host in **any**
@@ -742,7 +975,12 @@ What each level carries:
   rejected bearer), `public_model`, `stream`,
   `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
   snapshot generation the request bound to — correlating reloads with
-  behavior). The event is emitted when the request finishes, under the
+  behavior). Requests that reached the upstream also carry the egress
+  report (`egress_attempts`, `egress_kind`, `egress_target`,
+  `egress_exhausted`) and the provider walk's
+  (`provider_attempts`, `final_provider`, plus `provider_exhausted` when
+  every budgeted candidate failed without answering). The event is emitted
+  when the request finishes, under the
   level in effect at that moment — a reload mid-request can therefore
   change whether it appears. Also `config_reloaded` (`generation`,
   `model_count`, `log_level`), `config_file_recovered` (a file returned
@@ -807,7 +1045,10 @@ or upstream URL detail beyond scheme+host. Endpoint query strings (which
 providers use for API keys) survive even a dial failure's error text —
 errors are sanitized before logging — and upstream error bodies are no
 exception: the raw bytes of a 4xx/5xx never reach a log line at any level,
-only their count, shape, and fingerprint. The planted-secret E2E suite
+only their count, shape, and fingerprint. Usage metering follows the same
+rule: it stores only the factual event columns listed above, never an inbound
+credential, request body, prompt, provider error body, or database URL; its
+store failures log only a stable error class. The planted-secret E2E suite
 (`TestLoggingNeverLeaksSecrets`) holds this rule under success, streaming,
 rejection, dial-failure, and provider-echo traffic at maximum verbosity.
 
@@ -834,7 +1075,8 @@ On SIGTERM or SIGINT the service stops accepting new connections and drains:
 1. `http.Server.Shutdown(grace)` — in-flight requests and streams get up to
    `OAICR_SHUTDOWN_GRACE` (default 55s) to complete.
 2. If the budget runs out, `Close()` force-terminates the remainder.
-3. Idle keep-alive connections are closed; the process exits `0`.
+3. If usage metering is enabled, its accepted event backlog is then flushed through its bounded close window; events that cannot be persisted are explicitly counted and reported.
+4. Idle keep-alive connections are closed; the process exits `0`.
 
 A second signal while draining forces an immediate `exit 1`. Compose's
 `stop_grace_period: 60s` is deliberately larger than the default drain
@@ -947,11 +1189,14 @@ Decided, and not coming back without a design discussion:
 ## Repository layout
 
 ```
-cmd/openai-compatible-injector/  entrypoint + version/healthcheck subcommands
+cmd/openai-compatible-injector/  entrypoint + version/healthcheck/keys subcommands
 internal/config/                 bootstrap, runtime YAML (models, providers, transports), snapshot store, poller
+internal/auth/                   client identity: static + partner key store, decision cache, SQL migrations
+internal/migrate/                shared module-scoped SQL migration runner
+internal/usage/                  factual upstream usage capture, async pipeline, PostgreSQL repository
 internal/inject/                 pure request/response transforms (probe, chat, responses, rewrite, thinking usage)
 internal/transport/              outbound paths: Doer seam, direct client, proxy (http/https/socks5/socks5h), pool registry
-internal/proxy/                  handler, client auth, SSE copy, error envelopes
+internal/proxy/                  handler, client auth gate, SSE copy, error envelopes
 internal/server/                 listener + graceful shutdown
 e2e/                             black-box subprocess suite
 config.example.yaml              documented runtime config template

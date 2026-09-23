@@ -175,7 +175,7 @@ func TestRegistryExecuteSurvivesReload(t *testing.T) {
 	cfg := seed
 	r.mu.Lock()
 	r.doers["direct"] = blocker
-	r.doers[cfg.Key()] = r.newPoolDoerLocked(cfg.Pool)
+	r.doers[cfg.Key()] = r.newPoolDoerLocked(cfg.Pool, cfg.Key())
 	pd := r.doers[cfg.Key()].(*poolDoer)
 	st := pd.st
 	r.mu.Unlock()

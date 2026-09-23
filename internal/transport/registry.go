@@ -41,11 +41,15 @@ func (r *Registry) Doer(c Config) Doer {
 }
 
 // doerLocked is Doer with r.mu already held (pool creation resolves member
-// endpoint clients on the same lock).
+// endpoint clients on the same lock). Pool configs skip the plain doers-map
+// fast path: the cached poolDoer is only valid while its state is still the
+// registry's live state for the identity (see newPoolDoerLocked).
 func (r *Registry) doerLocked(c Config) Doer {
 	k := c.Key()
-	if d, ok := r.doers[k]; ok {
-		return d
+	if c.Kind != EgressPool {
+		if d, ok := r.doers[k]; ok {
+			return d
+		}
 	}
 	var d Doer
 	switch c.Kind {
@@ -54,7 +58,7 @@ func (r *Registry) doerLocked(c Config) Doer {
 	case Proxy:
 		d = newProxyClient(c.ProxyURL)
 	case EgressPool:
-		d = r.newPoolDoerLocked(c.Pool)
+		d = r.newPoolDoerLocked(c.Pool, k)
 	default:
 		panic("transport: unknown kind") // unreachable: Kind is set by validation alone
 	}
@@ -64,15 +68,35 @@ func (r *Registry) doerLocked(c Config) Doer {
 
 // newPoolDoerLocked builds the pool's Doer against the shared per-identity
 // state, creating that state (and every member's endpoint client) on first
-// use. r.mu must be held.
-func (r *Registry) newPoolDoerLocked(p *Pool) *poolDoer {
+// use. r.mu must be held. k is the config's content key ("pool "+identity).
+//
+// A state found under the identity is reused only while it is still live
+// (not retired). A retired state belongs to a generation that dropped the
+// pool; re-introducing the pool must not hand it out again — a fresh state
+// starts, and the superseded one's deferred retirement becomes a no-op
+// because it no longer owns the map entry (finishRetireLocked checks
+// instance identity, not the identity string). The doers-map entry is
+// rewritten in step with the state: state and doer entry always move as a
+// pair under r.mu.
+func (r *Registry) newPoolDoerLocked(p *Pool, k string) *poolDoer {
 	id := p.Identity()
-	st, ok := r.pools[id]
-	if !ok {
-		st = r.newPoolStateLocked(p)
-		r.pools[id] = st
+	if st, ok := r.pools[id]; ok && !st.retired {
+		if d, ok := r.doers[k]; ok {
+			if pd, ok := d.(*poolDoer); ok && pd.st == st {
+				return pd
+			}
+		}
+		// The state is live but its doer entry is missing or foreign
+		// (unreachable through the paired updates; kept impossible here).
+		pd := &poolDoer{pool: p, st: st}
+		r.doers[k] = pd
+		return pd
 	}
-	return &poolDoer{pool: p, st: st}
+	st := r.newPoolStateLocked(p)
+	r.pools[id] = st
+	pd := &poolDoer{pool: p, st: st}
+	r.doers[k] = pd
+	return pd
 }
 
 func (r *Registry) newPoolStateLocked(p *Pool) *poolState {
@@ -86,7 +110,7 @@ func (r *Registry) newPoolStateLocked(p *Pool) *poolState {
 		key:     "pool " + p.Identity(),
 		members: make([]memberState, len(p.Members)),
 		clock:   clock,
-		cw:      make([]int, len(p.Members)),
+		cw:      make([]int64, len(p.Members)),
 	}
 	for i, m := range p.Members {
 		st.members[i] = memberState{
@@ -168,10 +192,25 @@ func (r *Registry) retirePool(id string, st *poolState) {
 // connections and drops both map entries. r.mu must be held. members is
 // immutable after construction, so reading it needs only r.mu's protection
 // of the map entries.
+//
+// The ownership check is the load-bearing half: this runs both inline (from
+// Retain) and deferred (from a lease's last release, which may fire long
+// after later reloads re-introduced the same pool identity). If the map no
+// longer holds THIS state instance — a new active state lives under the
+// identity — the callback is a no-op: the active state owns the entries,
+// and retiring it here would delete a warm pool out from under live
+// traffic. Instance identity, never the identity string: two states of one
+// identity are different generations, and only the generation the registry
+// still owns may be torn down.
 func (r *Registry) finishRetireLocked(id string, st *poolState) {
+	if cur, ok := r.pools[id]; ok && cur != st {
+		return // superseded: the active state owns these entries now
+	}
 	if d, ok := r.doers[st.key]; ok {
-		closeIdle(d)
-		delete(r.doers, st.key)
+		if pd, isPd := d.(*poolDoer); !isPd || pd.st == st {
+			closeIdle(d)
+			delete(r.doers, st.key)
+		}
 	}
 	delete(r.pools, id)
 	for i := range st.members {
