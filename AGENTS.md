@@ -23,7 +23,7 @@ Owned decomposition:
 | `internal/auth`                  | Client identity: `Principal`/`Reason`/`Authenticator`/`Provider` seam, `StaticProvider` (snapshot-bound shared key, padded constant-time compare), `PartnerProvider` (store-backed, bounded positive/negative decision cache — errors never cached), crypto-random token/keyID minting + SHA-256-at-rest hashing, PostgreSQL key store (`PGStore`: lookup/create/list/revoke, off-path batched `last_used_at` flusher)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `internal/migrate`               | Shared SQL-first module-scoped migration runner: embedded-set parsing, legacy auth-ledger adoption, advisory-lock serialization, `information_schema` column-contract validation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `internal/usage`                 | Factual upstream usage capture (pre-rewrite), durable PostgreSQL event repository and reporting query seam, bounded asynchronous batch pipeline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify` and the context-aware `ClassifyAttempt` (`Failure`: canonical class, closed-set cause, caller-terminated flag, send state), egress pool runtime (`pool.go`: eligibility, scheduling, bounded provably-unsent fallback — a `send_unknown` failure stops the loop rather than replay, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish), the exchange-budget seam (`ExchangeBudget` declared HERE, on the consumer side — the transport performs the dials so the transport spends the units; the pool claims one per dialed endpoint after every eligibility, health and concurrency gate and immediately before the dial, skipped members claiming none, and a refused claim stops the loop without blaming an endpoint — and the producer satisfies it structurally, neither package importing the other for it) — the package knows nothing about providers or policy, only about paths and bytes                                                                                                                                                 |
+| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors, the typed local `RequestBuildError` (a request this process could not construct — static wording, the cause reachable but never printed), `Classify` and the context-aware `ClassifyAttempt` (`Failure`: canonical class, closed-set cause, caller-terminated flag, send state), egress pool runtime (`pool.go`: eligibility, scheduling, bounded provably-unsent fallback — a `send_unknown` failure stops the loop rather than replay, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish), the exchange-budget seam (`ExchangeBudget` declared HERE, on the consumer side — the transport performs the dials so the transport spends the units; the pool claims one per dialed endpoint after every eligibility, health and concurrency gate and immediately before the dial, skipped members claiming none, and a refused claim stops the loop without blaming an endpoint — and the producer satisfies it structurally, neither package importing the other for it) — the package knows nothing about providers or policy, only about paths and bytes        |
 | `internal/recovery`              | The provider recovery policy domain, deliberately free of I/O and of HTTP: typed `Failure` classes with closed-set cause tokens, typed allow-listed `Match` predicates and the three `Action`s (zero value `terminal`), the failure→action matrix with canonical rule IDs, specificity-derived precedence and equal-specificity overlap rejection (`matrix.go`), the shipped default policy (`defaults.go`), the layer merge (`merge.go`: pointer-typed `Partial`s — scalars replace, maps deep-merge, same-ID rule replaces, new ID appends, unstated inherits) and `Resolve` (validate after every layer, so no layer can smuggle a broken policy past the merge), the policy's stable data hash (`hash.go`, hand-written field order, never map iteration), and the `Engine` (`engine.go`/`budget.go`/`retryafter.go`/`backoff.go`) turning one `Observation` into one `Decision` under the four code-owned invariants — commitment, caller, envelope, immutability. It never sleeps, dials, writes a response, reads a pool, or logs; the proxy owns execution and the transport owns the wire                                                                                                                                                                                                                                                         |
 | `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping (auth delegated to the `auth.Provider` seam — static or partner), error envelopes, SSE copying (`CopySSE`), the provider candidate walk, orchestrated THROUGH the `recovery.Engine` — the handler contributes facts (which candidate, which attempt, what the attempt produced, whether the client is still there and whether a byte already reached it) and executes the returned decision (wait the decision's bounded delay, enter the next candidate, or relay what it holds), never classifying a status itself; the walk may not start at all until the snapshot's frozen policy says so, and no decision is taken outside the engine. Executes upstream calls through the model's resolved `transport.Doer` — the `Executor` (pool) branch handed the request's `recovery.Budget` and its `egress_kind`/`egress_target`/`egress_exhausted` report folded into the evidence — composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis)                                                                                                                                                                                                                                                                                                           |
 | `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -53,11 +53,16 @@ Owned decomposition:
   validated PostgreSQL-backed metering, asynchronous after startup; its DSN
   is never logged.
 - **The router decides WHICH provider; the transport decides HOW the
-  request reaches it.** The handler resolves a model's flattened
-  `transport.Config` through the `transport.Resolver` seam once per request
-  and executes on the returned `Doer` — no provider-specific branches, no
-  global `http.Client` coupling. `direct` is the tuned Go stack (ambient
-  env proxies honored, zero value of `Config`); `proxy` is exactly ONE
+  request reaches it.** Each candidate's flattened `transport.Config` comes
+  from the request's own snapshot — loaded once per request and immutable
+  for its life — and the handler resolves it through the `transport.Resolver`
+  seam to execute on the returned `Doer`: the lookup happens per attempt
+  (each candidate has its own config), and it is content-keyed, so every
+  retry and fallback of the same candidate gets the same long-lived `Doer`
+  and its warm pool state for as long as the config is live. No
+  provider-specific branches, no global `http.Client` coupling. `direct` is
+  the tuned Go stack (ambient env proxies honored, zero value of `Config`);
+  `proxy` is exactly ONE
   configured endpoint (`http/https/socks5/socks5h`, explicit port, userinfo
   = proxy auth). `socks5` resolves the upstream hostname locally and
   CONNECTs the IP; `socks5h` sends the hostname (remote DNS) — never
@@ -232,7 +237,10 @@ false` pins the primary candidate while same-candidate retries still
   endpoint. A value above a cap REJECTS the file rather than being clamped,
   because a silent clamp would leave the operator's file saying one thing
   and the process doing another. Transport failure (dial/TLS/proxy/pool
-  exhaustion) falls to the next candidate with NO same-candidate retry; a
+  exhaustion) falls to the next candidate with NO same-candidate retry under
+  the shipped default matrix — an operator matrix CAN ask for one, since
+  `transport`/`transport-cause-*` rows are matchable and a `retry` action
+  there is honored (only a configured matrix can ask for it); a
   malformed/incomplete answer before commitment (unparseable or over-cap
   200 body, error body that fails or stalls its bounded capture) is judged
   by the matrix like any other observation. The legacy `provider`,
@@ -273,13 +281,21 @@ false` pins the primary candidate while same-candidate retries still
   attempts (the candidate attempt; numerically the old candidate index when
   no retry fires) and NO LONGER doubles as the exchange count: a logical
   attempt and an outbound exchange are separate axes, and one logical
-  attempt may be several exchanges whenever an egress pool falls back.
+  attempt may be several exchanges whenever an egress pool falls back — or
+  NONE when the attempt never dialed (every member gated out, an envelope
+  refusal before the dial).
   `upstream_exchange` counts the real outbound exchanges, one-based and
-  request-wide, and the two differ exactly then — which is why they are
-  counted apart. `provider_attempts` on completions and usage events counts
-  provider-level attempts while `upstream_exchanges` counts outbound
-  exchanges, with `candidates_entered`, `candidate_attempts`,
-  `retry_attempts` and `egress_attempts` completing the walk's counters and
+  request-wide, and the two differ in BOTH directions — exchanges exceed
+  attempts when an attempt fans out across a pool's members, attempts exceed
+  exchanges when one dials nothing — which is why they are counted apart.
+  `provider_attempts` counts provider-level attempts on both
+  the completion record and the usage event, while the outbound-exchange
+  total is `upstream_exchanges` on the records and the persisted
+  `egress_attempts` column on the usage event — one quantity, two names,
+  because the column predates the field. The LOG field `egress_attempts` is
+  a third thing again and the narrowest: the relayed candidate's own pool
+  report, not the request-wide dial total. `candidates_entered`,
+  `candidate_attempts` and `retry_attempts` complete the walk's counters and
   `request_exchange_budget_remaining` reporting the REQUEST envelope's
   headroom — never the tighter of the two, which would read zero for every
   walk that ended because its candidate envelope was spent; on both the
@@ -308,10 +324,13 @@ provider_exhausted` over the final cause; a zero-dial pool reports
   `candidate_exchange_budget_spent` for an exchange the envelope refused
   before a dial (a refusal, never a failed endpoint: no strike, no
   `egress_attempt_failed`, and no `upstream_exchange`, because no exchange
-  happened for it to index; `policy_rule_id` is `budget-candidate`, or
-  `budget-request` when the request envelope is what refuses — terminal
-  whatever `retries.on-exhausted` says, since no policy may buy an exchange
-  the request envelope has already refused). Failure evidence carries the
+  happened for it to index; `policy_rule_id` is always `budget-candidate`,
+  and the record carries the disposition the refusal produced —
+  `retries.on-exhausted` still owns whether the walk moves). A refusal by
+  the REQUEST envelope never reaches that WARN: it is terminal whatever
+  `retries.on-exhausted` says — no policy may buy an exchange the request
+  envelope has already refused — so the walk ends there and the post-walk
+  `upstream_request_failed` names it under `budget-request`). Failure evidence carries the
   canonical `error_class` plus a closed-set `error_cause` token
   (`connection_refused`, `tls`, `dial`, `network_timeout`,
   `deadline_exceeded`, `proxy_connect`, `proxy_auth`, `proxy_timeout`,
@@ -327,17 +346,27 @@ provider_exhausted` over the final cause; a zero-dial pool reports
   class is a catch-all and reads an established-connection reset the same
   way it reads a refused connect, so `ClassConnection` must never be read as
   "never connected"; a `dial`/`proxyconnect` op, a typed proxy-tunnel
-  failure, a TLS handshake failure and a bare refused syscall prove no
-  request byte left, and everything else (a read/write op, a bare EOF, a
-  timeout on an established connection) is `send_unknown`. It is evidence
+  failure, a TLS CERTIFICATE-VERIFICATION failure and a bare refused
+  syscall prove no request byte left, and everything else (a read/write op,
+  a bare EOF, a timeout on an established connection) is `send_unknown`.
+  That TLS clause is deliberately one failure, not the phase: a handshake
+  that fails any other way — a fatal alert (`*net.OpError` op
+  `remote error` over unexported `tls` types), a plaintext peer (an untyped
+  string error), a peer closing at accept (a bare EOF) — is pre-send in
+  fact but not provable from a type, since Go produces those same shapes on
+  an established connection, so it stays `send_unknown` and the pool gives
+  up a fallback rather than risk a duplicate request. It is evidence
   about a DIALED attempt, so a zero-dial pool exhaustion reports none. The
   pool's refusal is inside one provider path only: the walk above it is the
   replay authority, so a chain whose candidates share a base-url does re-send
   by the matrix's own transport rows.
   `provider_attempt_started` fires before the attempt's first dial on both
-  paths — so it announces an intent, and its `provider_attempt` is the index
-  the attempt WILL carry, which an envelope refusal can leave unrealized —
-  and a dial's own egress evidence follows the marker it belongs to, and one-based nested indexes
+  paths — so it announces an intent, but its `provider_attempt` is the index
+  the logical attempt counter ALREADY holds, because the attempt is counted
+  when it begins rather than when a dial succeeds: an attempt the envelope
+  refuses before any dial still reports `provider_attempt` equal to
+  `provider_attempts`, with `upstream_exchanges` alone unmoved — and a dial's
+  own egress evidence follows the marker it belongs to, and one-based nested indexes
   `provider_attempt`/`egress_attempt` (egress index omitted when nothing
   was dialed); pooled records also carry the legacy `attempt` field as an
   alias equal to `egress_attempt` — compatibility only,

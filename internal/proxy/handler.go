@@ -311,14 +311,20 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// upstream answered non-SSE is relayed buffered, and the record says
 		// what happened, not what was asked.
 		streamed bool
-		// providerAttempts counts the walk's provider-level attempts — each
-		// candidate's initial attempt plus its same-candidate retries — and
-		// retriesTotal counts the retries among them. The two are counted
-		// separately, and retriesTotal is incremented where a retry actually
-		// starts, because deriving retries by subtracting entered candidates
-		// from attempts assumes every entered candidate attempted something:
-		// a candidate whose pool dials nothing is entered and attempts
-		// nothing, which would make the subtraction negative.
+		// providerAttempts counts the walk's LOGICAL provider-level attempts
+		// — each candidate attempt the walk began, whether or not the
+		// transport then managed to dial anything — and retriesTotal counts
+		// the re-asks among them. Both are incremented at the attempt's
+		// start, so retriesTotal can never report a re-ask the attempt
+		// counter does not contain.
+		//
+		// This is one of two independent axes, and the split is the point:
+		// upstream_exchanges counts real outbound dials and is claimed by
+		// the transport's budget at each one, so one pooled attempt may be
+		// several exchanges and an attempt the pool refuses before any dial
+		// is one attempt with zero exchanges. Neither number may be derived
+		// from the other — a logical attempt is what the recovery policy
+		// decides on, an exchange is what the wire carried.
 		// finalProvider is the identity (providers-table name, or endpoint
 		// origin) of the candidate whose answer was committed or, on
 		// exhaustion/disconnect, of the last one attempted.
@@ -356,8 +362,11 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// withProviders adds the walk's completion facts. candidate_attempts is
 	// the same total as provider_attempts seen from the other scope — one
 	// provider attempt IS one attempt on some candidate — while
-	// upstream_exchanges is the count of real dials and can be higher, since
-	// one pooled attempt may dial several members.
+	// upstream_exchanges is the count of real dials, an independent axis:
+	// higher than the attempts when one pooled attempt fans out across
+	// members, and lower — even zero — when an attempt was refused before
+	// any dial. provider_attempts therefore never drops to zero for an
+	// attempted candidate just because the transport dialed nothing.
 	// provider_attempts/retries_total stay as compatibility aliases of
 	// candidate_attempts/retry_attempts, the same way attempt aliases
 	// egress_attempt on the per-dial events; the new names are authoritative.
@@ -658,14 +667,6 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		invalid   int                   // answerInvalid flavor (invalid*)
 		cand      config.Candidate
 		candIndex int // one-based chain position
-		// committed marks a result the upstream has already produced, as
-		// opposed to a decision not to ask it. The walk commits one answer
-		// per request and does so before the first byte reaches the client,
-		// so nothing in this handler ever observes a failure on a committed
-		// result — the invariant holds structurally. The evidence still
-		// carries the fact, because the alternative is a policy that silently
-		// becomes able to retry after a relay has started.
-		committed bool
 		// egressKind is this attempt's own egress mode — the pool's last
 		// dialed member's kind, or direct. It rides along so a retained
 		// answer's usage record names ITS egress, not the last failed
@@ -823,25 +824,31 @@ walk:
 				return
 			}
 			copyForwardHeaders(req.Header, r.Header)
-			// Counted here, not at the loop head: these count provider-level
-			// ATTEMPTS, so a transform or request-build failure above — which
-			// never reaches a provider — must not report an attempt that never
-			// happened. attempt is candidate-local (its own retries included);
-			// providerAttempts is the walk's global provider-attempt index.
-			// Egress exchanges are claimed separately at each real dial by the
-			// budget, so a pooled attempt can honestly consume several.
+			// COUNTER AXIS 1 OF 2 — LOGICAL PROVIDER ATTEMPTS. One candidate
+			// attempt begins here: the candidate is entered, the request is
+			// built, and the transport is about to be asked. Counted here
+			// rather than at the loop head so a transform or request-build
+			// failure above — which never reaches a provider — reports no
+			// attempt that never happened; counted BEFORE the transport runs
+			// so the counter can never disagree with the provider_attempt
+			// marker emitted below, whether or not the transport ends up
+			// reaching the wire.
+			//
+			// It counts an ATTEMPT, not an exchange: an attempt is what the
+			// recovery policy decides on, and a pooled attempt that dials
+			// nothing (every member gated out, an exhausted envelope) is
+			// still an attempt the walk made and answered for. The count of
+			// real dials is a separate axis entirely — see upstream_exchanges,
+			// claimed by the budget at each dial. attempt is candidate-local
+			// (its own retries included); providerAttempts is the walk's
+			// global provider-attempt index, and the retry inside an attempt
+			// is counted beside it so retries_total can never report a re-ask
+			// the attempt counter does not contain.
 			attempt++
 			retryIndex := attempt - 1
-			// noteAttempt counts one provider-level attempt, and the retry
-			// inside it when there is one. Both are counted at the same place,
-			// after the transport confirmed the attempt reached a provider, so
-			// retries_total can never report a re-ask the attempt counter does
-			// not contain.
-			noteAttempt := func() {
-				providerAttempts++
-				if attempt > 1 {
-					retriesTotal++
-				}
+			providerAttempts++
+			if attempt > 1 {
+				retriesTotal++
 			}
 			// fallBackOnSpentCandidate answers the one refusal no observation
 			// can describe: the transport declined to dial because this
@@ -917,6 +924,14 @@ walk:
 			// refusal before a direct dial must not inherit the previous
 			// attempt's egress index into its final evidence.
 			lastEgressAttempt = 0
+			// And the send state is attempt-local for the same reason, reset
+			// alongside the index it describes. A pool that dials nothing this
+			// attempt must not republish the PREVIOUS attempt's wire evidence:
+			// an earlier dial's definitely_not_sent beside this attempt's
+			// egress_exhausted would read as "the pool proved nothing left",
+			// which is a claim about a dial it never made. Only an attempt that
+			// dialed sets it again below.
+			lastSendState = ""
 			if pooled {
 				// provider_attempt_started precedes the attempt's first dial:
 				// the pool may still refuse the attempt before ANY dial
@@ -924,12 +939,16 @@ walk:
 				// event — candidate_exchange_budget_spent or
 				// provider_attempt_failed — names the reason, so the marker
 				// stays honest: an attempt that begins is what it names, and
-				// the attempt index it carries is the one the evidence events
-				// will use when a dial does happen.
+				// the index it carries is the counter's own, already counted
+				// above, not an optimistic guess at what the counter will say
+				// if a dial happens to succeed. A zero-dial attempt therefore
+				// reports provider_attempt = provider_attempts = N with
+				// upstream_exchanges unchanged: the attempt is a logical fact,
+				// the exchange is a wire fact, and neither implies the other.
 				log.Debug().Str("provider", cand.Label()).
 					Str("upstream", origin(&upstream)).
 					Int64("bytes_out", int64(len(out))).
-					Int("provider_attempt", providerAttempts+1).
+					Int("provider_attempt", providerAttempts).
 					Int("candidate_index", i+1).
 					Int("candidate_attempt", attempt).
 					Int("retry_index", retryIndex).
@@ -946,19 +965,13 @@ walk:
 				})
 				egress = &info
 				lastEgressAttempt = info.Attempts
-				// The provider attempt is counted here — AFTER the pool is
-				// back and only when it dialed — so the counters name
-				// exchanges that reached a provider. A refusal inside the
-				// pool's loop leaves info.Attempts at its pre-refusal value
-				// in one case only (the envelope refusing the very next dial
-				// after this Execute's first real one, which returns the last
-				// endpoint error rather than an empty result), so the guard
-				// is what counts, not the flag. The started event above
-				// already carried the optimistic index (providerAttempts+1);
-				// the counter catches up here when a dial proved the attempt.
-				if info.Attempts > 0 {
-					noteAttempt()
-				}
+				// The provider attempt was counted before Execute, and
+				// deliberately not again here: info.Attempts is this
+				// attempt's EGRESS count (how many members the pool dialed),
+				// a different axis that the budget already claimed at each
+				// dial. Gating the attempt counter on it — as this code once
+				// did — made a zero-dial attempt report the contradictory
+				// pair provider_attempt_started = N, provider_attempts = N-1.
 				// Per-attempt evidence, bounded by the fallback budget: one WARN
 				// per dialed-and-failed endpoint, correlated by this request's
 				// request_id and its one-based provider/egress attempt indexes.
@@ -1018,15 +1031,17 @@ walk:
 				}
 			} else {
 				// provider_attempt_started precedes the single dial of a
-				// direct transport, matching the pooled path's placement.
-				// The envelope claim follows: a refusal fires
-				// candidate_exchange_budget_spent with its own identity,
-				// and the attempt counter stays honest because noteAttempt
-				// is called only when a dial actually happens.
+				// direct transport, matching the pooled path's placement and
+				// carrying the counter's own index, counted at the attempt's
+				// start above. The envelope claim follows: a refusal fires
+				// candidate_exchange_budget_spent with its own identity, and
+				// the pair stays honest in either direction — the attempt is
+				// reported whether or not the envelope let the dial happen,
+				// while upstream_exchanges moves only when one did.
 				log.Debug().Str("provider", cand.Label()).
 					Str("upstream", origin(&upstream)).
 					Int64("bytes_out", int64(len(out))).
-					Int("provider_attempt", providerAttempts+1).
+					Int("provider_attempt", providerAttempts).
 					Int("candidate_index", i+1).
 					Int("candidate_attempt", attempt).
 					Int("retry_index", retryIndex).
@@ -1044,7 +1059,6 @@ walk:
 					}
 					break
 				}
-				noteAttempt()
 				resp, uerr = d.Do(req)
 				lastEgressAttempt = 1
 			}
@@ -1065,6 +1079,31 @@ walk:
 			// transport failure never re-asks the same endpoint: the retry
 			// budgets are for answers, not for dead sockets.
 			if uerr != nil {
+				// A request this process failed to CONSTRUCT is a local fault,
+				// not an endpoint's: the pool never dialed, so no member may be
+				// blamed, struck, or named with a wire state. It is reported
+				// under the single-endpoint path's own build vocabulary and
+				// stops the walk — the request itself is what is wrong, so no
+				// other candidate does better with it — matching the transform
+				// error above.
+				//
+				// Unlike that path, the attempt here is already counted and its
+				// provider_attempt_started already emitted: a pool builds per
+				// member, inside Execute, which is past the marker. The attempt
+				// stays counted rather than being retroactively denied, because
+				// the marker and the counter may never disagree.
+				var rbe *transport.RequestBuildError
+				if errors.As(uerr, &rbe) {
+					log.Error().Str("model", model).
+						Str("upstream", origin(&upstream)).
+						Str("error_class", "request_build").
+						Int("provider_attempt", providerAttempts).
+						Int("candidate_index", i+1).
+						Msg("upstream_request_build_failed")
+					outcome = "upstream_unreachable"
+					reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+					return
+				}
 				lastUerr = uerr
 				f := transport.ClassifyAttempt(r.Context(), uerr)
 				class, cause := f.Class.String(), f.Cause
@@ -1081,6 +1120,13 @@ walk:
 				// that reports that is not an endpoint failure at all — its
 				// classification must not be read as wire evidence. The
 				// exhaustion line already says it: egress_exhausted.
+				//
+				// This is also the ONE value every record for this attempt
+				// publishes — the per-dial record, provider_attempt_failed and
+				// the post-walk exhaustion report all read it back rather than
+				// re-deriving it from f, so a state that was not earned by a
+				// dial can never be attached to a record by a second code path
+				// that forgot the guard.
 				if dialedAttempt(pooled, egress) && !f.CallerTerminated {
 					lastSendState = f.SendState.String()
 				}
@@ -1089,10 +1135,16 @@ walk:
 				// is the request context, never the wire, and the engine
 				// hard-stops on that class whatever the matrix says.
 				obs := recovery.Observation{
-					Class:            recovery.FailureTransport,
-					TransportClass:   transportClassOf(f.Class),
-					TransportCause:   f.Cause,
-					Streaming:        stream,
+					Class:          recovery.FailureTransport,
+					TransportClass: transportClassOf(f.Class),
+					TransportCause: f.Cause,
+					Streaming:      stream,
+					// A committed answer means the upstream already produced
+					// this result — as opposed to a decision not to ask it. The
+					// walk commits one answer per request, before the first byte
+					// reaches the client, so nothing here can observe a failure
+					// on a committed result: the invariant holds structurally,
+					// and the engine may not retry one.
 					Committed:        answer != nil,
 					CandidateIndex:   i + 1,
 					CandidateAttempt: attempt,
@@ -1154,7 +1206,7 @@ walk:
 						Str("egress_kind", "direct").Str("egress_target", "direct").
 						Str("failure_origin", "transport").
 						Str("error_class", class).Str("error_cause", cause).
-						Str("send_state", f.SendState.String()).
+						Str("send_state", lastSendState).
 						Int("egress_attempt", 1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+1, eng.Budget().RequestRemaining())
@@ -1174,9 +1226,15 @@ walk:
 					Str("error_class", class).
 					Str("error_cause", cause).
 					Str("failure_origin", "transport").
-					Str("send_state", f.SendState.String()).
 					Str("disposition", act.String()).
 					Str("reason", dec.Reason)
+				// A zero-dial attempt has no wire state to report — the pool
+				// dialed nothing, so a state here would be evidence about a
+				// request that was never sent anywhere. lastSendState is empty
+				// exactly then.
+				if lastSendState != "" {
+					event = event.Str("send_state", lastSendState)
+				}
 				if lastEgressAttempt > 0 {
 					event = event.Int("egress_attempt", lastEgressAttempt)
 				}
@@ -1355,7 +1413,7 @@ walk:
 				// SSE answer: the headers are the commitment. The body is
 				// not read here — it streams after the walk, and anything
 				// that kills it later truncates the committed stream.
-				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, committed: true}
+				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
 				break walk
 			}
 
@@ -1480,7 +1538,7 @@ walk:
 			}
 			// A valid 2xx answer: committed. The body rides the answer
 			// struct to the rewrite; no retry follows commitment.
-			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1, committed: true}
+			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
 			break walk
 		}
 	}
@@ -2110,15 +2168,21 @@ func (e *clientWriteError) Error() string {
 func (e *clientWriteError) Unwrap() error { return e.err }
 
 // clientSide reports whether a relay error happened on the client side: an
-// explicit write failure, or the request context surfacing canceled through
-// the upstream read — the context cancels when the client goes away, never
-// on an upstream hiccup.
+// explicit write failure, or the request context surfacing through the
+// upstream read — the context ends when the client goes away or its deadline
+// expires, never on an upstream hiccup.
+//
+// Cancellation and an expired deadline are the SAME ownership answer here, as
+// they are everywhere else in this service: ownership is read from the
+// request context, never from the error chain. Reporting an expired caller
+// deadline as an upstream read failure would blame the provider for a
+// request nobody is waiting for any more.
 func clientSide(err error) bool {
 	var cwe *clientWriteError
 	if errors.As(err, &cwe) {
 		return true
 	}
-	return errors.Is(err, context.Canceled)
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // copyVerbatim relays src to dst byte for byte with the same io.Copy

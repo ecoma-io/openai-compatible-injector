@@ -39,6 +39,22 @@ func (e *ProxyConnectError) Error() string {
 
 func (e *ProxyConnectError) Unwrap() error { return e.cause }
 
+// RequestBuildError reports a request this process could not CONSTRUCT: no
+// socket was touched, no member was chosen, and nothing reached any wire, so
+// the failure belongs to the caller that asked for the request rather than to
+// an endpoint — the handler reports it under its own local vocabulary rather
+// than as a transport failure, exactly as the single-endpoint path reports
+// its own build failure.
+//
+// The text is our own static wording. The cause (http.NewRequest's error,
+// which quotes the request URL inside its message) stays reachable through
+// errors.Is/As and is never printed: an endpoint URL can carry credentials in
+// its query string, and this value reaches a log line.
+type RequestBuildError struct{ cause error }
+
+func (e *RequestBuildError) Error() string { return "transport: request build failed" }
+func (e *RequestBuildError) Unwrap() error { return e.cause }
+
 // Class buckets a transport failure for the fallback decision and the
 // access log's error_class field. It is derived from typed errors and
 // stdlib sentinels only — never from message text.
@@ -129,12 +145,17 @@ type Failure struct {
 }
 
 // SendState records whether a failed attempt provably never left the
-// client. Only a failure in the CONNECTION-ESTABLISHMENT phase is
-// definitely-not-sent: no TCP connection, TLS handshake, or proxy tunnel
-// ever existed to carry the request bytes. Every other failure — a timeout
-// or a reset on an established connection above all — is send-unknown,
-// because the upstream may already be processing a request whose answer
-// never came back.
+// client. Only a failure in the CONNECTION-ESTABLISHMENT phase that is
+// ALSO provable as such is definitely-not-sent: no TCP connection, proxy
+// tunnel, or TLS certificate verification ever completed. Every other
+// failure — a timeout or a reset on an established connection above all —
+// is send-unknown, because the upstream may already be processing a request
+// whose answer never came back.
+//
+// "Provable" is the operative word, and it is why the mapping is narrower
+// than the phase: most of what fails during a TLS handshake arrives in the
+// same shapes Go produces AFTER the handshake, so the phase cannot be read
+// off the error. See sendStateOf.
 //
 // The zero value is the conservative one: a failure that is not proven
 // pre-send is treated as possibly-transmitted, never as provably-unsent.
@@ -175,13 +196,38 @@ func (s SendState) String() string {
 //
 //   - a proxy tunnel failure (typed auth or connect error) — the tunnel
 //     precedes the request;
-//   - a failed TLS handshake (typed verification error) — so does the
-//     handshake;
+//   - a TLS CERTIFICATE VERIFICATION failure (typed) — the client rejects
+//     the peer's certificate during the handshake, which completes before
+//     the first request byte;
 //   - a *net.OpError whose op is "dial" or "proxyconnect" — the failure is
 //     a failure to ESTABLISH the connection, whatever class it landed in.
 //     A blackholed egress belongs here: its error is timeout-shaped, but
 //     nothing was sent, so it is both fallback-eligible and safe to replay;
 //   - a bare refused syscall — only a connect attempt can produce it.
+//
+// Certificate verification is the ONLY TLS failure this mapping can prove,
+// and the narrowness is deliberate. A TLS handshake that fails for any
+// other reason is still pre-send — no request byte exists yet — but Go
+// reports those failures through shapes it also produces on an ESTABLISHED
+// connection, and none of them is typed as a handshake failure:
+//
+//   - a fatal alert from the peer (a version or cipher mismatch, a missing
+//     client certificate) arrives as `*net.OpError{Op: "remote error"}`
+//     wrapping an unexported `*tls.permanentError` and an unexported
+//     `tls.alert` — no exported type to match;
+//   - a peer that answers the hello with plaintext HTTP arrives as an
+//     untyped `errors.errorString` ("http: server gave HTTP response to
+//     HTTPS client"), reachable only by matching its text, which this
+//     package never does;
+//   - a peer that closes at accept arrives as a bare EOF, exactly like an
+//     established connection dying before it answered.
+//
+// Those stay send-unknown, and the two errors are not symmetric: calling a
+// delivered request unsent duplicates it upstream, while calling an unsent
+// failure unknown only makes that egress member ineligible for this one
+// attempt — the provider walk above still covers the request by policy. So
+// the mapping takes the conservative side wherever the phase is not
+// provable from a type, and gives up a fallback rather than a request.
 //
 // A "read"/"write" op, an error with no op to read at all (a bare EOF, an
 // HTTP/2 stream error, a shape this package does not know), and every other

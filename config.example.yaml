@@ -54,8 +54,12 @@ api-key: change-me-client-key
 # request cannot use are skipped without a dial (streaming gate, body-size
 # gate checked BEFORE sending, concurrency cap, health cooldown). A dialed
 # member failing with positive evidence that nothing was sent — refused,
-# unreachable, TLS handshake, proxy CONNECT or proxy auth — is retried on
-# the next eligible member up to fallback max-attempts. A failure that may
+# unreachable, a TLS certificate-verification failure, proxy CONNECT or
+# proxy auth — is retried on the next eligible member up to fallback
+# max-attempts. The evidence is read off TYPED failures, so a handshake
+# that fails any other way (a fatal alert, a plaintext peer, a peer closing
+# at accept) counts as possibly sent and does not fall back: the same shapes
+# appear on an established connection. A failure that may
 # have carried the request (a reset, a bare EOF, or a timeout on an
 # established connection — an HTTP forward proxy that accepts the connection
 # and dies without answering included) stops the loop and travels up to the

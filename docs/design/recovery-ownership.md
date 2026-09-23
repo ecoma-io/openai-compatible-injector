@@ -97,9 +97,16 @@ loops.
   paths (replaces the pooled path's late event; the direct path's existing
   event moves to the same moment/name). The pool's own per-dial events land
   where they land (they are per-exchange evidence, named
-  `egress_attempt_failed`). The marker is emitted before the dial, so an
-  attempt an envelope refusal never realizes leaves a marker whose index no
-  later record reaches; the README says so.
+  `egress_attempt_failed`). The marker is emitted before the dial, and the
+  LOGICAL attempt it announces is counted at the same moment — before the
+  transport is asked — so the index it carries is the counter's own already-
+  incremented value and an attempt that dials nothing still lives on in every
+  later record (`candidate_exchange_budget_spent` and the per-attempt
+  `provider_attempt_failed` both carry it). An earlier revision emitted the
+  marker against a counter incremented only after the transport returned,
+  which made a zero-dial attempt report `provider_attempt_started = N` with
+  `provider_attempts = N-1`; `internal/proxy/attempt_counter_test.go` pins the
+  corrected invariant, and the README describes it.
 
 ### 3. No `failure_origin` field (recovery-ownership observability)
 
@@ -136,18 +143,28 @@ unexpected EOF` — partial bytes are positive proof of delivery.
     path into a client-visible 502 and freezing the member's health at zero
     strikes forever.
 - The rule now reads the op: a `dial`/`proxyconnect` op, a typed proxy-tunnel
-  failure, a TLS handshake failure, or a bare refused syscall prove no request
-  byte left; a `read`/`write` op, an error with no op to read, and everything
-  else are `send_unknown` (the zero value, and the only defensible answer
-  without evidence). `internal/transport/sendstate_test.go` drives the real
-  HTTP stack to pin all five shapes.
-- The state rides `AttemptFailure` into `egress_attempt_failed`, is derived
-  again per attempt for `provider_attempt_failed`, and is reported by the
-  post-walk exhaustion `upstream_request_failed` — but only when a dial
-  actually happened. A zero-dial pool exhaustion carries no `send_state`: the
+  failure, a TLS CERTIFICATE-VERIFICATION failure, or a bare refused syscall
+  prove no request byte left; a `read`/`write` op, an error with no op to
+  read, and everything else are `send_unknown` (the zero value, and the only
+  defensible answer without evidence).
+  `internal/transport/sendstate_test.go` drives the real HTTP stack to pin
+  those shapes — the positive ones and, just as load-bearing, the TLS
+  negatives (below).
+- The state rides `AttemptFailure` into `egress_attempt_failed`, and for the
+  attempt's own `provider_attempt_failed` and the post-walk exhaustion
+  `upstream_request_failed` it is read back from the attempt's ONE recorded
+  value rather than re-derived from the classification — but only when a dial
+  actually happened, because that value is set under exactly that guard. A
+  zero-dial pool exhaustion carries no `send_state` on any of the three: the
   sentinel that reports it is a pool-level condition, not an endpoint's
   failure, and attaching a wire state to a dial that never happened is
   evidence about nothing.
+- The state is ATTEMPT-local, which is a second way the same error can be
+  made: it is reset at the start of each attempt alongside the egress index
+  it describes, because a field that survives an attempt lets a later
+  zero-dial attempt republish an EARLIER dial's `definitely_not_sent` beside
+  its own `egress_exhausted`. Both halves — the guard and the reset — are
+  pinned by `internal/proxy/pool_test.go`.
 - Residual boundary, stated rather than assumed: a TLS-handshake _timeout_ is
   a plain Go error with no typed marker and no wire op, so classification by
   type (never by text) cannot prove it pre-send and it reads
@@ -155,6 +172,29 @@ unexpected EOF` — partial bytes are positive proof of delivery.
   safe one. Likewise `internal/transport` cannot distinguish a server that
   read the request and died from one that never accepted it _if_ the error
   shape is a bare EOF — hence the conservative default.
+- The same reasoning sets the WIDTH of the TLS clause, which is narrower than
+  the phase it names: certificate verification is the only TLS handshake
+  failure Go types. The others were measured against the real stack (Go
+  1.26.4, `internal/transport/sendstate_test.go`), not assumed:
+  - a fatal alert — the peer rejecting the ClientHello (version, cipher,
+    client certificate) — surfaces as
+    `*net.OpError{Op: "remote error"}` over an unexported
+    `*tls.permanentError` over an unexported `tls.alert`;
+  - a peer answering the hello with plaintext HTTP surfaces as an untyped
+    `errors.errorString` ("http: server gave HTTP response to HTTPS client"),
+    and matching it would mean matching error TEXT, which this package
+    refuses to do anywhere;
+  - a peer that closes at accept surfaces as a bare EOF — byte-identical to
+    an established connection dying before its answer.
+    All three are pre-send in fact and `send_unknown` in this mapping, and
+    all three are pinned by a test so the width cannot drift silently. The
+    asymmetry justifies it: a false `definitely_not_sent` duplicates a
+    request upstream, while a false `send_unknown` only makes one member
+    ineligible for one attempt — the provider walk above still covers that
+    request by policy. Earlier revisions of this note (and of the README)
+    said "a failed TLS handshake", which claimed a whole phase the code can
+    only prove for part of one; the prose now matches what the code can
+    defend.
 - The e2e suite had the old behavior written into it, which is how the
   boundary got tested rather than assumed. Its `deadEgress` stub accepted
   every TCP connection and closed it at once, and three tests
@@ -183,6 +223,40 @@ unexpected EOF` — partial bytes are positive proof of delivery.
   fired and its members' idle connections stayed open. Pre-existing on `main`;
   fixed here because this branch's review surfaced it and the fix is one call.
 
+### 6. Two ways one state could be published about a dial that never happened
+
+Both surfaced in the branch's own review, against code this branch added.
+
+- **Stale state across attempts.** `lastSendState` was written per attempt but
+  never reset, so a walk that failed candidate 1 on a provably-unsent dial and
+  ended on candidate 2's zero-dial pool exhaustion republished candidate 1's
+  `definitely_not_sent` beside candidate 2's `egress_exhausted` — an operator
+  reads "the pool proved nothing left" about a dial it never made. It is now
+  reset at the start of each attempt, beside the egress index it describes.
+- **Re-derived state.** The per-attempt `provider_attempt_failed` record and
+  the single-endpoint `egress_attempt_failed` record published
+  `f.SendState.String()` unconditionally, so a zero-dial attempt carried the
+  zero-value `send_unknown` — an invented fact about a wire nothing was sent
+  to. Both now read back the attempt's one recorded value, which is set under
+  the same "a dial happened" guard the exhaustion report uses.
+
+### 7. The pooled path's local build failure named an endpoint
+
+- A request the pool cannot construct (`buildAttempt` fails on a bad method or
+  URL — unreachable with the shipped config, but the branch's own new code
+  path) was returned as a bare error and so classified as an ENDPOINT
+  transport failure: `failure_origin: transport`, an `error_class`/`error_cause`
+  pair, a `send_state`, and a walk that fell back to the next provider. None
+  of that is true of a request that never reached a socket. It is now a typed
+  `transport.RequestBuildError` (static wording, the cause — which quotes the
+  request URL — reachable through `Unwrap` and never printed), which the
+  handler reports under the single-endpoint path's own local vocabulary,
+  `upstream_request_build_failed`, and which stops the walk: the request
+  itself is what is wrong, so no candidate does better with it. The attempt
+  stays counted, because its `provider_attempt_started` marker was already
+  emitted before `Execute` was called and the marker and the counter may
+  never disagree.
+
 ## Reviewed and deliberately not changed
 
 - **The walk still replays a `send_unknown` failure — at the provider layer,
@@ -210,8 +284,17 @@ unexpected EOF` — partial bytes are positive proof of delivery.
   mapping happens in `internal/proxy` (`transportClassOf`, handler.go:1729).
   (It does import `net/http`, for `http.ParseTime` in `retryafter.go`, so an
   upstream `Retry-After` can be read: pre-existing, and HTTP-date parsing is a
-  date format, not transport coupling. It knows nothing about sockets,
-  proxies, pools or addresses.)
+  date format, not transport coupling. It performs no I/O, dials nothing,
+  sleeps nowhere and logs nothing, and it holds no address, socket or pool —
+  what it does name is the wire-level failure TAXONOMY it decides on:
+  `transport-cause-*` tokens including `proxy_auth`/`proxy_connect`, and
+  `no_eligible_endpoint`. That is a closed vocabulary of typed failure
+  conditions the transport maps its own errors onto, not a coupling to the
+  transport's implementation — `internal/recovery` imports no package of this
+  service at all, and the tokens do not depend on how a dial is made. It is
+  the one place the two layers share a vocabulary, and the sharing is
+  deliberate: a policy an operator writes has to be able to say "retry when
+  the proxy rejected us".)
 - `ActionRetry`/`ActionFallback`/`ActionTerminal` unchanged (action.go).
 - No new retry loop anywhere; no HTTP retry logic moved into transport; the
   transport still owns only paths and bytes.
@@ -223,15 +306,23 @@ unexpected EOF` — partial bytes are positive proof of delivery.
 - `internal/config` — rejection of provider/candidate override `fallback`;
   acceptance of global/model `fallback`; mutual-exclusion messages unchanged.
 - `internal/proxy` — `provider_attempt_started` precedes every dial (buffered
-  and pooled); `failure_origin` present on evidence events with correct
+  and pooled) and carries the counter's own index there, across a
+  same-candidate retry as well as across candidates; `failure_origin` present
+  on evidence events with correct
   values; `send_state` agrees across `egress_attempt_failed`,
   `provider_attempt_failed` and the exhaustion `upstream_request_failed`, and
-  is absent when the pool dialed nothing.
+  is absent when the pool dialed nothing — including on a LATER attempt after
+  an earlier one published a state; a local build failure is reported under
+  `upstream_request_build_failed`, stops the walk, and names no endpoint; an
+  expired caller deadline on a post-commitment relay is a client disconnect,
+  not an upstream read failure.
 - `internal/transport` — `ClassifyAttempt` send-state pinned per real wire
   shape (`sendstate_test.go`, against the real HTTP stack) and per synthetic
   cause token; a `send_unknown` failure dials exactly one member and strikes
   no health, while a refused dial and a dial timeout both fall back; the
-  zero-dial budget refusal releases its lease.
+  zero-dial budget refusal releases its lease; an unbuildable request is a
+  typed local failure that claims no exchange, holds no permit and prints no
+  URL.
 - `internal/recovery` — unchanged (no engine semantics changed).
 - e2e — `logging_test.go` lifecycle checks cover the new slug; the pool
   lifecycle tests exercise the fallback boundary through a tunnel-phase

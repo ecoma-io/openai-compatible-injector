@@ -334,6 +334,20 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 				continue
 			}
 		}
+		// The attempt's request is built BEFORE the envelope is claimed. A
+		// request this transport cannot even construct is not a dial: building
+		// touches no socket, so nothing reaches the member, no exchange was
+		// spent on it, and the member cannot be blamed or struck for it. It
+		// leaves as a local failure of this attempt — typed, so the caller can
+		// tell it from an endpoint's failure and does not name one for it.
+		req, buildErr := buildAttempt(ar)
+		if buildErr != nil {
+			// The permit goes back with it: it was taken for a dial that never
+			// happens, so holding it would shrink a capped member's capacity.
+			ms.lim.release()
+			st.end()
+			return nil, info, &RequestBuildError{cause: buildErr}
+		}
 		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
 			// The request's exchange envelope will not fund this dial. This
 			// is not an endpoint failure: nothing was dialed, no member is
@@ -361,7 +375,7 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			}
 			break
 		}
-		resp, err := p.dial(ms, ar)
+		resp, err := ms.client.Do(req)
 		attempts++
 		info.Attempts = attempts
 		info.Kind = p.pool.Members[idx].Endpoint.kindName()
@@ -428,17 +442,20 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 	return nil, info, lastErr
 }
 
-// dial builds this attempt's request from the AttemptRequest — a fresh
-// request object per attempt (the caller's request, and any previous
-// attempt's consumed body, are never reused) — and executes it on the
-// member's own client.
-func (p *poolDoer) dial(ms *memberState, ar *AttemptRequest) (*http.Response, error) {
+// buildAttempt builds this attempt's request from the AttemptRequest — a
+// fresh request object per attempt (the caller's request, and any previous
+// attempt's consumed body, are never reused).
+//
+// It is a pure construction step with no wire operation in it, which is why
+// the attempt loop runs it BEFORE claiming an exchange: a request that cannot
+// be built never reaches a member, so it must not spend one.
+func buildAttempt(ar *AttemptRequest) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ar.Ctx, ar.Method, ar.URL.String(), bytes.NewReader(ar.Body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header = ar.Header.Clone()
-	return ms.client.Do(req)
+	return req, nil
 }
 
 // Do satisfies Doer for contexts that resolve a pool but do not use the

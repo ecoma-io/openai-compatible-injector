@@ -545,6 +545,110 @@ func TestFailureOriginLabelsEvidence(t *testing.T) {
 	}
 }
 
+// TestRequestBuildErrorIsLocalNotAnEndpointFailure pins the vocabulary of the
+// pooled path's one purely LOCAL failure: a request the transport could not
+// construct. Nothing was dialed, so no member may be named, struck, blamed or
+// given a wire state — and because the request itself is what is wrong, the
+// walk stops rather than asking another provider to fail on it too.
+func TestRequestBuildErrorIsLocalNotAnEndpointFailure(t *testing.T) {
+	store := newChainStoreRetries(t, "", "")
+	ex := &buildErrorExecutor{}
+	buf, logger := captureLog(zerolog.WarnLevel)
+	h := NewHandler(store, kindResolver{direct: ex, proxied: ex}, nil, nil, logger)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"chain-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body %s)", rec.Code, rec.Body.String())
+	}
+	evs := buf.events(t, "upstream_request_build_failed")
+	if len(evs) != 1 || evs[0]["error_class"] != "request_build" {
+		t.Fatalf("build failure records = %v, want one request_build event", evs)
+	}
+	// No endpoint was blamed and no wire state invented for a request that
+	// never left this process: no per-dial record, no per-attempt transport
+	// failure (which would carry an error_class and a send_state), and no
+	// exhaustion line naming an upstream.
+	for _, slug := range []string{"egress_attempt_failed", "provider_attempt_failed", "upstream_request_failed"} {
+		if n := len(buf.events(t, slug)); n != 0 {
+			t.Errorf("%s records = %d, want 0: this failure is local, not an endpoint's", slug, n)
+		}
+	}
+	// The walk stopped at the first candidate: a request this process cannot
+	// build is not one another provider would accept.
+	if ex.calls != 1 {
+		t.Errorf("pool executions = %d, want 1: the walk must stop on a local build failure", ex.calls)
+	}
+}
+
+// buildErrorExecutor reports the pool's local construction failure: the
+// attempt's request could not be built, so nothing was dialed.
+type buildErrorExecutor struct{ calls int }
+
+func (e *buildErrorExecutor) Execute(*transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+	e.calls++
+	return nil, transport.AttemptInfo{}, &transport.RequestBuildError{}
+}
+
+func (e *buildErrorExecutor) Do(*http.Request) (*http.Response, error) {
+	panic("handler called Do on an Executor-capable doer")
+}
+
+// TestSendStateNotInheritedByLaterZeroDialAttempt pins the send state's
+// ATTEMPT locality. A walk that fails candidate 1 on a provably-unsent dial
+// and then ends on candidate 2's zero-dial pool exhaustion must not publish
+// candidate 1's definitely_not_sent beside candidate 2's egress_exhausted:
+// that reads as "the pool proved its own dial never left", a claim about a
+// dial it never made, and the opposite of what the exhaustion sentinel
+// reports. The state is per attempt and reset alongside the egress index it
+// describes, so only an attempt that dialed can leave one behind.
+func TestSendStateNotInheritedByLaterZeroDialAttempt(t *testing.T) {
+	store := newChainStoreRetries(t, "", "")
+	refused := &fakeUpstream{err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
+	ex := &allIneligibleExecutor{}
+	buf, logger := captureLog(zerolog.WarnLevel)
+	h := NewHandler(store, kindResolver{direct: refused, proxied: ex}, nil, nil, logger)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"chain-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body %s)", rec.Code, rec.Body.String())
+	}
+	// Candidate 1's failure really is a transport failure with a real state —
+	// this test's premise, asserted so it cannot decay into a vacuous pass.
+	// Candidate 2's is the zero-dial pool condition, and it must publish no
+	// state at all: send_state describes a dial, and the pool made none. A
+	// state re-derived from the classification instead of from the attempt
+	// would appear here as the zero value, which is an invented fact about the
+	// wire rather than a conservative one.
+	fails := buf.events(t, "provider_attempt_failed")
+	if len(fails) != 2 {
+		t.Fatalf("provider_attempt_failed events = %d, want one per attempted candidate: %v", len(fails), fails)
+	}
+	if fails[0]["provider_attempt"] != float64(1) || fails[0]["send_state"] != "definitely_not_sent" {
+		t.Errorf("candidate 1 evidence = %v, want attempt 1 with definitely_not_sent", fails[0])
+	}
+	if got, ok := fails[1]["send_state"]; ok {
+		t.Errorf("candidate 2 evidence send_state = %v, want the field absent: that attempt dialed nothing", got)
+	}
+	// Candidate 2 dialed nothing: the terminal report names the pool's own
+	// condition and carries no wire state — least of all candidate 1's.
+	final := buf.events(t, "upstream_request_failed")
+	if len(final) != 1 {
+		t.Fatalf("upstream_request_failed events = %d, want 1", len(final))
+	}
+	if got, ok := final[0]["send_state"]; ok {
+		t.Errorf("exhaustion send_state = %v, want the field absent: the final attempt dialed nothing", got)
+	}
+	if final[0]["error_class"] != "egress_exhausted" || final[0]["error_cause"] != "no_eligible_endpoint" {
+		t.Errorf("exhaustion class/cause = %v/%v, want the zero-dial pool condition",
+			final[0]["error_class"], final[0]["error_cause"])
+	}
+	if ex.calls != 1 {
+		t.Errorf("candidate 2 executions = %d, want 1", ex.calls)
+	}
+}
+
 // TestSendStateRidesTransportEvidence pins the send-state axis on every
 // transport-failure surface: a failure that provably never left the client
 // (a refused dial) reads definitely_not_sent, while a failure on an
