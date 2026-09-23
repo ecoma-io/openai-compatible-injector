@@ -141,6 +141,41 @@ models:
       # to it; both set -> the share is drawn per request in this range.
       min-ratio: 0.6
       max-ratio: 0.9
+    # Optional. Per-model status retry policy: EVERY candidate of the model
+    # (the single provider here, or every chain entry below) walks under it,
+    # and the same-candidate budget is enforced per candidate. Absent or
+    # null (like echo-model) selects exactly the defaults shown — the
+    # status disposition matrix applies by default, this block only SIZES
+    # it (which statuses retry, move on, or terminate is not configurable).
+    # Disposition summary: 408/425/429 and every 5xx except 501/505 retry
+    # this candidate while budget remains, then fall to the next; a
+    # 4xx/5xx whose error body stalls or fails its capture, and a 200 that
+    # is unparseable or over the buffered cap, are unusable answers and
+    # retry the same way; 401/403/404/405/409/422 move to the next
+    # candidate immediately (no same-candidate retry); every other status
+    # is terminal; caller cancellation is never retried or slept through;
+    # transport failures fall to the next candidate as before. The client
+    # always sees the LAST answer received.
+    #
+    # retries:
+    #   # Same-candidate retries AFTER the initial attempt, per candidate:
+    #   # 0 = one upstream exchange, 1 = two (the default), at most 8.
+    #   max-retries: 1
+    #   # One candidate's whole retry sequence must fit in this window,
+    #   # measured from its first attempt and checked before scheduling a
+    #   # wait; at least 1s, at most 2m.
+    #   max-elapsed: 10s
+    #   backoff:
+    #     # Delay before the first retry; doubled per further retry; >= 1ms.
+    #     initial: 250ms
+    #     # Caps the exponential growth AND any upstream Retry-After (an
+    #     # upstream can never make the proxy sleep longer than this);
+    #     # must be >= initial — omitted while initial sits above the 2s
+    #     # default, the ceiling rises to the initial.
+    #     max: 2s
+    #     # Uniform ±fraction spread of each delay, 0..1, so concurrent
+    #     # retries do not re-hit a recovering provider in step.
+    #     jitter: 0.1
 
   # A second example, without injection — pure model renaming.
   echo-model:
@@ -148,13 +183,24 @@ models:
     upstream-model: gpt-4o-mini
 
   # A chain example: an ordered provider candidate list. The first entry
-  # is the primary route; later entries are fallbacks tried ONLY when an
-  # earlier candidate fails before answering (dial, TLS, proxy, egress
-  # exhaustion). Any HTTP status — 429 and 5xx included — is an answer and
-  # ends the walk. Each candidate carries its own upstream-model; the
-  # injection prompt and thinking-usage above stay model-level (every
-  # candidate receives the same prompt). Bounded by the provider-fallback
-  # block below.
+  # is the primary route; later entries are fallbacks reached when an
+  # earlier candidate has no usable answer — a transport failure (dial,
+  # TLS, proxy, egress exhaustion), a retryable status (408, 425, 429, any
+  # 5xx except 501/505) whose same-candidate retry budget under the model's retries policy
+  # is spent, or a "not this provider" status (401, 403, 404, 405, 409,
+  # 422), which moves without waiting. Every other status is terminal and
+  # relayed exactly as a single-provider deployment would relay it, and the
+  # client always sees the LAST answer received (status preserved, body the
+  # canonical envelope — never raw provider bytes). Each candidate carries
+  # its own upstream-model; the injection prompt, thinking-usage and
+  # retries above stay model-level (every candidate receives the same
+  # prompt and walks under the same retry policy). Bounded by the
+  # provider-fallback block below: worst case is max-attempts candidates ×
+  # (max-retries + 1) exchanges each, with any egress pool's own fallback
+  # budget nested under a single candidate attempt. Both maxima together
+  # (8 candidates × 9 exchanges) is 72 exchanges for one request, and
+  # max-elapsed bounds one candidate's sleeps, not the whole request — a
+  # client that sets no deadline can hold a connection for a long time.
   # chained-model:
   #   providers:
   #     - provider: opencode # primary: the providers-table entry above
@@ -166,7 +212,9 @@ models:
 # selects the defaults below; a present block is validated even when it
 # disables the feature. max-attempts is the per-request candidate budget
 # (at least 1, at most 8) — the walk stops after this many candidates were
-# tried, chain length permitting. Hot-reloads with the rest of the file.
+# tried, chain length permitting; each tried candidate performs up to
+# (retries.max-retries + 1) upstream exchanges under that model's retries
+# policy. Hot-reloads with the rest of the file.
 #
 # provider-fallback:
 #   enabled: true

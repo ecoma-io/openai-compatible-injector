@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,6 +186,7 @@ func TestUsageAbsentStaysNull(t *testing.T) {
 // normalized outcome, and no tokens.
 
 func TestUsageUpstreamHTTPErrorMetered(t *testing.T) {
+	stubRetryTiming(t)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -246,6 +248,136 @@ func TestUsageFallbackChainFacts(t *testing.T) {
 	}
 	if ev.Outcome != "completed" || ev.HTTPStatus != http.StatusOK {
 		t.Fatalf("outcome/status = %q/%d", ev.Outcome, ev.HTTPStatus)
+	}
+}
+
+// Retries meter the same one event with the exchange counters: each
+// same-candidate retry is a provider attempt and one egress dial, so the
+// walk's counters sum them, while the answering candidate's identity and
+// usage are the only facts on the event.
+
+func TestUsageRetryChainFacts(t *testing.T) {
+	stubRetryTiming(t)
+	store := newChainStore(t, "")
+	pa := newScript(scriptStep{status: http.StatusTooManyRequests, body: `{"error":{"message":"rate limited"}}`})
+	pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`})
+	meter := &recordingMeter{}
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, meter, quietLogger())
+
+	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	ev := meter.single(t)
+	if ev.Provider != "pb" || ev.UpstreamModel != "up-b" {
+		t.Fatalf("provider/upstream = %q/%q, want the answering candidate pb/up-b", ev.Provider, ev.UpstreamModel)
+	}
+	// pa's initial attempt plus its one default retry, then pb: three
+	// exchanges, three dials.
+	if ev.ProviderAttempts != 3 || ev.EgressAttempts != 3 {
+		t.Fatalf("attempts = %d/%d, want 3 exchanges / 3 dials", ev.ProviderAttempts, ev.EgressAttempts)
+	}
+	if ev.PromptTokens == nil || *ev.PromptTokens != 3 ||
+		ev.CompletionTokens == nil || *ev.CompletionTokens != 4 ||
+		ev.TotalTokens == nil || *ev.TotalTokens != 7 {
+		t.Fatalf("metered tokens = %v/%v/%v, want only the answerer's 3/4/7", ev.PromptTokens, ev.CompletionTokens, ev.TotalTokens)
+	}
+	if ev.Outcome != "completed" || ev.HTTPStatus != http.StatusOK {
+		t.Fatalf("outcome/status = %q/%d", ev.Outcome, ev.HTTPStatus)
+	}
+}
+
+// statusExecutor is a pool-seam stand-in that answers every exchange with
+// one fixed HTTP status — the answer-shaped result a retained-answer test
+// needs from the Execute branch. Do panics: a pool candidate must never
+// fall back to it.
+type statusExecutor struct {
+	status   int
+	info     transport.AttemptInfo
+	doCalled bool
+}
+
+func (e *statusExecutor) Execute(*transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+	return &http.Response{
+		StatusCode: e.status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"rate limited"}}`)),
+	}, e.info, nil
+}
+
+func (e *statusExecutor) Do(*http.Request) (*http.Response, error) {
+	e.doCalled = true
+	panic("handler called Do on an Executor-capable doer")
+}
+
+// A retained answer's usage record names the RELAYED candidate's egress, not
+// the last failed one's: pa answers 429 through a POOL (Executor seam), its
+// budget runs out, pb then fails to dial at all — the adopted answer came
+// from the pool, so EgressKind is the pool member's kind, never pb's direct.
+func TestUsageRetainedAnswerNamesOwnEgress(t *testing.T) {
+	stubRetryTiming(t)
+	snap, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + `
+transports:
+  t1:
+    type: direct
+  t2:
+    type: proxy
+    proxy: http://127.0.0.1:9090
+  pool-egress:
+    type: pool
+    members: [t1]
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: pool-egress
+  pb:
+    base-url: https://b.example/v1
+    transport: t2
+models:
+  chain-model:
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	store := config.NewStore(snap)
+
+	px := &statusExecutor{
+		status: http.StatusTooManyRequests,
+		info:   transport.AttemptInfo{Attempts: 1, Kind: "proxy", Target: "http://127.0.0.1:9090"},
+	}
+	pb := &fakeUpstream{err: dialError("b.example")}
+	meter := &recordingMeter{}
+	h := NewHandler(store, &kindDoerResolver{pool: px, direct: pb}, nil, meter, quietLogger())
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want the retained 429", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"upstream_http_429"`) {
+		t.Fatalf("body = %s, want the canonical envelope", rec.Body.String())
+	}
+	if px.doCalled {
+		t.Fatal("handler fell back to Do on the pool candidate")
+	}
+
+	ev := meter.single(t)
+	if ev.Provider != "pa" || ev.UpstreamModel != "up-a" {
+		t.Fatalf("provider/upstream = %q/%q, want the answering candidate pa/up-a", ev.Provider, ev.UpstreamModel)
+	}
+	// pa's initial attempt plus its one default retry, then pb's failed dial:
+	// three exchanges, three dials.
+	if ev.ProviderAttempts != 3 || ev.EgressAttempts != 3 {
+		t.Fatalf("attempts = %d/%d, want 3 exchanges / 3 dials", ev.ProviderAttempts, ev.EgressAttempts)
+	}
+	if ev.EgressKind != "proxy" {
+		t.Fatalf("egress kind = %q, want the retained candidate's pool member kind %q", ev.EgressKind, "proxy")
+	}
+	if ev.Outcome != "upstream_http_error" || ev.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("outcome/status = %q/%d, want upstream_http_error/429", ev.Outcome, ev.HTTPStatus)
 	}
 }
 

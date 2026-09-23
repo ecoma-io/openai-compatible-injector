@@ -75,7 +75,7 @@ Division of responsibility:
 | ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- |
 | `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL`, `OAICR_USAGE_DATABASE_URL` | Environment (bootstrap) |
 | `api-key` (the shared inbound client credential)                                                                                                 | YAML file (runtime)     |
-| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,providers}`                                                              | YAML file (runtime)     |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,retries,providers}`                                                      | YAML file (runtime)     |
 | `provider-fallback.{enabled,max-attempts}`                                                                                                       | YAML file (runtime)     |
 | `sse-keep-alive.{enabled,interval}`                                                                                                              | YAML file (runtime)     |
 | `log-level`                                                                                                                                      | YAML file (runtime)     |
@@ -180,13 +180,15 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   entry carries `provider` (a reference into the top-level providers
   table, same rules as above) and `upstream-model` (the name sent to that
   candidate; required per candidate). The first entry is the primary
-  route; the rest are fallbacks walked only on transport-level failure,
-  bounded by [`provider-fallback`](#provider-fallback). Both forms at once
-  — a `providers` list next to `provider` or `endpoint` — is a rejection,
-  as is the same provider referenced twice in one chain. The
-  `injection-prompt` and `thinking-usage` stay model-level: every
-  candidate receives the same prompt, because injection is a property of
-  the public model. See [Provider fallback](#provider-fallback).
+  route; the rest are fallbacks reached when an earlier candidate has no
+  usable answer — which statuses re-ask or move on is the disposition
+  matrix of [`provider-fallback` + `retries`](#provider-fallback-and-retries).
+  Both forms at once — a `providers` list next to `provider` or
+  `endpoint` — is a rejection, as is the same provider referenced twice
+  in one chain. The `injection-prompt`, `thinking-usage` and `retries`
+  stay model-level: every candidate receives the same prompt and walks
+  under the same retry policy, because those are properties of the
+  public model. See [Provider fallback and retries](#provider-fallback-and-retries).
 - `upstream-model` — the `model` value actually forwarded upstream.
   Required on the single-provider and inline-endpoint forms (and per
   candidate inside a `providers` chain, where there is no model-level
@@ -202,6 +204,21 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   fixed to it). An absent or null block means off — responses stay
   byte-identical to an unconfigured deployment. See
   [Simulated thinking usage](#simulated-thinking-usage).
+- `retries` — optional block sizing the per-model status retry policy every
+  candidate of the model walks under. Absent, `null`, or `{}` selects the
+  defaults below; a present block is validated field by field — ranges and
+  combinations included — and any invalid value rejects the complete file.
+  `max-retries` is the number of same-candidate retries AFTER the initial
+  attempt (0..8, default 1; `0` = one upstream exchange per candidate);
+  `max-elapsed` bounds one candidate's whole retry sequence in time
+  (default `10s`, at least `1s`, at most `2m`); `backoff.initial` is the
+  first retry delay (default `250ms`, at least `1ms`), `backoff.max` caps
+  both the exponential growth and any effective `Retry-After` (default
+  `2s`, at least `initial` — omitted while `initial` sits above it, the
+  ceiling rises to the initial), and `backoff.jitter` is the uniform
+  ±fraction spread (0..1, default `0.1`). The block sizes the disposition
+  matrix; it never gates it. See
+  [Provider fallback and retries](#provider-fallback-and-retries).
 - `sse-keep-alive` — optional block controlling client-facing SSE heartbeat
   comments for both streaming routes. Absent, `null`, or `{}` defaults to
   `enabled: true`, `interval: 15s`; `enabled: false` opts out. `interval`, if
@@ -225,8 +242,10 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   `enabled: true`, `max-attempts: 2`; a present block is validated even
   when it disables the feature. `max-attempts` is the per-request
   candidate budget (at least 1, at most 8) — the walk stops after this
-  many candidates were tried, chain length permitting. See
-  [Provider fallback](#provider-fallback).
+  many candidates were tried, chain length permitting; each tried
+  candidate performs its own upstream exchanges under the model's
+  [`retries`](#provider-fallback-and-retries) policy. See
+  [Provider fallback and retries](#provider-fallback-and-retries).
 
 The file is validated strictly, in two layers:
 
@@ -239,9 +258,12 @@ The file is validated strictly, in two layers:
   key whose value is an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `provider`,
-  `upstream-model`, `injection-prompt`, `thinking-usage` and `providers`
-  (and, inside the block, outside `mode`, `min-ratio`, `max-ratio`) —
-  including a nested bootstrap key — is a rejection, not a warning. The
+  `upstream-model`, `injection-prompt`, `thinking-usage`, `retries` and
+  `providers` (and, inside the thinking-usage block, outside `mode`,
+  `min-ratio`, `max-ratio`; inside `retries`, outside `max-retries`,
+  `max-elapsed` and `backoff` — itself limited to `initial`, `max` and
+  `jitter`) — including a nested bootstrap key — is a rejection, not a
+  warning. The
   same strictness holds inside `providers` entries (`base-url`,
   `transport`), model-chain candidate entries (`provider`,
   `upstream-model`), `transports` entries
@@ -538,11 +560,14 @@ concurrency state for one endpoint must exist exactly once, and the
 duplicate check runs on the resolved endpoint (host case and userinfo
 spelling collapse), never on the YAML name.
 
-## Provider fallback
+## Provider fallback and retries
 
 A model may list several **provider candidates** — a primary route plus
 fallbacks. The single `provider`/`endpoint` forms are the degenerate
-one-candidate chain, so every request walks the same structure:
+one-candidate chain, so every request walks the same structure. Every
+candidate of a model also walks under one **retries** policy: a model-level
+block that sizes how often the same candidate is re-asked before the walk
+moves on.
 
 ```yaml
 models:
@@ -552,77 +577,173 @@ models:
         upstream-model: gpt-5-pro # required per candidate
       - provider: provider-b
         upstream-model: standard-gpt-5
+    retries: # optional; every candidate of the model walks under it
+      max-retries: 1 # same-candidate retries AFTER the initial attempt, 0..8
+      max-elapsed: 10s # per-candidate retry window, 1s..2m
+      backoff:
+        initial: 250ms # first retry delay, >= 1ms
+        max: 2s # >= initial; also caps effective Retry-After
+        jitter: 0.1 # 0..1, uniform ±fraction spread
 provider-fallback: # optional; these are the defaults
   enabled: true
   max-attempts: 2 # per-request candidate budget, 1..8
 ```
 
-Semantics, and the boundaries that keep the feature narrow:
+Absent, `null`, or `{}` selects exactly the defaults shown: **the status
+matrix below applies by default — the block sizes the policy, it does not
+gate it.** A present block is strictly validated (range and combination
+checks, the same two-layer strictness as the rest of the runtime YAML, error
+text that never quotes the offending input).
 
-- **Only transport failure falls back.** A candidate that answers — any
-  status — ends the walk, and its answer is THE answer: a `429` or `500`
-  from the primary is relayed exactly as a single-provider deployment
-  would relay it. A candidate is skipped only when it fails before
-  answering: dial failure, TLS, proxy failure, or its egress pool
-  exhausting (`502`-class `upstream_unreachable` conditions). Egress
-  fallback (between network paths) and provider fallback (between
-  providers) compose but never blur: a pool moves a request between
-  paths to the SAME provider; the walk moves it to the NEXT candidate
-  only after that provider had no answer at all.
-- **Never retried: local validation, caller death, commitment.** A body
-  that fails the request transform is answered `400` on the first
-  candidate — it would fail every candidate's transform. A caller that
-  is gone — disconnected, or holding an expired deadline — gets no
-  fallback (there is nobody left to answer, and a dead caller's failure
-  is the caller's event: the request context, not the error chain,
-  decides ownership, so an expired deadline can never masquerade as a
-  provider-local timeout and spend the budget). And the walk happens
-  entirely before the first response byte: a `200` SSE stream from the
-  primary is committed — no candidate switch after headers, ever.
-- **Replay is fresh and identical.** Each attempt rebuilds the request
-  from the same immutable client body through that candidate's own
-  transform — its own `upstream-model`, the same injected prompt. Nothing
-  observed on a failed attempt feeds the next one.
-- **The budget is a hard product.** Worst case dials are bounded by
-  `provider-fallback.max-attempts ×` the per-candidate egress fallback
-  budget — with the defaults `2 × 3 = 6` dials for a two-candidate chain
-  on default pools. The walk also never exceeds the chain length.
-- **Observability.** Every completion event carries `provider_attempts`
-  (candidates tried) and `final_provider` (the candidate that answered,
-  or the last one that failed); exhaustion adds `provider_exhausted: true`
-  and the terminal record's `error_class` becomes `provider_exhausted`
-  (a pool that dialed nothing reports `egress_exhausted` with cause
-  `no_eligible_endpoint`). Each failed candidate logs one WARN
-  `provider_attempt_failed` (provider, canonical `error_class` +
-  `error_cause`, indexes), and each dialed-and-failed egress endpoint —
-  pooled or direct — logs one WARN `egress_attempt_failed` in the same
-  vocabulary. Failures carry no error text: only the canonical class and
-  a closed-set cause token (`connection_refused`, `tls`, `dial`,
-  `network_timeout`, `proxy_connect`, `proxy_auth`,
-  `caller_canceled`, `caller_deadline_exceeded`, …) derived from typed
-  error shapes, never from message text.
-- **Attempt identity is correlatable.** Failure evidence is keyed by the
-  request's `request_id` plus one-based nested indexes: `provider_attempt`
-  (which candidate) and `egress_attempt` (which dial under it — omitted
-  when no endpoint was dialed). Direct attempts emit the same
-  `egress_attempt_failed` record pools do (`egress_kind`/`egress_target`
-  `direct`, `egress_attempt` `1`), so both egress shapes read identically.
-  The older `attempt` field still rides on pooled egress records as an
-  alias equal to `egress_attempt` — treat `egress_attempt` as
-  authoritative; `attempt` is temporary.
-- **Reload invariants hold.** The chain, its policy, and every candidate's
-  transport bind to the request's config snapshot like everything else —
-  a reload mid-walk cannot reshape the candidate list under in-flight
+### Which upstream results retry
+
+The disposition of every upstream result is closed and code-owned — it is not
+configurable:
+
+| Upstream result                                                                                                                                                        | What the walk does                                                                            |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| 2xx, 3xx, 204, 304, anything above 599                                                                                                                                 | **Answer** — existing behavior (streamed / verbatim / buffered)                               |
+| 408, 425, 429, every 5xx except 501/505 (unknown 5xx such as 520/529 included)                                                                                         | **Retry** the same candidate while the budget remains, then **fallback** to the next          |
+| 401, 403, 404, 405, 409, 422                                                                                                                                           | **Fallback** to the next candidate immediately — no same-candidate retry                      |
+| Every other status (400, 406, 410, 413, 415, 416, 421, 424, 428, 431, 451, 501, 505, …)                                                                                | **Terminal** — relayed (normalized) exactly as a single-provider deployment would relay it    |
+| Malformed or incomplete answer before commitment: a 200 that is unparseable or over the buffered cap, or a 4xx/5xx error body that fails or stalls its bounded capture | **Retry** the same candidate, then **fallback**                                               |
+| Caller cancellation or expired deadline                                                                                                                                | **Terminal disconnect** — never retried, never slept through                                  |
+| Transport-level failure (dial, TLS, proxy, egress-pool exhaustion)                                                                                                     | **Fallback** to the next candidate — unchanged; no same-candidate retry at the provider layer |
+
+The rationale follows what the status means. A credential or authorization
+rejection (401/403, with 404/405/409/422 alongside) justifies trying the NEXT
+configured provider but never hammering the same one, so those are
+fallback-only. A 400 stays terminal because the same body would fail
+identically on retry — the request, not the path, is the problem. Rate
+limits and 5xx are worth re-asking the provider that already holds the
+route.
+
+The log field `disposition` is a narrower vocabulary than this table: it is
+`retry`, `fallback`, or `terminal` — what the walk decided about one attempt
+— and never appears as `answer` or `success`.
+
+**Wait versus move.** A retried status waits out a bounded backoff before
+the same candidate is re-asked; a fallback-only status moves to the next
+candidate immediately — there is no wait between candidates.
+
+### Budget and timing
+
+- **The retry budget is per candidate, counted after the initial attempt.**
+  `max-retries: 0` means one upstream exchange per candidate; `1` means two;
+  `3` means four. Every candidate of the model gets the same budget, enforced
+  per candidate — never shared across candidates or models.
+- **Backoff doubles, then jitters.** The first retry waits `backoff.initial`
+  (default `250ms`), each subsequent retry doubles the previous delay, the
+  growth is capped at `backoff.max` (default `2s`), and the result is spread
+  by a uniform ±`backoff.jitter` (default `0.1`) so concurrent retries do not
+  re-hit a recovering provider as a synchronized herd.
+- **`Retry-After` is a bounded floor.** For same-candidate retries an
+  upstream `Retry-After` (delta-seconds or HTTP-date) raises the delay above
+  the jittered backoff — but never above `backoff.max`, the remaining
+  `max-elapsed` window, or the caller's remaining deadline. Invalid,
+  negative, or past values are ignored silently. An upstream can never make
+  the proxy sleep longer than `backoff.max`.
+- **The window closes the candidate.** Retries stop once `max-elapsed` has
+  passed since that candidate's FIRST attempt. The check runs before a wait
+  is scheduled: a sleep never runs past the window or the caller's deadline,
+  and a caller cancellation during a wait aborts with no further attempt.
+- **The budget is a hard product.** Worst-case upstream exchanges =
+  `provider-fallback.max-attempts × (retries.max-retries + 1)` — with the
+  defaults `2 × 2 = 4`, and `8 × 9 = 72` with both knobs at their maxima. The
+  walk also never exceeds the chain length. The product bounds EXCHANGES,
+  not wall-clock: each candidate's `max-elapsed` bounds its own sleeps, and
+  there is no overall request timeout, so a client that sets no deadline is
+  the outer bound. Egress pools keep their own
+  fallback budget nested under ONE provider attempt (unchanged): total dials
+  stay bounded by that product × the pool's budget, and an egress dial is
+  never counted as a provider retry.
+- **The layers stay separate.** Provider retries and fallback are the
+  injector's decision about WHICH provider answers; egress recovery — pool
+  scheduling, eligibility gates, health, member fallback — is the transport
+  layer's decision about HOW the request reaches it. A pool never retries on
+  a status: it hands the handler one answer (any status) or one error per
+  candidate, and the matrix above decides what happens next. Composed, the
+  worst case stays the product above — nothing multiplies beyond it.
+
+### Answers, commitment, and reload
+
+- **The last HTTP answer wins.** Whatever the walk's history, the relayed
+  response is the LAST answer a candidate produced: its status is preserved
+  and a 4xx/5xx body is the canonical envelope — never raw provider bytes. A
+  `429` or `503` from a later candidate is never collapsed into a `502`. That
+  includes the retained-answer rule: when a candidate's budget runs out on a
+  received answer and the walk moves on, only to have every later candidate
+  fail BEFORE answering (a dial failure, an exhausted pool), the client
+  receives the retained answer — the candidate that actually answered
+  becomes the completion record's `final_provider`, and
+  `provider_exhausted` stays unset, because a provider answered. The
+  `502` `upstream_unreachable` + `provider_exhausted` pair is reserved for
+  the case where NO candidate ever produced an HTTP response, and a capture
+  failure (timeout or read error) on the final retained answer answers
+  `502` `upstream_invalid_response`.
+- **Commitment is the hard boundary.** The whole walk — same-candidate
+  retries and candidate fallbacks — completes before any status is written
+  to the client. The candidate whose answer produces the first
+  client-visible byte has produced THE response: no retry and no candidate
+  switch after that, ever. A `200` SSE stream whose upstream dies before the
+  first event is truncated and logged, never retried or replaced mid-flight.
+- **Replay is fresh and identical.** Each attempt — a same-candidate retry
+  included — rebuilds the request from the same immutable client body
+  through that candidate's own transform: its own `upstream-model`, the same
+  injected prompt. Nothing observed on an earlier attempt feeds the next
+  one. A body that fails the transform still answers `400` on the first
+  candidate — it would fail every candidate's transform, so it never spends
+  budget.
+- **Reload invariants hold.** The chain, the fallback policy, the retries
+  policy, and every candidate's transport bind to the request's config
+  snapshot like everything else — a reload mid-walk, mid-wait included,
+  cannot reshape the candidate list, the budget, or the backoff of in-flight
   work. Every candidate's transport is part of the snapshot's egress
-  closure, so a fallback candidate's connection pool is warm even when
-  the primary answers everything.
+  closure, so a fallback candidate's connection pool is warm even when the
+  primary answers everything. `provider-fallback.enabled: false` pins the
+  request to the primary candidate; the model's same-candidate retries still
+  apply under its `retries` policy.
+- **Observability.** Every completion event carries `provider_attempts`
+  (upstream exchanges across the whole walk — same-candidate retries
+  included; numerically the old candidate count when no retry fires),
+  `final_provider` (the candidate whose answer is relayed), `final_candidate`
+  (its 1-based chain position), and `retries_total`; exhaustion adds
+  `provider_exhausted: true` and the terminal record's `error_class` becomes
+  `provider_exhausted` (a pool that dialed nothing reports
+  `egress_exhausted` with cause `no_eligible_endpoint`). Each failed attempt
+  logs one WARN `provider_attempt_failed`, and every received 4xx/5xx —
+  attempts a retry or fallback later discarded included — logs its
+  `upstream_http_error` evidence event; both carry the attempt identity
+  (`provider_attempt`, `candidate_index`, `candidate_attempt`,
+  `retry_index`, `disposition`, `reason`, `elapsed_ms`, plus the received
+  status as `upstream_status` on the events that have one — a transport
+  failure does not — detailed under [Logging](#logging)). Each dialed-and-failed egress endpoint —
+  pooled or direct — logs one WARN `egress_attempt_failed` in the same
+  vocabulary. Failures carry no error text: only the canonical class and a
+  closed-set cause token (`connection_refused`, `tls`, `dial`,
+  `network_timeout`, `proxy_connect`, `proxy_auth`, `caller_canceled`,
+  `caller_deadline_exceeded`, …) derived from typed error shapes, never from
+  message text.
+
+**Behavior change.** Deployments upgrading from ≤ 0.7.0 will see traffic
+this proxy previously relayed once now re-asked and re-routed: a 408, 425,
+429 or 5xx (except 501/505, and a 4xx/5xx body that stalls its capture) is retried on the same candidate (one retry by default, after a
+bounded wait) and 401/403/404/405/409/422 now walk to the next candidate,
+where earlier versions relayed the first received status immediately. Set
+`retries.max-retries: 0` to drop the same-candidate re-asks and
+`provider-fallback.enabled: false` to pin the primary candidate — together
+they restore the previous single-attempt walk; the disposition matrix itself
+is code-owned.
 
 **Not included, by design:** automatic egress rotation over time, active
 health probes, weighted or scored provider selection (the chain order is
-the operator's, not computed), any provider fallback on HTTP statuses (a
-rate-limited _provider_ is answered, not retried elsewhere), and any
-proxy-to-direct silent downgrade: when a candidate's members are all
-unusable the request fails loudly with `upstream_unreachable`.
+the operator's, not computed), retries or fallback after response
+commitment (once a status reaches the client the answer is final),
+caller-driven retry knobs (the policy is per model, from YAML — no
+per-request override), and any proxy-to-direct silent downgrade: a
+candidate whose pool has no usable member is a transport failure the walk
+moves past, and a walk that ends with nothing but unreachable egress
+answers the canonical `502` `upstream_unreachable`.
 
 ## Simulated thinking usage
 
@@ -768,19 +889,19 @@ live stream with correct per-chunk latency. Behavior:
 
 Upstream and client failures are classified, never fogged:
 
-| Condition                                                                                                       | Status                 | `error.type` / `code`                                                                                                                                                                           |
-| --------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Missing/malformed `Authorization: Bearer <key>`                                                                 | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`  |
-| Wrong bearer key (partner mode: unknown **or revoked** key, or an unavailable key store — fail closed)          | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
-| Body is not JSON                                                                                                | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                            |
-| Missing `model`                                                                                                 | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                      |
-| Request body over the 64 MiB cap                                                                                | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                  |
-| Request names an unmapped model                                                                                 | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`  |
-| Request path matches no route (unknown path, trailing slash, wrong case)                                        | 404                    | `invalid_request_error` — exact body: `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`                                           |
-| Upstream unreachable (dial/network)                                                                             | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                       |
-| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap, or a body read that fails mid-answer) | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                  |
-| Upstream answers 4xx/5xx                                                                                        | same as upstream       | `upstream_error` / `upstream_http_<status>` — canonical envelope: `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}` |
-| Upstream answers 3xx (redirect), 204, or 304                                                                    | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                            |
+| Condition                                                                                                                             | Status                 | `error.type` / `code`                                                                                                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Missing/malformed `Authorization: Bearer <key>`                                                                                       | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`  |
+| Wrong bearer key (partner mode: unknown **or revoked** key, or an unavailable key store — fail closed)                                | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
+| Body is not JSON                                                                                                                      | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                            |
+| Missing `model`                                                                                                                       | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                      |
+| Request body over the 64 MiB cap                                                                                                      | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                  |
+| Request names an unmapped model                                                                                                       | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`  |
+| Request path matches no route (unknown path, trailing slash, wrong case)                                                              | 404                    | `invalid_request_error` — exact body: `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`                                           |
+| Upstream unreachable (dial/network, no candidate answered)                                                                            | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                       |
+| Upstream 200 with unparseable body (or body over the 64 MiB buffered cap, or a body read that fails mid-answer), walk finalized on it | 502                    | `upstream_error` / `upstream_invalid_response`                                                                                                                                                  |
+| Upstream answers 4xx/5xx                                                                                                              | same as upstream       | `upstream_error` / `upstream_http_<status>` — canonical envelope: `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}` |
+| Upstream answers 3xx (redirect), 204, or 304                                                                                          | **forwarded verbatim** | status, bytes, and an allow-list of headers pass through (see below)                                                                                                                            |
 
 Consequences of the table:
 
@@ -795,7 +916,11 @@ Consequences of the table:
 - **Upstream 4xx/5xx errors are normalized.** The status is preserved
   exactly (401 stays 401, 429 stays 429, 500 stays 500 — never collapsed
   into a 502; 502 is reserved for the upstream delivering nothing usable at
-  all), but the body is always the canonical envelope above and
+  all), and the status preserved is the LAST answer the walk received — a
+  retryable status (408/425/429, any 5xx except 501/505) may first be re-asked within the
+  model's retry budget and then walk to the next candidate; see
+  [Provider fallback and retries](#provider-fallback-and-retries) — but the
+  body is always the canonical envelope above and
   `Content-Type` is always `application/json`. The provider's raw body —
   its message text, its HTML, even its model names — never reaches the
   client: an upstream error that quotes the alias target discloses nothing.
@@ -804,9 +929,11 @@ Consequences of the table:
   Logging); those bytes go nowhere else — not to the client, not into any
   log line. The read is also bounded in time, under a short fixed
   internal timeout (not runtime configuration): an upstream that answers
-  headers and then stalls on an error body gets the canonical `502`
-  `upstream_invalid_response` instead of a hung request — and the
-  already-answering candidate is never retried or replaced. A caller
+  headers and then stalls on an error body has produced an unusable answer,
+  and the walk treats it like one — the same candidate is re-asked while the
+  retry budget remains, then the next candidate is tried; the canonical
+  `502` `upstream_invalid_response` replaces a hung request only when the
+  capture fails on the final retained answer. A caller
   whose context ends during the capture gets the disconnect outcome, no
   envelope. `Retry-After` and the `X-RateLimit-*` headers still ride the
   allow-list below, so a 429 remains distinguishable and backoff-able.
@@ -910,10 +1037,13 @@ provider and upstream model, API surface, the relayed stream mode (what the
 response actually was — a `stream: true` request whose upstream answered
 non-SSE is recorded buffered), final client status and outcome,
 upstream-reported token counts, client wire byte counts, cumulative provider
-and egress attempt counters (summed across every candidate of a fallback
-walk), the final candidate's egress kind (`direct`, or the last dialed pool
+and egress attempt counters (`provider_attempts` counts upstream exchanges —
+same-candidate retries included — summed across every candidate of a
+fallback walk; egress dials are summed the same way), the final candidate's
+egress kind (`direct`, or the last dialed pool
 member's kind; empty when a pool exhausted without dialing anything), and full
-request latency. Provider fallback still emits **one** event: it describes the
+request latency. Provider fallback and same-candidate retries still emit
+**one** event: it describes the
 candidate that answered, or the final attempted candidate if all paths failed.
 Failed attempts are represented only by the attempt counters.
 
@@ -1009,7 +1139,9 @@ What each level carries:
   behavior). Requests that reached the upstream also carry the egress
   report (`egress_attempts`, `egress_kind`, `egress_target`,
   `egress_exhausted`) and the provider walk's
-  (`provider_attempts`, `final_provider`, plus `provider_exhausted` when
+  (`provider_attempts` — upstream exchanges, same-candidate retries
+  included; `retries_total`; `final_provider`; `final_candidate`, the
+  relayed candidate's 1-based chain position; plus `provider_exhausted` when
   every budgeted candidate failed without answering). The event is emitted
   when the request finishes, under the
   level in effect at that moment — a reload mid-request can therefore
@@ -1050,14 +1182,19 @@ What each level carries:
   with phase `upstream_read` — the one relay failure that is not a
   disconnect), and an upstream 5xx (`upstream_http_error` at error
   severity — 5xx is our outage even when the provider owns the cause),
-  plus anything fatal at startup. A 200 that is not
-  parseable JSON is not an event of its own: it surfaces only as the
-  `upstream_invalid_response` outcome on the INFO completion line, with
-  the 502 envelope on the wire.
+  plus anything fatal at startup. A 200 that is not parseable JSON — or is
+  over the buffered cap — logs one WARN `upstream_invalid_response` per
+  discarded attempt (like the error evidence event above), and surfaces as
+  the `upstream_invalid_response` outcome on the INFO completion line with
+  the 502 envelope on the wire only when the walk finalizes on it: the
+  candidate may still be re-asked, or the next candidate may answer.
 
-**The upstream 4xx/5xx evidence event.** Every normalized upstream error
+**The upstream 4xx/5xx evidence event.** Every received upstream 4xx/5xx
 emits one `upstream_http_error` event (WARN for 4xx, ERROR for 5xx) bound
-to the request's `request_id`: `api`, `public_model`, `upstream_model`,
+to the request's `request_id` — attempts a retry or fallback later
+discarded included, so a provider's flakiness stays visible even when a
+later attempt answers. Still one bounded, sanitized record per status:
+`api`, `public_model`, `upstream_model`,
 `upstream` (scheme+host only), `upstream_status`, `content_type`,
 `error_class` `upstream_error` with `error_cause`
 `upstream_http_4xx`/`upstream_http_5xx`, `error_shape`
@@ -1081,10 +1218,26 @@ log line; the client-side relay is unaffected). The raw error body
 itself never appears at any level: it exists only as the count, the shape,
 and the fingerprint. Every attempt-bearing lifecycle event
 (`upstream_request_started`, `upstream_response_received`,
-`upstream_request_failed`, the evidence event) also carries the nested
-`provider_attempt`/`egress_attempt` indexes described under
-[Provider fallback](#provider-fallback), so failures correlate by
-`request_id + provider_attempt + egress_attempt`.
+`upstream_request_failed`, `provider_attempt_failed`, the evidence event)
+also carries the attempt identity described under
+[Provider fallback and retries](#provider-fallback-and-retries): the nested
+`provider_attempt` (a one-based count of upstream EXCHANGES across the whole
+request — numerically the old candidate index when no retry fires) and, on
+the events after a dial, `egress_attempt` (`upstream_request_started` fires
+before one, so it carries the provider indexes only), plus `candidate_index`
+(1-based chain position), `candidate_attempt`
+(1-based within the candidate), `retry_index` (`candidate_attempt − 1`;
+`0` = the initial attempt), `disposition` (`retry` | `fallback` |
+`terminal`), `reason` (a closed token set: `http_408`,
+`http_425`, `http_429`, `http_5xx`, `http_<code>` for every other status
+below 500 — fallback-only and terminal rows alike — the transport cause
+tokens, and `upstream_invalid_response` /
+`upstream_body_timeout` / `upstream_body_read_failed` for unusable
+answers, which ride the unusable-answer events rather than
+`provider_attempt_failed`) and `elapsed_ms`. The evidence and body-read/invalid events carry
+the received HTTP status as `upstream_status` — a transport failure has no
+status to carry — so failures correlate by
+`request_id + candidate_index + candidate_attempt + egress_attempt`.
 
 The credential rule is absolute: no log line, at any level, ever contains
 an `Authorization` value, a request or response body, an injection prompt,
@@ -1224,7 +1377,9 @@ Decided, and not coming back without a design discussion:
   scheduling, eligibility gates, bounded fallback and passive health exist
   (see [Provider transports](#provider-transports)); what stays out is
   automatic egress rotation over time, active health probes, per-request
-  egress selection, and automatic retries of an answered request.
+  egress selection, and retries after response commitment or caller-driven
+  retry knobs (the retry policy is per model, from YAML — statuses of
+  uncommitted answers are retryable by design).
 - **TLS configuration** — upstream and proxy TLS verify chain and host with
   system roots; custom TLS setup (client certificates, custom CA pools,
   `insecure-skip-verify`) is not coming. (Ambient

@@ -493,10 +493,13 @@ func TestRelayOutcomeClassification(t *testing.T) {
 	})
 
 	t.Run("buffered_read_failure", func(t *testing.T) {
-		// An upstream that dies mid-body on the buffered path: its own
-		// outcome (upstream_read_failed), a WARN, and the same client-502
-		// envelope as an unparseable body — the wire contract is unchanged,
-		// the log distinguishes the causes.
+		// An upstream that dies mid-body on the buffered path: a read
+		// failure is a retryable attempt failure, so the default budget
+		// retries the candidate once; the second failure finalizes the walk
+		// with its own outcome (upstream_read_failed), a WARN per failed
+		// read, and the same client-502 envelope as an unparseable body —
+		// the wire contract is unchanged, the log distinguishes the causes.
+		stubRetryTiming(t)
 		buf, log := captureLog(zerolog.InfoLevel)
 		client := &http.Client{Transport: &stubTransport{resp: &http.Response{
 			StatusCode: http.StatusOK,
@@ -514,8 +517,12 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		if len(completed) != 1 || completed[0]["outcome"] != "upstream_read_failed" {
 			t.Fatalf("request_completed = %v, want outcome upstream_read_failed", completed)
 		}
-		if evs := buf.events(t, "upstream_body_read_failed"); len(evs) != 1 {
-			t.Fatalf("upstream_body_read_failed logged %d times, want 1: %s", len(evs), buf.String())
+		evs := buf.events(t, "upstream_body_read_failed")
+		if len(evs) != 2 {
+			t.Fatalf("upstream_body_read_failed logged %d times, want 2: %s", len(evs), buf.String())
+		}
+		if evs[0]["disposition"] != "retry" || evs[1]["disposition"] != "terminal" {
+			t.Errorf("dispositions = %v %v, want retry then terminal", evs[0]["disposition"], evs[1]["disposition"])
 		}
 	})
 
@@ -837,6 +844,7 @@ func TestBodyTooLargeOutcome(t *testing.T) {
 // rejection path is exercised: the write dies on the first attempt, so the
 // classification outcome on the old code would be the one reported.
 func TestErrorEnvelopeWriteFailureOutcome(t *testing.T) {
+	stubRetryTiming(t)
 	cases := []struct {
 		name        string
 		store       func(t *testing.T) *config.Store
