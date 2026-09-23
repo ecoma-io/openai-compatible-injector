@@ -287,6 +287,13 @@ type runtimeModel struct {
 	UpstreamModel   string                `yaml:"upstream-model"`
 	InjectionPrompt string                `yaml:"injection-prompt"`
 	ThinkingUsage   *runtimeThinkingUsage `yaml:"thinking-usage"`
+	// Retries is the optional per-model status retry policy: the budget
+	// (retry count, elapsed window, backoff) every candidate of this model
+	// walks under when an upstream answers with a retryable HTTP status.
+	// It is a property of the PUBLIC model, like the injection prompt —
+	// every candidate receives the same policy, and the budget is enforced
+	// per candidate, never shared across models.
+	Retries *runtimeRetries `yaml:"retries"`
 	// Providers is the optional ordered candidate chain: each entry is one
 	// provider candidate (a providers-table reference plus the upstream
 	// model name to send there). Mutually exclusive with provider and
@@ -310,6 +317,26 @@ type runtimeThinkingUsage struct {
 	Mode     string   `yaml:"mode"`
 	MinRatio *float64 `yaml:"min-ratio"`
 	MaxRatio *float64 `yaml:"max-ratio"`
+}
+
+// runtimeRetries mirrors the optional per-model retries block: the status
+// retry budget every candidate of the model walks under. The pointer
+// distinguishes an absent or null block (defaults) from a present one, which
+// is validated even where a field changes nothing — same discipline as the
+// pool fallback block. Durations stay strings for the same reason as the
+// SSE keep-alive interval: yaml.v3 decodes durations as bare integers
+// (nanoseconds), not the spelling operators write.
+type runtimeRetries struct {
+	MaxRetries *int            `yaml:"max-retries"`
+	MaxElapsed string          `yaml:"max-elapsed"`
+	Backoff    *runtimeBackoff `yaml:"backoff"`
+}
+
+// runtimeBackoff mirrors the optional retries backoff block.
+type runtimeBackoff struct {
+	Initial string   `yaml:"initial"`
+	Max     string   `yaml:"max"`
+	Jitter  *float64 `yaml:"jitter"`
 }
 
 // LoadRuntime parses and validates runtime configuration bytes into an
@@ -522,6 +549,115 @@ func buildProviderFallback(rf *runtimeProviderFallback) (ProviderFallbackPolicy,
 			return ProviderFallbackPolicy{}, fmt.Errorf("provider-fallback: max-attempts is unreasonably large (at most %d)", maxProviderFallbackAttempts)
 		}
 		p.MaxAttempts = n
+	}
+	return p, nil
+}
+
+// Per-model retry bounds. One same-candidate retry is the default: a
+// transient 429/5xx is worth one quiet re-ask before the walk moves on, and
+// the cap keeps a misconfigured budget from turning one client request into
+// an upstream hammer. The elapsed window bounds a candidate's whole retry
+// sequence in time, so a slow-drip provider cannot hold a request past the
+// window no matter how its statuses invite retries.
+const (
+	defaultRetryMaxRetries = 1
+	maxRetryRetries        = 8
+	// maxRetryElapsed bounds the per-candidate retry window: well above the
+	// default backoff ceiling (2s × a handful of retries), far below any
+	// client's patience.
+	defaultRetryMaxElapsed = 10 * time.Second
+	minRetryMaxElapsed     = time.Second
+	maxRetryMaxElapsed     = 2 * time.Minute
+	// minBackoffInitial keeps a zero/negative initial delay from producing
+	// a hot retry loop; one millisecond is still effectively immediate.
+	minBackoffInitial     = time.Millisecond
+	defaultBackoffInitial = 250 * time.Millisecond
+	defaultBackoffMax     = 2 * time.Second
+	// defaultBackoffJitter spreads concurrent retries so a provider
+	// recovering from a rate limit is not re-hit by a synchronized herd.
+	defaultBackoffJitter = 0.1
+)
+
+// buildRetryPolicy validates the optional per-model retries block into the
+// policy every candidate of the model walks under. Absent or null selects
+// the defaults (one same-candidate retry, 10s window, 250ms→2s backoff at
+// 0.1 jitter) — the status matrix applies by default; this block sizes it,
+// it does not gate it. A present block is fully validated field by field,
+// including combinations (initial > max), and every message is fixed text:
+// durations and numbers can carry pasted material just like any other
+// value position, and error text reaches logs verbatim.
+func buildRetryPolicy(rr *runtimeRetries) (RetryPolicy, error) {
+	p := RetryPolicy{
+		MaxRetries: defaultRetryMaxRetries,
+		MaxElapsed: defaultRetryMaxElapsed,
+		Backoff: BackoffPolicy{
+			Initial: defaultBackoffInitial,
+			Max:     defaultBackoffMax,
+			Jitter:  defaultBackoffJitter,
+		},
+	}
+	if rr == nil {
+		return p, nil
+	}
+	if rr.MaxRetries != nil {
+		n := *rr.MaxRetries
+		if n < 0 {
+			return RetryPolicy{}, errors.New("retries: max-retries must be at least 0")
+		}
+		if n > maxRetryRetries {
+			return RetryPolicy{}, fmt.Errorf("retries: max-retries is unreasonably large (at most %d)", maxRetryRetries)
+		}
+		p.MaxRetries = n
+	}
+	if rr.MaxElapsed != "" {
+		d, err := time.ParseDuration(rr.MaxElapsed)
+		if err != nil {
+			return RetryPolicy{}, errors.New("retries: max-elapsed must be a valid duration (e.g. 10s, 1m)")
+		}
+		if d < minRetryMaxElapsed {
+			return RetryPolicy{}, errors.New("retries: max-elapsed must be at least 1s")
+		}
+		if d > maxRetryMaxElapsed {
+			return RetryPolicy{}, fmt.Errorf("retries: max-elapsed is unreasonably large (at most %s)", maxRetryMaxElapsed)
+		}
+		p.MaxElapsed = d
+	}
+	if rr.Backoff == nil {
+		return p, nil
+	}
+	rb := rr.Backoff
+	if rb.Initial != "" {
+		d, err := time.ParseDuration(rb.Initial)
+		if err != nil {
+			return RetryPolicy{}, errors.New("retries: backoff.initial must be a valid duration (e.g. 250ms)")
+		}
+		if d < minBackoffInitial {
+			return RetryPolicy{}, errors.New("retries: backoff.initial must be positive")
+		}
+		p.Backoff.Initial = d
+	}
+	if rb.Max != "" {
+		d, err := time.ParseDuration(rb.Max)
+		if err != nil {
+			return RetryPolicy{}, errors.New("retries: backoff.max must be a valid duration (e.g. 2s)")
+		}
+		if d < p.Backoff.Initial {
+			// An omitted initial keeps its 250ms default here; an explicit
+			// initial above the max is a contradiction, not a value to fix.
+			return RetryPolicy{}, errors.New("retries: backoff.max must be at least backoff.initial")
+		}
+		p.Backoff.Max = d
+	} else if p.Backoff.Initial > p.Backoff.Max {
+		// Max omitted, initial raised above the 2s default: the initial is
+		// the honest floor for the ceiling, so the ceiling follows it.
+		p.Backoff.Max = p.Backoff.Initial
+	}
+	if rb.Jitter != nil {
+		j := *rb.Jitter
+		if math.IsNaN(j) || j < 0 || j > 1 {
+			return RetryPolicy{}, errors.New("retries: backoff.jitter must be a number between 0 and 1")
+		}
+		p.Backoff.Jitter = j
 	}
 	return p, nil
 }
@@ -1083,6 +1219,10 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 	if err != nil {
 		return Model{}, err
 	}
+	retries, err := buildRetryPolicy(rm.Retries)
+	if err != nil {
+		return Model{}, err
+	}
 	return Model{
 		Public:          name,
 		Provider:        chain[0].Provider,
@@ -1090,6 +1230,7 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 		UpstreamModel:   chain[0].UpstreamModel,
 		InjectionPrompt: rm.InjectionPrompt,
 		ThinkingUsage:   tu,
+		Retries:         retries,
 		Transport:       chain[0].Transport,
 		Chain:           chain,
 	}, nil

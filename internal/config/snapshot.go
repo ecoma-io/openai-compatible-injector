@@ -71,6 +71,32 @@ type ProviderFallbackPolicy struct {
 	MaxAttempts int
 }
 
+// BackoffPolicy is the validated per-model retry backoff: Initial is the
+// first same-candidate retry delay (doubled per subsequent retry), Max caps
+// both the exponential growth and any upstream-directed Retry-After, and
+// Jitter (in [0,1]) spreads the delay by a uniform ±fraction. The zero
+// value is not a usable default; snapshots are built by LoadRuntime, which
+// always materializes the defaults.
+type BackoffPolicy struct {
+	Initial time.Duration
+	Max     time.Duration
+	Jitter  float64
+}
+
+// RetryPolicy is the validated per-model status retry policy: MaxRetries is
+// the number of same-candidate retries AFTER a candidate's initial attempt
+// (0 disables same-candidate retry), MaxElapsed bounds one candidate's
+// whole retry sequence in time, and Backoff sizes the delays. It is a
+// property of the PUBLIC model: every candidate of the chain walks under
+// the same policy, enforced per candidate. The zero value is not a usable
+// default; snapshots are built by LoadRuntime, which always materializes
+// the defaults.
+type RetryPolicy struct {
+	MaxRetries int
+	MaxElapsed time.Duration
+	Backoff    BackoffPolicy
+}
+
 // Candidate is one provider hop in a model's routing chain: where the
 // request goes, under what upstream model name, and over which outbound
 // path. Chains are built immutable at config load; the first candidate is
@@ -128,6 +154,12 @@ type Model struct {
 	// ThinkingUsage is the validated simulated thinking-usage synthesis
 	// config. The zero value means the feature is off for this model.
 	ThinkingUsage ThinkingUsage
+	// Retries is the validated per-model status retry policy. Every
+	// candidate of the chain walks under it, enforced per candidate; a
+	// reload mid-request cannot change the policy a request is retrying
+	// under, because it binds to the request's snapshot like everything
+	// else.
+	Retries RetryPolicy
 	// Transport is the outbound path requests for this model execute
 	// through — the primary candidate's path. It always mirrors Chain[0].
 	Transport transport.Config
