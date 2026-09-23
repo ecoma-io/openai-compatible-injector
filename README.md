@@ -486,10 +486,15 @@ referenced by name from `providers`:
   - **Bounded fallback, transport failures only.** When a dialed member
     fails before any response arrives (connection, proxy connect, proxy
     auth, timeout), the next eligible member is tried, up to
-    `max-attempts` distinct endpoints. A client cancellation aborts
-    everything — no fallback, no strike, no penalty. **Any response — 429
-    and 5xx included — ends the attempt loop**: an HTTP status is the
-    upstream's answer, never a fallback trigger and never a health strike.
+    `max-attempts` distinct endpoints. A client cancellation — or an
+    expired caller deadline, which the request context reports the same
+    way — aborts everything: no fallback, no strike, no penalty. The
+    request context, not the error chain, decides ownership: a timeout
+    shape under a live context is the endpoint's failure and stays
+    fallback-eligible; the same shape under a done context is the
+    caller's and is terminal. **Any response — 429 and 5xx included —
+    ends the attempt loop**: an HTTP status is the upstream's answer,
+    never a fallback trigger and never a health strike.
   - **Passive health.** `failure-threshold` consecutive fallback-eligible
     failures open a `cooldown` during which the member is skipped. Recovery
     needs no probe: any response proves the path delivered and resets the
@@ -499,10 +504,10 @@ referenced by name from `providers`:
     access log carries `egress_attempts`, `egress_kind`, `egress_target`
     and `egress_exhausted` so the pool's decision is visible per request.
     Each dialed-and-failed endpoint also emits one WARN
-    `egress_attempt_failed` (kind, scheme+host target, typed
-    `error_class`, attempt number) — evidence per attempt, even when a
-    later member serves the request, with no error text and no
-    credentials.
+    `egress_attempt_failed` (kind, scheme+host target, canonical
+    `error_class` with its closed-set `error_cause`, attempt number) —
+    evidence per attempt, even when a later member serves the request,
+    with no error text and no credentials.
   - **Reload identity.** A pool whose policy bytes are unchanged across a
     reload keeps its scheduler position, health state and connection pools.
     A changed policy is a new identity: fresh state, and the old state
@@ -564,13 +569,16 @@ Semantics, and the boundaries that keep the feature narrow:
   providers) compose but never blur: a pool moves a request between
   paths to the SAME provider; the walk moves it to the NEXT candidate
   only after that provider had no answer at all.
-- **Never retried: local validation, cancellation, commitment.** A body
+- **Never retried: local validation, caller death, commitment.** A body
   that fails the request transform is answered `400` on the first
-  candidate — it would fail every candidate's transform. A client that
-  disconnects mid-walk gets no fallback (there is nobody left to answer).
-  And the walk happens entirely before the first response byte: a `200`
-  SSE stream from the primary is committed — no candidate switch after
-  headers, ever.
+  candidate — it would fail every candidate's transform. A caller that
+  is gone — disconnected, or holding an expired deadline — gets no
+  fallback (there is nobody left to answer, and a dead caller's failure
+  is the caller's event: the request context, not the error chain,
+  decides ownership, so an expired deadline can never masquerade as a
+  provider-local timeout and spend the budget). And the walk happens
+  entirely before the first response byte: a `200` SSE stream from the
+  primary is committed — no candidate switch after headers, ever.
 - **Replay is fresh and identical.** Each attempt rebuilds the request
   from the same immutable client body through that candidate's own
   transform — its own `upstream-model`, the same injected prompt. Nothing
@@ -581,10 +589,27 @@ Semantics, and the boundaries that keep the feature narrow:
   on default pools. The walk also never exceeds the chain length.
 - **Observability.** Every completion event carries `provider_attempts`
   (candidates tried) and `final_provider` (the candidate that answered,
-  or the last one that failed); exhaustion adds `provider_exhausted: true`.
-  Each failed candidate logs one WARN `provider_attempt_failed` (provider,
-  sanitized error class, attempt index), and each of its dialed-and-failed
-  egress endpoints logs the existing WARN `egress_attempt_failed`.
+  or the last one that failed); exhaustion adds `provider_exhausted: true`
+  and the terminal record's `error_class` becomes `provider_exhausted`
+  (a pool that dialed nothing reports `egress_exhausted` with cause
+  `no_eligible_endpoint`). Each failed candidate logs one WARN
+  `provider_attempt_failed` (provider, canonical `error_class` +
+  `error_cause`, indexes), and each dialed-and-failed egress endpoint —
+  pooled or direct — logs one WARN `egress_attempt_failed` in the same
+  vocabulary. Failures carry no error text: only the canonical class and
+  a closed-set cause token (`connection_refused`, `tls`, `dial`,
+  `network_timeout`, `proxy_connect`, `proxy_auth`,
+  `caller_canceled`, `caller_deadline_exceeded`, …) derived from typed
+  error shapes, never from message text.
+- **Attempt identity is correlatable.** Failure evidence is keyed by the
+  request's `request_id` plus one-based nested indexes: `provider_attempt`
+  (which candidate) and `egress_attempt` (which dial under it — omitted
+  when no endpoint was dialed). Direct attempts emit the same
+  `egress_attempt_failed` record pools do (`egress_kind`/`egress_target`
+  `direct`, `egress_attempt` `1`), so both egress shapes read identically.
+  The older `attempt` field still rides on pooled egress records as an
+  alias equal to `egress_attempt` — treat `egress_attempt` as
+  authoritative; `attempt` is temporary.
 - **Reload invariants hold.** The chain, its policy, and every candidate's
   transport bind to the request's config snapshot like everything else —
   a reload mid-walk cannot reshape the candidate list under in-flight
@@ -777,7 +802,13 @@ Consequences of the table:
   A bounded prefix (64 KiB) of the error body is read once, solely to
   classify its shape and fingerprint it for the log evidence event (see
   Logging); those bytes go nowhere else — not to the client, not into any
-  log line. `Retry-After` and the `X-RateLimit-*` headers still ride the
+  log line. The read is also bounded in time, under a short fixed
+  internal timeout (not runtime configuration): an upstream that answers
+  headers and then stalls on an error body gets the canonical `502`
+  `upstream_invalid_response` instead of a hung request — and the
+  already-answering candidate is never retried or replaced. A caller
+  whose context ends during the capture gets the disconnect outcome, no
+  envelope. `Retry-After` and the `X-RateLimit-*` headers still ride the
   allow-list below, so a 429 remains distinguishable and backoff-able.
   This holds for every request shape: an upstream 5xx answered as
   `text/event-stream` is normalized too (never streamed to the client),
@@ -998,17 +1029,23 @@ What each level carries:
   envelope's own classification), an upstream that
   died mid-body before the answer could be parsed
   (`upstream_body_read_failed`, outcome `upstream_read_failed`), a client
-  that cancels mid-request — including while the upstream request is in
-  flight (`upstream_request_failed` with `error_class` `client_canceled`,
-  outcome `client_disconnected`, and no error envelope, since the client is
+  that goes away mid-request — a disconnect or an expired deadline,
+  including while the upstream request is in flight
+  (`upstream_request_failed` with `error_class` `canceled` and
+  `error_cause` `caller_canceled` or `caller_deadline_exceeded`, outcome
+  `client_disconnected`, and no error envelope, since the client is
   gone), and an upstream 4xx — the `upstream_http_error` evidence event
   described below — one warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —
   plus `second_signal_forced_exit` and drain overflow.
-- **ERROR** — upstream connection failures (`upstream_request_failed` with
-  an `error_class` such as `connection_refused`, `timeout`, `tls`, `dial` —
-  never `client_canceled`, which is the WARN disconnect above), an
+- **ERROR** — upstream connection failures (`upstream_request_failed`
+  with a canonical `error_class` — `connection`, `timeout`,
+  `proxy_connect`, `proxy_auth` — and a closed-set `error_cause` such as
+  `connection_refused`, `tls`, `dial`, `network_timeout`, `proxy_timeout`;
+  a candidate budget exhausted without an answer reports `error_class`
+  `provider_exhausted` over the final cause — never `canceled`, which is
+  the WARN disconnect above), an
   upstream that died mid-relay on the verbatim path (`relay_copy_failed`
   with phase `upstream_read` — the one relay failure that is not a
   disconnect), and an upstream 5xx (`upstream_http_error` at error
@@ -1022,7 +1059,8 @@ What each level carries:
 emits one `upstream_http_error` event (WARN for 4xx, ERROR for 5xx) bound
 to the request's `request_id`: `api`, `public_model`, `upstream_model`,
 `upstream` (scheme+host only), `upstream_status`, `content_type`,
-`error_class` (`upstream_http_4xx`/`upstream_http_5xx`), `error_shape`
+`error_class` `upstream_error` with `error_cause`
+`upstream_http_4xx`/`upstream_http_5xx`, `error_shape`
 (`empty`, `json_error_object`, `json`, `text`, `malformed_json`,
 `truncated`), `body_bytes` (the size of the captured prefix — the whole
 body when it fit under the 64 KiB cap), `body_truncated`, and
@@ -1031,13 +1069,22 @@ join key for correlating repeated provider errors without keeping any of
 their bytes. When the provider's error object carries its own
 token-shaped `type`/`code` (`rate_limit_error`, `insufficient_quota`, …)
 they appear as `provider_error_type`/`provider_error_code` — only when the
-value is short printable ASCII, never the free-text `message`. The
+value is short printable ASCII, never the free-text `message`.
+`content_type` is log-normalized to the parsed media type alone (parameters
+dropped — their values are arbitrary upstream bytes), with the static
+markers `invalid`/`oversized` for unparseable or oversized values; the
+wire relay of response headers is untouched. The
 allow-listed `Retry-After`/`X-RateLimit-*` headers ride along as
 `retry_after`/`x_ratelimit_*` fields when present (values longer than 128
 bytes are dropped from the log — nothing an upstream controls can balloon a
 log line; the client-side relay is unaffected). The raw error body
 itself never appears at any level: it exists only as the count, the shape,
-and the fingerprint.
+and the fingerprint. Every attempt-bearing lifecycle event
+(`upstream_request_started`, `upstream_response_received`,
+`upstream_request_failed`, the evidence event) also carries the nested
+`provider_attempt`/`egress_attempt` indexes described under
+[Provider fallback](#provider-fallback), so failures correlate by
+`request_id + provider_attempt + egress_attempt`.
 
 The credential rule is absolute: no log line, at any level, ever contains
 an `Authorization` value, a request or response body, an injection prompt,
@@ -1173,18 +1220,20 @@ Decided, and not coming back without a design discussion:
 - **Per-request overrides** of prompt or upstream model — the mapping is
   static per public name; a request field that changes forwarding is a
   footgun.
-- **Transport pools, rotation, health checks, fallback, retries** — a
-  `type: proxy` transport is exactly one endpoint (see
-  [Provider transports](#provider-transports)); anything that picks between
-  egresses at request time is a separate design.
+- **More egress machinery than pools already provide** — egress pools with
+  scheduling, eligibility gates, bounded fallback and passive health exist
+  (see [Provider transports](#provider-transports)); what stays out is
+  automatic egress rotation over time, active health probes, per-request
+  egress selection, and automatic retries of an answered request.
 - **TLS configuration** — upstream and proxy TLS verify chain and host with
   system roots; custom TLS setup (client certificates, custom CA pools,
   `insecure-skip-verify`) is not coming. (Ambient
   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables still apply
   to `direct` transports, inherited from `net/http`'s default transport.)
-- **Inbound identities and authorization** — `api-key` is a single shared
-  client credential, not an identity system. Per-client keys, roles, tenant
-  isolation, quotas, and RBAC need a separate design.
+- **Authorization beyond key validity** — partner mode authenticates
+  per-partner keys (see [Partner API keys](#partner-api-keys)); roles,
+  tenant isolation, quotas, per-key model restrictions, and RBAC need a
+  separate design.
 
 ## Repository layout
 

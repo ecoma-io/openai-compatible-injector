@@ -126,12 +126,16 @@ func poolMembers(cfgs ...Config) []Member {
 }
 
 func execReq(streaming bool, body string) *AttemptRequest {
+	return execReqCtx(context.Background(), streaming, body)
+}
+
+func execReqCtx(ctx context.Context, streaming bool, body string) *AttemptRequest {
 	u, err := url.Parse("http://upstream.example/v1/chat/completions")
 	if err != nil {
 		panic(err)
 	}
 	return &AttemptRequest{
-		Ctx:       context.Background(),
+		Ctx:       ctx,
 		Method:    http.MethodPost,
 		URL:       u,
 		Header:    http.Header{"Content-Type": []string{"application/json"}},
@@ -141,6 +145,22 @@ func execReq(streaming bool, body string) *AttemptRequest {
 }
 
 func okResult(body string) stubResult { return stubResult{status: http.StatusOK, body: body} }
+
+// canceledCtx/deadlineCtx are caller-side contexts for ownership tests: the
+// caller is gone (or its deadline fired) before the attempt returned.
+func canceledCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+func deadlineCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 1))
+	cancel()
+	return ctx
+}
 
 // ---- scheduling ----
 
@@ -472,25 +492,77 @@ func TestPoolCancellationAbortsAndSparesHealth(t *testing.T) {
 	pd, _ := newTestPool(poolMembers(Config{}, Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: true, FailureThreshold: 1, Cooldown: 30 * time.Second}, nil, slow, other)
 
-	_, _, err := pd.Execute(execReq(false, "{}"))
+	_, _, err := pd.Execute(execReqCtx(canceledCtx(t), false, "{}"))
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if other.hitCount() != 0 {
 		t.Errorf("cancellation fell back to a second endpoint")
 	}
-	// A wrapped cancellation classifies the same way.
+	// No strike: threshold 1 with a strike would have opened a cooldown.
+	if h := pd.st.members[0].health; !h.usable() || h.fails != 0 {
+		t.Errorf("cancellation struck health: fails=%d usable=%v", h.fails, h.usable())
+	}
+	// A wrapped cancellation against a dead context classifies the same way —
+	// caller ownership beats the typed wrapper.
 	wrapped := &stubEndpoint{script: []stubResult{{err: &ProxyConnectError{msg: "socks5: dial proxy", cause: context.Canceled}}}}
 	pd2, _ := newTestPool(poolMembers(Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 2}, HealthPolicy{Enabled: true, FailureThreshold: 1, Cooldown: 30 * time.Second}, nil, wrapped)
-	_, _, err = pd2.Execute(execReq(false, "{}"))
+	_, _, err = pd2.Execute(execReqCtx(canceledCtx(t), false, "{}"))
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("wrapped err = %v, want context.Canceled through the typed wrapper", err)
 	}
-	// And no strike: threshold 1 with a strike would have opened a cooldown.
-	h := pd2.st.members[0].health
-	if !h.usable() || h.fails != 0 {
+	if h := pd2.st.members[0].health; !h.usable() || h.fails != 0 {
 		t.Errorf("cancellation struck health: fails=%d usable=%v", h.fails, h.usable())
+	}
+}
+
+// TestPoolCallerDeadlineIsTerminalNoFallback pins the deadline half of
+// caller ownership: a caller deadline that fired mid-dial must not read as
+// the endpoint's timeout — no second member is dialed, no health strike
+// lands, and the context's own error surfaces.
+func TestPoolCallerDeadlineIsTerminalNoFallback(t *testing.T) {
+	deadline := &stubEndpoint{script: []stubResult{{err: context.DeadlineExceeded}}}
+	other := &stubEndpoint{script: []stubResult{okResult("{}")}}
+	pd, _ := newTestPool(poolMembers(Config{}, Config{}), RoundRobin,
+		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: true, FailureThreshold: 1, Cooldown: 30 * time.Second}, nil, deadline, other)
+
+	_, info, err := pd.Execute(execReqCtx(deadlineCtx(t), false, "{}"))
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if other.hitCount() != 0 {
+		t.Errorf("caller deadline fell back to a second endpoint")
+	}
+	if h := pd.st.members[0].health; !h.usable() || h.fails != 0 {
+		t.Errorf("caller deadline struck health: fails=%d usable=%v", h.fails, h.usable())
+	}
+	_ = info
+}
+
+// TestPoolProviderLocalTimeoutFallsBack pins the other half: with the
+// caller's context still live, a timeout-shaped endpoint failure is the
+// endpoint's — it strikes health, carries canonical timeout evidence, and
+// falls back within budget.
+func TestPoolProviderLocalTimeoutFallsBack(t *testing.T) {
+	slow := &stubEndpoint{script: []stubResult{{err: &fakeNetError{timeout: true}}}}
+	live := &stubEndpoint{script: []stubResult{okResult("{}")}}
+	pd, _ := newTestPool(poolMembers(Config{}, Config{}), RoundRobin,
+		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: true, FailureThreshold: 3, Cooldown: 30 * time.Second}, nil, slow, live)
+
+	resp, info, err := pd.Execute(execReq(false, "{}"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	_ = resp.Body.Close()
+	if slow.hitCount() != 1 || live.hitCount() != 1 {
+		t.Errorf("dials = %d/%d, want 1/1", slow.hitCount(), live.hitCount())
+	}
+	if len(info.Failures) != 1 || info.Failures[0].Class != "timeout" || info.Failures[0].Cause != CauseNetworkTimeout {
+		t.Errorf("failures = %+v, want one timeout/network_timeout record", info.Failures)
+	}
+	if h := pd.st.members[0].health; h.fails != 1 {
+		t.Errorf("provider-local timeout did not strike health: fails=%d", h.fails)
 	}
 }
 

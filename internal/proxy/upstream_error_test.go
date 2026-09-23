@@ -1,13 +1,16 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Pure-function coverage for the upstream error machinery: classification,
@@ -104,9 +107,9 @@ func TestCaptureUpstreamErrorEvidence(t *testing.T) {
 		Header:     hdr,
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
-	ev, err := captureUpstreamErrorEvidence(resp)
-	if err != nil {
-		t.Fatalf("capture: %v", err)
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureOK {
+		t.Fatalf("capture: %v", cerr)
 	}
 	if ev.status != http.StatusServiceUnavailable || ev.class != "upstream_http_5xx" {
 		t.Errorf("status/class = %d/%q", ev.status, ev.class)
@@ -142,9 +145,9 @@ func TestCaptureUpstreamErrorEvidenceTruncated(t *testing.T) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader("0123456789abcdef")),
 	}
-	ev, err := captureUpstreamErrorEvidence(resp)
-	if err != nil {
-		t.Fatalf("capture: %v", err)
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureOK {
+		t.Fatalf("capture: %v", cerr)
 	}
 	if !ev.truncated {
 		t.Error("truncated = false, want true (body crossed the cap)")
@@ -190,14 +193,129 @@ func TestCaptureUpstreamErrorRateLimitBound(t *testing.T) {
 		Header:     hdr,
 		Body:       io.NopCloser(strings.NewReader(`{}`)),
 	}
-	ev, err := captureUpstreamErrorEvidence(resp)
-	if err != nil {
-		t.Fatalf("capture: %v", err)
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureOK {
+		t.Fatalf("capture: %v", cerr)
 	}
 	if _, ok := ev.rateLimit["Retry-After"]; ok {
 		t.Errorf("oversized Retry-After harvested into evidence: %d bytes", maxRateLimitHeaderBytes+1)
 	}
 	if ev.rateLimit["X-RateLimit-Limit"] != "100" {
 		t.Errorf("X-RateLimit-Limit = %v, want 100 (under the bound)", ev.rateLimit["X-RateLimit-Limit"])
+	}
+}
+
+// TestLogSafeContentType pins the log-only content-type normalizer: media
+// type only (parameters are arbitrary upstream bytes), static markers for
+// the absent/unparseable/oversized cases. The wire relay is a different
+// surface and stays untouched.
+func TestLogSafeContentType(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"application/json", "application/json"},
+		{"text/html; charset=utf-8", "text/html"},
+		{"APPLICATION/Json", "application/json"}, // ParseMediaType canonicalizes case
+		{"not a media type", "invalid"},
+		{">>>", "invalid"},
+		{";" + strings.Repeat("p", 40) + "=" + strings.Repeat("v", 100), "oversized"},
+	} {
+		if got := logSafeContentType(tc.in); got != tc.want {
+			t.Errorf("logSafeContentType(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if got := logSafeContentType(strings.Repeat("x", maxLogContentTypeBytes+1)); got != "oversized" {
+		t.Errorf("oversized content type = %q, want the static marker", got)
+	}
+}
+
+// blockingBody never yields a byte: Read blocks until the body is closed.
+type blockingBody struct{ pr *io.PipeReader }
+
+func (b blockingBody) Read(p []byte) (int, error) { return b.pr.Read(p) }
+func (b blockingBody) Close() error               { return b.pr.Close() }
+
+// TestCaptureUpstreamErrorEvidenceCallerEnded pins the ownership half of the
+// capture contract: the caller's cancellation closes the stalled body and
+// the capture reports caller-ended — the handler answers with the
+// disconnect outcome and no envelope, never a 502.
+func TestCaptureUpstreamErrorEvidenceCallerEnded(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       blockingBody{pr: pr},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ev, cerr := captureUpstreamErrorEvidence(ctx, resp)
+	if cerr != captureCallerEnded {
+		t.Fatalf("capture outcome = %v, want captureCallerEnded", cerr)
+	}
+	if ev.status != 0 || ev.shape != "" || ev.fingerprint != "" || len(ev.rateLimit) != 0 {
+		t.Errorf("evidence = %+v, want the zero value", ev)
+	}
+	// The AfterFunc must have closed the stalled body — no detached reader.
+	if _, err := pr.Read(make([]byte, 1)); !errors.Is(err, io.ErrClosedPipe) {
+		t.Errorf("body not closed by the capture: %v", err)
+	}
+}
+
+// TestCaptureUpstreamErrorEvidenceDeadline pins the timer half: a stalled
+// body outliving the fixed capture deadline is closed and reported as
+// captureDeadline — terminal for the answering candidate (the handler turns
+// it into the canonical 502), never a reason to fall back.
+func TestCaptureUpstreamErrorEvidenceDeadline(t *testing.T) {
+	old := upstreamErrorCaptureTimeout
+	upstreamErrorCaptureTimeout = 50 * time.Millisecond
+	defer func() { upstreamErrorCaptureTimeout = old }()
+
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       blockingBody{pr: pr},
+	}
+
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureDeadline {
+		t.Fatalf("capture outcome = %v, want captureDeadline", cerr)
+	}
+	if ev.status != 0 || ev.shape != "" || ev.fingerprint != "" || len(ev.rateLimit) != 0 {
+		t.Errorf("evidence = %+v, want the zero value", ev)
+	}
+	if _, err := pr.Read(make([]byte, 1)); !errors.Is(err, io.ErrClosedPipe) {
+		t.Errorf("body not closed by the capture: %v", err)
+	}
+}
+
+// readFailBody fails every read with a fixed error, mimicking a reset or
+// truncated error-body connection.
+type readFailBody struct{ err error }
+
+func (b readFailBody) Read([]byte) (int, error) { return 0, b.err }
+func (b readFailBody) Close() error             { return nil }
+
+// TestCaptureUpstreamErrorEvidenceReadFailed pins the generic read-failure
+// outcome: an error that is neither the caller's (live context) nor the
+// capture timer's reports captureReadFailed and no evidence — the handler's
+// 502-with-upstream_error WARN, never a raw error string.
+func TestCaptureUpstreamErrorEvidenceReadFailed(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Header:     http.Header{},
+		Body:       readFailBody{err: errors.New("http2: connection error: read failure")},
+	}
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureReadFailed {
+		t.Fatalf("capture outcome = %v, want captureReadFailed", cerr)
+	}
+	if ev.status != 0 || ev.shape != "" || ev.fingerprint != "" || len(ev.rateLimit) != 0 {
+		t.Errorf("evidence = %+v, want the zero value", ev)
 	}
 }

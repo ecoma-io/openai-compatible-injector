@@ -605,11 +605,12 @@ func TestLifecycleLogMatrix(t *testing.T) {
 	postJSON(t, p.addr, "/v1/chat/completions", `{broken`, nil)
 	expect(want{"request_completed", "info", map[string]any{"outcome": "invalid_json"}})
 
-	// Upstream unreachable: ERROR with the classified cause, plus the
-	// completion line with the 502 outcome.
+	// Upstream unreachable: ERROR with the canonical exhaustion class, the
+	// refused connection as its bounded cause, plus the completion line with
+	// the 502 outcome.
 	postJSON(t, p.addr, "/v1/chat/completions", `{"model":"dead"}`, nil)
 	expect(want{"upstream_request_failed", "error", map[string]any{
-		"error_class": "connection_refused", "public_model": "dead",
+		"error_class": "provider_exhausted", "error_cause": "connection_refused", "public_model": "dead",
 	}})
 	expect(want{"request_completed", "info", map[string]any{
 		"outcome": "upstream_unreachable", "status": 502,

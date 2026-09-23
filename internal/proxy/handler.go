@@ -554,6 +554,17 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// lastUerr is the most recent transport failure; the exhaustion
 		// report after the walk carries it.
 		lastUerr error
+		// lastEgressAttempt is the final egress dial index of the most
+		// recent candidate — 1 on the single-endpoint path, the pool's dial
+		// count on a pooled one, 0 when a pool dialed nothing. It feeds the
+		// attempt indexes on the events after the walk, and is never
+		// invented for a zero-dial exhaustion.
+		lastEgressAttempt int
+		// lastFailureCause carries the last endpoint-owned failure's cause
+		// token into the post-walk exhaustion report, classified when the
+		// failure happened: re-classifying after the walk could let a client
+		// disconnect that raced the loop's end re-own an endpoint failure.
+		lastFailureCause string
 	)
 	for i := range m.Chain {
 		if providerAttempts >= budget {
@@ -609,7 +620,9 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		meterEvent = true
 		log.Debug().Str("provider", cand.Label()).
 			Str("upstream", origin(&upstream)).
-			Int64("bytes_out", int64(len(out))).Msg("upstream_request_started")
+			Int64("bytes_out", int64(len(out))).
+			Int("provider_attempt", providerAttempts).
+			Msg("upstream_request_started")
 		lastUpstream = &upstream
 
 		// The outbound hop: the candidate's provider transport, resolved
@@ -627,7 +640,8 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// Do(req).
 		var uerr error
 		d := h.doers.Doer(cand.Transport)
-		if ex, ok := d.(transport.Executor); ok {
+		ex, pooled := d.(transport.Executor)
+		if pooled {
 			var info transport.AttemptInfo
 			resp, info, uerr = ex.Execute(&transport.AttemptRequest{
 				Ctx:       r.Context(),
@@ -639,15 +653,21 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			})
 			egress = &info
 			egressAttemptsTotal += info.Attempts
-			// Per-attempt evidence, bounded by the fallback budget: one WARN per
-			// dialed-and-failed endpoint, correlated by this request's request_id.
-			// Typed class and scheme+host only — the error text, any credential
-			// material, and skipped members (no dial, no event) stay out.
-			for j, f := range info.Failures {
+			lastEgressAttempt = info.Attempts
+			// Per-attempt evidence, bounded by the fallback budget: one WARN
+			// per dialed-and-failed endpoint, correlated by this request's
+			// request_id and its one-based provider/egress attempt indexes.
+			// Typed class, closed-set cause, and scheme+host only — the error
+			// text, any credential material, and skipped members (no dial, no
+			// event) stay out. attempt rides along as the pre-existing alias
+			// for egress_attempt; the new field is authoritative.
+			for j, fl := range info.Failures {
 				log.Warn().Str("public_model", model).
 					Str("provider", cand.Label()).
-					Str("egress_kind", f.Kind).Str("egress_target", f.Target).
-					Str("error_class", f.Class).
+					Str("egress_kind", fl.Kind).Str("egress_target", fl.Target).
+					Str("error_class", fl.Class).Str("error_cause", fl.Cause).
+					Int("provider_attempt", providerAttempts).
+					Int("egress_attempt", j+1).
 					Int("attempt", j+1).
 					Msg("egress_attempt_failed")
 			}
@@ -655,29 +675,64 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			resp, uerr = d.Do(req)
 			// One exchange, dialed or failed — the attempt happened either way.
 			egressAttemptsTotal++
+			lastEgressAttempt = 1
 		}
 		if uerr == nil {
 			finalCand = cand
 			withEgress(log.Debug()).Int("status", resp.StatusCode).
-				Str("content_type", resp.Header.Get(contentTypeHeader)).
+				Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))).
+				Int("provider_attempt", providerAttempts).
+				Int("egress_attempt", lastEgressAttempt).
 				Msg("upstream_response_received")
 			break
 		}
 		lastUerr = uerr
-		if errors.Is(uerr, context.Canceled) {
-			// The client went away before any upstream answered. No
-			// fallback — there is nobody left to answer — and the outcome
-			// is the disconnect: an upstream_unreachable 502 would
-			// misreport a client-side event as an upstream failure.
+		// One classification, one owner: the context the attempt ran under
+		// decides whether the client's own cancellation or deadline ended the
+		// request — terminal, no fallback, no envelope — or the failure is
+		// the endpoint's and keeps its bounded fallback eligibility. A caller
+		// deadline must never read as a provider-local timeout.
+		f := transport.ClassifyAttempt(r.Context(), uerr)
+		class, cause := f.Class.String(), f.Cause
+		if !f.CallerTerminated && pooled && egress.Exhausted {
+			// Zero dials is a pool-level condition — no member was blamed —
+			// so the endpoint vocabulary would be an invention.
+			class, cause = "egress_exhausted", "no_eligible_endpoint"
+		}
+		lastFailureCause = cause
+		if f.CallerTerminated {
+			// The client went away — canceled, or done waiting — before any
+			// upstream answered. No fallback: there is nobody left to
+			// answer. The outcome is the disconnect either way; an
+			// upstream_unreachable 502 would misreport a client-side event
+			// as an upstream failure.
 			outcome = "client_disconnected"
-			withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
+			event := withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
 				Str("public_model", model).
 				Str("provider", cand.Label()).
 				Str("upstream", origin(&upstream)).
-				Str("error_class", upstreamErrorClass(uerr)).
-				Msg("upstream_request_failed")
+				Str("error_class", class).
+				Str("error_cause", cause).
+				Int("provider_attempt", providerAttempts)
+			if lastEgressAttempt > 0 {
+				event = event.Int("egress_attempt", lastEgressAttempt)
+			}
+			event.Msg("upstream_request_failed")
 			complete()
 			return
+		}
+		// Uniform egress evidence on the single-endpoint path: a direct
+		// failure gets the same per-dial record a pool member's failure gets
+		// (kind direct, first egress attempt), so downstream queries need no
+		// knowledge of which transport served the candidate.
+		if !pooled {
+			log.Warn().Str("public_model", model).
+				Str("provider", cand.Label()).
+				Str("egress_kind", "direct").Str("egress_target", "direct").
+				Str("error_class", class).Str("error_cause", cause).
+				Int("provider_attempt", providerAttempts).
+				Int("egress_attempt", 1).
+				Msg("egress_attempt_failed")
 		}
 		// Transport-level failure with the client still present: one WARN
 		// per failed candidate — the *url.Error from client.Do embeds the
@@ -686,34 +741,43 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// sanitized error and the scheme+host origin only — then, policy
 		// permitting, the next candidate. Exhaustion is reported after
 		// the walk.
-		withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
+		event := withEgress(log.Warn()).Err(sanitizeUpstreamError(uerr, &upstream)).
 			Str("public_model", model).
 			Str("provider", cand.Label()).
 			Str("upstream", origin(&upstream)).
-			Str("error_class", upstreamErrorClass(uerr)).
-			Int("provider_attempt", providerAttempts).
-			Msg("provider_attempt_failed")
+			Str("error_class", class).
+			Str("error_cause", cause).
+			Int("provider_attempt", providerAttempts)
+		if lastEgressAttempt > 0 {
+			event = event.Int("egress_attempt", lastEgressAttempt)
+		}
+		event.Msg("provider_attempt_failed")
 	}
 
 	if resp == nil {
 		// Every budgeted candidate failed without answering. The client
 		// gets the canonical unreachable envelope; the ERROR carries the
 		// last attempt's failure, sanitized, with the pool's report when
-		// that candidate routed through one.
+		// that candidate routed through one. The class names the layer
+		// that ran out — provider_exhausted for the walk, egress_exhausted
+		// for a pool that could not dial at all — and the cause stays the
+		// final bounded token.
 		providerExhausted = true
-		class := upstreamErrorClass(lastUerr)
+		class, cause := "provider_exhausted", lastFailureCause
 		if egress != nil && egress.Exhausted {
-			// Zero dials is a pool-level condition — no member was reachable
-			// for this request — and gets its own class token; the error text
-			// is the pool's static sentinel.
-			class = "egress_exhausted"
+			class, cause = "egress_exhausted", "no_eligible_endpoint"
 		}
-		withProviders(withEgress(log.Error())).Err(sanitizeUpstreamError(lastUerr, lastUpstream)).
+		event := withProviders(withEgress(log.Error())).Err(sanitizeUpstreamError(lastUerr, lastUpstream)).
 			Str("public_model", model).
 			Str("provider", finalProvider).
 			Str("upstream", origin(lastUpstream)).
 			Str("error_class", class).
-			Bool("provider_exhausted", true).
+			Str("error_cause", cause).
+			Int("provider_attempt", providerAttempts)
+		if lastEgressAttempt > 0 {
+			event = event.Int("egress_attempt", lastEgressAttempt)
+		}
+		event.Bool("provider_exhausted", true).
 			Msg("upstream_request_failed")
 		outcome = "upstream_unreachable"
 		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
@@ -728,22 +792,41 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// but the client body is always the canonical JSON envelope. HTML,
 		// text, or provider JSON — none of it passes through: an error body
 		// can echo request material and break SDK error decoding alike.
-		ev, err := captureUpstreamErrorEvidence(resp)
-		if err != nil {
-			// The same body-read vocabulary the buffered path applies: a
-			// read that died on the client side is a disconnect — no
-			// envelope is attempted for a connection that is already gone —
-			// and anything else is the upstream dying mid-answer, answered
-			// with the synthetic 502 rather than half a provider body.
-			if clientSide(err) {
-				outcome = "client_disconnected"
-				log.Warn().Err(err).Str("public_model", model).
-					Str("phase", "client_write").Msg("relay_copy_failed")
-				complete()
-				return
-			}
+		ev, cerr := captureUpstreamErrorEvidence(r.Context(), resp)
+		switch cerr {
+		case captureOK:
+			// The prefix is captured; the evidence below is complete
+			// (truncation is a field on it, not a failure).
+		case captureCallerEnded:
+			// The caller's context ended mid-capture — canceled, or done
+			// waiting. Ownership stays with the caller: no envelope is
+			// written for a client that is gone, and the outcome is the
+			// disconnect, not the upstream's half-read error.
+			outcome = "client_disconnected"
+			log.Warn().Str("public_model", model).
+				Str("phase", "client_write").Msg("relay_copy_failed")
+			complete()
+			return
+		case captureDeadline:
+			// The capture's own deadline fired on a body that never
+			// finished. The candidate already answered — no fallback — and
+			// the answer is the synthetic 502, never half a provider body.
 			outcome = "upstream_read_failed"
-			log.Warn().Err(err).Str("public_model", model).Msg("upstream_body_read_failed")
+			log.Warn().Str("public_model", model).
+				Str("error_class", "upstream_error_body_timeout").
+				Str("error_cause", "capture_deadline_exceeded").
+				Msg("upstream_body_read_failed")
+			reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
+			return
+		case captureReadFailed:
+			// The upstream died mid-body. The raw read error never reaches
+			// the log — its text can quote upstream bytes — so the typed
+			// outcome is the evidence.
+			outcome = "upstream_read_failed"
+			log.Warn().Str("public_model", model).
+				Str("error_class", "upstream_error").
+				Str("error_cause", "body_read_failed").
+				Msg("upstream_body_read_failed")
 			reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
 			return
 		}
@@ -752,7 +835,8 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// provider failing (ERROR). Metadata only — the bounded body was
 		// reduced to shape + fingerprint inside the capture, the provider's
 		// own message never leaves it, and the endpoint appears as its
-		// scheme+host origin.
+		// scheme+host origin. The canonical class names the layer
+		// (upstream_error); the status bucket rides as the cause.
 		event := log.Warn()
 		if ev.status >= http.StatusInternalServerError {
 			event = log.Error()
@@ -761,11 +845,14 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("upstream", origin(lastUpstream)).
 			Int("upstream_status", ev.status).
 			Str("content_type", ev.contentType).
-			Str("error_class", ev.class).
+			Str("error_class", "upstream_error").
+			Str("error_cause", ev.class).
 			Str("error_shape", ev.shape).
 			Int64("body_bytes", ev.bodyBytes).
 			Bool("body_truncated", ev.truncated).
-			Str("error_fingerprint", ev.fingerprint)
+			Str("error_fingerprint", ev.fingerprint).
+			Int("provider_attempt", providerAttempts).
+			Int("egress_attempt", lastEgressAttempt)
 		for _, f := range evidenceRateLimitFields {
 			if v := ev.rateLimit[f.header]; v != "" {
 				event = event.Str(f.field, v)
@@ -1082,38 +1169,6 @@ func transportErrorTextSafe(err error) bool {
 	var errno syscall.Errno
 	return errors.As(err, &ne) || errors.As(err, &oe) ||
 		errors.As(err, &te) || errors.As(err, &errno)
-}
-
-// upstreamErrorClass buckets a client.Do error for logging. The error is
-// classified in its raw form — sanitization only strips the URL text. The
-// transport's typed proxy errors classify from their type: a proxy that
-// demanded or refused authentication is proxy_auth; a failed connection to
-// or through the proxy is proxy_connect.
-func upstreamErrorClass(err error) string {
-	if errors.Is(err, context.Canceled) {
-		return "client_canceled"
-	}
-	var pae *transport.ProxyAuthError
-	if errors.As(err, &pae) {
-		return "proxy_auth"
-	}
-	var pce *transport.ProxyConnectError
-	if errors.As(err, &pce) {
-		return "proxy_connect"
-	}
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return "timeout"
-	}
-	var te *tls.CertificateVerificationError
-	if errors.As(err, &te) {
-		return "tls"
-	}
-	var oe *net.OpError
-	if errors.As(err, &oe) && errors.Is(oe.Err, syscall.ECONNREFUSED) {
-		return "connection_refused"
-	}
-	return "dial"
 }
 
 // writeEnvelope writes a locally generated error envelope and reports the

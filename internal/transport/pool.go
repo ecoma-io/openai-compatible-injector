@@ -338,21 +338,26 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			return resp, info, nil
 		}
 		ms.lim.release()
-		class := Classify(err)
-		if class == ClassCanceled {
-			// The caller went away: no fallback, no strike, no envelope —
-			// nothing here is the endpoint's fault.
+		// The context the attempt ran under decides ownership: a caller
+		// cancellation or deadline that fired during the dial is terminal —
+		// no fallback, no strike, no evidence — while a failure against a
+		// still-live context is the endpoint's and keeps its bounded
+		// fallback eligibility (a provider-local timeout included).
+		f := ClassifyAttempt(ar.Ctx, err)
+		if f.CallerTerminated {
 			st.end()
 			return nil, info, err
 		}
 		ms.health.strike()
 		// Bounded per-attempt evidence for the access log: one record per
-		// actually dialed-and-failed endpoint, typed class only — never the
-		// error text, never more than maxAttempts records per request.
+		// actually dialed-and-failed endpoint, canonical class and closed-set
+		// cause only — never the error text, never more than maxAttempts
+		// records per request.
 		info.Failures = append(info.Failures, AttemptFailure{
 			Kind:   info.Kind,
 			Target: info.Target,
-			Class:  class.String(),
+			Class:  f.Class.String(),
+			Cause:  f.Cause,
 		})
 		lastErr = err
 	}
@@ -384,6 +389,15 @@ func (p *poolDoer) dial(ms *memberState, ar *AttemptRequest) (*http.Response, er
 // Executor seam (and for tests standing in for the handler). Request
 // handling uses Execute; Do buffers the body — every body on this proxy's
 // paths is buffered already.
+//
+// Do reports Streaming=false to Execute, because a *http.Request carries no
+// probed stream flag — that fact belongs to the caller's probe. A member
+// that excludes streaming requests is therefore NOT excluded on this path:
+// the streaming eligibility gate holds only where the handler hands the
+// pool its own request facts through Execute. Do exists so a pool can sit
+// behind the plain Doer seam without lying about its capability; routing
+// client traffic through it for a pool would silently bypass that gate and
+// is a defect, not a supported mode.
 func (p *poolDoer) Do(req *http.Request) (*http.Response, error) {
 	var body []byte
 	if req.Body != nil {

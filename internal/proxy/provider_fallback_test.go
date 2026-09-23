@@ -217,8 +217,25 @@ func TestProviderChainFallsBackOnTransportFailure(t *testing.T) {
 	if failed[0]["provider"] != "pa" || failed[0]["provider_attempt"] != float64(1) {
 		t.Errorf("provider_attempt_failed fields = %v %v, want pa/1", failed[0]["provider"], failed[0]["provider_attempt"])
 	}
-	if failed[0]["error_class"] != "dial" {
-		t.Errorf("error_class = %v, want dial", failed[0]["error_class"])
+	if failed[0]["error_class"] != "connection" {
+		t.Errorf("error_class = %v, want connection", failed[0]["error_class"])
+	}
+	if failed[0]["error_cause"] != "dial" {
+		t.Errorf("error_cause = %v, want dial", failed[0]["error_cause"])
+	}
+	if failed[0]["egress_attempt"] != float64(1) {
+		t.Errorf("egress_attempt = %v, want 1 (the direct dial)", failed[0]["egress_attempt"])
+	}
+	// The uniform per-dial evidence the single-endpoint path now emits: a
+	// direct failure carries the same egress_attempt_failed record a pool
+	// member's failure gets.
+	eg := logBuf.events(t, "egress_attempt_failed")
+	if len(eg) != 1 {
+		t.Fatalf("egress_attempt_failed events = %d, want 1", len(eg))
+	}
+	if eg[0]["egress_kind"] != "direct" || eg[0]["egress_target"] != "direct" || eg[0]["egress_attempt"] != float64(1) {
+		t.Errorf("direct egress evidence = %v/%v/%v, want direct/direct/1",
+			eg[0]["egress_kind"], eg[0]["egress_target"], eg[0]["egress_attempt"])
 	}
 	done := logBuf.events(t, "request_completed")
 	if len(done) != 1 {
@@ -372,7 +389,10 @@ func TestProviderChainTransformErrorNeverFallsBack(t *testing.T) {
 
 // TestProviderChainCancellationAbortsWalk pins the cancellation boundary:
 // when the client goes away mid-walk there is no fallback — nobody is left
-// to answer — and the outcome is the disconnect, not a 502.
+// to answer — and the outcome is the disconnect, not a 502. The request
+// context arrives genuinely canceled (doDisconnectedRequest): under the
+// ownership rule the context, not the error shape, decides what is the
+// caller's failure.
 func TestProviderChainCancellationAbortsWalk(t *testing.T) {
 	store := newChainStore(t, "")
 	pa := &fakeUpstream{err: context.Canceled}
@@ -380,7 +400,7 @@ func TestProviderChainCancellationAbortsWalk(t *testing.T) {
 	logBuf, log := captureLog(zerolog.InfoLevel)
 	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
-	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	rec := doDisconnectedRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want the bare recorder default (nothing written)", rec.Code)
 	}
@@ -640,19 +660,157 @@ models:
 	if len(egress) != 4 {
 		t.Fatalf("egress_attempt_failed events = %d, want 4 (2 per provider attempt)", len(egress))
 	}
+	// The nested attempt identity, real stack edition: dial order pins the
+	// (provider_attempt, egress_attempt) pairs — (1,1),(1,2),(2,1),(2,2) —
+	// and attempt rides along as the egress_attempt alias.
+	wantPairs := [][2]int{{1, 1}, {1, 2}, {2, 1}, {2, 2}}
 	perProvider := map[string]int{}
-	for _, ev := range egress {
+	for i, ev := range egress {
 		perProvider[ev["provider"].(string)]++
 		if ev["error_class"] != "proxy_connect" {
 			t.Errorf("egress error_class = %v, want proxy_connect", ev["error_class"])
+		}
+		if ev["provider_attempt"] != float64(wantPairs[i][0]) || ev["egress_attempt"] != float64(wantPairs[i][1]) {
+			t.Errorf("event %d attempt indexes = %v/%v, want %d/%d",
+				i, ev["provider_attempt"], ev["egress_attempt"], wantPairs[i][0], wantPairs[i][1])
+		}
+		if ev["attempt"] != ev["egress_attempt"] {
+			t.Errorf("event %d attempt alias = %v, want %v (the egress_attempt alias)", i, ev["attempt"], ev["egress_attempt"])
 		}
 	}
 	if perProvider["pa"] != 2 || perProvider["pb"] != 2 {
 		t.Errorf("egress failures per provider = %v, want 2 each", perProvider)
 	}
+	attemptFailed := logBuf.events(t, "provider_attempt_failed")
+	if len(attemptFailed) != 2 {
+		t.Fatalf("provider_attempt_failed events = %d, want 2", len(attemptFailed))
+	}
+	for i, provider := range []string{"pa", "pb"} {
+		ev := attemptFailed[i]
+		if ev["provider"] != provider || ev["provider_attempt"] != float64(i+1) {
+			t.Errorf("provider_attempt_failed %d = %v/%v, want %s/%d", i, ev["provider"], ev["provider_attempt"], provider, i+1)
+		}
+		if ev["egress_attempt"] != float64(2) {
+			t.Errorf("provider_attempt_failed %d egress_attempt = %v, want 2", i, ev["egress_attempt"])
+		}
+		if ev["error_class"] != "proxy_connect" || ev["error_cause"] != "proxy_connect" {
+			t.Errorf("provider_attempt_failed %d class/cause = %v/%v, want proxy_connect/proxy_connect",
+				i, ev["error_class"], ev["error_cause"])
+		}
+	}
+	exhausted := findLogEvent(t, logBuf.String(), "upstream_request_failed")
+	if exhausted["error_class"] != "provider_exhausted" || exhausted["error_cause"] != "proxy_connect" {
+		t.Errorf("exhaustion class/cause = %v/%v, want provider_exhausted/proxy_connect",
+			exhausted["error_class"], exhausted["error_cause"])
+	}
+	if exhausted["provider_attempt"] != float64(2) || exhausted["egress_attempt"] != float64(2) {
+		t.Errorf("exhaustion attempt indexes = %v/%v, want 2/2", exhausted["provider_attempt"], exhausted["egress_attempt"])
+	}
 	done := logBuf.events(t, "request_completed")
 	if len(done) != 1 || done[0]["provider_attempts"] != float64(2) ||
 		done[0]["provider_exhausted"] != true || done[0]["egress_attempts"] != float64(2) {
 		t.Errorf("request_completed = %v, want provider 2/exhausted with last pool report", done)
+	}
+}
+
+// timeoutError mimics the net.Error timeout shape a provider-local dial or
+// header timeout produces — endpoint-owned and fallback-eligible under a
+// live caller context.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "dial tcp: provider-local timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return false }
+
+// TestProviderChainCallerDeadlinePreventsCandidateB pins the deadline half
+// of the ownership rule at the walk level: a caller whose deadline has
+// already fired is done waiting — the primary's failure is the caller's
+// event, the fallback candidate is never dialed, and the answer is the
+// disconnect (no envelope, no 502). A caller deadline must never read as a
+// provider-local timeout, which would burn the fallback budget for a client
+// that is gone.
+func TestProviderChainCallerDeadlinePreventsCandidateB(t *testing.T) {
+	store := newChainStore(t, "")
+	pa := &fakeUpstream{err: dialError("a.example")}
+	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doDeadlineRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Body.Len() != 0 {
+		t.Errorf("body = %q, want nothing written for a done caller", rec.Body.String())
+	}
+	if pb.calls() != 0 {
+		t.Errorf("fallback dialed after the caller's deadline: %d calls", pb.calls())
+	}
+	failed := logBuf.events(t, "upstream_request_failed")
+	if len(failed) != 1 {
+		t.Fatalf("upstream_request_failed events = %d, want 1", len(failed))
+	}
+	if failed[0]["error_class"] != "canceled" {
+		t.Errorf("error_class = %v, want canceled", failed[0]["error_class"])
+	}
+	if failed[0]["error_cause"] != "caller_deadline_exceeded" {
+		t.Errorf("error_cause = %v, want caller_deadline_exceeded", failed[0]["error_cause"])
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
+		t.Fatalf("outcome = %v, want client_disconnected", done)
+	}
+	if done[0]["provider_attempts"] != float64(1) {
+		t.Errorf("provider_attempts = %v, want 1 (no second candidate)", done[0]["provider_attempts"])
+	}
+	if _, exhausted := done[0]["provider_exhausted"]; exhausted {
+		t.Errorf("provider_exhausted set on a caller deadline")
+	}
+}
+
+// TestProviderChainProviderLocalTimeoutStillFallsBack pins the complement:
+// a timeout-shaped failure under a LIVE caller context is the endpoint's —
+// canonical class timeout, bounded cause network_timeout — and keeps its
+// bounded fallback eligibility, so the walk reaches candidate B and answers.
+// Both pieces of per-dial evidence fire: the direct attempt's uniform
+// egress_attempt_failed record and the candidate's provider_attempt_failed.
+func TestProviderChainProviderLocalTimeoutStillFallsBack(t *testing.T) {
+	store := newChainStore(t, "")
+	pa := &fakeUpstream{err: timeoutError{}}
+	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"model":"chain-model"`) {
+		t.Errorf("response not the fallback candidate's answer: %s", rec.Body.String())
+	}
+	eg := logBuf.events(t, "egress_attempt_failed")
+	if len(eg) != 1 {
+		t.Fatalf("egress_attempt_failed events = %d, want 1 (the direct dial)", len(eg))
+	}
+	if eg[0]["egress_kind"] != "direct" || eg[0]["egress_target"] != "direct" || eg[0]["egress_attempt"] != float64(1) {
+		t.Errorf("direct egress evidence = %v/%v/%v, want direct/direct/1",
+			eg[0]["egress_kind"], eg[0]["egress_target"], eg[0]["egress_attempt"])
+	}
+	if eg[0]["error_class"] != "timeout" || eg[0]["error_cause"] != "network_timeout" {
+		t.Errorf("direct egress class/cause = %v/%v, want timeout/network_timeout",
+			eg[0]["error_class"], eg[0]["error_cause"])
+	}
+	failed := logBuf.events(t, "provider_attempt_failed")
+	if len(failed) != 1 {
+		t.Fatalf("provider_attempt_failed events = %d, want 1", len(failed))
+	}
+	if failed[0]["provider"] != "pa" || failed[0]["provider_attempt"] != float64(1) || failed[0]["egress_attempt"] != float64(1) {
+		t.Errorf("provider_attempt_failed fields = %v/%v/%v, want pa/1/1",
+			failed[0]["provider"], failed[0]["provider_attempt"], failed[0]["egress_attempt"])
+	}
+	if failed[0]["error_class"] != "timeout" || failed[0]["error_cause"] != "network_timeout" {
+		t.Errorf("provider_attempt_failed class/cause = %v/%v, want timeout/network_timeout",
+			failed[0]["error_class"], failed[0]["error_cause"])
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["provider_attempts"] != float64(2) || done[0]["final_provider"] != "pb" {
+		t.Errorf("provider fields = %v, want 2/pb", done)
 	}
 }

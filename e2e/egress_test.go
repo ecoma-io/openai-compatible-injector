@@ -866,7 +866,7 @@ func TestEgressPoolClientCancelAbortsCleanly(t *testing.T) {
 
 	// Let the held upstream go so later requests answer fast, then pin the
 	// abort's shape: no fallback dial, the disconnect outcome, and the
-	// canceled class on the WARN.
+	// canceled class with its caller_canceled cause on the WARN.
 	mu.Lock()
 	hold = false
 	mu.Unlock()
@@ -886,8 +886,11 @@ func TestEgressPoolClientCancelAbortsCleanly(t *testing.T) {
 	if len(failed) != 1 {
 		t.Fatalf("upstream_request_failed events = %d, want 1", len(failed))
 	}
-	if failed[0]["error_class"] != "client_canceled" {
-		t.Errorf("error_class = %v, want client_canceled", failed[0]["error_class"])
+	if failed[0]["error_class"] != "canceled" {
+		t.Errorf("error_class = %v, want canceled", failed[0]["error_class"])
+	}
+	if failed[0]["error_cause"] != "caller_canceled" {
+		t.Errorf("error_cause = %v, want caller_canceled", failed[0]["error_cause"])
 	}
 
 	// No strike: with threshold 1 a counted failure would cool the first

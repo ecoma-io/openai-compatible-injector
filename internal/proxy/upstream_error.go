@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // Upstream HTTP errors (any 4xx/5xx) are normalized, not relayed: the
@@ -24,6 +28,15 @@ import (
 // wall a cooperative one does. A var (like the other caps) so tests can pin
 // the truncation edge without megabytes per case.
 var maxUpstreamErrorBodyBytes int64 = 64 << 10 // 64 KiB
+
+// upstreamErrorCaptureTimeout bounds the ERROR-BODY CAPTURE in time — the
+// byte cap alone lets a peer that sends a prefix and then holds the body
+// open strand the request forever. It applies only to this evidence read on
+// an already-answered 4xx/5xx: never to the successful 2xx paths (buffered
+// or SSE), and never as an overall request timeout. Fixed, not configurable:
+// the value protects one bounded read, and it is deliberately internal. A var
+// so tests can pin the timer edge in milliseconds.
+var upstreamErrorCaptureTimeout = 5 * time.Second
 
 // evidenceRateLimitFields pairs the operational response headers copied into
 // the log event (when present) with their snake_case field names. The header
@@ -101,17 +114,42 @@ type upstreamErrorEvidence struct {
 	rateLimit map[string]string
 }
 
+// captureError is the typed outcome of an error-body capture — a closed set,
+// decided from the capture context and stdlib sentinels, never from error
+// text:
+//
+//	captureOK              the prefix was captured; the evidence is complete
+//	                       (truncation is a field, not a failure);
+//	captureCallerEnded     the caller's context canceled or its deadline
+//	                       fired mid-capture: the client is gone (or done
+//	                       waiting) and no envelope is written;
+//	captureDeadline        the capture's own deadline fired on a body that
+//	                       never finished: the answer stays the canonical
+//	                       502 invalid-response;
+//	captureReadFailed      the upstream died mid-body: the same 502, and the
+//	                       raw error never reaches a log (its text can quote
+//	                       upstream bytes).
+type captureError int
+
+const (
+	captureOK captureError = iota
+	captureCallerEnded
+	captureDeadline
+	captureReadFailed
+)
+
 // captureUpstreamErrorEvidence reads a bounded prefix of an upstream 4xx/5xx
 // body and reduces it to evidence. The read is cap+1 bytes so truncation is
 // detectable without trusting Content-Length; the extra byte never enters the
-// capture, the fingerprint, or the classification. A read error is returned
-// untouched for the handler to classify with the same body-read vocabulary
-// the buffered 2xx path applies: clientSide means the client is gone,
-// anything else is the upstream dying mid-answer.
-func captureUpstreamErrorEvidence(resp *http.Response) (upstreamErrorEvidence, error) {
+// capture, the fingerprint, or the classification. The read is bounded in
+// TIME as well as bytes: a capture deadline derived from the request context
+// closes the body when the peer stalls after a prefix (Body.Read has no
+// context, so closing it is what unblocks the read — connection reuse is the
+// deliberate casualty, and an abnormal capture loses nothing worth keeping).
+func captureUpstreamErrorEvidence(ctx context.Context, resp *http.Response) (upstreamErrorEvidence, captureError) {
 	ev := upstreamErrorEvidence{
 		status:      resp.StatusCode,
-		contentType: resp.Header.Get(contentTypeHeader),
+		contentType: logSafeContentType(resp.Header.Get(contentTypeHeader)),
 		rateLimit:   map[string]string{},
 	}
 	for _, f := range evidenceRateLimitFields {
@@ -125,9 +163,22 @@ func captureUpstreamErrorEvidence(resp *http.Response) (upstreamErrorEvidence, e
 		ev.class = "upstream_http_4xx"
 	}
 
+	cctx, cancel := context.WithTimeout(ctx, upstreamErrorCaptureTimeout)
+	defer cancel()
+	stopClose := context.AfterFunc(cctx, func() { _ = resp.Body.Close() })
 	captured, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes+1))
+	stopClose()
 	if err != nil {
-		return upstreamErrorEvidence{}, err
+		switch {
+		case ctx.Err() != nil:
+			// The caller left mid-capture: ownership stays with the caller,
+			// whatever the read's own error text says.
+			return upstreamErrorEvidence{}, captureCallerEnded
+		case errors.Is(cctx.Err(), context.DeadlineExceeded):
+			return upstreamErrorEvidence{}, captureDeadline
+		default:
+			return upstreamErrorEvidence{}, captureReadFailed
+		}
 	}
 	if int64(len(captured)) > maxUpstreamErrorBodyBytes {
 		ev.truncated = true
@@ -141,10 +192,35 @@ func captureUpstreamErrorEvidence(resp *http.Response) (upstreamErrorEvidence, e
 		// A partial body cannot be classified honestly — the bytes that
 		// would decide the shape were never read.
 		ev.shape = shapeTruncated
-		return ev, nil
+		return ev, captureOK
 	}
 	ev.shape, ev.providerType, ev.providerCode = classifyErrorBody(captured)
-	return ev, nil
+	return ev, captureOK
+}
+
+// maxLogContentTypeBytes bounds the content-type string carried into a log
+// event. Real media types are tiny; an upstream-controlled value longer than
+// this is not evidence anyone needs.
+const maxLogContentTypeBytes = 128
+
+// logSafeContentType reduces an upstream-controlled Content-Type to a
+// log-safe value: the parsed media type alone (no parameters — a hostile or
+// creative peer can stuff arbitrary bytes into them), bounded, with static
+// markers for the absent/unparseable cases. Log-only: the wire relay of
+// response headers is untouched.
+func logSafeContentType(v string) string {
+	if v == "" {
+		return ""
+	}
+	if len(v) > maxLogContentTypeBytes {
+		return "oversized"
+	}
+	mt, params, err := mime.ParseMediaType(v)
+	if err != nil || mt == "" {
+		return "invalid"
+	}
+	_ = params // dropped: parameter values are arbitrary upstream bytes
+	return mt
 }
 
 // classifyErrorBody shapes a complete (non-truncated) bounded error body and,
