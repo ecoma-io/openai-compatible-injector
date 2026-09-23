@@ -304,10 +304,16 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 	return 0
 }
 
-// Test seams. Production uses the wall clock, a crypto-quality global
+// Test seams. Production uses the wall clock, a randomly-seeded global
 // random source, and a context-aware timer wait; tests pin all three for
 // determinism (the same pattern as the thinking-usage draw and the capture
-// timeout).
+// timeout). The jitter draw is the SAME non-crypto math/rand/v2 seam the
+// thinking-usage share uses (thinkingDraw): de-synchronizing retries is not
+// a security or key-derivation decision, no credential or identifier is
+// derived from it, and predicting it buys an adversary nothing beyond
+// guessing one backoff a little early. It stays math/rand/v2 deliberately —
+// crypto/rand would drag an error path into a pure policy function for no
+// gain.
 
 var (
 	// retryNow is the clock the walk reads.
