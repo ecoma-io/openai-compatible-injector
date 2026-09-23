@@ -223,6 +223,99 @@ func hasTopLevelResponseKey(body []byte) bool {
 // client's payload in flight. (Unlike the model rewriters, the two scopes
 // may legitimately disagree on the same body: they differ not only in the
 // response-object descent but in the usage shape's member names.)
+// FuzzStripFields pins the strip engine's load-bearing invariants against
+// arbitrary bytes: it never panics; an empty path list and invalid JSON are
+// returned byte-identical; valid input with no matchable first-segment key
+// bytes is byte-identical; and an active strip never turns valid JSON into
+// invalid JSON, for EITHER API scope. Which members are found and excised
+// stay the unit table's business. (Unlike the model rewriters, the scopes
+// may legitimately disagree on the same body: the responses descent is real,
+// so a key present only inside a top-level "response" object differs.)
+func FuzzStripFields(f *testing.F) {
+	seeds := []string{
+		``,       // empty body
+		`   `,    // whitespace only
+		`[DONE]`, // SSE terminator, not JSON
+		`{"provider":"kilo","model":"x","service_tier":"std"}`, // the happy path
+		`{"model":"x"}`, // no matchable key
+		`{"content":"the \"provider\" key","provider":"kilo"}`, // string decoy
+		`{"provider":"a","provider":"b"}`,                      // duplicate keys
+		`{"a":{"provider":"kilo"},"provider":"y"}`,             // prefix path + the path itself
+		`{"response":{"service_tier":"std"}}`,                  // responses descent scope
+		`{"response":{"a":{"provider":"kilo"}}}`,               // deeper than the descent
+		`{"a":{"b":{"c":1}}}`,                                  // deep nesting, no strip
+		`{"a.b":{"c":1}}`,                                      // quoted-dot key
+		`{"choices":[{"provider":"kilo"}]}`,                    // array document fragment
+		`[{}, {}, {"provider":1}]`,                             // array document
+		`"just a string"`,                                      // bare string document
+		`42`,                                                   // number document
+		`{"provider":`,                                         // truncated JSON
+		`not json`,                                             // garbage
+		`{"provider":"x","a":` + strings.Repeat("[", 64) + strings.Repeat("]", 64) + `}`, // deep nesting
+		`{"provider":"` + strings.Repeat("x", 8192) + `"}`,                               // huge string value
+		"{\n \"provider\" : \"kilo\",\n \"model\": \"x\"\n}\n",                           // whitespace-heavy framing
+	}
+	for _, s := range seeds {
+		f.Add([]byte(s))
+	}
+	rawSeeds := [][]byte{
+		[]byte("\xff"),
+		[]byte("{\"provider\":\xff}"),
+		[]byte("{\"provider\":\"a\xffb\"}"),
+		[]byte("\xef\xbb\xbf{\"provider\":\"kilo\"}"),
+	}
+	for _, b := range rawSeeds {
+		f.Add(b)
+	}
+
+	paths := [][]string{
+		{"provider"},
+		{"service_tier"},
+		{"a"},
+		{"a", "b"},
+		{"a", "b", "provider"},
+		{"parent name", "child"}, // the quoted-spelling decode
+		{"a.b", "c"},             // a quoted dot segment
+		{"response"},
+		{"response", "provider"},
+	}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		if got := StripChatFields(body, nil); !bytes.Equal(got, body) {
+			t.Fatalf("empty path list mutated the body:\n in  %q\n out %q", body, got)
+		}
+		if got := StripResponsesFields(body, nil); !bytes.Equal(got, body) {
+			t.Fatalf("empty response path list mutated the body:\n in  %q\n out %q", body, got)
+		}
+
+		for name, got := range map[string][]byte{
+			"chat":      StripChatFields(body, paths),
+			"responses": StripResponsesFields(body, paths),
+		} {
+			if !json.Valid(body) {
+				if !bytes.Equal(got, body) {
+					t.Fatalf("%s: invalid input was not returned unchanged:\n in  %q\n out %q", name, body, got)
+				}
+				continue
+			}
+			if !json.Valid(got) {
+				t.Fatalf("%s: strip broke JSON validity:\n in  %q\n out %q", name, body, got)
+			}
+			// No in-scope key can exist when none of the first-segment bytes
+			// appear anywhere, so the output must be the input: the query
+			// would find only string-value decoys, and those are never keys.
+			if !bytes.Contains(body, []byte(`"provider"`)) &&
+				!bytes.Contains(body, []byte(`"service_tier"`)) &&
+				!bytes.Contains(body, []byte(`"a"`)) &&
+				!bytes.Contains(body, []byte(`"parent name"`)) &&
+				!bytes.Contains(body, []byte(`"a.b"`)) &&
+				!bytes.Contains(body, []byte(`"response"`)) &&
+				!bytes.Equal(got, body) {
+				t.Fatalf("%s: no first-segment key present, input mutated:\n in  %q\n out %q", name, body, got)
+			}
+		}
+	})
+}
+
 func FuzzSynthesizeThinkingUsage(f *testing.F) {
 	seeds := []string{
 		``,                                    // empty body
