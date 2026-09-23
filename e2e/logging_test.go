@@ -338,7 +338,7 @@ func TestDebugLifecycleCheckpoints(t *testing.T) {
 	chain := []string{
 		"request_received", "probe_completed", "model_resolved",
 		"request_transform_started", "request_transform_completed",
-		"upstream_request_started", "upstream_response_received",
+		"provider_attempt_started", "upstream_response_received",
 		"response_transform_started", "response_transform_completed",
 		"client_write_completed", "request_completed",
 	}

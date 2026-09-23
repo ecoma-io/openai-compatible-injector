@@ -222,7 +222,7 @@ func thinkingModeName(mode config.ThinkingMode) string {
 // Logging rides the same flow: the DEBUG lifecycle chain (request_received,
 // probe_completed, model_resolved, thinking_usage_resolved when the model
 // configures the feature, request_transform_started/completed,
-// upstream_request_started, upstream_response_received,
+// provider_attempt_started, upstream_response_received,
 // response_transform_started/completed, client_write_completed — and for
 // streams stream_started, periodic stream_event_progress, stream_completed),
 // one INFO request_completed per request with the wire facts (status,
@@ -710,6 +710,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// failure happened: re-classifying after the walk could let a client
 		// disconnect that raced the loop's end re-own an endpoint failure.
 		lastFailureCause string
+		// lastSendState carries that failure's send state alongside it: the
+		// exhaustion report says whether the walk ended on a request that
+		// provably never left (definitely_not_sent) or one that may already
+		// have reached an upstream (send_unknown). Empty when the walk ended
+		// on something that was not a transport failure.
+		lastSendState string
 		// lastRuleID is the identity of the decision that ended the last
 		// attempt — a matrix rule, or one of the engine's reserved invariant
 		// identities. It rides the exhaustion report so an operator can tell
@@ -866,6 +872,7 @@ walk:
 					Str("error_class", "provider_exhausted").
 					Str("error_cause", recovery.CauseExchangeBudget).
 					Str("disposition", act.String()).
+					Str("failure_origin", "envelope").
 					Str("reason", dec.Reason).
 					Str("policy_rule_id", dec.RuleID).
 					Str("policy_hash", lastPolicyHash).
@@ -911,6 +918,22 @@ walk:
 			// attempt's egress index into its final evidence.
 			lastEgressAttempt = 0
 			if pooled {
+				// provider_attempt_started precedes the attempt's first dial:
+				// the pool may still refuse the attempt before ANY dial
+				// (eligibility gate, health, envelope), and the refusal's own
+				// event — candidate_exchange_budget_spent or
+				// provider_attempt_failed — names the reason, so the marker
+				// stays honest: an attempt that begins is what it names, and
+				// the attempt index it carries is the one the evidence events
+				// will use when a dial does happen.
+				log.Debug().Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Int64("bytes_out", int64(len(out))).
+					Int("provider_attempt", providerAttempts+1).
+					Int("candidate_index", i+1).
+					Int("candidate_attempt", attempt).
+					Int("retry_index", retryIndex).
+					Msg("provider_attempt_started")
 				var info transport.AttemptInfo
 				resp, info, uerr = ex.Execute(&transport.AttemptRequest{
 					Ctx:       r.Context(),
@@ -930,17 +953,11 @@ walk:
 				// in one case only (the envelope refusing the very next dial
 				// after this Execute's first real one, which returns the last
 				// endpoint error rather than an empty result), so the guard
-				// is what counts, not the flag.
+				// is what counts, not the flag. The started event above
+				// already carried the optimistic index (providerAttempts+1);
+				// the counter catches up here when a dial proved the attempt.
 				if info.Attempts > 0 {
 					noteAttempt()
-					log.Debug().Str("provider", cand.Label()).
-						Str("upstream", origin(&upstream)).
-						Int64("bytes_out", int64(len(out))).
-						Int("provider_attempt", providerAttempts).
-						Int("candidate_index", i+1).
-						Int("candidate_attempt", attempt).
-						Int("retry_index", retryIndex).
-						Msg("upstream_request_started")
 				}
 				// Per-attempt evidence, bounded by the fallback budget: one WARN
 				// per dialed-and-failed endpoint, correlated by this request's
@@ -951,11 +968,15 @@ walk:
 				// for egress_attempt; the new field is authoritative. No decision
 				// produced these records — the dial failed before any disposition
 				// was reached — so policy_rule_id is empty here by construction.
+				// failure_origin is transport: these are dial failures, not
+				// answers.
 				for j, fl := range info.Failures {
 					event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 						Str("provider", cand.Label()).
 						Str("egress_kind", fl.Kind).Str("egress_target", fl.Target).
+						Str("failure_origin", "transport").
 						Str("error_class", fl.Class).Str("error_cause", fl.Cause).
+						Str("send_state", fl.SendState).
 						Int("egress_attempt", j+1).
 						Int("attempt", j+1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
@@ -996,6 +1017,20 @@ walk:
 					}
 				}
 			} else {
+				// provider_attempt_started precedes the single dial of a
+				// direct transport, matching the pooled path's placement.
+				// The envelope claim follows: a refusal fires
+				// candidate_exchange_budget_spent with its own identity,
+				// and the attempt counter stays honest because noteAttempt
+				// is called only when a dial actually happens.
+				log.Debug().Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Int64("bytes_out", int64(len(out))).
+					Int("provider_attempt", providerAttempts+1).
+					Int("candidate_index", i+1).
+					Int("candidate_attempt", attempt).
+					Int("retry_index", retryIndex).
+					Msg("provider_attempt_started")
 				// The exchange envelope is claimed here for a single-endpoint
 				// candidate: the transport claims its own dials, and this path is
 				// one dial. A refusal is not a transport failure — nothing was
@@ -1010,14 +1045,6 @@ walk:
 					break
 				}
 				noteAttempt()
-				log.Debug().Str("provider", cand.Label()).
-					Str("upstream", origin(&upstream)).
-					Int64("bytes_out", int64(len(out))).
-					Int("provider_attempt", providerAttempts).
-					Int("candidate_index", i+1).
-					Int("candidate_attempt", attempt).
-					Int("retry_index", retryIndex).
-					Msg("upstream_request_started")
 				resp, uerr = d.Do(req)
 				lastEgressAttempt = 1
 			}
@@ -1048,6 +1075,9 @@ walk:
 					class, cause = "egress_exhausted", recovery.CauseNoEligibleEndpoint
 				}
 				lastFailureCause = cause
+				if !f.CallerTerminated {
+					lastSendState = f.SendState.String()
+				}
 				// The observation the engine decides on. A caller-terminated
 				// failure leaves the transport vocabulary entirely: its owner
 				// is the request context, never the wire, and the engine
@@ -1095,7 +1125,8 @@ walk:
 						Str("error_class", class).
 						Str("error_cause", cause).
 						Str("disposition", act.String()).
-						Str("reason", dec.Reason)
+						Str("reason", dec.Reason).
+						Str("failure_origin", "caller")
 					if lastEgressAttempt > 0 {
 						event = event.Int("egress_attempt", lastEgressAttempt)
 					}
@@ -1115,7 +1146,9 @@ walk:
 					event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 						Str("provider", cand.Label()).
 						Str("egress_kind", "direct").Str("egress_target", "direct").
+						Str("failure_origin", "transport").
 						Str("error_class", class).Str("error_cause", cause).
+						Str("send_state", f.SendState.String()).
 						Int("egress_attempt", 1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+1, eng.Budget().RequestRemaining())
@@ -1134,6 +1167,8 @@ walk:
 					Str("upstream", origin(&upstream)).
 					Str("error_class", class).
 					Str("error_cause", cause).
+					Str("failure_origin", "transport").
+					Str("send_state", f.SendState.String()).
 					Str("disposition", act.String()).
 					Str("reason", dec.Reason)
 				if lastEgressAttempt > 0 {
@@ -1250,7 +1285,8 @@ walk:
 						providerAttempts, i+1, attempt, elapsed),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 						Str("disposition", act.String()).
-						Str("reason", dec.Reason)
+						Str("reason", dec.Reason).
+						Str("failure_origin", "upstream_http")
 					for _, f := range evidenceRateLimitFields {
 						if v := ev.rateLimit[f.header]; v != "" {
 							event = event.Str(f.field, v)
@@ -1267,10 +1303,12 @@ walk:
 					w := log.Warn().Str("public_model", model)
 					if cerr == captureDeadline {
 						w = w.Str("error_class", "upstream_error_body_timeout").
-							Str("error_cause", "capture_deadline_exceeded")
+							Str("error_cause", "capture_deadline_exceeded").
+							Str("failure_origin", "protocol")
 					} else {
 						w = w.Str("error_class", "upstream_error").
-							Str("error_cause", "body_read_failed")
+							Str("error_cause", "body_read_failed").
+							Str("failure_origin", "protocol")
 					}
 					w = withPolicyFields(withAttemptFields(w, providerAttempts, i+1, attempt, elapsed),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
@@ -1352,7 +1390,8 @@ walk:
 				act := walkAction(dec.Action, i+1 < len(m.Chain))
 				event := withPolicyFields(withAttemptFields(log.Warn().Err(rerr).Str("public_model", model).
 					Str("upstream", origin(&upstream)).
-					Int("upstream_status", status),
+					Int("upstream_status", status).
+					Str("failure_origin", "protocol"),
 					providerAttempts, i+1, attempt, elapsed),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
@@ -1402,7 +1441,8 @@ walk:
 				event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status).
-					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))),
+					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))).
+					Str("failure_origin", "protocol"),
 					providerAttempts, i+1, attempt, elapsed),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
@@ -1462,6 +1502,11 @@ walk:
 		providerExhausted = true
 		class, cause := "provider_exhausted", lastFailureCause
 		ruleID := lastRuleID
+		// The walk exhausted through one of three origins: the exchange
+		// envelope refused another dial (envelope), a pool could not dial at
+		// all (transport), or repeated transport failures spent the budgets
+		// (transport).
+		failureOrigin := "transport"
 		switch {
 		case budgetStopped || (egress != nil && egress.BudgetExhausted):
 			// The exchange envelope, not a provider, ended the walk: the next
@@ -1471,6 +1516,7 @@ walk:
 			// scope when the request's ceiling was the binding one, candidate
 			// scope otherwise — and neither is a matrix rule.
 			class, cause = "provider_exhausted", recovery.CauseExchangeBudget
+			failureOrigin = "envelope"
 			if eng.Budget().Exhausted() == recovery.ExhaustionRequest {
 				ruleID = recovery.RuleIDBudgetRequest
 			} else {
@@ -1487,8 +1533,14 @@ walk:
 			Str("upstream", origin(lastUpstream)).
 			Str("error_class", class).
 			Str("error_cause", cause).
+			Str("failure_origin", failureOrigin).
 			Str("policy_rule_id", ruleID).
 			Int("provider_attempt", providerAttempts)
+		// The send state rides only a transport-origin exhaustion: an
+		// envelope refusal dialed nothing, and an answer was committed.
+		if failureOrigin == "transport" && lastSendState != "" {
+			event = event.Str("send_state", lastSendState)
+		}
 		if lastEgressAttempt > 0 {
 			event = event.Int("egress_attempt", lastEgressAttempt)
 		}
