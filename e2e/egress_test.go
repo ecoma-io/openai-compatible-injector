@@ -843,6 +843,15 @@ func TestEgressPoolClientCancelAbortsCleanly(t *testing.T) {
 	mu.Lock()
 	hold = true
 	mu.Unlock()
+	// The held upstream answers only when this test ENDS. Releasing it
+	// earlier races the assertions below: the injector would receive the 200
+	// and complete a request the client had already canceled — the write to a
+	// half-closed client socket succeeds, so nothing there marks the
+	// disconnect — and the test would read `outcome: completed` for a cancel
+	// it did observe client-side. Parked at the end, the only way the request
+	// can settle while those assertions read the log is the disconnect they
+	// mean to pin. (Reproduced under CPU load before this: issue #60.)
+	defer close(release)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	type outcome struct {
@@ -882,13 +891,14 @@ func TestEgressPoolClientCancelAbortsCleanly(t *testing.T) {
 		t.Fatal("the canceled request never returned to the client")
 	}
 
-	// Let the held upstream go so later requests answer fast, then pin the
-	// abort's shape: no fallback dial, the disconnect outcome, and the
-	// canceled class with its caller_canceled cause on the WARN.
+	// Stop holding NEW requests so the rotation checks below answer fast (the
+	// one already blocked inside the upstream stays blocked until the defer
+	// above releases it), then pin the abort's shape: no fallback dial, the
+	// disconnect outcome, and the canceled class with its caller_canceled
+	// cause on the WARN.
 	mu.Lock()
 	hold = false
 	mu.Unlock()
-	close(release)
 
 	if fpSpare.count() != 0 {
 		t.Errorf("spare member dialed %d times after cancellation — a cancel must not fall back", fpSpare.count())
