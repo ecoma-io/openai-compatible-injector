@@ -160,7 +160,9 @@ func TestLoadRuntimeProviderChainRejections(t *testing.T) {
 // defaults (enabled, two candidates), a present block is validated even when
 // it disables the feature, and the candidate reach is bounded. Disabling the
 // walk states a one-candidate reach, because a disabled fallback policy that
-// still claimed a longer reach would be a contradiction.
+// still claimed a longer reach would be a contradiction — including when the
+// block states a reach of its own, which this block never applied while the
+// walk was off.
 func TestLoadRuntimeProviderFallbackPolicy(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -178,7 +180,7 @@ func TestLoadRuntimeProviderFallbackPolicy(t *testing.T) {
 		{name: "zero attempts", block: "provider-fallback:\n  max-attempts: 0\n", reject: "fallback.max-candidates"},
 		{name: "over cap", block: "provider-fallback:\n  max-attempts: 9\n", reject: "fallback.max-candidates"},
 		{name: "negative", block: "provider-fallback:\n  max-attempts: -2\n", reject: "fallback.max-candidates"},
-		{name: "disabled with a reach", block: "provider-fallback:\n  enabled: false\n  max-attempts: 3\n", reject: "fallback.max-candidates"},
+		{name: "disabled with a reach", block: "provider-fallback:\n  enabled: false\n  max-attempts: 3\n", enabled: false, max: 1},
 	}
 	for _, tc := range cases {
 		data := chainRuntime("    provider: pa\n    upstream-model: up-a\n", tc.block)

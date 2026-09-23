@@ -141,26 +141,32 @@ type runtimeRecoveryRetryAfter struct {
 }
 
 // buildGlobalRecovery builds the global layer's partial from the top-level
-// `recovery` block and the legacy `provider-fallback` block. The two forms
-// are alternatives for the same policy: stating both in one layer rejects the
-// file rather than silently preferring one, because which of the two the
-// service actually runs would otherwise be invisible in the file.
+// `recovery` block and the legacy `provider-fallback` block.
+//
+// The two forms are alternatives for the SAME field: stating both the
+// fallback policy and its legacy spelling in one layer rejects the file
+// rather than silently preferring one, because which of the two the service
+// actually runs would otherwise be invisible in the file. Stating the legacy
+// block beside a recovery block that does NOT carry a fallback is not a
+// contradiction — the two are separate fields of the same layer, exactly as
+// the per-model `retries` alias folds in beside a model recovery block that
+// does not state `recovery.retries` — so the legacy value is folded into the
+// layer instead of being dropped.
 func buildGlobalRecovery(block *runtimeRecovery, legacy *runtimeProviderFallback) (recovery.Partial, error) {
 	var p recovery.Partial
 	if block != nil {
-		p, err := buildRecoveryPartial(block)
+		built, err := buildRecoveryPartial(block)
 		if err != nil {
 			return recovery.Partial{}, err
 		}
 		if legacy != nil && block.Fallback != nil {
 			return recovery.Partial{}, errors.New("recovery.fallback and the legacy provider-fallback block are mutually exclusive")
 		}
-		return p, nil
+		p = built
 	}
-	if legacy == nil {
-		return p, nil
+	if legacy != nil && p.Fallback == nil {
+		p.Fallback = buildLegacyFallback(legacy)
 	}
-	p.Fallback = buildLegacyFallback(legacy)
 	return p, nil
 }
 
@@ -604,16 +610,22 @@ func buildModelRecovery(rm runtimeModel) (*recovery.Partial, error) {
 // — enabled, two candidates — and disabling the walk states a one-candidate
 // reach explicitly, which is what the domain's validation requires of a
 // disabled policy.
+//
+// A disabled block states the one-candidate reach whatever `max-attempts`
+// says, because that is what the block always meant: the pre-policy-engine
+// walk read the count only when the walk was enabled, so a file that carried
+// both ran pinned, and an alias must not turn a working file into a startup
+// failure over a number that never had an effect.
 func buildLegacyFallback(rf *runtimeProviderFallback) *recovery.FallbackPartial {
 	enabled := true
-	maxCandidates := defaultProviderFallbackAttempts
 	if rf.Enabled != nil {
 		enabled = *rf.Enabled
 	}
-	if rf.MaxAttempts != nil {
-		maxCandidates = *rf.MaxAttempts
-	} else if !enabled {
+	maxCandidates := defaultProviderFallbackAttempts
+	if !enabled {
 		maxCandidates = 1
+	} else if rf.MaxAttempts != nil {
+		maxCandidates = *rf.MaxAttempts
 	}
 	out := &recovery.FallbackPartial{Enabled: &enabled, MaxCandidates: &maxCandidates}
 	return out

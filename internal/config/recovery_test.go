@@ -305,6 +305,26 @@ func TestRecoveryProviderOverrideScopedToItsProvider(t *testing.T) {
 	}
 }
 
+// TestRecoveryProviderOverrideRewritesOneMatrixRow is the provider-specific
+// disposition scenario: the global matrix sends a 401 to the next candidate,
+// and one provider's override makes it terminal for its own candidates only.
+// The row keeps its canonical identity, so the override replaces it rather
+// than adding a second rule that would have to be disambiguated.
+func TestRecoveryProviderOverrideRewritesOneMatrixRow(t *testing.T) {
+	data := recoveryYAML(
+		"recovery:\n  matrix:\n    http:\n      exact:\n        \"401\": fallback\n",
+		"    recovery:\n      matrix:\n        http:\n          exact:\n            \"401\": terminal\n",
+		"  on-pa:\n    provider: pa\n    upstream-model: up-a\n"+
+			"  on-pb:\n    provider: pb\n    upstream-model: up-b\n")
+
+	if got := recoveryRule(t, recoveryModel(t, data, "on-pa").Recovery, recovery.StatusRuleID(401)).Action; got != recovery.ActionTerminal {
+		t.Errorf("provider-a 401 action = %s, want the provider's terminal", got)
+	}
+	if got := recoveryRule(t, recoveryModel(t, data, "on-pb").Recovery, recovery.StatusRuleID(401)).Action; got != recovery.ActionFallback {
+		t.Errorf("provider-b 401 action = %s, want the global fallback", got)
+	}
+}
+
 // TestRecoveryChainedModelResolvesPerCandidate pins the per-candidate
 // resolution: two candidates of one model may end up under different
 // policies, because each folds its own provider and its own override, and
@@ -427,6 +447,84 @@ func TestRecoveryLegacyAndBlockAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+// TestRecoveryLegacyFallbackSurvivesARecoveryBlock is the compatibility rule
+// for the other half of the pair: a legacy provider-fallback stated beside a
+// recovery block that does NOT carry a fallback is folded into the layer, not
+// discarded. Dropping it would leave the operator's statement silently
+// unapplied — the disabled walk still walking, a reach of three becoming the
+// default two — which is exactly the invisible behavior the mutual-exclusion
+// rule exists to prevent.
+func TestRecoveryLegacyFallbackSurvivesARecoveryBlock(t *testing.T) {
+	cases := []struct {
+		name       string
+		legacy     string
+		enabled    bool
+		candidates int
+	}{
+		{
+			"a disabled legacy walk beside an unrelated recovery block",
+			"provider-fallback:\n  enabled: false\n  max-attempts: 5\n" +
+				"recovery:\n  retries:\n    max-retries: 4\n",
+			false, 1,
+		},
+		{
+			"an enabled legacy reach of three beside an unrelated block",
+			"provider-fallback:\n  enabled: true\n  max-attempts: 3\n" +
+				"recovery:\n  matrix:\n    default: terminal\n",
+			true, 3,
+		},
+		{
+			"a legacy block beside an empty recovery block",
+			"provider-fallback:\n  enabled: false\n  max-attempts: 5\n" +
+				"recovery: {}\n",
+			false, 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := recoveryModel(t, recoveryYAML(tc.legacy, "", "  m:\n    provider: pa\n    upstream-model: up-a\n"), "m")
+			if got := m.Recovery.Fallback.Enabled; got != tc.enabled {
+				t.Errorf("fallback.enabled = %v, want %v", got, tc.enabled)
+			}
+			if got := m.Recovery.Fallback.MaxCandidates; got != tc.candidates {
+				t.Errorf("fallback.max-candidates = %d, want %d", got, tc.candidates)
+			}
+		})
+	}
+}
+
+// TestRecoveryLegacyDisabledWalkIgnoresItsReach pins the one legacy nicety
+// that is preserved rather than turned into a rejection: a block that states
+// `enabled: false` alongside `max-attempts` ran pinned before the policy
+// engine (the count was read only when the walk was on), so it still does. A
+// file that worked must not become a startup failure over a number that never
+// had an effect.
+func TestRecoveryLegacyDisabledWalkIgnoresItsReach(t *testing.T) {
+	m := recoveryModel(t, recoveryYAML(
+		"provider-fallback:\n  enabled: false\n  max-attempts: 5\n",
+		"", "  m:\n    provider: pa\n    upstream-model: up-a\n"), "m")
+	if m.Recovery.Fallback.Enabled {
+		t.Error("the walk was not disabled")
+	}
+	if m.Recovery.Fallback.MaxCandidates != 1 {
+		t.Errorf("fallback.max-candidates = %d, want the pinned reach 1", m.Recovery.Fallback.MaxCandidates)
+	}
+}
+
+// TestRecoveryLegacyRetriesRejectNonFiniteJitter pins the same guard on the
+// legacy alias, which is where the shipped service enforced it: a jitter the
+// arithmetic cannot use is a rejected file on either spelling, never a
+// silently different schedule.
+func TestRecoveryLegacyRetriesRejectNonFiniteJitter(t *testing.T) {
+	for _, jitter := range []string{".nan", ".inf", "2"} {
+		data := recoveryYAML("", "", "  m:\n    provider: pa\n    upstream-model: up-a\n"+
+			"    retries:\n      backoff:\n        jitter: "+jitter+"\n")
+		if _, err := LoadRuntime([]byte(data)); err == nil {
+			t.Errorf("jitter %s: accepted, want rejection", jitter)
+		}
+	}
+}
+
 // TestRecoveryRejections pins the whole-file rejections of the recovery
 // schema, and the no-echo rule over them: every message is fixed text that
 // names the position, and the distinctive marker every case carries never
@@ -478,6 +576,9 @@ func TestRecoveryRejections(t *testing.T) {
 		{"bad caller-cause token", "recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {caller-cause: " + marker + "}\n        action: retry\n", "caller cause must be one of"},
 		{"two cause kinds", "recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {transport-cause: tls, protocol-cause: body_timeout}\n        action: retry\n", "a single cause kind"},
 		{"disabled fallback with a reach", "recovery:\n  fallback:\n    enabled: false\n    max-candidates: 3\n", "fallback.max-candidates"},
+		// NaN survives every comparison, so a bare range check admits it and
+		// the spread arithmetic collapses to a zero wait. It must be named.
+		{"nan jitter", "recovery:\n  retries:\n    backoff:\n      jitter: .nan\n", "jitter"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -597,5 +698,59 @@ func TestRecoveryTopLevelKeyIsLegal(t *testing.T) {
 		"recoveries: {}\n", "", "  m:\n    provider: pa\n    upstream-model: up-a\n")))
 	if err == nil {
 		t.Fatal("a near-miss top-level key was accepted")
+	}
+}
+
+// TestRecoveryHashIsStableAcrossLoadsAndNamesTheData pins the frozen
+// policy's data identity at the load boundary: two loads of the same file
+// carry the same hash for the same candidate and model, a file whose
+// recovery block differs carries a different one, and the flattened
+// Model.RecoveryHash always mirrors Chain[0].RecoveryHash.
+func TestRecoveryHashIsStableAcrossLoadsAndNamesTheData(t *testing.T) {
+	body := recoveryYAML(
+		"recovery:\n  retries:\n    max-retries: 3\n",
+		"",
+		"  m:\n    provider: pa\n    upstream-model: up-a\n")
+
+	first := recoveryModel(t, body, "m")
+	if first.RecoveryHash == "" {
+		t.Fatal("no hash was frozen onto the model")
+	}
+	if first.RecoveryHash != first.Chain[0].RecoveryHash {
+		t.Errorf("model hash %q does not mirror Chain[0]'s %q", first.RecoveryHash, first.Chain[0].RecoveryHash)
+	}
+	if want := first.Recovery.Hash(); first.RecoveryHash != want {
+		t.Errorf("frozen hash %q does not match the policy's own %q", first.RecoveryHash, want)
+	}
+	if second := recoveryModel(t, body, "m"); second.RecoveryHash != first.RecoveryHash {
+		t.Errorf("two loads of one file hashed differently: %q vs %q", second.RecoveryHash, first.RecoveryHash)
+	}
+
+	// A different recovery field is a different policy, and the evidence
+	// must be able to tell the two deployments apart.
+	changed := recoveryModel(t, recoveryYAML(
+		"recovery:\n  retries:\n    max-retries: 4\n",
+		"",
+		"  m:\n    provider: pa\n    upstream-model: up-a\n"), "m")
+	if changed.RecoveryHash == first.RecoveryHash {
+		t.Errorf("a changed recovery block kept hash %q", first.RecoveryHash)
+	}
+
+	// A candidate-level override is a per-candidate policy, so the chain's
+	// entries can differ from each other and from the model's primary.
+	perCand := recoveryModel(t, recoveryYAML(
+		"", "",
+		"  m:\n    providers:\n"+
+			"      - provider: pa\n        upstream-model: up-a\n"+
+			"      - provider: pb\n        upstream-model: up-b\n"+
+			"        recovery:\n          retries:\n            max-retries: 5\n"), "m")
+	if len(perCand.Chain) != 2 {
+		t.Fatalf("chain = %d candidates, want 2", len(perCand.Chain))
+	}
+	if perCand.Chain[0].RecoveryHash == perCand.Chain[1].RecoveryHash {
+		t.Error("two candidates under different policies share a hash")
+	}
+	if perCand.RecoveryHash != perCand.Chain[0].RecoveryHash {
+		t.Error("model hash does not mirror the primary candidate's")
 	}
 }
