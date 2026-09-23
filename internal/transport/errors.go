@@ -2,9 +2,12 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
+	"net/url"
 	"os"
+	"syscall"
 )
 
 // ProxyAuthError reports an egress proxy that refused this client's
@@ -105,4 +108,109 @@ func Classify(err error) Class {
 		return ClassTimeout
 	}
 	return ClassConnection
+}
+
+// Failure is the context-aware classification of one failed outbound
+// attempt: the canonical class the fallback decision reads, a bounded
+// cause token for the evidence log, and whether the caller's own request
+// ended (cancellation or deadline). CallerTerminated is terminal at every
+// fallback layer — there is nobody left to answer — while every other
+// failure keeps its existing bounded-fallback eligibility.
+type Failure struct {
+	Class            Class
+	Cause            string
+	CallerTerminated bool
+}
+
+// Cause tokens. Closed set, code-owned, never derived from error text —
+// they carry the detail the single Class token deliberately flattens
+// (refused vs TLS vs dial) while staying bounded by construction.
+const (
+	// connection-class causes.
+	CauseConnectionRefused = "connection_refused"
+	CauseTLS               = "tls"
+	CauseDial              = "dial"
+	// proxy-class causes.
+	CauseProxyConnect = "proxy_connect"
+	CauseProxyTimeout = "proxy_timeout"
+	// timeout-class causes.
+	CauseDeadlineExceeded = "deadline_exceeded"
+	CauseNetworkTimeout   = "network_timeout"
+	// canceled-class causes.
+	CauseCallerCanceled         = "caller_canceled"
+	CauseCallerDeadlineExceeded = "caller_deadline_exceeded"
+)
+
+// ClassifyAttempt buckets a failed attempt WITH the context the attempt
+// ran under. Error-chain inspection alone cannot establish deadline
+// ownership — a caller deadline and a transport timer both surface as
+// context.DeadlineExceeded — so the caller's context decides: a context
+// that is already done owns the failure (canceled, terminal), and only a
+// still-live context classifies the error on its own terms, where a
+// timeout-shaped failure is the endpoint's and stays fallback-eligible.
+func ClassifyAttempt(ctx context.Context, err error) Failure {
+	if err == nil {
+		return Failure{Class: ClassNone}
+	}
+	// Caller-owned wins over whatever the error chain carries: a
+	// cancellation racing a proxy failure is the caller's event, and a
+	// caller deadline that fired mid-attempt must never read as the
+	// endpoint's timeout.
+	switch ctx.Err() {
+	case context.Canceled:
+		return Failure{Class: ClassCanceled, Cause: CauseCallerCanceled, CallerTerminated: true}
+	case context.DeadlineExceeded:
+		return Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true}
+	}
+	class := Classify(err)
+	f := Failure{Class: class}
+	switch class {
+	case ClassProxyAuth:
+		f.Cause = "proxy_auth"
+	case ClassProxyConnect:
+		f.Cause = CauseProxyConnect
+		if isTimeoutErr(err) {
+			f.Cause = CauseProxyTimeout
+		}
+	case ClassTimeout:
+		f.Cause = CauseNetworkTimeout
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+			f.Cause = CauseDeadlineExceeded
+		}
+	case ClassConnection:
+		f.Cause = causeOfConnection(err)
+	}
+	return f
+}
+
+// isTimeoutErr reports whether the error chain carries a timeout marker
+// (stdlib deadline sentinels or a net.Error timeout), independent of the
+// class the typed proxy errors contributed.
+func isTimeoutErr(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// causeOfConnection narrows the connection class to its code-owned cause:
+// refused, TLS verification, or the generic dial/transport bucket.
+func causeOfConnection(err error) string {
+	var oe *net.OpError
+	if errors.As(err, &oe) && errors.Is(oe.Err, syscall.ECONNREFUSED) {
+		return CauseConnectionRefused
+	}
+	var te *tls.CertificateVerificationError
+	if errors.As(err, &te) {
+		return CauseTLS
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return causeOfConnection(ue.Err)
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return CauseConnectionRefused
+	}
+	return CauseDial
 }

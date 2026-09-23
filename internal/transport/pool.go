@@ -338,21 +338,26 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			return resp, info, nil
 		}
 		ms.lim.release()
-		class := Classify(err)
-		if class == ClassCanceled {
-			// The caller went away: no fallback, no strike, no envelope —
-			// nothing here is the endpoint's fault.
+		// The context the attempt ran under decides ownership: a caller
+		// cancellation or deadline that fired during the dial is terminal —
+		// no fallback, no strike, no evidence — while a failure against a
+		// still-live context is the endpoint's and keeps its bounded
+		// fallback eligibility (a provider-local timeout included).
+		f := ClassifyAttempt(ar.Ctx, err)
+		if f.CallerTerminated {
 			st.end()
 			return nil, info, err
 		}
 		ms.health.strike()
 		// Bounded per-attempt evidence for the access log: one record per
-		// actually dialed-and-failed endpoint, typed class only — never the
-		// error text, never more than maxAttempts records per request.
+		// actually dialed-and-failed endpoint, canonical class and closed-set
+		// cause only — never the error text, never more than maxAttempts
+		// records per request.
 		info.Failures = append(info.Failures, AttemptFailure{
 			Kind:   info.Kind,
 			Target: info.Target,
-			Class:  class.String(),
+			Class:  f.Class.String(),
+			Cause:  f.Cause,
 		})
 		lastErr = err
 	}
