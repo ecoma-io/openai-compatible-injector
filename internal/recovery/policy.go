@@ -3,6 +3,7 @@ package recovery
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -193,7 +194,11 @@ func (p Policy) Validate() error {
 	if p.Retry.Backoff.Max > MaxBackoffCap {
 		return errors.New("recovery: retries.backoff.max exceeds the allowed maximum")
 	}
-	if p.Retry.Backoff.Jitter < 0 || p.Retry.Backoff.Jitter > 1 {
+	// NaN must be named: every comparison against it is false, so a bare
+	// range check lets it through and the schedule silently degenerates —
+	// `base + base*NaN` converts to the minimum int64 duration and clamps to
+	// zero, turning every configured wait into an immediate re-ask.
+	if math.IsNaN(p.Retry.Backoff.Jitter) || p.Retry.Backoff.Jitter < 0 || p.Retry.Backoff.Jitter > 1 {
 		return errors.New("recovery: retries.backoff.jitter must be between 0 and 1")
 	}
 	if p.Retry.OnExhausted != ActionFallback && p.Retry.OnExhausted != ActionTerminal {

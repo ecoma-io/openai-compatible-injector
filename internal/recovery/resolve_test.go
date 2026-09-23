@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -235,6 +236,12 @@ func TestResolveRejectsContradictoryBudgets(t *testing.T) {
 		}}},
 		{"jitter above one", Layer{Name: "model", Partial: Partial{
 			Retry: &RetryPartial{Backoff: &BackoffPartial{Jitter: floatp(1.5)}},
+		}}},
+		// NaN is false against every comparison, so it has to be named
+		// explicitly: the range test alone admits it, and it then collapses
+		// every wait the policy schedules to zero.
+		{"nan jitter", Layer{Name: "model", Partial: Partial{
+			Retry: &RetryPartial{Backoff: &BackoffPartial{Jitter: floatp(math.NaN())}},
 		}}},
 		{"negative retry budget", Layer{Name: "model", Partial: Partial{
 			Retry: &RetryPartial{MaxRetries: intp(-1)},

@@ -1,6 +1,9 @@
 package recovery
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // backoffDelay is the unjittered wait before a retry: the initial delay for
 // the first retry, doubled once per further retry and saturating at the
@@ -37,9 +40,15 @@ func backoffDelay(b BackoffPolicy, attempts int) time.Duration {
 // A negative draw cannot produce a negative delay: a full negative swing is
 // floored at zero, and the policy's ceiling is applied by the caller before
 // the wait is scheduled.
+//
+// NaN is treated as no jitter rather than as a fraction: Validate rejects it,
+// and this second gate keeps the arithmetic honest for a policy that reached
+// here without passing validation — every comparison against NaN is false, so
+// the range test above would let it through and the spread would convert to
+// the minimum int64 duration, clamping the wait to zero.
 func jitteredBackoff(b BackoffPolicy, attempts int, draw func() float64) time.Duration {
 	base := backoffDelay(b, attempts)
-	if b.Jitter <= 0 {
+	if math.IsNaN(b.Jitter) || b.Jitter <= 0 {
 		return base
 	}
 	d := base + time.Duration(float64(base)*b.Jitter*draw())
