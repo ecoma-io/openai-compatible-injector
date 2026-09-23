@@ -1173,18 +1173,20 @@ Decided, and not coming back without a design discussion:
 - **Per-request overrides** of prompt or upstream model — the mapping is
   static per public name; a request field that changes forwarding is a
   footgun.
-- **Transport pools, rotation, health checks, fallback, retries** — a
-  `type: proxy` transport is exactly one endpoint (see
-  [Provider transports](#provider-transports)); anything that picks between
-  egresses at request time is a separate design.
+- **More egress machinery than pools already provide** — egress pools with
+  scheduling, eligibility gates, bounded fallback and passive health exist
+  (see [Provider transports](#provider-transports)); what stays out is
+  automatic egress rotation over time, active health probes, per-request
+  egress selection, and automatic retries of an answered request.
 - **TLS configuration** — upstream and proxy TLS verify chain and host with
   system roots; custom TLS setup (client certificates, custom CA pools,
   `insecure-skip-verify`) is not coming. (Ambient
   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables still apply
   to `direct` transports, inherited from `net/http`'s default transport.)
-- **Inbound identities and authorization** — `api-key` is a single shared
-  client credential, not an identity system. Per-client keys, roles, tenant
-  isolation, quotas, and RBAC need a separate design.
+- **Authorization beyond key validity** — partner mode authenticates
+  per-partner keys (see [Partner API keys](#partner-api-keys)); roles,
+  tenant isolation, quotas, per-key model restrictions, and RBAC need a
+  separate design.
 
 ## Repository layout
 
