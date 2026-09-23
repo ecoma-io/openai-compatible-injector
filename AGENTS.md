@@ -16,18 +16,19 @@ streaming passthrough.
 
 Owned decomposition:
 
-| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables incl. the pool schema (`buildModel`/`buildProviders`/`buildTransports` two-pass + pool policy builders, no-echo rejections, duplicate resolved-endpoint member rejection via `endpointKey`, RFC 1929 credential bound in `parseProxyURL`), egress-closure snapshot retention over model CHAINS (every candidate's transport), provider candidate chains (`runtimeModelCandidate`/`buildChain`), the `provider-fallback` policy builder, the per-model retries policy builder (`buildRetryPolicy` → `RetryPolicy`/`BackoffPolicy`, defaults materialized on absent), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
-| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `internal/auth`                  | Client identity: `Principal`/`Reason`/`Authenticator`/`Provider` seam, `StaticProvider` (snapshot-bound shared key, padded constant-time compare), `PartnerProvider` (store-backed, bounded positive/negative decision cache — errors never cached), crypto-random token/keyID minting + SHA-256-at-rest hashing, PostgreSQL key store (`PGStore`: lookup/create/list/revoke, off-path batched `last_used_at` flusher)                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `internal/migrate`               | Shared SQL-first module-scoped migration runner: embedded-set parsing, legacy auth-ledger adoption, advisory-lock serialization, `information_schema` column-contract validation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `internal/usage`                 | Factual upstream usage capture (pre-rewrite), durable PostgreSQL event repository and reporting query seam, bounded asynchronous batch pipeline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify` and the context-aware `ClassifyAttempt` (`Failure`: canonical class, closed-set cause, caller-terminated flag), egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                                                                                                                                                                                                                                                                                                              |
-| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping (auth delegated to the `auth.Provider` seam — static or partner), error envelopes, SSE copying (`CopySSE`), provider candidate walk (bounded by the snapshot's provider-fallback policy, with the snapshot's `RetryPolicy` driving status-aware same-candidate retries per the closed disposition matrix), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                                                                                                                                                                 |
-| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, `keys create/list/revoke` (partner key lifecycle; list exposes no secrets), default serve                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Directory                        | Owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables incl. the pool schema (`buildModel`/`buildProviders`/`buildTransports` two-pass + pool policy builders, no-echo rejections, duplicate resolved-endpoint member rejection via `endpointKey`, RFC 1929 credential bound in `parseProxyURL`), egress-closure snapshot retention over model CHAINS (every candidate's transport), provider candidate chains (`runtimeModelCandidate`/`buildChain`), the runtime `recovery` block's config surface (`recovery.go`: one shape accepted in four positions, shorthand-to-canonical-rule expansion with typed predicate parsing, per-layer `buildGlobalRecovery`/`buildRecoveryOverride`/`buildModelRecovery` carrying the layer-scoped mutual-exclusion rejections, the legacy `retries`/`provider-fallback` spellings normalized into the same engine rather than run beside it, and `resolveCandidateRecovery` folding the layers in the fixed global→provider→model→candidate order and freezing one effective `recovery.Policy` onto every `Candidate` — the model's `Recovery` is `Chain[0]`'s), snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
+| `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `internal/auth`                  | Client identity: `Principal`/`Reason`/`Authenticator`/`Provider` seam, `StaticProvider` (snapshot-bound shared key, padded constant-time compare), `PartnerProvider` (store-backed, bounded positive/negative decision cache — errors never cached), crypto-random token/keyID minting + SHA-256-at-rest hashing, PostgreSQL key store (`PGStore`: lookup/create/list/revoke, off-path batched `last_used_at` flusher)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `internal/migrate`               | Shared SQL-first module-scoped migration runner: embedded-set parsing, legacy auth-ledger adoption, advisory-lock serialization, `information_schema` column-contract validation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `internal/usage`                 | Factual upstream usage capture (pre-rewrite), durable PostgreSQL event repository and reporting query seam, bounded asynchronous batch pipeline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify` and the context-aware `ClassifyAttempt` (`Failure`: canonical class, closed-set cause, caller-terminated flag), egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish), the exchange-budget seam (`ExchangeBudget` declared HERE, on the consumer side — the transport performs the dials so the transport spends the units; the pool claims one per dialed endpoint after every eligibility, health and concurrency gate and immediately before the dial, skipped members claiming none, and a refused claim stops the loop without blaming an endpoint — and the producer satisfies it structurally, neither package importing the other for it) — the package knows nothing about providers or policy, only about paths and bytes                                                                                                                                                                                                                                          |
+| `internal/recovery`              | The provider recovery policy domain, deliberately free of I/O and of HTTP: typed `Failure` classes with closed-set cause tokens, typed allow-listed `Match` predicates and the three `Action`s (zero value `terminal`), the failure→action matrix with canonical rule IDs, specificity-derived precedence and equal-specificity overlap rejection (`matrix.go`), the shipped default policy (`defaults.go`), the layer merge (`merge.go`: pointer-typed `Partial`s — scalars replace, maps deep-merge, same-ID rule replaces, new ID appends, unstated inherits) and `Resolve` (validate after every layer, so no layer can smuggle a broken policy past the merge), the policy's stable data hash (`hash.go`, hand-written field order, never map iteration), and the `Engine` (`engine.go`/`budget.go`/`retryafter.go`/`backoff.go`) turning one `Observation` into one `Decision` under the four code-owned invariants — commitment, caller, envelope, immutability. It never sleeps, dials, writes a response, reads a pool, or logs; the proxy owns execution and the transport owns the wire                                                                                                                                                                                                                                                         |
+| `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping (auth delegated to the `auth.Provider` seam — static or partner), error envelopes, SSE copying (`CopySSE`), the provider candidate walk, orchestrated THROUGH the `recovery.Engine` — the handler contributes facts (which candidate, which attempt, what the attempt produced, whether the client is still there and whether a byte already reached it) and executes the returned decision (wait the decision's bounded delay, enter the next candidate, or relay what it holds), never classifying a status itself; the walk may not start at all until the snapshot's frozen policy says so, and no decision is taken outside the engine. Executes upstream calls through the model's resolved `transport.Doer` — the `Executor` (pool) branch handed the request's `recovery.Budget` and its `egress_kind`/`egress_target`/`egress_exhausted` report folded into the evidence — composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis)                                                                                                                                                                                                                                                                                                           |
+| `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `cmd/openai-compatible-injector` | Entrypoint: subcommands `version`, `healthcheck`, `keys create/list/revoke` (partner key lifecycle; list exposes no secrets), default serve                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `e2e`                            | Black-box tests driving the real binary as a subprocess                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ## Non-negotiables
 
@@ -123,53 +124,100 @@ Owned decomposition:
   between network paths to the SAME provider; only the handler's
   provider walk (its own non-negotiable below) moves between providers.
   The pool never status-retries either: ANY status is one answer handed up
-  to the handler, and only the handler's status disposition matrix (its own
-  non-negotiable below) retries or falls back on it.
-- **Provider fallback is a bounded walk over a candidate chain, and every
-  candidate retries statuses under the model's RetryPolicy.** Every model
-  carries `Chain` (≥1 `Candidate`: providers-table name, endpoint,
-  per-candidate upstream-model, transport) and one `RetryPolicy` (the
-  model-level `retries` block; absent/null/empty = the defaults —
-  `MaxRetries` 1, `MaxElapsed` 10s, backoff 250ms→2s at jitter 0.1) that
-  EVERY candidate walks under: the block SIZES the policy, it never gates
-  it. The legacy `provider`/`endpoint` forms build a one-candidate chain,
-  so the handler walks one uniform structure — no separate legacy path.
-  `provider-fallback` (`enabled`, default true; `max-attempts`, default 2,
-  cap 8) bounds the walk to `min(max-attempts, len(chain))` candidates;
-  the retry budget is enforced PER CANDIDATE, never shared, so worst-case
-  upstream exchanges = `max-attempts × (MaxRetries + 1)` (defaults
-  2 × 2 = 4; pools keep their egress budget nested under ONE provider
-  attempt — an egress dial is never a provider retry, total dials ≤ that
-  product × the pool fallback budget). Disposition is a CLOSED, code-owned
-  matrix, never configuration: 2xx/3xx/204/304 and >599 answer;
-  408/425/429/every 5xx except 501/505 RETRY the same candidate while
-  budget remains, then
-  fall to the next; 401/403/404/405/409/422 fall to the next candidate
-  IMMEDIATELY
-  (a credential/authorization rejection justifies the next provider, never
-  hammering the same one); every other status — 400 included (the same
-  body would fail identically on retry) and the 501/505 carve-outs inside
-  5xx — is terminal and relayed exactly
-  as a single-provider deployment would; a malformed/incomplete answer
-  before commitment (unparseable or over-cap 200 body, error body that
-  fails or stalls its bounded capture) is retry-then-fallback; a caller
-  cancellation or expired deadline is terminal disconnect — never retried,
-  never slept through, and never mistaken for a provider-local failure (the
-  request context, not the error chain, decides ownership, so a dead caller
-  never spends the budget); transport failure (dial/TLS/proxy/pool
-  exhaustion) falls to the next candidate with NO same-candidate retry.
-  Retried
-  statuses wait a bounded backoff before the re-ask; fallback-only
-  statuses move immediately (no inter-candidate wait). Backoff starts at
-  `Backoff.Initial` and doubles per retry, capped at `Backoff.Max`, then
-  spreads ±`Backoff.Jitter`; an upstream `Retry-After` (delta-seconds or
-  HTTP-date; invalid/negative/past ignored silently) is a floor over the
-  jittered delay but always capped by `Backoff.Max`, the remaining
-  `MaxElapsed` window, and the caller's remaining deadline — an upstream
-  can never make the proxy sleep past `Backoff.Max`. `MaxElapsed` closes a
-  candidate: measured from its FIRST attempt, checked BEFORE scheduling a
-  wait — a sleep never runs past the window or the deadline, and a cancel
-  during a wait aborts with no further attempt. Hard boundaries: the walk
+  to the handler, and only the request's resolved recovery policy (its own
+  non-negotiable below) retries or falls back on it. Its one piece of
+  provider-agnostic bookkeeping is the exchange budget: the transport
+  package declares the `ExchangeBudget` seam on the consumer side and the
+  pool claims one unit immediately before each real dial — after every
+  eligibility, health and concurrency gate — so a member skipped before
+  dialing spends nothing, and a claim that comes back spent ends the
+  attempt loop with no dial, no strike and no endpoint blamed. Claiming at
+  the dial rather than at the handler is what makes the count measure
+  traffic instead of intent: a candidate that fans out across a pool's
+  fallback is several exchanges, and each of them pays its own way.
+- **Provider recovery is policy DATA resolved per request and frozen for
+  that request's life; the bounded walk over the candidate chain is what
+  executes it.** Every model carries `Chain` (≥1 `Candidate`:
+  providers-table name, endpoint, per-candidate upstream-model, transport)
+  and EVERY candidate carries the effective `recovery.Policy` its layer
+  chain resolved — global → provider → model → candidate, deep-merged and
+  re-validated at each step, so an override states only what changes and
+  inherits everything else, and a layer that contradicts the one below it
+  is rejected rather than quietly winning. What a failure MEANS is that
+  policy's matrix, never a table in the handler: typed observations (exact
+  status, status class, provider error type/code, transport class and
+  cause, protocol cause, caller cause) map onto `retry`/`fallback`/
+  `terminal`, written as shorthand (`http.exact`, `http.classes`,
+  `transport`, `protocol`, `caller`, `default`) or as explicit rules with
+  stable IDs — typed allow-listed predicates only, no expressions,
+  scripting or regex, because a policy an operator cannot read off the
+  page is one they cannot reason about while paged. `internal/recovery`
+  ships the default matrix that reproduces the behavior of earlier
+  releases exactly, so absent/null/empty changes no traffic; the block
+  SIZES and STEERS the walk, it never gates whether one happens. The
+  effective policy is resolved from the request's own snapshot and lives
+  exactly as long as the request — a reload mid-walk, mid-wait included,
+  cannot reshape in-flight budgets, retries or rows. Precedence is
+  deterministic and independent of Go map iteration and of YAML order:
+  exact status > provider-error predicate > status class > failure cause >
+  failure class, with the shorthand expanded into canonical IDs
+  (`http-<status>`, `http-class-<class>`, `transport-cause-<cause>`, …);
+  equally-specific rules that overlap are REJECTED at load, so no
+  disposition is left to whichever rule the runtime happens to reach
+  first.
+  Four things stay code-owned, non-configurable, and are applied BEFORE
+  the matrix, because a configuration able to weaken them would turn a
+  client disconnect into upstream traffic or a committed answer into a
+  retried one: a committed response is terminal; a caller cancellation or
+  expired deadline is terminal, judged from the request context and never
+  from the error chain or its text, so a dead caller never spends the
+  budget; the request-wide exchange envelope is absolute; and a resolved
+  policy is immutable. The decision's evidence names which of the four
+  fired (`committed`, `caller`, `budget-request`, `budget-candidate`)
+  beside the rule ID, so an operator can tell "the 429 row said fall back"
+  from "the client hung up". The two envelope identities are not
+  interchangeable: a spent REQUEST envelope ends the walk, because no
+  candidate can start another exchange, while a spent CANDIDATE envelope
+  forbids only another exchange on THAT candidate — the walk may still
+  fall back, since `EnterCandidate` opens the next candidate's envelope
+  fresh, and a per-candidate number must never silently pin a chain the
+  operator configured to fall back.
+  What the matrix decides, the mechanical policies only size: a retried
+  failure waits a bounded backoff before the re-ask (initial, doubling to a
+  ceiling, then spread ±jitter), a fallback action moves immediately with
+  no inter-candidate wait, and a retryable failure whose candidate budget
+  is spent takes the policy's `on-exhausted` action. An upstream
+  `Retry-After` (delta-seconds or HTTP-date; invalid/negative/past ignored
+  silently) can only ever RAISE a wait, and never past the backoff ceiling,
+  the retry-after policy's own `max-delay`, the candidate's remaining
+  `max-elapsed` window, or the caller's remaining deadline — whichever
+  binds first. That window is measured from the candidate's FIRST attempt
+  and checked BEFORE a wait is scheduled, so a sleep never runs past it and
+  a cancel during one aborts with no further attempt. `fallback.enabled:
+false` pins the primary candidate while same-candidate retries still
+  apply; `fallback.max-candidates` counts candidates ENTERED (the primary
+  included), never the candidates the chain lists, and the retry budget is
+  enforced PER CANDIDATE, never shared.
+  The exchange envelope is the absolute bound, and it counts REAL outbound
+  exchanges rather than the intent to make them: `budget.request` wraps
+  `budget.candidate` and the tighter of the two binds, one unit is claimed
+  by the transport immediately before each dial (its own non-negotiable
+  above), so a candidate attempt that fans a pool's fallback across three
+  members spends three while a member skipped by an eligibility gate
+  spends nothing and a refused claim ends the walk without blaming any
+  endpoint. A value above a cap REJECTS the file rather than being clamped,
+  because a silent clamp would leave the operator's file saying one thing
+  and the process doing another. Transport failure (dial/TLS/proxy/pool
+  exhaustion) falls to the next candidate with NO same-candidate retry; a
+  malformed/incomplete answer before commitment (unparseable or over-cap
+  200 body, error body that fails or stalls its bounded capture) is judged
+  by the matrix like any other observation. The legacy `provider`,
+  `endpoint`, `retries` and `provider-fallback` spellings normalize into
+  this one engine — the legacy `provider`/`endpoint` forms build a
+  one-candidate chain, so the handler walks one uniform structure, and
+  there is no mode in which a legacy block and its `recovery` counterpart
+  run side by side: the config layer rejects the pair. Hard boundaries: the
+  walk
   (retries and fallbacks) completes before the first client-visible byte —
   the candidate whose answer produces it has produced THE response, so
   streaming commitment holds by construction, and a committed stream that
@@ -182,22 +230,32 @@ Owned decomposition:
   `provider_exhausted` stays unset (a provider answered);
   `provider_exhausted`/502 `upstream_unreachable` happens only when NO
   candidate ever answered; a capture failure on the final retained answer
-  answers `upstream_invalid_response`. `provider-fallback.enabled: false`
-  pins the primary candidate; same-candidate retries still apply. Each
+  answers `upstream_invalid_response`. Each
   attempt — retries included — replays the immutable client body through
   that candidate's own transform (fresh request, identical transformed
   body per candidate; nothing observed on an earlier attempt feeds the
   next), and a local transform error still answers 400 immediately (a body
-  failing one candidate's transform fails all). Chains, both policies, and
-  per-candidate transports bind to the request's snapshot — a reload
-  mid-walk, mid-wait included, cannot reshape in-flight budgets; the
-  egress closure covers every candidate's transport. Boundary: provider
+  failing one candidate's transform fails all). Chains, the resolved
+  policies, and per-candidate transports bind to the request's snapshot,
+  and the egress closure covers every candidate's transport. Boundary:
+  provider
   retry/fallback = injector (WHICH provider answers); egress recovery =
   transport layer (HOW it is reached) — a pool never status-retries.
-  Observability: `provider_attempt` counts one-based upstream EXCHANGES
-  across the whole request (numerically the old candidate index when no
-  retry fires); `provider_attempts` on completions and usage events counts
-  exchanges; `request_completed` adds `retries_total` and `final_candidate`
+  Observability: a decision records `policy_rule_id` — the matrix row that
+  decided, or one of the reserved invariant identities — beside the frozen
+  policy's `policy_hash` and `policy_generation`, so two requests can be
+  told apart as "ran under the same policy" without putting the policy on a
+  log line. `provider_attempt` counts one-based provider-level attempts (the
+  candidate attempt; numerically the old candidate index when no retry
+  fires) and NO LONGER doubles as the exchange count: `upstream_exchange`
+  counts the real outbound exchanges, one-based and request-wide, and the
+  two differ exactly when an egress pool falls back — which is why they are
+  counted apart. `provider_attempts` on completions and usage events counts
+  provider-level attempts while `upstream_exchanges` counts outbound
+  exchanges, with `candidates_entered`, `candidate_attempts`,
+  `retry_attempts` and `egress_attempts` completing the walk's counters and
+  `request_exchange_budget_remaining` reporting the tighter envelope's
+  headroom; `request_completed` adds `retries_total` and `final_candidate`
   (1-based) and `final_provider` names the relayed candidate;
   `provider_exhausted` on exhaustion (terminal `error_class:
 provider_exhausted` over the final cause; a zero-dial pool reports
