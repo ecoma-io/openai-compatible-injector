@@ -99,6 +99,31 @@ loops.
   events, so upstream-HTTP vs transport vs caller vs protocol is
   distinguishable at a glance. No new classification required.
 
+### 4. No send state on transport failures (replay safety below the injector)
+
+- A `Do` error means no response came back — it does not mean the request
+  never left. The pool's fallback (pool.go:377-393) struck health and dialed
+  the next member on ANY non-caller error, a **post-connect timeout
+  included**: the upstream may already be processing a request whose answer
+  never arrived, and the next member would silently duplicate it.
+- **Fix:** classify every transport failure with a send state —
+  `definitely_not_sent` (the connection-class and proxy-class buckets:
+  refused, TLS, dial, proxy CONNECT/auth — no connection ever carried the
+  request) or `send_unknown` (timeout-class, caller-class, anything
+  unclassified). The pool **falls back only on `definitely_not_sent`**: a
+  `send_unknown` failure stops the attempt loop without a strike and travels
+  up to the injector's recovery policy, the only layer that owns replay.
+  Production egress elasticity is preserved where it is provable: a refused
+  or unreachable egress still falls back.
+- The state rides `AttemptFailure` into `egress_attempt_failed`, is derived
+  again per attempt for `provider_attempt_failed`, and is reported by the
+  post-walk exhaustion `upstream_request_failed`.
+- Boundary stated plainly: the `dial` cause bucket is a
+  connection-establishment failure by the classifier's contract, so a
+  premature close after a partial write is treated as pre-send. Refining
+  that would need op-level (`read`/`write`) error inspection — a larger
+  change than this alignment, recorded here rather than silently assumed.
+
 ## NOT changed (contract preservation)
 
 - `internal/recovery` stays free of transport/HTTP/IP/proxy/RPGW knowledge —
@@ -114,7 +139,12 @@ loops.
   `fallback`; acceptance of global/model `fallback`; mutual-exclusion messages
   unchanged.
 - `internal/proxy` — `provider_attempt_started` precedes every dial (buffered
-  and pooled); `failure_origin` present on evidence events with correct values.
+  and pooled); `failure_origin` present on evidence events with correct values;
+  `send_state` agrees across `egress_attempt_failed`,
+  `provider_attempt_failed` and the exhaustion `upstream_request_failed`.
+- `internal/transport` — `ClassifyAttempt` send-state mapping pinned per cause
+  token; a `send_unknown` (timeout) failure dials exactly one member and
+  strikes no health, while a connection-class failure still falls back.
 - `internal/recovery` — unchanged (no engine semantics changed).
 - e2e — extend `logging_test.go` lifecycle checks for the new slug/field;
   `recovery_test.go` counters unchanged.

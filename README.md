@@ -560,20 +560,25 @@ referenced by name from `providers`:
     tried first. The concurrency permit for the chosen member is acquired
     inside the same selection step, so two concurrent requests can never
     both take a member's last permit and both dial.
-  - **Bounded fallback, transport failures only.** When a dialed member
-    fails before any response arrives (connection, proxy connect, proxy
-    auth, timeout), the next eligible member is tried, up to
-    `max-attempts` distinct endpoints. A client cancellation — or an
-    expired caller deadline, which the request context reports the same
-    way — aborts everything: no fallback, no strike, no penalty. The
-    request context, not the error chain, decides ownership: a timeout
-    shape under a live context is the endpoint's failure and stays
-    fallback-eligible; the same shape under a done context is the
-    caller's and is terminal. **Any response — 429 and 5xx included —
-    ends the attempt loop**: an HTTP status is the upstream's answer,
-    never a fallback trigger and never a health strike.
-  - **Passive health.** `failure-threshold` consecutive fallback-eligible
-    failures open a `cooldown` during which the member is skipped. Recovery
+  - **Bounded fallback, provably-unsent failures only.** When a dialed
+    member fails before a connection ever carried the request — refused,
+    TLS handshake, dial, proxy CONNECT or proxy auth — the next eligible
+    member is tried, up to `max-attempts` distinct endpoints. A failure
+    that may have reached the member stops the loop instead: a timeout on
+    an established connection is `send_unknown`, because the upstream may
+    already be processing a request whose answer never came back, and
+    replaying it on another egress would silently duplicate it. That
+    failure travels up to the recovery policy, which owns replay. A client
+    cancellation — or an expired caller deadline, which the request context
+    reports the same way — aborts everything: no fallback, no strike, no
+    penalty. The request context, not the error chain, decides ownership.
+    **Any response — 429 and 5xx included — ends the attempt loop**: an
+    HTTP status is the upstream's answer, never a fallback trigger and
+    never a health strike.
+  - **Passive health.** `failure-threshold` consecutive
+    `definitely_not_sent` failures open a `cooldown` during which the
+    member is skipped — a `send_unknown` timeout proves nothing about the
+    endpoint and never strikes. Recovery
     needs no probe: any response proves the path delivered and resets the
     count.
   - **Zero eligible members** (all skipped or the fallback budget spent on
@@ -582,7 +587,8 @@ referenced by name from `providers`:
     and `egress_exhausted` so the pool's decision is visible per request.
     Each dialed-and-failed endpoint also emits one WARN
     `egress_attempt_failed` (kind, scheme+host target, canonical
-    `error_class` with its closed-set `error_cause`, attempt number) —
+    `error_class` with its closed-set `error_cause`, its `send_state`
+    (`definitely_not_sent` / `send_unknown`), attempt number) —
     evidence per attempt, even when a later member serves the request,
     with no error text and no credentials.
   - **Reload identity.** A pool whose policy bytes are unchanged across a
@@ -1529,7 +1535,8 @@ What each level carries:
   (mode, whether the request signaled intent, whether synthesis is active —
   models with a `thinking-usage` block only), `request_transform_started`/
   `request_transform_completed` (byte counts around prompt injection),
-  `upstream_request_started` (origin + forwarded byte count),
+  `provider_attempt_started` (origin + forwarded byte count, emitted before
+  the attempt's first dial on both the direct and pooled paths),
   `upstream_response_received` (upstream status + content type). From there
   the lifecycle forks: a buffered response continues with
   `response_transform_started`/`response_transform_completed` (byte counts
@@ -1637,7 +1644,7 @@ bytes are dropped from the log — nothing an upstream controls can balloon a
 log line; the client-side relay is unaffected). The raw error body
 itself never appears at any level: it exists only as the count, the shape,
 and the fingerprint. Every attempt-bearing lifecycle event
-(`upstream_request_started`, `upstream_response_received`,
+(`provider_attempt_started`, `upstream_response_received`,
 `upstream_request_failed`, `provider_attempt_failed`, the evidence event)
 also carries the attempt identity described under
 [Provider recovery policy](#provider-recovery-policy): the nested
@@ -1647,7 +1654,7 @@ whole request — numerically the old candidate index when no retry fires),
 attempts, the second the real outbound exchanges — they differ whenever an
 egress pool falls back), `policy_rule_id` (the rule or code-owned invariant
 that decided the attempt), `request_exchange_budget_remaining`, and, on
-the events after a dial, `egress_attempt` (`upstream_request_started` fires
+the events after a dial, `egress_attempt` (`provider_attempt_started` fires
 before one, so it carries the provider indexes only), plus `candidate_index`
 (1-based chain position), `candidate_attempt`
 (1-based within the candidate), `retry_index` (`candidate_attempt − 1`;
@@ -1659,7 +1666,11 @@ below 500 — fallback-only and terminal rows alike — the transport cause
 tokens, and `upstream_invalid_response` /
 `upstream_body_timeout` / `upstream_body_read_failed` for unusable
 answers, which ride the unusable-answer events rather than
-`provider_attempt_failed`) and `elapsed_ms`. The evidence and body-read/invalid events carry
+`provider_attempt_failed`), `failure_origin` (`upstream_http` | `transport` |
+`protocol` | `caller` | `envelope` — the layer the failure belongs to) and
+`elapsed_ms`. Transport failures additionally carry `send_state`
+(`definitely_not_sent` | `send_unknown`): whether the request provably never
+left the client. The evidence and body-read/invalid events carry
 the received HTTP status as `upstream_status` — a transport failure has no
 status to carry — so failures correlate by
 `request_id + candidate_index + candidate_attempt + egress_attempt`.
