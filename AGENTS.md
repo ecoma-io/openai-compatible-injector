@@ -186,12 +186,22 @@ Owned decomposition:
   failure waits a bounded backoff before the re-ask (initial, doubling to a
   ceiling, then spread ±jitter), a fallback action moves immediately with
   no inter-candidate wait, and a retryable failure whose candidate budget
-  is spent takes the policy's `on-exhausted` action. An upstream
+  is spent takes the policy's `on-exhausted` action — which is also the
+  answer to the one refusal no observation can describe, a transport that
+  declined to dial because the candidate's envelope was already spent
+  (`Engine.CandidateSpent`), so a per-candidate number can never pin a
+  chain the operator configured to fall back while a spent REQUEST
+  envelope stays terminal there regardless of the policy. An upstream
   `Retry-After` (delta-seconds or HTTP-date; invalid/negative/past ignored
   silently) can only ever RAISE a wait, and never past the backoff ceiling,
   the retry-after policy's own `max-delay`, the candidate's remaining
   `max-elapsed` window, or the caller's remaining deadline — whichever
-  binds first. That window is measured from the candidate's FIRST attempt
+  binds first. `max-delay` ceilings the DIRECTIVE, not the schedule: a
+  capped directive is then compared with the jittered backoff, so a
+  `max-delay` below `backoff.max` shortens how far an upstream can push the
+  wait and never shortens a wait the operator's own schedule asked for —
+  a policy that ignores the directive has nothing to say about the file's
+  backoff. That window is measured from the candidate's FIRST attempt
   and checked BEFORE a wait is scheduled, so a sleep never runs past it and
   a cancel during one aborts with no further attempt. `fallback.enabled:
 false` pins the primary candidate while same-candidate retries still
@@ -254,8 +264,11 @@ false` pins the primary candidate while same-candidate retries still
   provider-level attempts while `upstream_exchanges` counts outbound
   exchanges, with `candidates_entered`, `candidate_attempts`,
   `retry_attempts` and `egress_attempts` completing the walk's counters and
-  `request_exchange_budget_remaining` reporting the tighter envelope's
-  headroom; `request_completed` adds `retries_total` and `final_candidate`
+  `request_exchange_budget_remaining` reporting the REQUEST envelope's
+  headroom — never the tighter of the two, which would read zero for every
+  walk that ended because its candidate envelope was spent; on both the
+  per-attempt events and the completion record;
+  `request_completed` adds `retries_total` and `final_candidate`
   (1-based) and `final_provider` names the relayed candidate;
   `provider_exhausted` on exhaustion (terminal `error_class:
 provider_exhausted` over the final cause; a zero-dial pool reports
@@ -275,7 +288,14 @@ provider_exhausted` over the final cause; a zero-dial pool reports
   (a transport failure has no status to carry) — and one WARN
   `egress_attempt_failed` per dialed-and-failed endpoint — pooled or
   direct (`egress_kind`/`egress_target` `direct`, egress attempt 1), so
-  both egress shapes emit the same record. Failure evidence carries the
+  both egress shapes emit the same record — and one WARN
+  `candidate_exchange_budget_spent` for an exchange the envelope refused
+  before a dial (a refusal, never a failed endpoint: no strike, no
+  `egress_attempt_failed`, and no `upstream_exchange`, because no exchange
+  happened for it to index; `policy_rule_id` is `budget-candidate`, or
+  `budget-request` when the request envelope is what refuses — terminal
+  whatever `retries.on-exhausted` says, since no policy may buy an exchange
+  the request envelope has already refused). Failure evidence carries the
   canonical `error_class` plus a closed-set `error_cause` token
   (`connection_refused`, `tls`, `dial`, `network_timeout`,
   `deadline_exceeded`, `proxy_connect`, `proxy_auth`, `proxy_timeout`,

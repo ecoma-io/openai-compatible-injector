@@ -918,6 +918,17 @@ action decides whether the walk moves on, with the next candidate opening its
 own envelope fresh. A per-candidate number therefore sizes one candidate's
 retries; it never pins a chain the operator configured to fall back.
 
+A refusal is not a failure and is never reported as one: nothing was dialed,
+no endpoint is blamed, and no `provider_attempt_failed` or
+`egress_attempt_failed` is emitted for it. The exhausted candidate's turn ends
+on a WARN `candidate_exchange_budget_spent` carrying `policy_rule_id`
+(`budget-candidate`, or `budget-request` when the request envelope is the one
+that refuses — which is terminal whatever `on-exhausted` says), the closed-set
+`error_cause: exchange_budget`, and the walk's position (`candidate_index`,
+`candidate_attempt`, `retry_index`, `provider_attempt`,
+`request_exchange_budget_remaining`). It carries no `upstream_exchange` and no
+`disposition`, because no exchange happened for it to have a place in.
+
 **A configuration above a cap is rejected, never clamped.** The absolute caps
 are `64` and `32` exchanges and `5m`/`2m` elapsed for the request and candidate
 envelopes respectively, `8` retries, `8` fallback candidates, and `2m` for the
@@ -956,15 +967,21 @@ recovery:
 An upstream `Retry-After` (delta-seconds or an HTTP-date) is honored at all
 only when `enabled`; `mode: max` treats it as a **floor** — the wait becomes
 the larger of the jittered backoff and the directive — while `mode: ignore`
-discards it and sleeps the backoff schedule. `max-delay` is the policy's own
-ceiling on the directive; the default (`5s`) sits above the default backoff
-ceiling (`2s`) deliberately, so by default the backoff is what binds. Invalid,
-negative, zero, unparseable, and already-past values are ignored silently.
+discards it and sleeps the backoff schedule. `max-delay` bounds the
+**directive**, not the schedule: a directive larger than `max-delay` is
+reduced to it before it is compared with the backoff, and every wait is capped
+by `backoff.max` regardless. A `max-delay` below `backoff.max` therefore
+shortens how far an upstream can push the wait; it never shortens a wait the
+operator's own backoff schedule asked for. The default (`5s`) sits above the
+default backoff ceiling (`2s`) deliberately, so by default the backoff is what
+binds. Invalid, negative, zero, unparseable, and already-past values are
+ignored silently.
 
 **An upstream can never make the gateway sleep longer than `backoff.max`, the
 retry-after `max-delay`, or the caller's remaining deadline — whichever binds
 first.** The remaining retry window is a fourth veto. Every cap is applied in
-order and each one only ever shortens the wait, so a hostile or broken upstream
+order, and each one bounds either the directive or the whole wait, never the
+configured schedule on the directive's behalf, so a hostile or broken upstream
 cannot buy itself an arbitrarily long gateway sleep.
 
 ### Answers, commitment, and reload
@@ -1027,10 +1044,13 @@ walk's counters ride the completion record:
   (1-based within one candidate attempt's egress dials), `provider_attempt`
   (1-based provider-level attempt across the walk), `upstream_exchange` (the
   real outbound exchange, counted where the dial happens), and
-  `request_exchange_budget_remaining` — how much of the request envelope is
-  still unspent.
+  `request_exchange_budget_remaining` — how much of the REQUEST-wide envelope
+  is still unspent. It is deliberately not the tighter of the two envelopes:
+  after a candidate has spent its own, the tighter number would read zero on a
+  request that still had most of its budget.
 - the counters: `candidates_entered`, `candidate_attempts`, `retry_attempts`,
-  `egress_attempts`, and `upstream_exchanges`.
+  `egress_attempts`, and `upstream_exchanges`. The completion record carries
+  all five, `request_exchange_budget_remaining` included.
 
 `provider_attempts` counts provider-level attempts; `upstream_exchanges` counts
 real outbound exchanges — and the two differ whenever an egress pool falls
@@ -1043,8 +1063,12 @@ Each failed attempt logs one WARN `provider_attempt_failed`, and every received
 `answer` or `success`), the closed-set `reason` token, and `elapsed_ms`, plus
 the received status as `upstream_status` on the events that have one — a
 transport failure has none. Each dialed-and-failed egress endpoint — pooled or
-direct — logs one WARN `egress_attempt_failed` in the same vocabulary. Details
-under [Logging](#logging).
+direct — logs one WARN `egress_attempt_failed` in the same vocabulary. An
+exchange the envelope refused before a dial is not a failure and gets its own
+WARN `candidate_exchange_budget_spent` instead, carrying
+`policy_rule_id`/`disposition`/`reason` and the walk's position but no
+`upstream_exchange` — there was no exchange for it to index. Details under
+[Logging](#logging).
 
 ### Invariants that are not configurable
 
@@ -1559,7 +1583,11 @@ What each level carries:
   `error_cause` `caller_canceled` or `caller_deadline_exceeded`, outcome
   `client_disconnected`, and no error envelope, since the client is
   gone), and an upstream 4xx — the `upstream_http_error` evidence event
-  described below — one warning per transition into a failed config
+  described below — a candidate whose exchange envelope refused another dial
+  (`candidate_exchange_budget_spent`, `error_class` `provider_exhausted` over
+  `error_cause` `exchange_budget`: a refusal, not a failed endpoint, so no
+  endpoint is blamed and no `egress_attempt_failed` accompanies it) — one
+  warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —
   plus `second_signal_forced_exit` and drain overflow.
