@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.6.0...v0.7.0) (2026-09-23)
+
+
+### Features
+
+* **proxy:** add multi-egress transport routing ([#41](https://github.com/ecoma-io/openai-compatible-injector/issues/41)) ([f9261ac](https://github.com/ecoma-io/openai-compatible-injector/commit/f9261ac7e69d231f1505555eddc4c24017458b81))
+* **proxy:** add provider transport abstraction ([#39](https://github.com/ecoma-io/openai-compatible-injector/issues/39)) ([138b5b4](https://github.com/ecoma-io/openai-compatible-injector/commit/138b5b4aaad806cece019d24a0298cca87220ced))
+* **proxy:** egress scheduling, provider fallback chains, partner keys, usage metering ([#48](https://github.com/ecoma-io/openai-compatible-injector/issues/48)) ([098a8a2](https://github.com/ecoma-io/openai-compatible-injector/commit/098a8a285072109ad7c3ac2130edf6a83678e036))
+
+
+### Bug Fixes
+
+* **proxy:** caller-deadline fallback, bounded error capture, canonical failure evidence ([#51](https://github.com/ecoma-io/openai-compatible-injector/issues/51)) ([61789ce](https://github.com/ecoma-io/openai-compatible-injector/commit/61789cebcafa0b46396f8b99fcac0fb908e9708a)), closes [#49](https://github.com/ecoma-io/openai-compatible-injector/issues/49) [#50](https://github.com/ecoma-io/openai-compatible-injector/issues/50)
+* **proxy:** normalize upstream HTTP 4xx/5xx into a canonical envelope ([#36](https://github.com/ecoma-io/openai-compatible-injector/issues/36)) ([269102e](https://github.com/ecoma-io/openai-compatible-injector/commit/269102ed8d8005fe5a446c304929a11f518b6927))
+
 ## [0.6.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.5.0...v0.6.0) (2026-09-22)
 
 
