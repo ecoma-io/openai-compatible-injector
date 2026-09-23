@@ -455,8 +455,11 @@ func TestProviderChainStatusMatrix(t *testing.T) {
 
 // TestProviderChainRetryBudgetExact pins the budget semantics: max-retries
 // counts the retries AFTER a candidate's initial attempt — a policy of N
-// gives every candidate exactly N+1 exchanges before the walk moves on.
-// provider_attempts counts exchanges, retries_total only retries.
+// gives every candidate exactly N+1 provider-level attempts before the walk
+// moves on. provider_attempts is the compatibility alias of
+// candidate_attempts; upstream_exchanges is the separately named count of
+// real egress dials, and retries_total remains the compatibility alias of
+// retry_attempts.
 func TestProviderChainRetryBudgetExact(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -947,6 +950,9 @@ func TestProviderChainTransformErrorNeverFallsBack(t *testing.T) {
 // ownership rule the context, not the error shape, decides what is the
 // caller's failure.
 func TestProviderChainCancellationAbortsWalk(t *testing.T) {
+	stubRetryTiming(t)
+	waits := 0
+	retryWait = func(_ context.Context, _ time.Duration) bool { waits++; return true }
 	store := newChainStore(t, "")
 	pa := &fakeUpstream{err: context.Canceled}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
@@ -962,6 +968,9 @@ func TestProviderChainCancellationAbortsWalk(t *testing.T) {
 	}
 	if pb.calls() != 0 {
 		t.Errorf("fallback dialed after client cancellation: %d calls", pb.calls())
+	}
+	if waits != 0 {
+		t.Errorf("retry waits after client cancellation = %d, want 0", waits)
 	}
 	done := logBuf.events(t, "request_completed")
 	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
@@ -1335,6 +1344,9 @@ func (timeoutError) Temporary() bool { return false }
 // provider-local timeout, which would burn the fallback budget for a client
 // that is gone.
 func TestProviderChainCallerDeadlinePreventsCandidateB(t *testing.T) {
+	stubRetryTiming(t)
+	waits := 0
+	retryWait = func(_ context.Context, _ time.Duration) bool { waits++; return true }
 	store := newChainStore(t, "")
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
@@ -1347,6 +1359,9 @@ func TestProviderChainCallerDeadlinePreventsCandidateB(t *testing.T) {
 	}
 	if pb.calls() != 0 {
 		t.Errorf("fallback dialed after the caller's deadline: %d calls", pb.calls())
+	}
+	if waits != 0 {
+		t.Errorf("retry waits after caller deadline = %d, want 0", waits)
 	}
 	failed := logBuf.events(t, "upstream_request_failed")
 	if len(failed) != 1 {
@@ -1417,5 +1432,453 @@ func TestProviderChainProviderLocalTimeoutStillFallsBack(t *testing.T) {
 	done := logBuf.events(t, "request_completed")
 	if len(done) != 1 || done[0]["provider_attempts"] != float64(2) || done[0]["final_provider"] != "pb" {
 		t.Errorf("provider fields = %v, want 2/pb", done)
+	}
+}
+
+// TestProviderWalkEngineRecoveryActions pins the engine-owned status walk at
+// the handler boundary: a retryable answer waits once and re-asks the SAME
+// candidate; a fallback-only answer moves immediately; and terminal rows do
+// neither. It also checks that the evidence carries the matrix identity and
+// effective policy data that explain the action without exposing the policy.
+func TestProviderWalkEngineRecoveryActions(t *testing.T) {
+	t.Run("retry waits and reasks the same candidate", func(t *testing.T) {
+		stubRetryTiming(t)
+		var waits []time.Duration
+		retryWait = func(_ context.Context, d time.Duration) bool {
+			waits = append(waits, d)
+			return true
+		}
+		store := newChainStoreRetries(t, "", "    retries:\n      backoff:\n        initial: 125ms\n        max: 125ms\n        jitter: 0\n")
+		pa := newScript(
+			scriptStep{status: http.StatusTooManyRequests, body: `{}`},
+			scriptStep{status: http.StatusOK, body: `{"model":"up-a","choices":[]}`},
+		)
+		pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+		logs, log := captureLog(zerolog.InfoLevel)
+		rec := doRequest(t, NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log), http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+		if rec.Code != http.StatusOK || pa.calls() != 2 || pb.calls() != 0 {
+			t.Fatalf("status/calls = %d/%d/%d, want 200/2/0", rec.Code, pa.calls(), pb.calls())
+		}
+		if len(waits) != 1 || waits[0] != 125*time.Millisecond {
+			t.Fatalf("waits = %v, want one 125ms wait", waits)
+		}
+		evs := logs.events(t, "upstream_http_error")
+		if len(evs) != 1 || evs[0]["disposition"] != "retry" || evs[0]["policy_rule_id"] != "http-429" || evs[0]["reason"] != "http_429" {
+			t.Errorf("429 evidence = %v, want retry/status-429/http_429", evs)
+		}
+		if evs[0]["policy_hash"] == "" || evs[0]["policy_generation"] != float64(0) || evs[0]["upstream_exchange"] != float64(1) || evs[0]["request_exchange_budget_remaining"] != float64(15) {
+			t.Errorf("retry observability = %v", evs[0])
+		}
+		done := logs.events(t, "request_completed")
+		if len(done) != 1 || done[0]["candidates_entered"] != float64(1) || done[0]["candidate_attempts"] != float64(2) || done[0]["retry_attempts"] != float64(1) || done[0]["upstream_exchanges"] != float64(2) {
+			t.Errorf("completion counters = %v", done)
+		}
+	})
+
+	t.Run("fallback-only answer never waits", func(t *testing.T) {
+		stubRetryTiming(t)
+		waits := 0
+		retryWait = func(_ context.Context, _ time.Duration) bool { waits++; return true }
+		store := newChainStore(t, "")
+		pa := newScript(scriptStep{status: http.StatusUnauthorized, body: `{}`})
+		pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+		logs, log := captureLog(zerolog.InfoLevel)
+		rec := doRequest(t, NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log), http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+		if rec.Code != http.StatusOK || pa.calls() != 1 || pb.calls() != 1 || waits != 0 {
+			t.Fatalf("status/calls/waits = %d/%d/%d/%d, want 200/1/1/0", rec.Code, pa.calls(), pb.calls(), waits)
+		}
+		evs := logs.events(t, "upstream_http_error")
+		if len(evs) != 1 || evs[0]["disposition"] != "fallback" || evs[0]["policy_rule_id"] != "http-401" {
+			t.Errorf("401 evidence = %v, want fallback/status-401", evs)
+		}
+	})
+
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotImplemented, http.StatusHTTPVersionNotSupported} {
+		t.Run(fmt.Sprintf("terminal %d never reasks", status), func(t *testing.T) {
+			stubRetryTiming(t)
+			waits := 0
+			retryWait = func(_ context.Context, _ time.Duration) bool { waits++; return true }
+			store := newChainStore(t, "")
+			pa := newScript(scriptStep{status: status, body: `{}`})
+			pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
+			logs, log := captureLog(zerolog.InfoLevel)
+			rec := doRequest(t, NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log), http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+			if rec.Code != status || pa.calls() != 1 || pb.calls() != 0 || waits != 0 {
+				t.Fatalf("status/calls/waits = %d/%d/%d/%d, want %d/1/0/0", rec.Code, pa.calls(), pb.calls(), waits, status)
+			}
+			evs := logs.events(t, "upstream_http_error")
+			if len(evs) != 1 || evs[0]["disposition"] != "terminal" || evs[0]["policy_rule_id"] != terminalRuleID(status) {
+				t.Errorf("terminal %d evidence = %v", status, evs)
+			}
+		})
+	}
+}
+
+// TestProviderWalkEntryBudgetStopsBeforeLongerChain proves the engine's
+// EnterCandidate gate is the only candidate counter: a chain longer than the
+// primary policy's fallback reach cannot execute an extra candidate even
+// though the YAML contains one, and the completion count names entries, not
+// an accidental count of iterations.
+func TestProviderWalkEntryBudgetStopsBeforeLongerChain(t *testing.T) {
+	stubRetryTiming(t)
+	cfg := "api-key: " + testAPIKey + `
+recovery:
+  fallback:
+    max-candidates: 2
+transports:
+  direct:
+    type: direct
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: direct
+  pb:
+    base-url: https://b.example/v1
+    transport: direct
+  pc:
+    base-url: https://c.example/v1
+    transport: direct
+models:
+  chain-model:
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+      - provider: pc
+        upstream-model: up-c
+`
+	snap, err := config.LoadRuntime([]byte(cfg))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	pa := &fakeUpstream{err: dialError("a.example")}
+	pb := &fakeUpstream{err: dialError("b.example")}
+	pc := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-c","choices":[]}`}
+	logs, log := captureLog(zerolog.InfoLevel)
+	resolver := fixedDoer{d: doerFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Host {
+		case "a.example":
+			return pa.Do(req)
+		case "b.example":
+			return pb.Do(req)
+		default:
+			return pc.Do(req)
+		}
+	})}
+	rec := doRequest(t, NewHandler(config.NewStore(snap), resolver, nil, nil, log), http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusBadGateway || pa.calls() != 1 || pb.calls() != 1 || pc.calls() != 0 {
+		t.Fatalf("status/calls = %d/%d/%d/%d, want 502/1/1/0", rec.Code, pa.calls(), pb.calls(), pc.calls())
+	}
+	done := logs.events(t, "request_completed")
+	if len(done) != 1 || done[0]["candidates_entered"] != float64(2) || done[0]["candidate_attempts"] != float64(2) {
+		t.Errorf("completion = %v, want two entered/two attempts", done)
+	}
+}
+
+// terminalRuleID states the shipped default matrix's exact rule identity for
+// each terminal row the handler-level test walks. The broad 4xx catch-all is
+// deliberately one named rule; 501/505 have their own 5xx carve-out rows.
+func terminalRuleID(status int) string {
+	if status == http.StatusBadRequest {
+		return "http-class-4xx"
+	}
+	return fmt.Sprintf("http-%d", status)
+}
+
+// TestProviderWalkOversizedAnswerIsItsOwnProtocolCause pins that the
+// oversized_response shorthand is a policy an operator can actually reach.
+// An over-cap 200 and an unparseable 200 are both unusable answers, but they
+// are different decisions: a provider whose every answer exceeds this proxy's
+// buffer will answer the same way on a re-ask, while a malformed one may not.
+// The handler must classify them apart, or the narrower rule silently never
+// fires while changing the policy hash.
+func TestProviderWalkOversizedAnswerIsItsOwnProtocolCause(t *testing.T) {
+	stubRetryTiming(t)
+	old := maxBufferedResponseBytes
+	maxBufferedResponseBytes = 1 << 10 // 1 KiB for the test
+	defer func() { maxBufferedResponseBytes = old }()
+
+	cfg := "api-key: " + testAPIKey + `
+recovery:
+  fallback:
+    max-candidates: 2
+  matrix:
+    protocol:
+      oversized_response: fallback
+      invalid_response: terminal
+transports:
+  t-direct:
+    type: direct
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t-direct
+  pb:
+    base-url: https://b.example/v1
+    transport: t-direct
+models:
+  chain-model:
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+`
+	snap, err := config.LoadRuntime([]byte(cfg))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	big := `{"model":"up-a","padding":"` + strings.Repeat("x", 4<<10) + `"}`
+	pa := &fakeUpstream{status: http.StatusOK, body: big}
+	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	logs, log := captureLog(zerolog.InfoLevel)
+	resolver := poolKindResolver{pool: pb, plain: doerFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "a.example" {
+			return pa.Do(req)
+		}
+		return pb.Do(req)
+	})}
+	h := NewHandler(config.NewStore(snap), resolver, nil, nil, log)
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"model":"chain-model"`) {
+		t.Fatalf("response = %d %s, want 200 from the fallback candidate", rec.Code, rec.Body.String())
+	}
+	if pa.calls() != 1 || pb.calls() != 1 {
+		t.Errorf("calls = %d/%d, want 1/1 (an oversized answer falls back without a re-ask)", pa.calls(), pb.calls())
+	}
+	ev := logs.events(t, "upstream_invalid_response")
+	if len(ev) != 1 || ev[0]["policy_rule_id"] != "protocol-oversized_response" || ev[0]["disposition"] != "fallback" {
+		t.Errorf("oversized evidence = %v, want protocol-oversized_response/fallback", ev)
+	}
+}
+
+// TestProviderWalkSpentCandidateEnvelopeStillFallsBack is the boundary
+// between the two exchange envelopes. Provider A's transport is a pool that
+// fans ONE provider attempt out into two real dials; with a two-exchange
+// candidate envelope, that single attempt spends the candidate's whole
+// envelope in one go — before A's one permitted same-candidate retry could
+// use it. A spent CANDIDATE envelope forbids another exchange on A (a retry
+// would be an over-budget dial), but it is not a verdict about the walk: the
+// request-wide envelope has room, so the policy's fallback still reaches B,
+// whose own envelope opens fresh. Treating the candidate ceiling as terminal
+// would let a per-candidate number silently override the configured
+// fallback — the envelope sizes one candidate's retries, it never pins the
+// chain.
+func TestProviderWalkSpentCandidateEnvelopeStillFallsBack(t *testing.T) {
+	stubRetryTiming(t)
+	cfg := "api-key: " + testAPIKey + `
+recovery:
+  retries:
+    max-retries: 1
+  budget:
+    candidate:
+      max-exchanges: 2
+transports:
+  t-pool:
+    type: pool
+    members: [m1]
+  m1:
+    type: direct
+  t-direct:
+    type: direct
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t-pool
+  pb:
+    base-url: https://b.example/v1
+    transport: t-direct
+models:
+  chain-model:
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+`
+	snap, err := config.LoadRuntime([]byte(cfg))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	pa := &budgetScriptExecutor{perCall: 2, terminal: errors.New("pool failed")}
+	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
+	logs, log := captureLog(zerolog.InfoLevel)
+	// The pool-shaped resolver: A's transport is the pool, B's is plain
+	// direct, so the two candidates must not share a Doer.
+	resolver := poolKindResolver{pool: pa, plain: pb}
+	h := NewHandler(config.NewStore(snap), resolver, nil, nil, log)
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"model":"chain-model"`) {
+		t.Fatalf("response = %d %s, want 200 from the fallback candidate", rec.Code, rec.Body.String())
+	}
+	// A was asked exactly once: the envelope refused the retry the matrix
+	// would otherwise have authorized.
+	if calls, dials := pa.counts(); calls != 1 || dials != 2 {
+		t.Errorf("A calls/dials = %d/%d, want 1/2 (the retry was over budget)", calls, dials)
+	}
+	if pb.calls() != 1 {
+		t.Errorf("B calls = %d, want 1 (the spent candidate envelope must not pin the chain)", pb.calls())
+	}
+	done := logs.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "completed" || done[0]["candidates_entered"] != float64(2) ||
+		done[0]["final_provider"] != "pb" {
+		t.Errorf("completion = %v, want a completed two-candidate walk ending on pb", done)
+	}
+	// Both real dials carry their record; the envelope refusal is not one of
+	// them, and it is not an endpoint verdict either — egress_exhausted means
+	// the pool found no usable member, and A's member was never unusable.
+	eg := logs.events(t, "egress_attempt_failed")
+	if len(eg) != 2 || eg[0]["egress_target"] != "direct" || eg[1]["upstream_exchange"] != float64(2) {
+		t.Errorf("egress evidence = %v, want one record per real dial", eg)
+	}
+	failed := logs.events(t, "provider_attempt_failed")
+	if len(failed) != 1 || failed[0]["provider"] != "pa" || failed[0]["disposition"] != "fallback" {
+		t.Errorf("provider_attempt_failed = %v, want one fallback from pa", failed)
+	}
+}
+
+// poolKindResolver answers pool-shaped configs with the scripted executor
+// and everything else with the plain Doer. kindResolver splits on Proxy vs
+// not, which cannot separate a pool from a direct transport.
+type poolKindResolver struct {
+	pool  transport.Doer
+	plain transport.Doer
+}
+
+func (r poolKindResolver) Doer(c transport.Config) transport.Doer {
+	if c.Kind == transport.EgressPool {
+		return r.pool
+	}
+	return r.plain
+}
+
+// budgetScriptExecutor stands in for a pool with a scripted number of real
+// outbound exchanges. It claims the shared exchange envelope immediately
+// before each exchange, just as poolDoer does; the test can therefore prove
+// a request-wide ceiling against traffic that fans one provider attempt out
+// into several egress dials.
+type budgetScriptExecutor struct {
+	mu       sync.Mutex
+	calls    int
+	dials    int
+	perCall  int
+	status   int
+	terminal error
+}
+
+func (e *budgetScriptExecutor) Execute(ar *transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	info := transport.AttemptInfo{Kind: "direct", Target: "direct"}
+	for i := 0; i < e.perCall; i++ {
+		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+			info.BudgetExhausted = true
+			if info.Attempts == 0 {
+				// The same distinction poolDoer draws: an envelope that
+				// refused the first dial is the request's own condition, not
+				// an endpoint verdict, so no exhaustion sentinel is raised.
+				return nil, info, nil
+			}
+			return nil, info, e.terminal
+		}
+		e.mu.Lock()
+		e.dials++
+		e.mu.Unlock()
+		info.Attempts++
+		// One sanitized record per real dial, as the real pool emits: a
+		// scripted executor that dialed and failed must look like one.
+		info.Failures = append(info.Failures, transport.AttemptFailure{
+			Kind: info.Kind, Target: info.Target, Class: "connection", Cause: "connection_refused",
+		})
+	}
+	if e.status != 0 {
+		return &http.Response{
+			StatusCode: e.status,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, info, nil
+	}
+	return nil, info, e.terminal
+}
+
+func (e *budgetScriptExecutor) counts() (calls, dials int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls, e.dials
+}
+
+func (e *budgetScriptExecutor) Do(*http.Request) (*http.Response, error) {
+	panic("handler called Do on an Executor-capable budget script")
+}
+
+// TestProviderWalkRequestExchangeEnvelopeCountsRealPoolDials proves the
+// envelope bounds exchanges rather than provider attempts. A's first and
+// retried 429 each consume three pool dials (six); B starts with two dials
+// planned, receives the seventh, and its eighth claim is refused. The
+// handler stops before B can dial again. A's final received 429 remains the
+// client answer: no synthetic 502 outranks a retained HTTP answer.
+func TestProviderWalkRequestExchangeEnvelopeCountsRealPoolDials(t *testing.T) {
+	stubRetryTiming(t)
+	cfg := "api-key: " + testAPIKey + `
+recovery:
+  budget:
+    request:
+      max-exchanges: 7
+    candidate:
+      max-exchanges: 7
+transports:
+  t1:
+    type: direct
+  t2:
+    type: proxy
+    proxy: http://127.0.0.1:9090
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t1
+  pb:
+    base-url: https://b.example/v1
+    transport: t2
+models:
+  chain-model:
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+`
+	snap, err := config.LoadRuntime([]byte(cfg))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	pa := &budgetScriptExecutor{perCall: 3, status: http.StatusTooManyRequests, terminal: errors.New("pool failed")}
+	pb := &budgetScriptExecutor{perCall: 2, terminal: errors.New("pool failed")}
+	logs, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(config.NewStore(snap), kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), `"code":"upstream_http_429"`) {
+		t.Fatalf("response = %d %s, want retained canonical 429", rec.Code, rec.Body.String())
+	}
+	if calls, dials := pa.counts(); calls != 2 || dials != 6 {
+		t.Errorf("A calls/dials = %d/%d, want 2/6", calls, dials)
+	}
+	if calls, dials := pb.counts(); calls != 1 || dials != 1 {
+		t.Errorf("B calls/dials = %d/%d, want 1/1 (eighth refused)", calls, dials)
+	}
+	_, ad := pa.counts()
+	_, bd := pb.counts()
+	if ad+bd != 7 {
+		t.Errorf("real exchanges = %d, want request ceiling 7", ad+bd)
+	}
+	// A retained HTTP answer wins before the no-answer exhaustion branch, so
+	// no synthetic upstream_request_failed event is emitted for the refusal.
+	if failed := logs.events(t, "upstream_request_failed"); len(failed) != 0 {
+		t.Errorf("synthetic exhaustion evidence = %v, want none behind retained 429", failed)
+	}
+	done := logs.events(t, "request_completed")
+	if len(done) != 1 || done[0]["candidates_entered"] != float64(2) || done[0]["candidate_attempts"] != float64(3) || done[0]["retry_attempts"] != float64(1) || done[0]["upstream_exchanges"] != float64(7) {
+		t.Errorf("completion = %v, want entries 2 attempts 3 retries 1 exchanges 7", done)
 	}
 }

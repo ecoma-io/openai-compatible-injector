@@ -271,6 +271,20 @@ const (
 	CallerDeadline = "caller_deadline_exceeded"
 )
 
+// CauseExchangeBudget names the exchange envelope itself as the reason a walk
+// stopped: the request had real exchanges left in principle, but not one more
+// the envelope would fund, so the next outbound HTTP request was refused
+// before it was dialed.
+//
+// It is deliberately NOT a transport cause. The transport causes blame a
+// network path — a refused socket, a TLS handshake, a proxy — and this token
+// blames nothing: no endpoint was reached, no member was struck, and the pool
+// that refused the claim had already handed its permit back. It sits outside
+// transportCauses so a class rule can never claim it, and it is reported
+// under the reserved RuleIDBudgetRequest / RuleIDBudgetCandidate identities
+// the engine attaches to its own envelope decision.
+const CauseExchangeBudget = "exchange_budget"
+
 // KnownCallerCause reports whether a token is part of the closed set.
 func KnownCallerCause(s string) bool {
 	switch s {
