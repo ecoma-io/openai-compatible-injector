@@ -372,24 +372,40 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 		// The context the attempt ran under decides ownership: a caller
 		// cancellation or deadline that fired during the dial is terminal —
 		// no fallback, no strike, no evidence — while a failure against a
-		// still-live context is the endpoint's and keeps its bounded
-		// fallback eligibility (a provider-local timeout included).
+		// still-live context is the endpoint's.
 		f := ClassifyAttempt(ar.Ctx, err)
 		if f.CallerTerminated {
 			st.end()
 			return nil, info, err
 		}
-		ms.health.strike()
 		// Bounded per-attempt evidence for the access log: one record per
-		// actually dialed-and-failed endpoint, canonical class and closed-set
-		// cause only — never the error text, never more than maxAttempts
-		// records per request.
-		info.Failures = append(info.Failures, AttemptFailure{
-			Kind:   info.Kind,
-			Target: info.Target,
-			Class:  f.Class.String(),
-			Cause:  f.Cause,
-		})
+		// actually dialed-and-failed endpoint, canonical class, closed-set
+		// cause and send state only — never the error text, never more than
+		// maxAttempts records per request.
+		failure := AttemptFailure{
+			Kind:      info.Kind,
+			Target:    info.Target,
+			Class:     f.Class.String(),
+			Cause:     f.Cause,
+			SendState: f.SendState.String(),
+		}
+		// Send-unknown stops the loop. The endpoint answered nothing, but
+		// the request may still have reached it, so dialing the next member
+		// would silently duplicate a request the upstream may already be
+		// processing. This layer does not get to make that call: the pool
+		// neither strikes the endpoint (its health is unproven) nor spends
+		// another member, and the failure travels up to the injector's
+		// recovery policy — the only layer that owns replay — with the
+		// evidence carrying why.
+		if f.SendState == SendStateUnknown {
+			info.Failures = append(info.Failures, failure)
+			st.end()
+			return nil, info, err
+		}
+		// Definitely-not-sent: no connection ever carried the request, so a
+		// different egress can be tried with no duplicate-request risk.
+		ms.health.strike()
+		info.Failures = append(info.Failures, failure)
 		lastErr = err
 	}
 	st.end()

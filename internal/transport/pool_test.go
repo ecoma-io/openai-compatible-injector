@@ -378,6 +378,11 @@ func TestPoolFallsBackOnPreResponseFailure(t *testing.T) {
 	if info.Attempts != 2 || info.Target != "direct" {
 		t.Errorf("info = %+v", info)
 	}
+	// A connection-class failure proved no connection ever carried the
+	// request, which is exactly what licenses the egress fallback.
+	if len(info.Failures) != 1 || info.Failures[0].SendState != "definitely_not_sent" {
+		t.Errorf("failures = %+v, want one definitely_not_sent record", info.Failures)
+	}
 }
 
 // TestPoolMaxAttemptsCapsDistinctDials pins the bound: three failing
@@ -753,25 +758,33 @@ func TestPoolCallerDeadlineIsTerminalNoFallback(t *testing.T) {
 // caller's context still live, a timeout-shaped endpoint failure is the
 // endpoint's — it strikes health, carries canonical timeout evidence, and
 // falls back within budget.
-func TestPoolProviderLocalTimeoutFallsBack(t *testing.T) {
+// TestPoolSendUnknownTimeoutNeverReplays pins the load-bearing boundary: a
+// timeout on an established connection may have reached the upstream, so no
+// layer below the injector may replay it. The pool dials no second member,
+// strikes no health (the endpoint is unproven, not failed), and hands the
+// failure up carrying its send state.
+func TestPoolSendUnknownTimeoutNeverReplays(t *testing.T) {
 	slow := &stubEndpoint{script: []stubResult{{err: &fakeNetError{timeout: true}}}}
 	live := &stubEndpoint{script: []stubResult{okResult("{}")}}
 	pd, _ := newTestPool(poolMembers(Config{}, Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: true, FailureThreshold: 3, Cooldown: 30 * time.Second}, nil, slow, live)
 
-	resp, info, err := pd.Execute(execReq(false, "{}"))
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
+	_, info, err := pd.Execute(execReq(false, "{}"))
+	if err == nil {
+		t.Fatal("expected the timeout failure to surface")
 	}
-	_ = resp.Body.Close()
-	if slow.hitCount() != 1 || live.hitCount() != 1 {
-		t.Errorf("dials = %d/%d, want 1/1", slow.hitCount(), live.hitCount())
+	if slow.hitCount() != 1 || live.hitCount() != 0 {
+		t.Errorf("dials = %d/%d, want 1/0: a send-unknown failure must never replay", slow.hitCount(), live.hitCount())
 	}
-	if len(info.Failures) != 1 || info.Failures[0].Class != "timeout" || info.Failures[0].Cause != CauseNetworkTimeout {
-		t.Errorf("failures = %+v, want one timeout/network_timeout record", info.Failures)
+	if info.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", info.Attempts)
 	}
-	if h := pd.st.members[0].health; h.fails != 1 {
-		t.Errorf("provider-local timeout did not strike health: fails=%d", h.fails)
+	if len(info.Failures) != 1 || info.Failures[0].Class != "timeout" ||
+		info.Failures[0].Cause != CauseNetworkTimeout || info.Failures[0].SendState != "send_unknown" {
+		t.Errorf("failures = %+v, want one timeout/network_timeout/send_unknown record", info.Failures)
+	}
+	if h := pd.st.members[0].health; h.fails != 0 {
+		t.Errorf("a send-unknown failure struck health: fails=%d, want 0", h.fails)
 	}
 }
 

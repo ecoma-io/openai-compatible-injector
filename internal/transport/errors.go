@@ -81,10 +81,12 @@ func (c Class) String() string {
 	}
 }
 
-// Classify buckets a Do error. Every class except canceled is
-// fallback-eligible: the request provably got no response. The canceled
-// check comes first so a cancellation racing a proxy failure classifies as
-// the caller's event, not the endpoint's.
+// Classify buckets a Do error. The request provably got no response —
+// that is what a Do error means — but "no response" is not "never sent":
+// only the connection-class and proxy-class buckets establish that no
+// connection ever carried the request. The canceled check comes first so a
+// cancellation racing a proxy failure classifies as the caller's event,
+// not the endpoint's.
 func Classify(err error) Class {
 	if err == nil {
 		return ClassNone
@@ -112,14 +114,63 @@ func Classify(err error) Class {
 
 // Failure is the context-aware classification of one failed outbound
 // attempt: the canonical class the fallback decision reads, a bounded
-// cause token for the evidence log, and whether the caller's own request
-// ended (cancellation or deadline). CallerTerminated is terminal at every
-// fallback layer — there is nobody left to answer — while every other
-// failure keeps its existing bounded-fallback eligibility.
+// cause token for the evidence log, whether the caller's own request
+// ended (cancellation or deadline), and whether the request could have
+// reached the wire. CallerTerminated is terminal at every fallback layer —
+// there is nobody left to answer — and SendStateUnknown forbids a replay
+// below the layer that owns retry policy, because a request that may have
+// been processed can never be repeated behind the operator's back.
 type Failure struct {
 	Class            Class
 	Cause            string
 	CallerTerminated bool
+	SendState        SendState
+}
+
+// SendState records whether a failed attempt provably never left the
+// client. Only connection-establishment failures are definitely-not-sent:
+// no TCP connection, TLS handshake, or proxy tunnel ever existed to carry
+// the request bytes. Every other failure — a timeout on an established
+// connection above all — is send-unknown, because the upstream may already
+// be processing a request whose answer never came back.
+//
+// The zero value is the conservative one: an unclassified failure is
+// treated as possibly-transmitted, never as provably-unsent.
+type SendState int
+
+const (
+	// SendStateUnknown means the request may have reached the upstream.
+	// No layer below the policy owner may silently replay it.
+	SendStateUnknown SendState = iota
+	// SendStateNotSent means the failure provably preceded any request
+	// byte — the connection was never established — so replaying it on
+	// another egress carries no duplicate-request risk.
+	SendStateNotSent
+)
+
+// String renders the send state as the closed-set evidence token.
+func (s SendState) String() string {
+	if s == SendStateNotSent {
+		return "definitely_not_sent"
+	}
+	return "send_unknown"
+}
+
+// sendStateOf maps a classified failure to its send state. The cause
+// vocabulary already carries the axis: connection-class causes
+// (connection_refused / tls / dial) and proxy-class causes are
+// connection-establishment failures, while timeout-class failures are the
+// ones that can arrive after the request went out. REFUSED and TLS are the
+// load-bearing cases — a refused TCP connect and a failed TLS handshake
+// both provably precede the HTTP request — so a refused or unreachable
+// egress still falls back while a timeout never does.
+func sendStateOf(class Class) SendState {
+	switch class {
+	case ClassConnection, ClassProxyConnect, ClassProxyAuth:
+		return SendStateNotSent
+	default:
+		return SendStateUnknown
+	}
 }
 
 // Cause tokens. Closed set, code-owned, never derived from error text —
@@ -158,12 +209,12 @@ func ClassifyAttempt(ctx context.Context, err error) Failure {
 	// endpoint's timeout.
 	switch ctx.Err() {
 	case context.Canceled:
-		return Failure{Class: ClassCanceled, Cause: CauseCallerCanceled, CallerTerminated: true}
+		return Failure{Class: ClassCanceled, Cause: CauseCallerCanceled, CallerTerminated: true, SendState: SendStateUnknown}
 	case context.DeadlineExceeded:
-		return Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true}
+		return Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true, SendState: SendStateUnknown}
 	}
 	class := Classify(err)
-	f := Failure{Class: class}
+	f := Failure{Class: class, SendState: sendStateOf(class)}
 	switch class {
 	case ClassProxyAuth:
 		f.Cause = "proxy_auth"
