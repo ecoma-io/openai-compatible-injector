@@ -82,6 +82,12 @@ type Candidate struct {
 	// mid-walk (mid-wait included) cannot reshape these budgets: a request
 	// is bound to the policy it started under.
 	Recovery recovery.Policy
+	// RecoveryHash is Recovery's data identity, computed once at load time
+	// and carried alongside it so the request path never re-hashes a policy
+	// per attempt. It names the policy DATA, not a behavioural claim: two
+	// candidates sharing a hash ran under the same rules and budgets, which
+	// is exactly what the evidence needs to say.
+	RecoveryHash string
 }
 
 // Label is the candidate's observability identity: the providers-table
@@ -124,6 +130,11 @@ type Model struct {
 	// effective policy the handler builds its engine from without reaching
 	// into the chain. It always mirrors Chain[0].Recovery.
 	Recovery recovery.Policy
+	// RecoveryHash is Recovery's data identity, and always mirrors
+	// Chain[0].RecoveryHash. It is what the completion record names, so an
+	// operator can tell two request populations apart by the policy they ran
+	// under without reading the policy itself.
+	RecoveryHash string
 	// Transport is the outbound path requests for this model execute
 	// through — the primary candidate's path. It always mirrors Chain[0].
 	Transport transport.Config

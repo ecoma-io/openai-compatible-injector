@@ -1148,6 +1148,12 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 			return Model{}, fmt.Errorf("provider candidate %d: %w", i+1, err)
 		}
 		chain[i].Recovery = policy
+		// The policy's data identity is computed here, once per load, and
+		// travels with the frozen policy: the request path reports it on
+		// every attempt's evidence, and hashing a policy per attempt would
+		// put a digest on the hot path for a value that cannot change while
+		// the snapshot lives.
+		chain[i].RecoveryHash = policy.Hash()
 	}
 	return Model{
 		Public:          name,
@@ -1157,6 +1163,7 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 		InjectionPrompt: rm.InjectionPrompt,
 		ThinkingUsage:   tu,
 		Recovery:        chain[0].Recovery,
+		RecoveryHash:    chain[0].RecoveryHash,
 		Transport:       chain[0].Transport,
 		Chain:           chain,
 	}, nil
