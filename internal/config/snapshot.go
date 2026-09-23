@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
 )
 
@@ -55,54 +56,12 @@ type SSEKeepAlive struct {
 	Interval time.Duration
 }
 
-// ProviderFallbackPolicy bounds the provider candidate walk: how many
-// chain candidates one request may try when earlier ones fail without
-// answering (transport-level failure only — any HTTP status is an answer
-// and ends the walk). Enabled=false pins the request to the primary
-// candidate. The zero value is a usable "one attempt" policy, but
-// snapshots are built by LoadRuntime, which always materializes the
-// defaults.
-type ProviderFallbackPolicy struct {
-	// Enabled turns candidate fallback on. The default is on.
-	Enabled bool
-	// MaxAttempts is the per-request candidate budget: the walk stops
-	// after this many candidates were tried, chain length permitting.
-	// Between minProviderFallbackAttempts and maxProviderFallbackAttempts.
-	MaxAttempts int
-}
-
-// BackoffPolicy is the validated per-model retry backoff: Initial is the
-// first same-candidate retry delay (doubled per subsequent retry), Max caps
-// both the exponential growth and any upstream-directed Retry-After, and
-// Jitter (in [0,1]) spreads the delay by a uniform ±fraction. The zero
-// value is not a usable default; snapshots are built by LoadRuntime, which
-// always materializes the defaults.
-type BackoffPolicy struct {
-	Initial time.Duration
-	Max     time.Duration
-	Jitter  float64
-}
-
-// RetryPolicy is the validated per-model status retry policy: MaxRetries is
-// the number of same-candidate retries AFTER a candidate's initial attempt
-// (0 disables same-candidate retry), MaxElapsed bounds one candidate's
-// whole retry sequence in time, and Backoff sizes the delays. It is a
-// property of the PUBLIC model: every candidate of the chain walks under
-// the same policy, enforced per candidate. The zero value is not a usable
-// default; snapshots are built by LoadRuntime, which always materializes
-// the defaults.
-type RetryPolicy struct {
-	MaxRetries int
-	MaxElapsed time.Duration
-	Backoff    BackoffPolicy
-}
-
 // Candidate is one provider hop in a model's routing chain: where the
-// request goes, under what upstream model name, and over which outbound
-// path. Chains are built immutable at config load; the first candidate is
-// the primary route and the rest are fallbacks a request walks only when
-// an earlier one fails before answering (never on an HTTP status — statuses
-// are answers).
+// request goes, under what upstream model name, over which outbound path,
+// and under which recovery policy. Chains are built immutable at config
+// load; the first candidate is the primary route and the rest are fallbacks
+// a request walks only when an earlier one fails before answering (never on
+// an HTTP status — statuses are answers).
 type Candidate struct {
 	// Provider names the providers-table entry; empty for the legacy inline
 	// endpoint form, which builds a one-candidate chain.
@@ -116,6 +75,19 @@ type Candidate struct {
 	// the provider's referenced transport, or the zero value (direct) for
 	// a provider without a transport reference.
 	Transport transport.Config
+	// Recovery is the effective recovery policy this candidate executes
+	// under. It is resolved at load time — global block, then this
+	// candidate's provider override, then the model override, then the
+	// candidate's own override — and frozen onto the snapshot, so a reload
+	// mid-walk (mid-wait included) cannot reshape these budgets: a request
+	// is bound to the policy it started under.
+	Recovery recovery.Policy
+	// RecoveryHash is Recovery's data identity, computed once at load time
+	// and carried alongside it so the request path never re-hashes a policy
+	// per attempt. It names the policy DATA, not a behavioural claim: two
+	// candidates sharing a hash ran under the same rules and budgets, which
+	// is exactly what the evidence needs to say.
+	RecoveryHash string
 }
 
 // Label is the candidate's observability identity: the providers-table
@@ -154,12 +126,15 @@ type Model struct {
 	// ThinkingUsage is the validated simulated thinking-usage synthesis
 	// config. The zero value means the feature is off for this model.
 	ThinkingUsage ThinkingUsage
-	// Retries is the validated per-model status retry policy. Every
-	// candidate of the chain walks under it, enforced per candidate; a
-	// reload mid-request cannot change the policy a request is retrying
-	// under, because it binds to the request's snapshot like everything
-	// else.
-	Retries RetryPolicy
+	// Recovery is the model's primary-candidate recovery policy: the
+	// effective policy the handler builds its engine from without reaching
+	// into the chain. It always mirrors Chain[0].Recovery.
+	Recovery recovery.Policy
+	// RecoveryHash is Recovery's data identity, and always mirrors
+	// Chain[0].RecoveryHash. It is what the completion record names, so an
+	// operator can tell two request populations apart by the policy they ran
+	// under without reading the policy itself.
+	RecoveryHash string
 	// Transport is the outbound path requests for this model execute
 	// through — the primary candidate's path. It always mirrors Chain[0].
 	Transport transport.Config
@@ -189,7 +164,6 @@ type Snapshot struct {
 	transports []transport.Config
 	logLevel   zerolog.Level
 	keepAlive  SSEKeepAlive
-	fallback   ProviderFallbackPolicy
 }
 
 // Gen returns the snapshot's generation number (0 for the initial snapshot,
@@ -211,11 +185,6 @@ func (s *Snapshot) APIKey() string { return s.apiKey }
 // They bind to the request like everything else on the snapshot, so an
 // in-flight stream keeps the interval it started with across a reload.
 func (s *Snapshot) SSEKeepAlive() SSEKeepAlive { return s.keepAlive }
-
-// ProviderFallback returns the provider candidate-walk policy this
-// snapshot carries. It binds to the request like everything else on the
-// snapshot: a request that started on one policy finishes under it.
-func (s *Snapshot) ProviderFallback() ProviderFallbackPolicy { return s.fallback }
 
 // Transports returns the distinct outbound transport configs this
 // snapshot's models reference. The registry retains exactly these on

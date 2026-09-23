@@ -290,13 +290,20 @@ func TestUsageRetryChainFacts(t *testing.T) {
 // one fixed HTTP status — the answer-shaped result a retained-answer test
 // needs from the Execute branch. Do panics: a pool candidate must never
 // fall back to it.
+//
+// It claims the request's exchange envelope the way a real pool does — one
+// unit per dial, immediately before the dial — so the handler's exchange
+// accounting sees the traffic this stand-in actually stands for.
 type statusExecutor struct {
 	status   int
 	info     transport.AttemptInfo
 	doCalled bool
 }
 
-func (e *statusExecutor) Execute(*transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+func (e *statusExecutor) Execute(ar *transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+	if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+		return nil, transport.AttemptInfo{BudgetExhausted: true}, errors.New("exchange budget exhausted")
+	}
 	return &http.Response{
 		StatusCode: e.status,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},

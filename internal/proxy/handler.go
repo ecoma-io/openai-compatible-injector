@@ -23,6 +23,7 @@ import (
 	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/inject"
+	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
 	"openai-compatible-injector/internal/usage"
 )
@@ -289,39 +290,60 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// construction — scheme+host only, the same surface origin() allows;
 		// userinfo never enters AttemptInfo.
 		egress *transport.AttemptInfo
-		// egressAttemptsTotal sums the endpoints actually dialed across
-		// every candidate of the walk — the pool's report where a candidate
-		// routed through one, the single dial where it did not — because the
-		// usage record is one row for the whole request, not one per
-		// candidate. egressKind is the last candidate's egress mode, in the
-		// same vocabulary the log events use: "direct" for the
-		// single-endpoint path, the last dialed pool member's kind otherwise,
-		// and empty when a pool exhausted without dialing anything — which,
-		// with the total, keeps a zero-dial exhaustion distinguishable from
-		// a direct dial (direct dials at least once).
-		egressAttemptsTotal int
+		// eng is the request's recovery engine: the snapshot-bound policy
+		// that decides what one failed attempt means, plus the exchange
+		// envelope every dial claims from. It is created at the walk's start
+		// and nil before then, and the completion closures below treat a nil
+		// engine as "no provider path was reached".
+		eng *recovery.Engine
+		// budgetStopped records that the exchange envelope, not a provider,
+		// ended the walk: the transport refused (or the handler declined) the
+		// next outbound exchange. It outranks every other explanation of a
+		// walk that received no answer, because none of them happened — no
+		// endpoint was dialed and no member was blamed.
+		budgetStopped bool
+		// lastPolicyHash is the effective policy hash of the most recently
+		// entered candidate: the policy the last attempt ran under, which is
+		// what the completion evidence names.
+		lastPolicyHash string
 		// streamed is the mode the response was actually relayed in, which
 		// the probe's stream flag only predicts: a stream=true request whose
 		// upstream answered non-SSE is relayed buffered, and the record says
 		// what happened, not what was asked.
 		streamed bool
-		// providerAttempts counts the walk's upstream EXCHANGES — each
-		// candidate's initial attempt plus its same-candidate retries —
-		// and finalProvider is the identity (providers-table name, or
-		// endpoint origin) of the candidate whose answer was committed or,
-		// on exhaustion/disconnect, of the last one attempted.
+		// providerAttempts counts the walk's provider-level attempts — each
+		// candidate's initial attempt plus its same-candidate retries — and
+		// retriesTotal counts the retries among them. The two are counted
+		// separately, and retriesTotal is incremented where a retry actually
+		// starts, because deriving retries by subtracting entered candidates
+		// from attempts assumes every entered candidate attempted something:
+		// a candidate whose pool dials nothing is entered and attempts
+		// nothing, which would make the subtraction negative.
+		// finalProvider is the identity (providers-table name, or endpoint
+		// origin) of the candidate whose answer was committed or, on
+		// exhaustion/disconnect, of the last one attempted.
 		// providerExhausted marks the walk ending with no candidate
-		// answering. retriesTotal counts the same-candidate status retries
-		// the walk performed; lastCandIndex is the one-based chain position
-		// of the most recent candidate — the answering one whenever an
-		// answer was committed (an answer is always committed for the
-		// current candidate), else the last attempted one.
+		// answering. lastCandIndex is the one-based chain position of the
+		// most recent candidate — the answering one whenever an answer was
+		// committed (an answer is always committed for the current
+		// candidate), else the last attempted one.
 		providerAttempts  int
+		retriesTotal      int
 		finalProvider     string
 		providerExhausted bool
-		retriesTotal      int
 		lastCandIndex     int
 	)
+	// exchanges is how many real outbound exchanges the request has spent so
+	// far. It is read from the engine's live envelope rather than counted
+	// here: the transport claims the units where the dials happen (a pool's
+	// fallback included), so one number serves the log, the usage record, and
+	// the budget decision without any of them being able to drift.
+	exchanges := func() int {
+		if eng == nil {
+			return 0
+		}
+		return eng.Budget().RequestExchanges()
+	}
 	withEgress := func(ev *zerolog.Event) *zerolog.Event {
 		if egress == nil {
 			return ev
@@ -331,12 +353,39 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("egress_target", egress.Target).
 			Bool("egress_exhausted", egress.Exhausted)
 	}
+	// withProviders adds the walk's completion facts. candidate_attempts is
+	// the same total as provider_attempts seen from the other scope — one
+	// provider attempt IS one attempt on some candidate — while
+	// upstream_exchanges is the count of real dials and can be higher, since
+	// one pooled attempt may dial several members.
+	// provider_attempts/retries_total stay as compatibility aliases of
+	// candidate_attempts/retry_attempts, the same way attempt aliases
+	// egress_attempt on the per-dial events; the new names are authoritative.
+	//
+	// request_exchange_budget_remaining reports the REQUEST-wide envelope's
+	// headroom, not the tighter of the two: a finished walk has usually spent
+	// its candidate envelope, so the tighter number would read zero for every
+	// ordinary request.
+	//
+	// A walk that entered a candidate but dialed nothing still carries its
+	// walk facts: the gate is the engine, not the exchange count, because a
+	// zero-dial walk had a policy decide it and the operator needs the same
+	// identity — final_provider, policy_hash, provider_exhausted — that any
+	// other walk reports.
 	withProviders := func(ev *zerolog.Event) *zerolog.Event {
-		if providerAttempts == 0 {
+		if eng == nil || eng.CandidatesEntered() == 0 {
 			return ev
 		}
+		entered := eng.CandidatesEntered()
 		ev = ev.Int("provider_attempts", providerAttempts).
 			Int("retries_total", retriesTotal).
+			Int("candidate_attempts", providerAttempts).
+			Int("retry_attempts", retriesTotal).
+			Int("candidates_entered", entered).
+			Int("upstream_exchanges", exchanges()).
+			Int("request_exchange_budget_remaining", eng.Budget().RequestRemaining()).
+			Str("policy_hash", lastPolicyHash).
+			Uint64("policy_generation", snap.Gen()).
 			Int("final_candidate", lastCandIndex).
 			Str("final_provider", finalProvider)
 		if providerExhausted {
@@ -398,7 +447,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 				BytesIn:          bytesIn,
 				BytesOut:         sw.bytes,
 				ProviderAttempts: providerAttempts,
-				EgressAttempts:   egressAttemptsTotal,
+				EgressAttempts:   exchanges(),
 				EgressKind:       egressKind,
 				LatencyMS:        time.Since(start).Milliseconds(),
 			})
@@ -537,23 +586,31 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 
 	log.Debug().Int64("bytes_in", bytesIn).Msg("request_transform_started")
 
-	// The provider walk. The model's candidate chain is tried primary
-	// first under the snapshot's provider-fallback policy, and the
-	// snapshot-bound status matrix (retry.go) decides what one upstream
-	// result means for the walk:
+	// The provider walk. The model's candidate chain is tried primary first,
+	// and the engine built here decides what one finished attempt means —
+	// from the snapshot-bound recovery policy, which is the closed matrix of
+	// dispositions plus the retry, fallback, retry-after, and exchange
+	// envelope numbers, as data:
 	//
-	//   - retryable results — 408/425/429, every 5xx except 501/505, and
-	//     a malformed or incomplete response received before commitment —
-	//     re-ask the SAME candidate while its retry budget lasts (bounded
-	//     count, bounded elapsed window, capped backoff, capped
-	//     Retry-After), then move to the next candidate;
-	//   - fallback-only results — 401/403/404/405/409/422 — move to the
-	//     next candidate immediately, never re-asking the same one;
-	//   - terminal results (every other 4xx/5xx) and answers (2xx/3xx/
+	//   - a retryable result — 408/425/429, every 5xx except the 501/505
+	//     carve-outs, and a malformed or incomplete response received before
+	//     commitment — re-asks the SAME candidate while its retry budget
+	//     lasts (bounded count, bounded elapsed window, capped backoff, capped
+	//     Retry-After), then moves to the next candidate;
+	//   - a fallback-only result — 401/403/404/405/409/422 — moves to the next
+	//     candidate immediately, never re-asking the same one;
+	//   - a terminal result (every other 4xx/5xx) and an answer (2xx/3xx/
 	//     204/304) end the walk;
-	//   - transport-level failures (dial, TLS, proxy, egress exhaustion)
-	//     never re-ask the same candidate — they move to the next one
-	//     directly.
+	//   - a transport-level failure (dial, TLS, proxy, egress exhaustion)
+	//     carries the class its own cause belongs to and, by default, moves to
+	//     the next candidate.
+	//
+	// The engine is handed the request context, the walk's clock, and the
+	// walk's jitter draw, so one request is measured and spread by one clock
+	// and one draw whichever layer asks. It owns the fallback budget
+	// (EnterCandidate), the retry budget, and the exchange envelope
+	// (Budget), and it is a pure decision maker: it never dials, never
+	// sleeps, never writes, and never logs. The handler executes.
 	//
 	// Each attempt replays the same immutable client body through the
 	// candidate's own transform (its upstream model name and endpoint
@@ -570,17 +627,9 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// transform fails every candidate's transform (the transform sees only
 	// the body and model mapping, never the network), so the 400 is
 	// answered on the first attempt.
-	policy := snap.ProviderFallback()
-	budget := 1
-	if policy.Enabled {
-		budget = policy.MaxAttempts
-	}
-	if budget > len(m.Chain) {
-		budget = len(m.Chain)
-	}
-	// Caller deadline, read once: the retry decisions cap their waits to
-	// the caller's remaining time, and the walk never outlives it.
-	callerDeadline, _ := r.Context().Deadline()
+	eng = recovery.NewEngine(r.Context(), m.Recovery,
+		recovery.WithClock(retryNow),
+		recovery.WithJitterSource(retryJitterDraw))
 
 	// answerKind is the committed result's shape, chosen by the post-walk
 	// relay branches. answerSSE and answerVerbatim hold the live response;
@@ -609,6 +658,14 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		invalid   int                   // answerInvalid flavor (invalid*)
 		cand      config.Candidate
 		candIndex int // one-based chain position
+		// committed marks a result the upstream has already produced, as
+		// opposed to a decision not to ask it. The walk commits one answer
+		// per request and does so before the first byte reaches the client,
+		// so nothing in this handler ever observes a failure on a committed
+		// result — the invariant holds structurally. The evidence still
+		// carries the fact, because the alternative is a policy that silently
+		// becomes able to retry after a relay has started.
+		committed bool
 		// egressKind is this attempt's own egress mode — the pool's last
 		// dialed member's kind, or direct. It rides along so a retained
 		// answer's usage record names ITS egress, not the last failed
@@ -653,36 +710,18 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// failure happened: re-classifying after the walk could let a client
 		// disconnect that raced the loop's end re-own an endpoint failure.
 		lastFailureCause string
-		// candidatesTried is how many chain candidates this walk has
-		// entered — the provider-fallback budget's denominator.
-		candidatesTried int
-		// retryStart is the current candidate's first-attempt timestamp;
-		// its elapsed window (retries.max-elapsed) measures from here.
-		retryStart time.Time
+		// lastRuleID is the identity of the decision that ended the last
+		// attempt — a matrix rule, or one of the engine's reserved invariant
+		// identities. It rides the exhaustion report so an operator can tell
+		// "the 429 row said fall back" from "the envelope stopped the walk".
+		lastRuleID string
 	)
 
-	// decide evaluates one failed attempt against the snapshot-bound retry
-	// policy — the walk's only decision point. It feeds facts (which kind
-	// of failure, the candidate's own budget state, whether a next
-	// candidate is still reachable, the parsed Retry-After) and gets back
-	// a flow, never I/O.
-	decide := func(disp statusDisposition, attempt, i, tried int, ra time.Duration) retryDecision {
-		return evaluateRetry(retryInput{
-			Disp:           disp,
-			Attempts:       attempt,
-			HasNext:        i+1 < len(m.Chain) && tried < budget,
-			Start:          retryStart,
-			Now:            retryNow(),
-			Policy:         m.Retries,
-			CallerDeadline: callerDeadline,
-			RetryAfter:     ra,
-		})
-	}
 	// waitOut sleeps a same-candidate retry's bounded delay, cancellable.
 	// False means the caller went away during the wait: the request is
 	// done — no further attempt, no envelope, only the completion record.
-	waitOut := func(dec retryDecision) bool {
-		if dec.Action != retrySameCandidate {
+	waitOut := func(dec recovery.Decision) bool {
+		if dec.Action != recovery.ActionRetry {
 			return true
 		}
 		// retryWait is the only sleep site and reports the context's
@@ -718,16 +757,22 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 walk:
 	for i := range m.Chain {
-		if candidatesTried >= budget {
+		cand := m.Chain[i]
+		// EnterCandidate is the fallback budget's gate. The first candidate is
+		// always enterable; every later one spends a fallback slot, opens the
+		// candidate's own exchange envelope, and starts its retry window. A
+		// false means the walk may not reach another candidate at all — the
+		// finalize path below still prefers a retained answer over a
+		// synthesized 502.
+		if !eng.EnterCandidate(cand.Recovery) {
 			break
 		}
-		cand := m.Chain[i]
-		candidatesTried++
 		lastCandIndex = i + 1
 		finalProvider = cand.Label()
 		lastCand = cand
+		lastPolicyHash = cand.RecoveryHash
 		egress = nil
-		retryStart = retryNow()
+		candStart := eng.Now()
 
 		// The candidate view: same public model, same injection prompt,
 		// same thinking plan — only the upstream identity changes. m is a
@@ -740,10 +785,7 @@ walk:
 
 		attempt := 0
 		for {
-			attemptStart := retryNow()
-			// A next candidate is reachable only when the chain has one
-			// AND the fallback budget still covers it.
-			hasNext := i+1 < len(m.Chain) && candidatesTried < budget
+			attemptStart := eng.Now()
 
 			out, terr := transform(body, m)
 			if terr != nil {
@@ -775,28 +817,71 @@ walk:
 				return
 			}
 			copyForwardHeaders(req.Header, r.Header)
-			// Counted here, not at the loop head: these count upstream
-			// EXCHANGES, so a transform or request-build failure above — which
+			// Counted here, not at the loop head: these count provider-level
+			// ATTEMPTS, so a transform or request-build failure above — which
 			// never reaches a provider — must not report an attempt that never
 			// happened. attempt is candidate-local (its own retries included);
-			// providerAttempts is the walk's global exchange index.
+			// providerAttempts is the walk's global provider-attempt index.
+			// Egress exchanges are claimed separately at each real dial by the
+			// budget, so a pooled attempt can honestly consume several.
 			attempt++
-			providerAttempts++
 			retryIndex := attempt - 1
-			if retryIndex > 0 {
-				retriesTotal++
+			// noteAttempt counts one provider-level attempt, and the retry
+			// inside it when there is one. Both are counted at the same place,
+			// after the transport confirmed the attempt reached a provider, so
+			// retries_total can never report a re-ask the attempt counter does
+			// not contain.
+			noteAttempt := func() {
+				providerAttempts++
+				if attempt > 1 {
+					retriesTotal++
+				}
+			}
+			// fallBackOnSpentCandidate answers the one refusal no observation
+			// can describe: the transport declined to dial because this
+			// candidate's own exchange envelope is spent. It asks the engine —
+			// whose answer is the retry policy's on-exhausted action — and
+			// reports whether the walk may move on.
+			//
+			// A refusal by the REQUEST envelope is not this case: it is
+			// terminal whatever the policy says, it is reported by the
+			// post-walk record under the request identity, and this returns
+			// false so the caller stops the walk exactly as it always has.
+			//
+			// The record carries no upstream_exchange index, because the
+			// refusal claimed no exchange: naming one would invent an exchange
+			// that never happened. provider_attempt carries the attempts made
+			// so far — the same number the other events' one-based index is
+			// derived from — and request_exchange_budget_remaining is the
+			// headroom the refusal left for the rest of the walk.
+			fallBackOnSpentCandidate := func() bool {
+				if eng.Budget().Exhausted() == recovery.ExhaustionRequest {
+					return false
+				}
+				dec := eng.CandidateSpent(recovery.CauseExchangeBudget)
+				act := walkAction(dec.Action, i+1 < len(m.Chain))
+				log.Warn().
+					Str("public_model", model).
+					Str("provider", cand.Label()).
+					Str("error_class", "provider_exhausted").
+					Str("error_cause", recovery.CauseExchangeBudget).
+					Str("disposition", act.String()).
+					Str("reason", dec.Reason).
+					Str("policy_rule_id", dec.RuleID).
+					Str("policy_hash", lastPolicyHash).
+					Uint64("policy_generation", snap.Gen()).
+					Int("provider_attempt", providerAttempts).
+					Int("candidate_index", i+1).
+					Int("candidate_attempt", attempt).
+					Int("retry_index", retryIndex).
+					Int("request_exchange_budget_remaining", eng.Budget().RequestRemaining()).
+					Int64("elapsed_ms", eng.Now().Sub(attemptStart).Milliseconds()).
+					Msg("candidate_exchange_budget_spent")
+				return act == recovery.ActionFallback
 			}
 			// This request has now reached the provider path. Any subsequent
 			// dial failure still yields one event with the walk's final facts.
 			meterEvent = true
-			log.Debug().Str("provider", cand.Label()).
-				Str("upstream", origin(&upstream)).
-				Int64("bytes_out", int64(len(out))).
-				Int("provider_attempt", providerAttempts).
-				Int("candidate_index", i+1).
-				Int("candidate_attempt", attempt).
-				Int("retry_index", retryIndex).
-				Msg("upstream_request_started")
 			lastUpstream = &upstream
 
 			// The outbound hop: the candidate's provider transport, resolved
@@ -816,6 +901,15 @@ walk:
 			var resp *http.Response
 			d := h.doers.Doer(cand.Transport)
 			ex, pooled := d.(transport.Executor)
+			// The exchanges this request had already spent when this attempt
+			// began. The attempt's own upstream_exchange index is this plus its
+			// place in the attempt's own dial order, because a pooled attempt is
+			// several real exchanges where a direct one is a single exchange.
+			exchangeBefore := eng.Budget().RequestExchanges()
+			// This is an attempt-local index. In particular, an envelope
+			// refusal before a direct dial must not inherit the previous
+			// attempt's egress index into its final evidence.
+			lastEgressAttempt = 0
 			if pooled {
 				var info transport.AttemptInfo
 				resp, info, uerr = ex.Execute(&transport.AttemptRequest{
@@ -825,31 +919,106 @@ walk:
 					Header:    req.Header.Clone(),
 					Body:      out,
 					Streaming: stream,
+					Budget:    eng.Budget(),
 				})
 				egress = &info
-				egressAttemptsTotal += info.Attempts
 				lastEgressAttempt = info.Attempts
+				// The provider attempt is counted here — AFTER the pool is
+				// back and only when it dialed — so the counters name
+				// exchanges that reached a provider. A refusal inside the
+				// pool's loop leaves info.Attempts at its pre-refusal value
+				// in one case only (the envelope refusing the very next dial
+				// after this Execute's first real one, which returns the last
+				// endpoint error rather than an empty result), so the guard
+				// is what counts, not the flag.
+				if info.Attempts > 0 {
+					noteAttempt()
+					log.Debug().Str("provider", cand.Label()).
+						Str("upstream", origin(&upstream)).
+						Int64("bytes_out", int64(len(out))).
+						Int("provider_attempt", providerAttempts).
+						Int("candidate_index", i+1).
+						Int("candidate_attempt", attempt).
+						Int("retry_index", retryIndex).
+						Msg("upstream_request_started")
+				}
 				// Per-attempt evidence, bounded by the fallback budget: one WARN
 				// per dialed-and-failed endpoint, correlated by this request's
 				// request_id and its one-based provider/egress attempt indexes.
 				// Typed class, closed-set cause, and scheme+host only — the error
 				// text, any credential material, and skipped members (no dial, no
 				// event) stay out. attempt rides along as the pre-existing alias
-				// for egress_attempt; the new field is authoritative.
+				// for egress_attempt; the new field is authoritative. No decision
+				// produced these records — the dial failed before any disposition
+				// was reached — so policy_rule_id is empty here by construction.
 				for j, fl := range info.Failures {
-					event := withAttemptFields(log.Warn().Str("public_model", model).
+					event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 						Str("provider", cand.Label()).
 						Str("egress_kind", fl.Kind).Str("egress_target", fl.Target).
 						Str("error_class", fl.Class).Str("error_cause", fl.Cause).
 						Int("egress_attempt", j+1).
 						Int("attempt", j+1),
-						providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
+						"", lastPolicyHash, snap.Gen(), exchangeBefore+j+1, eng.Budget().RequestRemaining())
 					event.Msg("egress_attempt_failed")
 				}
+				if info.BudgetExhausted {
+					// The envelope refused the pool's next dial, so no member
+					// was struck for a dial that never started and the pool
+					// handed the refused member's permit back before
+					// returning.
+					//
+					// Which envelope refused it decides the walk. A spent
+					// REQUEST envelope ends everything: no candidate may spend
+					// another exchange, so the walk stops with the envelope
+					// named rather than an endpoint. A spent CANDIDATE envelope
+					// forbids only another exchange on THIS candidate, and the
+					// walk keeps its ordinary options — a dial did fail here
+					// (the pool returns that last error with the flag set), so
+					// the failure is observed and decided like any other, and
+					// the engine turns a retry into the retry policy's
+					// on-exhausted action. A per-candidate number must never
+					// silently pin a chain the operator configured to fall
+					// back.
+					if eng.Budget().Exhausted() == recovery.ExhaustionRequest {
+						budgetStopped = true
+						break walk
+					}
+					if uerr == nil {
+						// The refusal came before this attempt's first dial,
+						// so there is no failure to observe: the engine is
+						// asked the candidate-envelope question directly.
+						if !fallBackOnSpentCandidate() {
+							budgetStopped = true
+							break walk
+						}
+						break
+					}
+				}
 			} else {
+				// The exchange envelope is claimed here for a single-endpoint
+				// candidate: the transport claims its own dials, and this path is
+				// one dial. A refusal is not a transport failure — nothing was
+				// dialed, no endpoint is to blame — so no observation is built:
+				// the walk stops with the envelope named, exactly as it does for
+				// a pool that refused a dial.
+				if !eng.Budget().ConsumeExchange() {
+					if !fallBackOnSpentCandidate() {
+						budgetStopped = true
+						break walk
+					}
+					break
+				}
+				noteAttempt()
+				log.Debug().Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Int64("bytes_out", int64(len(out))).
+					Int("provider_attempt", providerAttempts).
+					Int("candidate_index", i+1).
+					Int("candidate_attempt", attempt).
+					Int("retry_index", retryIndex).
+					Msg("upstream_request_started")
 				resp, uerr = d.Do(req)
-				// One exchange, dialed or failed — the attempt happened either way.
-				egressAttemptsTotal++
 				lastEgressAttempt = 1
 			}
 			// This attempt's own egress mode — the pool's last dialed
@@ -876,9 +1045,42 @@ walk:
 					// Zero dials is a pool-level condition — no member was
 					// blamed — so the endpoint vocabulary would be an
 					// invention.
-					class, cause = "egress_exhausted", "no_eligible_endpoint"
+					class, cause = "egress_exhausted", recovery.CauseNoEligibleEndpoint
 				}
 				lastFailureCause = cause
+				// The observation the engine decides on. A caller-terminated
+				// failure leaves the transport vocabulary entirely: its owner
+				// is the request context, never the wire, and the engine
+				// hard-stops on that class whatever the matrix says.
+				obs := recovery.Observation{
+					Class:            recovery.FailureTransport,
+					TransportClass:   transportClassOf(f.Class),
+					TransportCause:   f.Cause,
+					Streaming:        stream,
+					Committed:        answer != nil,
+					CandidateIndex:   i + 1,
+					CandidateAttempt: attempt,
+					RetryIndex:       retryIndex,
+					Elapsed:          eng.Now().Sub(candStart).Milliseconds(),
+				}
+				if f.CallerTerminated {
+					obs.Class = recovery.FailureCaller
+					obs.CallerCause = f.Cause
+					obs.TransportClass = recovery.TransportClassNone
+					obs.TransportCause = ""
+				} else if pooled && egress.Exhausted {
+					// A pool that dialed nothing has no endpoint to blame, and
+					// no_eligible_endpoint is the token that says so.
+					obs.TransportCause = recovery.CauseNoEligibleEndpoint
+					obs.TransportClass = recovery.TransportClassOfCause(recovery.CauseNoEligibleEndpoint)
+				}
+				dec := eng.Observe(obs)
+				lastRuleID = dec.RuleID
+				// The decision folded against the chain: a fallback with no
+				// candidate left to fall to is a terminal outcome, and an
+				// exhausted chain must never be reported as a fallback that
+				// happened.
+				act := walkAction(dec.Action, i+1 < len(m.Chain))
 				if f.CallerTerminated {
 					// The client went away — canceled, or done waiting —
 					// before any upstream answered. No fallback: there is
@@ -892,12 +1094,13 @@ walk:
 						Str("upstream", origin(&upstream)).
 						Str("error_class", class).
 						Str("error_cause", cause).
-						Str("disposition", "terminal").
-						Str("reason", cause)
+						Str("disposition", act.String()).
+						Str("reason", dec.Reason)
 					if lastEgressAttempt > 0 {
 						event = event.Int("egress_attempt", lastEgressAttempt)
 					}
-					event = withAttemptFields(event, providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+					event = withPolicyFields(withAttemptFields(event, providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining())
 					event.Msg("upstream_request_failed")
 					complete()
 					return
@@ -906,14 +1109,16 @@ walk:
 				// direct failure gets the same per-dial record a pool
 				// member's failure gets (kind direct, first egress attempt),
 				// so downstream queries need no knowledge of which transport
-				// served the candidate.
+				// served the candidate. A pool emitted its own records as the
+				// dials failed, before this point.
 				if !pooled {
-					event := withAttemptFields(log.Warn().Str("public_model", model).
+					event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 						Str("provider", cand.Label()).
 						Str("egress_kind", "direct").Str("egress_target", "direct").
 						Str("error_class", class).Str("error_cause", cause).
 						Int("egress_attempt", 1),
-						providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+1, eng.Budget().RequestRemaining())
 					event.Msg("egress_attempt_failed")
 				}
 				// Transport-level failure with the client still present: one
@@ -929,14 +1134,27 @@ walk:
 					Str("upstream", origin(&upstream)).
 					Str("error_class", class).
 					Str("error_cause", cause).
-					Str("disposition", dispositionName(moveOrFinalize(hasNext).Action)).
-					Str("reason", cause)
+					Str("disposition", act.String()).
+					Str("reason", dec.Reason)
 				if lastEgressAttempt > 0 {
 					event = event.Int("egress_attempt", lastEgressAttempt)
 				}
-				event = withAttemptFields(event, providerAttempts, i+1, attempt, retryNow().Sub(attemptStart))
+				event = withPolicyFields(withAttemptFields(event, providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
+					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining())
 				event.Msg("provider_attempt_failed")
-				break
+				if !waitOut(dec) {
+					return
+				}
+				if act == recovery.ActionRetry {
+					// Only a configured matrix can ask for this — the default
+					// rows move a transport failure on rather than re-asking a
+					// dead socket — and the engine's budget already sized it.
+					continue
+				}
+				if act == recovery.ActionFallback {
+					break
+				}
+				break walk
 			}
 
 			// An HTTP answer arrived. Logged per exchange (discarded
@@ -972,44 +1190,52 @@ walk:
 					complete()
 					return
 				}
-				var (
-					disp   statusDisposition
-					reason string
-					ra     time.Duration
-				)
-				switch cerr {
-				case captureOK:
-					disp = classifyStatus(status)
-					reason = statusReason(status)
-				case captureDeadline:
-					// An error body whose bounded capture stalled: the status
-					// never really arrived, so its own row in the matrix does
-					// not apply — an unusable answer is retryable whatever
-					// code it was carrying.
-					disp = dispRetryable
-					reason = reasonBodyTimeout
-				default:
-					disp = dispRetryable
-					reason = reasonBodyReadFailed
-				}
-				if disp == dispRetryable {
+				// The observation the matrix decides on. A complete capture
+				// classified the status it received; a stalled or failed
+				// capture never really received a usable answer, so the
+				// status's own row does not apply — an unusable answer is
+				// whatever the protocol cause says it is, whatever code the
+				// response was carrying.
+				obs := recovery.Observation{
+					Streaming:        stream,
+					Committed:        answer != nil,
+					CandidateIndex:   i + 1,
+					CandidateAttempt: attempt,
+					RetryIndex:       retryIndex,
+					Elapsed:          eng.Now().Sub(candStart).Milliseconds(),
 					// A bounded directive, honored only for same-candidate
 					// retries and always re-capped by the policy before any
 					// sleep. It rides the response, not the body: a stalled
 					// capture still read the headers.
-					ra = parseRetryAfter(resp.Header.Get("Retry-After"), retryNow())
+					RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), eng.Now()),
 				}
-				dec := decide(disp, attempt, i, candidatesTried, ra)
+				switch cerr {
+				case captureOK:
+					obs.Class = recovery.FailureHTTP
+					obs.HTTPStatus = status
+					obs.StatusClass = recovery.StatusClassOf(status)
+					obs.ProviderErrorType = ev.providerType
+					obs.ProviderErrorCode = ev.providerCode
+				case captureDeadline:
+					obs.Class = recovery.FailureProtocol
+					obs.ProtocolCause = recovery.ProtocolBodyTimeout
+				default:
+					obs.Class = recovery.FailureProtocol
+					obs.ProtocolCause = recovery.ProtocolBodyReadFailed
+				}
+				dec := eng.Observe(obs)
+				lastRuleID = dec.RuleID
+				act := walkAction(dec.Action, i+1 < len(m.Chain))
 				// One evidence event per received error response — the
 				// discarded attempts included; the canonical envelope write
 				// happens after the walk, from the retained evidence.
-				elapsed := retryNow().Sub(attemptStart)
+				elapsed := eng.Now().Sub(attemptStart)
 				if cerr == captureOK {
 					event := log.Warn()
 					if status >= http.StatusInternalServerError {
 						event = log.Error()
 					}
-					event = withAttemptFields(event.Str("public_model", model).
+					event = withPolicyFields(withAttemptFields(event.Str("public_model", model).
 						Str("upstream_model", cand.UpstreamModel).
 						Str("upstream", origin(&upstream)).
 						Int("upstream_status", ev.status).
@@ -1021,9 +1247,10 @@ walk:
 						Bool("body_truncated", ev.truncated).
 						Str("error_fingerprint", ev.fingerprint).
 						Int("egress_attempt", lastEgressAttempt),
-						providerAttempts, i+1, attempt, elapsed).
-						Str("disposition", dispositionName(dec.Action)).
-						Str("reason", reason)
+						providerAttempts, i+1, attempt, elapsed),
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
+						Str("disposition", act.String()).
+						Str("reason", dec.Reason)
 					for _, f := range evidenceRateLimitFields {
 						if v := ev.rateLimit[f.header]; v != "" {
 							event = event.Str(f.field, v)
@@ -1045,19 +1272,20 @@ walk:
 						w = w.Str("error_class", "upstream_error").
 							Str("error_cause", "body_read_failed")
 					}
-					w = withAttemptFields(w, providerAttempts, i+1, attempt, elapsed).
-						Str("disposition", dispositionName(dec.Action)).
-						Str("reason", reason).
+					w = withPolicyFields(withAttemptFields(w, providerAttempts, i+1, attempt, elapsed),
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
+						Str("disposition", act.String()).
+						Str("reason", dec.Reason).
 						Int("upstream_status", status)
 					w.Msg("upstream_body_read_failed")
 				}
 				if !waitOut(dec) {
 					return
 				}
-				if dec.Action == retrySameCandidate {
+				if act == recovery.ActionRetry {
 					continue
 				}
-				if dec.Action == retryNextCandidate {
+				if act == recovery.ActionFallback {
 					// The candidate's budget is spent, but it DID answer —
 					// remember that answer: if every remaining candidate
 					// then fails before answering, this one becomes the
@@ -1083,7 +1311,7 @@ walk:
 				// SSE answer: the headers are the commitment. The body is
 				// not read here — it streams after the walk, and anything
 				// that kills it later truncates the committed stream.
-				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, committed: true}
 				break walk
 			}
 
@@ -1099,29 +1327,44 @@ walk:
 				// upstream failure or spend the retry budget.
 				if r.Context().Err() != nil || clientSide(rerr) {
 					// The client is gone mid-answer and the upstream may be
-					// fine. No envelope write is attempted.
+					// fine. No envelope write is attempted. The caller owns
+					// this branch — the direct context check decides it before
+					// any error-chain classification can call it an upstream
+					// body failure.
 					outcome = "client_disconnected"
 					log.Warn().Err(rerr).Str("public_model", model).
 						Str("phase", "client_write").Msg("relay_copy_failed")
 					complete()
 					return
 				}
-				elapsed := retryNow().Sub(attemptStart)
-				dec := decide(dispRetryable, attempt, i, candidatesTried, 0)
-				event := withAttemptFields(log.Warn().Err(rerr).Str("public_model", model).
+				elapsed := eng.Now().Sub(attemptStart)
+				dec := eng.Observe(recovery.Observation{
+					Class:            recovery.FailureProtocol,
+					ProtocolCause:    recovery.ProtocolBodyReadFailed,
+					Streaming:        stream,
+					Committed:        answer != nil,
+					CandidateIndex:   i + 1,
+					CandidateAttempt: attempt,
+					RetryIndex:       retryIndex,
+					Elapsed:          eng.Now().Sub(candStart).Milliseconds(),
+				})
+				lastRuleID = dec.RuleID
+				act := walkAction(dec.Action, i+1 < len(m.Chain))
+				event := withPolicyFields(withAttemptFields(log.Warn().Err(rerr).Str("public_model", model).
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status),
-					providerAttempts, i+1, attempt, elapsed).
-					Str("disposition", dispositionName(dec.Action)).
-					Str("reason", reasonBodyReadFailed)
+					providerAttempts, i+1, attempt, elapsed),
+					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
+					Str("disposition", act.String()).
+					Str("reason", dec.Reason)
 				event.Msg("upstream_body_read_failed")
 				if !waitOut(dec) {
 					return
 				}
-				if dec.Action == retrySameCandidate {
+				if act == recovery.ActionRetry {
 					continue
 				}
-				if dec.Action == retryNextCandidate {
+				if act == recovery.ActionFallback {
 					// The read failed, but the upstream answered 2xx — keep
 					// the shape: later candidates failing before answering
 					// fall back to this answer over a synthesized 502.
@@ -1132,23 +1375,46 @@ walk:
 				break walk
 			}
 			if len(bodyBytes) > int(maxBufferedResponseBytes) || !json.Valid(bodyBytes) {
-				elapsed := retryNow().Sub(attemptStart)
-				dec := decide(dispRetryable, attempt, i, candidatesTried, 0)
-				event := withAttemptFields(log.Warn().Str("public_model", model).
+				// Over-cap and unparseable are separate protocol causes, and
+				// the policy can name them apart: both are unusable answers
+				// that share a retry-by-default disposition and the same
+				// upstream_invalid_response reason token, but a configuration
+				// that says "stop on an unparseable body, move on when a
+				// provider sends more than this proxy will hold" is a policy
+				// the matrix must be able to state.
+				protocolCause := recovery.ProtocolInvalidResponse
+				if len(bodyBytes) > int(maxBufferedResponseBytes) {
+					protocolCause = recovery.ProtocolOversizedResponse
+				}
+				elapsed := eng.Now().Sub(attemptStart)
+				dec := eng.Observe(recovery.Observation{
+					Class:            recovery.FailureProtocol,
+					ProtocolCause:    protocolCause,
+					Streaming:        stream,
+					Committed:        answer != nil,
+					CandidateIndex:   i + 1,
+					CandidateAttempt: attempt,
+					RetryIndex:       retryIndex,
+					Elapsed:          eng.Now().Sub(candStart).Milliseconds(),
+				})
+				lastRuleID = dec.RuleID
+				act := walkAction(dec.Action, i+1 < len(m.Chain))
+				event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status).
 					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))),
-					providerAttempts, i+1, attempt, elapsed).
-					Str("disposition", dispositionName(dec.Action)).
-					Str("reason", reasonInvalidBody)
+					providerAttempts, i+1, attempt, elapsed),
+					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
+					Str("disposition", act.String()).
+					Str("reason", dec.Reason)
 				event.Msg("upstream_invalid_response")
 				if !waitOut(dec) {
 					return
 				}
-				if dec.Action == retrySameCandidate {
+				if act == recovery.ActionRetry {
 					continue
 				}
-				if dec.Action == retryNextCandidate {
+				if act == recovery.ActionFallback {
 					// Same as the read failure: a 2xx arrived, only the body
 					// is unusable — the shape stays the retained answer.
 					retained = &walkAnswer{kind: answerInvalid, invalid: invalidBody, cand: cand, candIndex: i + 1, egressKind: kindHere}
@@ -1159,7 +1425,7 @@ walk:
 			}
 			// A valid 2xx answer: committed. The body rides the answer
 			// struct to the rewrite; no retry follows commitment.
-			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1, committed: true}
 			break walk
 		}
 	}
@@ -1178,6 +1444,11 @@ walk:
 		finalProvider = answer.cand.Label()
 		lastCand = answer.cand
 		lastCandIndex = answer.candIndex
+		// The completion record describes the candidate whose answer the
+		// client actually receives. A later candidate may have failed before
+		// answering, but its policy did not produce the retained response and
+		// must not overwrite the answer's policy identity.
+		lastPolicyHash = answer.cand.RecoveryHash
 		ansEgressKind = answer.egressKind
 	}
 	if answer == nil {
@@ -1190,8 +1461,25 @@ walk:
 		// final bounded token.
 		providerExhausted = true
 		class, cause := "provider_exhausted", lastFailureCause
-		if egress != nil && egress.Exhausted {
-			class, cause = "egress_exhausted", "no_eligible_endpoint"
+		ruleID := lastRuleID
+		switch {
+		case budgetStopped || (egress != nil && egress.BudgetExhausted):
+			// The exchange envelope, not a provider, ended the walk: the next
+			// outbound exchange was refused before it was dialed, so there is
+			// no endpoint to blame and no transport cause to report. The
+			// engine's own envelope decision supplies the identity — request
+			// scope when the request's ceiling was the binding one, candidate
+			// scope otherwise — and neither is a matrix rule.
+			class, cause = "provider_exhausted", recovery.CauseExchangeBudget
+			if eng.Budget().Exhausted() == recovery.ExhaustionRequest {
+				ruleID = recovery.RuleIDBudgetRequest
+			} else {
+				ruleID = recovery.RuleIDBudgetCandidate
+			}
+		case egress != nil && egress.Exhausted:
+			// A pool that dialed nothing: every member was skipped, so no
+			// endpoint owns the failure.
+			class, cause = "egress_exhausted", recovery.CauseNoEligibleEndpoint
 		}
 		event := withProviders(withEgress(log.Error())).Err(sanitizeUpstreamError(lastUerr, lastUpstream)).
 			Str("public_model", model).
@@ -1199,6 +1487,7 @@ walk:
 			Str("upstream", origin(lastUpstream)).
 			Str("error_class", class).
 			Str("error_cause", cause).
+			Str("policy_rule_id", ruleID).
 			Int("provider_attempt", providerAttempts)
 		if lastEgressAttempt > 0 {
 			event = event.Int("egress_attempt", lastEgressAttempt)
@@ -1415,19 +1704,58 @@ walk:
 	complete()
 }
 
-// dispositionName renders a retry decision as the evidence events' closed
-// disposition token: retry (same candidate, after the bounded wait),
-// fallback (next candidate), terminal (the walk ends — this attempt's
-// result, or the absence of one, is final).
-func dispositionName(a retryAction) string {
-	switch a {
-	case retrySameCandidate:
-		return "retry"
-	case retryNextCandidate:
-		return "fallback"
-	default:
-		return "terminal"
+// walkAction folds a decided action against the chain it will be executed
+// on. The engine cannot see the chain — it decides what a failure means, not
+// what is left to try — so the one case it cannot know is a fallback with no
+// candidate left to fall to. That is a terminal outcome (the walk ends on
+// this attempt), and reporting it as a fallback would claim a move that
+// never happened. The fold is what the emitted disposition token carries,
+// and what the walk's control flow follows.
+func walkAction(a recovery.Action, hasNext bool) recovery.Action {
+	if a == recovery.ActionFallback && !hasNext {
+		return recovery.ActionTerminal
 	}
+	return a
+}
+
+// transportClassOf maps the transport package's failure class onto the
+// recovery vocabulary the matrix matches on. The mapping lives here, on the
+// handler's side of the seam: the transport layer reports what happened to a
+// socket and never learns what a provider policy is, and the recovery
+// package never learns what a socket is. ClassCanceled has no transport
+// class here because a caller-terminated failure is reclassified as
+// FailureCaller outright — it belongs to the request context, not to the
+// endpoint.
+func transportClassOf(c transport.Class) recovery.TransportClass {
+	switch c {
+	case transport.ClassConnection:
+		return recovery.TransportClassConnection
+	case transport.ClassTimeout:
+		return recovery.TransportClassTimeout
+	case transport.ClassProxyConnect:
+		return recovery.TransportClassProxyConnect
+	case transport.ClassProxyAuth:
+		return recovery.TransportClassProxyAuth
+	default:
+		return recovery.TransportClassNone
+	}
+}
+
+// withPolicyFields adds the recovery-policy facts one attempt-scoped
+// evidence event carries: the identity of the decision it produced (empty
+// when no decision did — a dial that failed before any disposition was
+// reached), the effective policy hash and snapshot generation the attempt
+// ran under, the one-based index of the real outbound exchange across the
+// whole request, and how much of the REQUEST-wide exchange envelope was left
+// after the attempt — the envelope the field is named for, never the tighter
+// of the two: a candidate that has spent its own envelope would otherwise
+// report zero headroom on a request with most of its budget untouched.
+func withPolicyFields(ev *zerolog.Event, ruleID, policyHash string, generation uint64, exchange, remaining int) *zerolog.Event {
+	return ev.Str("policy_rule_id", ruleID).
+		Str("policy_hash", policyHash).
+		Uint64("policy_generation", generation).
+		Int("upstream_exchange", exchange).
+		Int("request_exchange_budget_remaining", remaining)
 }
 
 // withAttemptFields adds the per-attempt identity every evidence event

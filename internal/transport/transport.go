@@ -289,6 +289,16 @@ type AttemptRequest struct {
 	Header    http.Header
 	Body      []byte
 	Streaming bool
+
+	// Budget, when non-nil, is claimed once immediately before each real
+	// dial. A nil budget means the caller is not metering exchanges.
+	//
+	// The claim sits AFTER every eligibility, health, and concurrency gate
+	// and immediately before the dial, so it counts exchanges that actually
+	// reached the wire: a member skipped before dialing spends nothing. A
+	// claim that returns false stops the attempt loop — nothing is dialed
+	// on that turn and no member is blamed for it.
+	Budget ExchangeBudget
 }
 
 // AttemptFailure is the sanitized evidence of one dialed-and-failed
@@ -312,15 +322,21 @@ type AttemptFailure struct {
 // were actually dialed (skipped members consume no attempt), the kind and
 // scheme+host of the last endpoint dialed (empty when none was),
 // whether the loop ended without dialing anything (every member was
-// ineligible, unhealthy, or saturated), and the per-attempt failure
-// evidence (one AttemptFailure per dialed endpoint that failed, in dial
-// order — bounded by the fallback budget).
+// ineligible, unhealthy, or saturated, or the request's exchange budget
+// refused the first dial), and the per-attempt failure evidence (one
+// AttemptFailure per dialed endpoint that failed, in dial order — bounded
+// by the fallback budget).
 type AttemptInfo struct {
 	Attempts  int
 	Kind      string
 	Target    string
 	Exhausted bool
 	Failures  []AttemptFailure
+
+	// BudgetExhausted reports that the attempt loop stopped because the
+	// request's exchange budget refused another dial. It is set whether the
+	// loop stopped before any dial (Attempts == 0) or after some.
+	BudgetExhausted bool
 }
 
 // Executor is the capability of a Doer that owns multi-egress policy. The
@@ -333,4 +349,22 @@ type AttemptInfo struct {
 // releases the member's concurrency permit and the pool's in-flight lease).
 type Executor interface {
 	Execute(*AttemptRequest) (*http.Response, AttemptInfo, error)
+}
+
+// ExchangeBudget is the per-request ceiling on real outbound exchanges,
+// claimed immediately before a dial. It is declared HERE, on the consumer
+// side: the transport layer performs the dials, so the transport layer
+// spends the units, and the pool takes one claim per dialed endpoint —
+// fallback attempts included, skipped members excluded. The producer
+// satisfies this interface structurally; this package never imports it.
+//
+// Consuming at the dial — not at the handler — is what makes the count
+// honest: a handler-side count would miss the exchanges a pool's fallback
+// adds to one candidate attempt. A claim that reports false means the
+// request has spent everything it may spend, and the caller MUST NOT dial.
+type ExchangeBudget interface {
+	// ConsumeExchange claims one unit for an exchange that is about to
+	// start, reporting false when the request's envelope is spent — in
+	// which case the caller MUST NOT dial.
+	ConsumeExchange() bool
 }

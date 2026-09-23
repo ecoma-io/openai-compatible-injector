@@ -81,6 +81,13 @@ type stubExecutor struct {
 
 func (e *stubExecutor) Execute(ar *transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
 	e.got = ar
+	// A real pool claims the request's exchange envelope once per dial; the
+	// stand-in does the same, so the handler's exchange accounting sees the
+	// traffic the stub stands for. A refusal is the pool's own exhausted
+	// shape: nothing dialed, the budget flag set and no answer to relay.
+	if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+		return nil, transport.AttemptInfo{BudgetExhausted: true}, errors.New("exchange budget exhausted")
+	}
 	if e.err == nil {
 		// A nil error always means a response on this seam; default to a
 		// fresh minimal 200 JSON answer when the test pinned none — fresh

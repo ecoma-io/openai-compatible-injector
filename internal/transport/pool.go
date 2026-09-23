@@ -263,6 +263,15 @@ func (st *poolState) end() {
 // timeout fall back; the caller's own cancellation aborts everything
 // without penalizing any member; zero dials is exhaustion, not an endpoint
 // error.
+//
+// When the request supplies an exchange budget the loop is additionally
+// bounded by it: each real dial claims one unit immediately before it, a
+// skipped member claims none, and a refusal stops the loop where it stands
+// with AttemptInfo.BudgetExhausted set. A refusal before the first dial
+// returns no error at all — nothing was dialed, so no endpoint owns the
+// failure and the exhaustion sentinel (an endpoint verdict) must not be
+// raised; a refusal after at least one dial leaves the last endpoint error
+// in force.
 func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, error) {
 	st := p.st
 	st.begin()
@@ -320,6 +329,28 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			if !ms.lim.tryAcquire() {
 				continue
 			}
+		}
+		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+			// The request's exchange envelope will not fund this dial. This
+			// is not an endpoint failure: nothing was dialed, no member is
+			// struck, and this member is left untouched.
+			//
+			// The member's permit is handed back first: it was taken for a
+			// dial that never happens, so a refused exchange must not read
+			// as an in-flight request and shrink a capped member's capacity.
+			ms.lim.release()
+			info.BudgetExhausted = true
+			// A refusal on the FIRST dial of this Execute is not an endpoint
+			// failure, so the zero-dial exhaustion sentinel must not be
+			// raised for it: Exhausted means "every member was ineligible,
+			// unhealthy, or saturated", and an endpoint never dialed for
+			// want of budget is not one the pool could not use. A refusal
+			// AFTER a real dial keeps its last endpoint error in force,
+			// which is exactly the case the zero-dial sentinel is for.
+			if attempts == 0 {
+				return nil, info, nil
+			}
+			break
 		}
 		resp, err := p.dial(ms, ar)
 		attempts++

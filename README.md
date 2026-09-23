@@ -75,8 +75,8 @@ Division of responsibility:
 | ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- |
 | `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL`, `OAICR_USAGE_DATABASE_URL` | Environment (bootstrap) |
 | `api-key` (the shared inbound client credential)                                                                                                 | YAML file (runtime)     |
-| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,retries,providers}`                                                      | YAML file (runtime)     |
-| `provider-fallback.{enabled,max-attempts}`                                                                                                       | YAML file (runtime)     |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,retries,recovery,providers}`                                             | YAML file (runtime)     |
+| `provider-fallback.{enabled,max-attempts}`, `recovery` (global, and per provider/model/candidate)                                                | YAML file (runtime)     |
 | `sse-keep-alive.{enabled,interval}`                                                                                                              | YAML file (runtime)     |
 | `log-level`                                                                                                                                      | YAML file (runtime)     |
 
@@ -127,16 +127,56 @@ transports:
       failure-threshold: 3 # default 3
       cooldown: 30s # default 30s, min 1s
 
+# Optional. The recovery policy every model starts from: which failures retry,
+# fall back, or terminate, how the same candidate is re-asked, how far the
+# candidate walk reaches, and how many real upstream exchanges one request may
+# spend. Overrides of the same shape sit on a providers entry, a models entry,
+# and one chain candidate; each layer merges onto the one before it.
+recovery:
+  matrix:
+    http:
+      exact:
+        "408": retry # shorthand: exact status -> action
+        "429": retry
+        "401": fallback
+      classes:
+        "4xx": terminal # status bucket -> action
+        "5xx": retry
+    default: terminal # the catch-all
+  retries:
+    max-retries: 1 # same-candidate re-asks after the initial attempt, 0..8
+    backoff:
+      initial: 250ms # >= 1ms; doubles per retry, capped at backoff.max
+      max: 2s # also the ceiling any Retry-After can never push past
+      jitter: 0.1 # uniform ±fraction spread, 0..1
+  fallback:
+    max-candidates: 2 # candidates ENTERED (primary included), 1..8
+  budget:
+    request: # the whole request; this block is top-level only
+      max-exchanges: 32 # real outbound HTTP exchanges, 1..64
+    candidate:
+      max-exchanges: 16 # per candidate, 1..32
+  retry-after:
+    mode: max # max (default) | ignore
+
 # Optional. Named upstream bases, each routed through a transport.
 providers:
   opencode:
     base-url: https://api.opencode.example/v1 # validated like a model endpoint
     transport: egress # optional named transport; omitted = direct
+    recovery: # optional provider override: every model routed through here
+      retries:
+        max-retries: 3 # a provider that recovers slowly gets more re-asks
 
 models:
   gpt-reviewer:
     provider: opencode # either provider or endpoint — never both, never neither
     upstream-model: gpt-5-pro # required; the model name sent upstream
+    recovery: # optional model override: this model only
+      matrix:
+        http:
+          exact:
+            "429": terminal # this provider's 429 means "out of quota"
     injection-prompt: | # optional; empty/omitted disables injection
       Review the following code rigorously. Report every bug you can find,
       ordered by severity, and suggest a fix for each.
@@ -181,14 +221,15 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   table, same rules as above) and `upstream-model` (the name sent to that
   candidate; required per candidate). The first entry is the primary
   route; the rest are fallbacks reached when an earlier candidate has no
-  usable answer — which statuses re-ask or move on is the disposition
-  matrix of [`provider-fallback` + `retries`](#provider-fallback-and-retries).
+  usable answer — which failures re-ask or move on is the
+  [recovery matrix](#provider-recovery-policy). A candidate entry may
+  carry its own `recovery` override, which applies to that hop alone.
   Both forms at once — a `providers` list next to `provider` or
   `endpoint` — is a rejection, as is the same provider referenced twice
-  in one chain. The `injection-prompt`, `thinking-usage` and `retries`
-  stay model-level: every candidate receives the same prompt and walks
-  under the same retry policy, because those are properties of the
-  public model. See [Provider fallback and retries](#provider-fallback-and-retries).
+  in one chain. The `injection-prompt` and `thinking-usage` stay
+  model-level: every candidate receives the same prompt and the same
+  synthesis setting, because those are properties of the public model,
+  not of a hop. See [Provider recovery policy](#provider-recovery-policy).
 - `upstream-model` — the `model` value actually forwarded upstream.
   Required on the single-provider and inline-endpoint forms (and per
   candidate inside a `providers` chain, where there is no model-level
@@ -204,21 +245,30 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   fixed to it). An absent or null block means off — responses stay
   byte-identical to an unconfigured deployment. See
   [Simulated thinking usage](#simulated-thinking-usage).
-- `retries` — optional block sizing the per-model status retry policy every
-  candidate of the model walks under. Absent, `null`, or `{}` selects the
-  defaults below; a present block is validated field by field — ranges and
-  combinations included — and any invalid value rejects the complete file.
-  `max-retries` is the number of same-candidate retries AFTER the initial
-  attempt (0..8, default 1; `0` = one upstream exchange per candidate);
-  `max-elapsed` bounds one candidate's whole retry sequence in time
-  (default `10s`, at least `1s`, at most `2m`); `backoff.initial` is the
-  first retry delay (default `250ms`, at least `1ms`), `backoff.max` caps
-  both the exponential growth and any effective `Retry-After` (default
+- `recovery` — optional block carrying the model recovery policy: the
+  `matrix` (which failure retries, falls back, or terminates), `retries`,
+  `fallback`, `budget`, and `retry-after`. The same block is accepted at the
+  top level (the global layer, and the only position that may state the
+  request-scoped `budget.request`), on a `providers` entry, here, and on one
+  chain candidate. The layers merge in the order global → provider → model →
+  candidate, so an override states only what changes; an invalid, ambiguous,
+  or over-cap block rejects the complete file. Absent, `null`, or `{}`
+  inherits the layer beneath — the built-in default policy at the global
+  position. See [Provider recovery policy](#provider-recovery-policy).
+- `retries` — the **legacy** spelling of the model layer's retry mechanics,
+  normalized into the same policy engine as `recovery.retries`; stating both
+  in one model entry is rejected rather than leaving the effective behavior
+  to whichever the code reads first. Absent, `null`, or `{}` selects the
+  defaults; `max-retries` is the number of same-candidate re-asks AFTER the
+  initial attempt (0..8, default 1; `0` = one upstream exchange per
+  candidate); `max-elapsed` bounds one candidate's whole retry sequence in
+  time (default `10s`, at least `1ms`, at most `2m`); `backoff.initial` is
+  the first retry delay (default `250ms`, at least `1ms`), `backoff.max`
+  caps both the exponential growth and any effective `Retry-After` (default
   `2s`, at least `initial` — omitted while `initial` sits above it, the
   ceiling rises to the initial), and `backoff.jitter` is the uniform
-  ±fraction spread (0..1, default `0.1`). The block sizes the disposition
-  matrix; it never gates it. See
-  [Provider fallback and retries](#provider-fallback-and-retries).
+  ±fraction spread (0..1, default `0.1`). See
+  [Provider recovery policy](#provider-recovery-policy).
 - `sse-keep-alive` — optional block controlling client-facing SSE heartbeat
   comments for both streaming routes. Absent, `null`, or `{}` defaults to
   `enabled: true`, `interval: 15s`; `enabled: false` opts out. `interval`, if
@@ -237,36 +287,41 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   `https`, `socks5` or `socks5h`, a host, an explicit port, optional
   userinfo as proxy authentication, and nothing after the authority. See
   [Provider transports](#provider-transports).
-- `provider-fallback` — optional block bounding the provider candidate
-  walk of chain models. Absent, `null`, or `{}` defaults to
+- `provider-fallback` — the **legacy** spelling of the global layer's
+  fallback mechanics, normalized into the same policy engine as
+  `recovery.fallback`; stating both in the file (with `recovery.fallback`
+  present) is rejected rather than leaving the effective behavior to
+  whichever the code reads first. Absent, `null`, or `{}` defaults to
   `enabled: true`, `max-attempts: 2`; a present block is validated even
-  when it disables the feature. `max-attempts` is the per-request
-  candidate budget (at least 1, at most 8) — the walk stops after this
-  many candidates were tried, chain length permitting; each tried
-  candidate performs its own upstream exchanges under the model's
-  [`retries`](#provider-fallback-and-retries) policy. See
-  [Provider fallback and retries](#provider-fallback-and-retries).
+  when it disables the feature. `max-attempts` becomes
+  `fallback.max-candidates` (at least 1, at most 8) and counts candidates
+  **entered**, the primary included. See
+  [Provider recovery policy](#provider-recovery-policy).
 
 The file is validated strictly, in two layers:
 
 - **Top-level keys** are checked against the raw YAML: only `models`,
-  `api-key`, `log-level`, `sse-keep-alive`, `providers`, `transports`, and
-  `provider-fallback` are legal. This is the bootstrap-plane rule — a file
+  `api-key`, `log-level`, `sse-keep-alive`, `providers`, `transports`,
+  `provider-fallback` and `recovery` are legal. This is the bootstrap-plane
+  rule — a file
   that tries to define `listen`, `config-file`, `config-poll-interval` or
   `shutdown-grace`, `auth-database-url`, or `usage-database-url` is rejected
   whatever its value's shape (a strict struct decode alone misses a bootstrap
   key whose value is an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `provider`,
-  `upstream-model`, `injection-prompt`, `thinking-usage`, `retries` and
+  `upstream-model`, `injection-prompt`, `thinking-usage`, `retries`,
+  `recovery` and
   `providers` (and, inside the thinking-usage block, outside `mode`,
   `min-ratio`, `max-ratio`; inside `retries`, outside `max-retries`,
   `max-elapsed` and `backoff` — itself limited to `initial`, `max` and
-  `jitter`) — including a nested bootstrap key — is a rejection, not a
+  `jitter`; inside `recovery`, outside `matrix`, `retries`, `fallback`,
+  `budget` and `retry-after` — each with its own strict field set) — including
+  a nested bootstrap key — is a rejection, not a
   warning. The
   same strictness holds inside `providers` entries (`base-url`,
-  `transport`), model-chain candidate entries (`provider`,
-  `upstream-model`), `transports` entries
+  `transport`, `recovery`), model-chain candidate entries (`provider`,
+  `upstream-model`, `recovery`), `transports` entries
   (`type`, `proxy`, and the pool fields `members`, `strategy`, `fallback`,
   `health`, each with their own strict field sets), and pool `members`
   entries (`transport`, `max-body-bytes`, `max-concurrency`, `streaming`,
@@ -560,110 +615,374 @@ concurrency state for one endpoint must exist exactly once, and the
 duplicate check runs on the resolved endpoint (host case and userinfo
 spelling collapse), never on the YAML name.
 
-## Provider fallback and retries
+## Provider recovery policy
 
-A model may list several **provider candidates** — a primary route plus
-fallbacks. The single `provider`/`endpoint` forms are the degenerate
-one-candidate chain, so every request walks the same structure. Every
-candidate of a model also walks under one **retries** policy: a model-level
-block that sizes how often the same candidate is re-asked before the walk
-moves on.
+A model routes through an **ordered candidate chain** — a primary route plus
+fallbacks; the single `provider`/`endpoint` forms are the degenerate
+one-candidate chain, so every request walks the same structure. What a failed
+attempt _means_, how often the same candidate is re-asked, when the walk moves
+on, and how much real upstream traffic one request may spend are decided by
+one **recovery policy**: a data structure resolved from YAML at config load
+and frozen onto the request's snapshot. The disposition table is policy DATA
+with a shipped default, not a Go switch — a provider whose `429` means "your
+account has no quota" can be told to move on, while the same status from a hop
+that is merely throttled can be told to re-ask.
+
+### The layers
+
+A `recovery` block is accepted in four positions, and the same shape means
+something different in each:
+
+| Position                                            | Rank      | Applies to                                               |
+| --------------------------------------------------- | --------- | -------------------------------------------------------- |
+| top-level `recovery`                                | global    | every model in the file                                  |
+| a `providers` entry's `recovery`                    | provider  | every model whose candidate routes through that provider |
+| a `models` entry's `recovery`                       | model     | that model                                               |
+| one entry of a model's `providers` chain `recovery` | candidate | that single hop                                          |
+
+Resolution runs once, at config load, in the order **global → provider → model
+→ candidate** — narrowest last, so an override always beats what it overrides.
+It is per candidate rather than per model, because a chain may route through
+several providers and a candidate override speaks for exactly one; the result
+is frozen onto the snapshot, so a reload mid-walk (mid-wait included) cannot
+reshape the budgets of work already in flight.
 
 ```yaml
+recovery: # global: the layer every model starts from
+  retries:
+    max-retries: 3
+    backoff:
+      initial: 1s
+  fallback:
+    max-candidates: 4
+  matrix:
+    http:
+      exact:
+        "429": retry
+
+providers:
+  provider-a:
+    base-url: https://a.example/v1
+    recovery: # provider: applies to every model routing through provider-a
+      retries:
+        max-retries: 5
+      matrix:
+        default: fallback
+
 models:
   gpt-reviewer:
-    providers: # ordered; the first entry is the primary route
-      - provider: provider-a # a top-level providers-table reference
-        upstream-model: gpt-5-pro # required per candidate
-      - provider: provider-b
-        upstream-model: standard-gpt-5
-    retries: # optional; every candidate of the model walks under it
-      max-retries: 1 # same-candidate retries AFTER the initial attempt, 0..8
-      max-elapsed: 10s # per-candidate retry window, 1s..2m
-      backoff:
-        initial: 250ms # first retry delay, >= 1ms
-        max: 2s # >= initial; also caps effective Retry-After
-        jitter: 0.1 # 0..1, uniform ±fraction spread
-provider-fallback: # optional; these are the defaults
-  enabled: true
-  max-attempts: 2 # per-request candidate budget, 1..8
+    recovery: # model: this model only
+      matrix:
+        http:
+          exact:
+            "429": terminal
+    providers:
+      - provider: provider-a
+        upstream-model: gpt-5-pro
+        recovery: # candidate: this hop only
+          retries:
+            max-retries: 1
+            backoff:
+              jitter: 0.4
 ```
 
-Absent, `null`, or `{}` selects exactly the defaults shown: **the status
-matrix below applies by default — the block sizes the policy, it does not
-gate it.** A present block is strictly validated (range and combination
-checks, the same two-layer strictness as the rest of the runtime YAML, error
-text that never quotes the offending input).
+The candidate's effective policy is:
 
-### Which upstream results retry
+- `retries.max-retries: 1` — candidate (1) beats provider (5) beats global (3);
+- `retries.backoff` `{initial: 1s, max: 2s, jitter: 0.4}` — `initial` from the
+  global layer, `max` from the built-in default, `jitter` from the candidate:
+  maps deep-merge field by field, they are not swapped wholesale;
+- `retries.max-elapsed` `10s` and `retries.on-exhausted` `fallback` — no layer
+  states them, so they are inherited from the defaults;
+- `fallback.max-candidates: 4` — the global layer's reach, untouched;
+- the `http-429` rule is `terminal` — a rule restated by identity **replaces**
+  the inherited row wherever precedence had put it — while every other global
+  matrix row, and the provider layer's `default: fallback`, survive untouched.
 
-The disposition of every upstream result is closed and code-owned — it is not
-configurable:
+### How layers merge
 
-| Upstream result                                                                                                                                                        | What the walk does                                                                            |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| 2xx, 3xx, 204, 304, anything above 599                                                                                                                                 | **Answer** — existing behavior (streamed / verbatim / buffered)                               |
-| 408, 425, 429, every 5xx except 501/505 (unknown 5xx such as 520/529 included)                                                                                         | **Retry** the same candidate while the budget remains, then **fallback** to the next          |
-| 401, 403, 404, 405, 409, 422                                                                                                                                           | **Fallback** to the next candidate immediately — no same-candidate retry                      |
-| Every other status (400, 406, 410, 413, 415, 416, 421, 424, 428, 431, 451, 501, 505, …)                                                                                | **Terminal** — relayed (normalized) exactly as a single-provider deployment would relay it    |
-| Malformed or incomplete answer before commitment: a 200 that is unparseable or over the buffered cap, or a 4xx/5xx error body that fails or stalls its bounded capture | **Retry** the same candidate, then **fallback**                                               |
-| Caller cancellation or expired deadline                                                                                                                                | **Terminal disconnect** — never retried, never slept through                                  |
-| Transport-level failure (dial, TLS, proxy, egress-pool exhaustion)                                                                                                     | **Fallback** to the next candidate — unchanged; no same-candidate retry at the provider layer |
+The merge is semantic and deep, never an object replacement:
 
-The rationale follows what the status means. A credential or authorization
-rejection (401/403, with 404/405/409/422 alongside) justifies trying the NEXT
-configured provider but never hammering the same one, so those are
-fallback-only. A 400 stays terminal because the same body would fail
-identically on retry — the request, not the path, is the problem. Rate
-limits and 5xx are worth re-asking the provider that already holds the
-route.
+- **A scalar the layer states replaces the base's; a scalar it omits is
+  inherited**, at every depth. A layer stating only `backoff.jitter` keeps the
+  inherited `initial` and `max`.
+- **Maps deep-merge**, member by member.
+- **A rule with the same ID replaces** the inherited rule, wherever ordering
+  had placed it; **a rule with a new ID appends**. A child layer never has to
+  restate the parent's rule list to change one row.
+- **Nothing is ever removed, and nothing is ever reset to a zero value by
+  omission.**
+- **A YAML `null` is not a statement**: `recovery:`, `max-retries: null` and an
+  omitted `max-retries` all mean "not stated", and the field inherits. A scalar
+  stated as its zero value (`jitter: 0`) is a statement and is honoured as
+  zero — that distinction is why every optional field is pointer-typed
+  internally.
 
-The log field `disposition` is a narrower vocabulary than this table: it is
-`retry`, `fallback`, or `terminal` — what the walk decided about one attempt
-— and never appears as `answer` or `success`.
+Each merge step is validated before the next layer is applied, and one layer
+may state a given rule ID only once. A layer that leaves the policy incoherent
+is rejected even when a later layer would have repaired it: a configuration
+whose middle state is meaningless is a configuration whose author was not
+describing what they thought.
 
-**Wait versus move.** A retried status waits out a bounded backoff before
-the same candidate is re-asked; a fallback-only status moves to the next
-candidate immediately — there is no wait between candidates.
+### The matrix
 
-### Budget and timing
+A `matrix` maps one failure to one of three actions:
 
-- **The retry budget is per candidate, counted after the initial attempt.**
-  `max-retries: 0` means one upstream exchange per candidate; `1` means two;
-  `3` means four. Every candidate of the model gets the same budget, enforced
-  per candidate — never shared across candidates or models.
-- **Backoff doubles, then jitters.** The first retry waits `backoff.initial`
-  (default `250ms`), each subsequent retry doubles the previous delay, the
-  growth is capped at `backoff.max` (default `2s`), and the result is spread
-  by a uniform ±`backoff.jitter` (default `0.1`) so concurrent retries do not
-  re-hit a recovering provider as a synchronized herd.
-- **`Retry-After` is a bounded floor.** For same-candidate retries an
-  upstream `Retry-After` (delta-seconds or HTTP-date) raises the delay above
-  the jittered backoff — but never above `backoff.max`, the remaining
-  `max-elapsed` window, or the caller's remaining deadline. Invalid,
-  negative, or past values are ignored silently. An upstream can never make
-  the proxy sleep longer than `backoff.max`.
-- **The window closes the candidate.** Retries stop once `max-elapsed` has
-  passed since that candidate's FIRST attempt. The check runs before a wait
-  is scheduled: a sleep never runs past the window or the caller's deadline,
-  and a caller cancellation during a wait aborts with no further attempt.
-- **The budget is a hard product.** Worst-case upstream exchanges =
-  `provider-fallback.max-attempts × (retries.max-retries + 1)` — with the
-  defaults `2 × 2 = 4`, and `8 × 9 = 72` with both knobs at their maxima. The
-  walk also never exceeds the chain length. The product bounds EXCHANGES,
-  not wall-clock: each candidate's `max-elapsed` bounds its own sleeps, and
-  there is no overall request timeout, so a client that sets no deadline is
-  the outer bound. Egress pools keep their own
-  fallback budget nested under ONE provider attempt (unchanged): total dials
-  stay bounded by that product × the pool's budget, and an egress dial is
-  never counted as a provider retry.
-- **The layers stay separate.** Provider retries and fallback are the
-  injector's decision about WHICH provider answers; egress recovery — pool
-  scheduling, eligibility gates, health, member fallback — is the transport
-  layer's decision about HOW the request reaches it. A pool never retries on
-  a status: it hands the handler one answer (any status) or one error per
-  candidate, and the matrix above decides what happens next. Composed, the
-  worst case stays the product above — nothing multiplies beyond it.
+- **`retry`** — re-ask the SAME candidate after a bounded wait;
+- **`fallback`** — move to the next candidate immediately (there is no wait
+  between candidates);
+- **`terminal`** — stop: the last received answer, or the synthesized failure
+  when no candidate ever answered, becomes the client's response.
+
+The shorthand forms cover the common cases and expand into canonical rules:
+
+```yaml
+recovery:
+  matrix:
+    http:
+      exact: # exact status -> action; keys are three-digit statuses
+        "408": retry
+        "429": retry
+        "401": fallback
+        "501": terminal
+      classes: # status bucket -> action
+        "4xx": terminal
+        "5xx": retry
+    transport: # transport class or transport cause -> action
+      connection: fallback
+      tls: fallback
+      proxy_auth: fallback
+    protocol: # unusable-answer cause -> action
+      invalid_response: retry
+      body_timeout: retry
+    caller: # canceled | deadline; terminal only
+      canceled: terminal
+      deadline: terminal
+    default: terminal # the catch-all, taken by any unmatched failure
+```
+
+A free-form `rules` list expresses what the shorthand cannot:
+
+```yaml
+recovery:
+  matrix:
+    rules:
+      - id: provider-quota-exhausted # a stable identity; required
+        when: # optional; an omitted `when` constrains nothing
+          failure: http
+          provider-error:
+            code: insufficient_quota
+            type: insufficient_quota
+        action: fallback
+      - id: streamed-503 # a new identity appends to the inherited matrix
+        when:
+          status: 503
+          streaming: true
+        action: retry
+```
+
+`id` and `action` are required on a rule entry. Predicates are typed and drawn
+from a closed vocabulary — `status`, `status-class`, `failure`
+(`http`/`transport`/`protocol`/`caller`), `transport-class`,
+`transport-cause`, `protocol-cause`, `caller-cause`, `provider-error.type`,
+`provider-error.code`, `streaming`, `candidate-index`, `retry-index` — and a
+token outside it is rejected at load, because a rule that could never fire is a
+misunderstanding of the schema rather than a policy. There are **no
+expressions, no scripting, no regular expressions, and no body matching**: a
+predicate is a bounded, validated value, never a pattern or a memory. The only
+provider-supplied inputs are the upstream error object's own `type`/`code`
+members, already gated to short printable tokens, so a provider's free-text
+`message` can never be matched. Restricting the vocabulary to values the proxy
+can prove it understands is what makes evaluation total and deterministic —
+there is no operator-supplied program to time out, to argue about, or to
+silently mis-evaluate.
+
+### Precedence
+
+Evaluation is first-match-wins over rules ordered by a precedence key derived
+from the predicates themselves, highest first, then by rule identity ascending
+so the order is total. From most to least specific:
+
+1. **caller hard-stop** — a caller cancellation or expired deadline ends the
+   walk before the matrix is consulted at all (see the invariants below);
+2. **exact HTTP status** — `status: 429`;
+3. **provider-specific error predicate** — `provider-error.type`/`.code`;
+4. **status class** — `"5xx"`;
+5. **failure-specific rule** — a transport, protocol or caller cause, such as
+   `transport-cause: tls`;
+6. **failure class / transport class** — `failure: http`,
+   `transport-class: connection`;
+7. the **`default`** action, under the reserved rule identity `default`.
+
+Nothing in that order depends on Go map iteration or on the order rules happen
+to appear in YAML: shorthand keys expand in sorted order into canonical rule
+IDs (`http-429`, `http-class-5xx`, `transport-class-connection`,
+`transport-cause-tls`, `protocol-invalid_response`, `caller-canceled`, …), the
+free-form list is folded in and the whole matrix re-sorted deterministically.
+Because the shorthand canonicalises to those IDs, an override may replace any
+of those rows by name without restating it. There is no `priority` field:
+precedence is a property of the predicate shapes, not a number an operator
+assigns.
+
+Two rules of **equal precedence that can match the same failure are rejected at
+load** — an ambiguous policy has no defensible resolution, and silently
+preferring one of two equipollent rows would make the effective policy depend
+on something the operator cannot see. So are a missing or malformed rule
+identity, a repeated identity, and a predicate set that contradicts the failure
+layer it names (an HTTP status on a transport rule, two cause kinds on one
+rule, a status inconsistent with its own class).
+
+### Retry mechanics
+
+```yaml
+recovery:
+  retries:
+    max-retries: 1 # re-asks AFTER the initial attempt, 0..8
+    max-elapsed: 10s # the candidate's whole retry window, >= 1ms, <= 2m
+    on-exhausted: fallback # fallback (default) | terminal
+    backoff:
+      initial: 250ms # first retry delay, >= 1ms
+      max: 2s # ceiling for the doubling AND for Retry-After, >= initial, <= 2m
+      jitter: 0.1 # uniform +/-fraction spread, 0..1
+```
+
+Retry mechanics never decide _whether_ a failure is retryable — that is the
+matrix's job — only how often, how long, and how long to wait. `max-retries`
+counts re-asks after the initial attempt, per candidate: `0` means one upstream
+exchange per candidate, `1` two (the default), `3` four. `max-elapsed` closes
+the candidate, measured from its FIRST attempt and checked before a wait is
+scheduled, so a sleep never runs past the window. The delay starts at
+`initial`, doubles per retry, saturates at `max`, then spreads by a uniform
+±`jitter` so a provider coming back from an outage is not re-hit by a
+synchronized herd of retries. When a retryable failure arrives with the retry
+budget spent, `on-exhausted` decides: `fallback` (the default) moves to the
+next candidate, `terminal` relays the answer. `on-exhausted: retry` is
+rejected — a retry budget that re-arms itself is not a budget.
+
+### Fallback mechanics
+
+```yaml
+recovery:
+  fallback:
+    enabled: true # default true
+    max-candidates: 2 # candidates ENTERED, 1..8
+    on-exhausted: terminal # always terminal
+```
+
+`max-candidates` counts candidates **entered**, the primary included — not
+candidates the chain happens to list. A chain of eight behind a budget of two
+walks two. Once the walk has entered its last reachable candidate and that
+candidate fails, the walk is over: `on-exhausted` is always `terminal`, and any
+other value is rejected, because there is nowhere further to go. `enabled:
+false` pins the request to the primary candidate and is exactly a one-candidate
+reach, so `max-candidates` must then be `1`; a disabled walk stating a larger
+reach is rejected rather than silently ignored. Same-candidate retries still
+apply under the pinned candidate. How far a request may walk is a property of
+the request's primary policy, not of the candidate it happens to be standing
+on, so a candidate-level override cannot extend another candidate's reach.
+
+### The exchange budget
+
+Retries, fallbacks, and egress fallback multiply: one candidate attempt may
+fan out into several pool dials, and the walk multiplies that by its candidates
+and their retries. Two nested envelopes bound the product where it is actually
+spent.
+
+```yaml
+recovery:
+  budget:
+    request: # the whole request; top-level block only
+      max-exchanges: 32 # 1..64
+      max-elapsed: 5m # >= 1ms, <= 5m
+    candidate: # each candidate within it
+      max-exchanges: 16 # 1..32, must not exceed the request envelope
+      max-elapsed: 2m # must not exceed budget.request.max-elapsed
+```
+
+`max-exchanges` counts **real outbound HTTP exchanges**: a pool that falls back
+across three members spends three, not one. A member skipped before dialing —
+ineligible, unhealthy, saturated — spends nothing, because it never reached the
+wire. The unit is claimed by the transport layer immediately before a dial,
+after every eligibility gate, which is what makes the count honest: a
+handler-side count would miss the exchanges a pool's fallback adds to one
+candidate attempt. A refusal stops that dial; nothing is dialed and no endpoint
+is blamed — an endpoint that was never reached is never struck, and a pool that
+refused the claim hands its concurrency permit back. `max-elapsed` bounds each
+scope in wall-clock time.
+
+The two envelopes stop different things. A spent **request** envelope ends the
+walk: no candidate may start another exchange, so the request is over. A spent
+**candidate** envelope ends only _that_ candidate's turn — another exchange on
+the same candidate (a retry) is refused, and the retry rule's `on-exhausted`
+action decides whether the walk moves on, with the next candidate opening its
+own envelope fresh. A per-candidate number therefore sizes one candidate's
+retries; it never pins a chain the operator configured to fall back.
+
+A refusal is not a failure and is never reported as one: nothing was dialed,
+no endpoint is blamed, and no `provider_attempt_failed` or
+`egress_attempt_failed` is emitted for it. The exhausted candidate's turn ends
+on a WARN `candidate_exchange_budget_spent` carrying `policy_rule_id`
+(`budget-candidate`, or `budget-request` when the request envelope is the one
+that refuses — which is terminal whatever `on-exhausted` says), the closed-set
+`error_cause: exchange_budget`, and the walk's position (`candidate_index`,
+`candidate_attempt`, `retry_index`, `provider_attempt`,
+`request_exchange_budget_remaining`). It carries no `upstream_exchange` and no
+`disposition`, because no exchange happened for it to have a place in.
+
+**A configuration above a cap is rejected, never clamped.** The absolute caps
+are `64` and `32` exchanges and `5m`/`2m` elapsed for the request and candidate
+envelopes respectively, `8` retries, `8` fallback candidates, and `2m` for the
+backoff ceiling and the retry window. A value silently reduced to something
+else (or grown to it) is a policy the operator did not write and cannot read
+back from the file. The same fail-closed rule covers contradictions between
+envelopes: a candidate envelope above the request's, a retry window wider than
+the candidate envelope it runs inside, a retry budget (`max-retries + 1`) the
+candidate's exchange envelope cannot fund, or a `backoff.max` below
+`backoff.initial`. All are whole-file rejections — on reload they land on the
+last-known-good snapshot.
+
+The defaults never bind a default deployment. The default walk reaches at most
+`2 candidates × 2 attempts × 3 egress attempts = 12` exchanges against a
+request envelope of 32, which is why the envelope is a backstop against a
+runaway walk rather than a tuning knob. An unstated `retries.max-elapsed` and
+an unstated candidate envelope default to their caps for the same reason: a
+default that rejected a window the vocabulary allows would make a previously
+valid file unloadable.
+
+`budget.request` may only be stated in the top-level block; a provider, model,
+or candidate override that states one is rejected by position, because the
+request-wide ceiling is a property of the request and two candidates must not
+be able to disagree about it.
+
+### Retry-After
+
+```yaml
+recovery:
+  retry-after:
+    enabled: true # default true
+    mode: max # max (default) | ignore
+    max-delay: 5s # this policy's own ceiling on the directive
+```
+
+An upstream `Retry-After` (delta-seconds or an HTTP-date) is honored at all
+only when `enabled`; `mode: max` treats it as a **floor** — the wait becomes
+the larger of the jittered backoff and the directive — while `mode: ignore`
+discards it and sleeps the backoff schedule. `max-delay` bounds the
+**directive**, not the schedule: a directive larger than `max-delay` is
+reduced to it before it is compared with the backoff, and every wait is capped
+by `backoff.max` regardless. A `max-delay` below `backoff.max` therefore
+shortens how far an upstream can push the wait; it never shortens a wait the
+operator's own backoff schedule asked for. The default (`5s`) sits above the
+default backoff ceiling (`2s`) deliberately, so by default the backoff is what
+binds. Invalid, negative, zero, unparseable, and already-past values are
+ignored silently.
+
+**An upstream can never make the gateway sleep longer than `backoff.max`, the
+retry-after `max-delay`, or the caller's remaining deadline — whichever binds
+first.** The remaining retry window is a fourth veto. Every cap is applied in
+order, and each one bounds either the directive or the whole wait, never the
+configured schedule on the directive's behalf, so a hostile or broken upstream
+cannot buy itself an arbitrarily long gateway sleep.
 
 ### Answers, commitment, and reload
 
@@ -694,52 +1013,142 @@ candidate immediately — there is no wait between candidates.
   one. A body that fails the transform still answers `400` on the first
   candidate — it would fail every candidate's transform, so it never spends
   budget.
-- **Reload invariants hold.** The chain, the fallback policy, the retries
+- **Reload invariants hold.** The chain, every candidate's resolved recovery
   policy, and every candidate's transport bind to the request's config
   snapshot like everything else — a reload mid-walk, mid-wait included,
-  cannot reshape the candidate list, the budget, or the backoff of in-flight
-  work. Every candidate's transport is part of the snapshot's egress
-  closure, so a fallback candidate's connection pool is warm even when the
-  primary answers everything. `provider-fallback.enabled: false` pins the
-  request to the primary candidate; the model's same-candidate retries still
-  apply under its `retries` policy.
-- **Observability.** Every completion event carries `provider_attempts`
-  (upstream exchanges across the whole walk — same-candidate retries
-  included; numerically the old candidate count when no retry fires),
-  `final_provider` (the candidate whose answer is relayed), `final_candidate`
-  (its 1-based chain position), and `retries_total`; exhaustion adds
-  `provider_exhausted: true` and the terminal record's `error_class` becomes
-  `provider_exhausted` (a pool that dialed nothing reports
-  `egress_exhausted` with cause `no_eligible_endpoint`). Each failed attempt
-  logs one WARN `provider_attempt_failed`, and every received 4xx/5xx —
-  attempts a retry or fallback later discarded included — logs its
-  `upstream_http_error` evidence event; both carry the attempt identity
-  (`provider_attempt`, `candidate_index`, `candidate_attempt`,
-  `retry_index`, `disposition`, `reason`, `elapsed_ms`, plus the received
-  status as `upstream_status` on the events that have one — a transport
-  failure does not — detailed under [Logging](#logging)). Each dialed-and-failed egress endpoint —
-  pooled or direct — logs one WARN `egress_attempt_failed` in the same
-  vocabulary. Failures carry no error text: only the canonical class and a
-  closed-set cause token (`connection_refused`, `tls`, `dial`,
-  `network_timeout`, `proxy_connect`, `proxy_auth`, `caller_canceled`,
-  `caller_deadline_exceeded`, …) derived from typed error shapes, never from
-  message text.
+  cannot reshape the candidate list, the effective matrix, the envelopes, or
+  the backoff of in-flight work. Every candidate's transport is part of the
+  snapshot's egress closure, so a fallback candidate's connection pool is
+  warm even when the primary answers everything.
+  `fallback.enabled: false` pins the request to the primary candidate; the
+  pinned candidate's same-candidate retries still apply under its own retry
+  mechanics.
 
-**Behavior change.** Deployments upgrading from ≤ 0.7.0 will see traffic
-this proxy previously relayed once now re-asked and re-routed: a 408, 425,
-429 or 5xx (except 501/505, and a 4xx/5xx body that stalls its capture) is retried on the same candidate (one retry by default, after a
-bounded wait) and 401/403/404/405/409/422 now walk to the next candidate,
-where earlier versions relayed the first received status immediately. Set
+### Observability
+
+Every decision event carries the identity of what decided the attempt, and the
+walk's counters ride the completion record:
+
+- `policy_rule_id` — the rule that decided: a canonical or operator-defined
+  rule ID (`http-429`, `transport-cause-tls`, `provider-quota-exhausted`), the
+  reserved `default` when no rule matched, or one of the code-owned invariant
+  identities (`committed`, `caller`, `budget-request`, `budget-candidate`) when
+  the engine hard-stopped before the matrix was consulted. "The matrix decided
+  this" is therefore verifiable per request rather than inferred.
+- `policy_hash` and `policy_generation` — the identity of the resolved policy
+  the request bound to, so a behavior change can be tied to the file that
+  produced it.
+- the attempt identity: `candidate_index` (1-based chain position),
+  `candidate_attempt` (1-based within that candidate), `retry_index`
+  (`candidate_attempt − 1`; `0` = the initial attempt), `egress_attempt`
+  (1-based within one candidate attempt's egress dials), `provider_attempt`
+  (1-based provider-level attempt across the walk), `upstream_exchange` (the
+  real outbound exchange, counted where the dial happens), and
+  `request_exchange_budget_remaining` — how much of the REQUEST-wide envelope
+  is still unspent. It is deliberately not the tighter of the two envelopes:
+  after a candidate has spent its own, the tighter number would read zero on a
+  request that still had most of its budget.
+- the counters: `candidates_entered`, `candidate_attempts`, `retry_attempts`,
+  `egress_attempts`, and `upstream_exchanges`. The completion record carries
+  all five, `request_exchange_budget_remaining` included.
+
+`provider_attempts` counts provider-level attempts; `upstream_exchanges` counts
+real outbound exchanges — and the two differ whenever an egress pool falls
+back, because one provider attempt that dials three members is three exchanges.
+
+Each failed attempt logs one WARN `provider_attempt_failed`, and every received
+4xx/5xx — attempts a retry or fallback later discarded included — logs its
+`upstream_http_error` evidence event; both carry `disposition` (`retry`,
+`fallback`, or `terminal` — what the walk decided about one attempt, never
+`answer` or `success`), the closed-set `reason` token, and `elapsed_ms`, plus
+the received status as `upstream_status` on the events that have one — a
+transport failure has none. Each dialed-and-failed egress endpoint — pooled or
+direct — logs one WARN `egress_attempt_failed` in the same vocabulary. An
+exchange the envelope refused before a dial is not a failure and gets its own
+WARN `candidate_exchange_budget_spent` instead, carrying
+`policy_rule_id`/`disposition`/`reason` and the walk's position but no
+`upstream_exchange` — there was no exchange for it to index. Details under
+[Logging](#logging).
+
+### Invariants that are not configurable
+
+Everything above is data. A short list is not, because a configuration that
+could weaken it would turn a client disconnect into upstream traffic, or a
+committed response into a retried one:
+
+- **a committed response is final** — once the first client-visible byte
+  exists, no retry and no fallback, whatever the matrix says;
+- **a caller cancellation or expired deadline is terminal**, decided from the
+  request context rather than from any rule, never retried and never slept
+  through;
+- **the exchange envelope is absolute** — no retry, fallback, or dial happens
+  once either envelope is spent;
+- **replayability** — each attempt rebuilds its request from the same
+  immutable client body, so no attempt can observe another's leftovers;
+- **determinism** — the decision for one (policy, observation, budget state) is
+  a pure function of the policy; nothing reads map iteration order;
+- **immutability** — a resolved policy is a value bound to the request's
+  snapshot, so a reload can never reshape in-flight decisions;
+- **bounded, secret-free logging** — no event carries a body, a prompt, or a
+  credential, and a `policy_rule_id` is an identity, never operator prose.
+
+A policy may _describe_ the caller's cancellation — the default matrix does, as
+a terminal row — but no configuration can make it anything else: a caller rule
+that is not `terminal` is rejected at load, and so is a `caller` shorthand
+entry with any other action.
+
+### Compatibility with the legacy blocks
+
+Two blocks predate the policy engine and still load:
+
+- a top-level `provider-fallback` (`enabled`, `max-attempts`) — normalized into
+  the **global** layer's fallback policy, where `max-attempts` becomes
+  `fallback.max-candidates` and an omitted `max-attempts` keeps its historic
+  default of two. A block that disables the walk states a reach of one whatever
+  `max-attempts` says, because that is what the block always meant: the count
+  was read only while the walk was on, so a file carrying both ran pinned and
+  still does;
+- a per-model `retries` (`max-retries`, `max-elapsed`, `backoff`) — normalized
+  into the **model** layer's retry mechanics.
+
+Both build the same partial a `recovery` block builds, and there is exactly
+**one effective policy engine at runtime** — there is no mode in which the
+legacy blocks run alongside it. The two spellings are alternatives for the same
+policy _within one layer_, so a layer that states both rejects the file rather
+than leaving the effective behavior to whichever the code happened to read
+first. Precisely:
+
+- a top-level `provider-fallback` next to a top-level `recovery.fallback` is
+  rejected as mutually exclusive; `provider-fallback` next to a `recovery`
+  block that states no `fallback` is accepted, and the legacy block becomes the
+  global layer's fallback policy;
+- a model `retries` next to a model `recovery.retries` is rejected as mutually
+  exclusive; `retries` next to a `recovery` block stating some other section (a
+  `matrix`, say) is accepted, because the two speak about different mechanics
+  and both apply;
+- there is no legacy spelling at the provider or candidate position.
+
+A file that states neither runs the built-in default policy — the disposition
+table this proxy has always had, now stated as data in the `internal/recovery`
+domain.
+
+**Behavior change.** Deployments upgrading from ≤ 0.7.0 will see traffic this
+proxy previously relayed once now re-asked and re-routed: under the default
+policy a 408, 425, 429 or 5xx (except 501/505, and a 4xx/5xx body that stalls
+its capture) is retried on the same candidate — one retry by default, after a
+bounded wait — and 401/403/404/405/409/422 walk to the next candidate, where
+earlier versions relayed the first received status immediately. Set
 `retries.max-retries: 0` to drop the same-candidate re-asks and
-`provider-fallback.enabled: false` to pin the primary candidate — together
-they restore the previous single-attempt walk; the disposition matrix itself
-is code-owned.
+`provider-fallback.enabled: false` to pin the primary candidate — together they
+restore the previous single-attempt walk — or write the equivalent `recovery`
+block and change the rows themselves; the disposition is now an operator's to
+edit, not only to size.
 
 **Not included, by design:** automatic egress rotation over time, active
 health probes, weighted or scored provider selection (the chain order is
 the operator's, not computed), retries or fallback after response
 commitment (once a status reaches the client the answer is final),
-caller-driven retry knobs (the policy is per model, from YAML — no
+caller-driven retry knobs (the effective policy comes from YAML — no
 per-request override), and any proxy-to-direct silent downgrade: a
 candidate whose pool has no usable member is a transport failure the walk
 moves past, and a walk that ends with nothing but unreachable egress
@@ -916,10 +1325,11 @@ Consequences of the table:
 - **Upstream 4xx/5xx errors are normalized.** The status is preserved
   exactly (401 stays 401, 429 stays 429, 500 stays 500 — never collapsed
   into a 502; 502 is reserved for the upstream delivering nothing usable at
-  all), and the status preserved is the LAST answer the walk received — a
-  retryable status (408/425/429, any 5xx except 501/505) may first be re-asked within the
-  model's retry budget and then walk to the next candidate; see
-  [Provider fallback and retries](#provider-fallback-and-retries) — but the
+  all), and the status preserved is the LAST answer the walk received — under
+  the default recovery policy a retryable status (408/425/429, any 5xx except
+  501/505) may first be re-asked within the candidate's retry budget and then
+  walk to the next candidate; see
+  [Provider recovery policy](#provider-recovery-policy) — but the
   body is always the canonical envelope above and
   `Content-Type` is always `application/json`. The provider's raw body —
   its message text, its HTML, even its model names — never reaches the
@@ -1037,9 +1447,11 @@ provider and upstream model, API surface, the relayed stream mode (what the
 response actually was — a `stream: true` request whose upstream answered
 non-SSE is recorded buffered), final client status and outcome,
 upstream-reported token counts, client wire byte counts, cumulative provider
-and egress attempt counters (`provider_attempts` counts upstream exchanges —
-same-candidate retries included — summed across every candidate of a
-fallback walk; egress dials are summed the same way), the final candidate's
+and egress attempt counters (`provider_attempts` counts provider-level
+attempts — same-candidate retries included — summed across every candidate of
+a fallback walk; `upstream_exchanges` counts the real outbound HTTP exchanges
+the walk spent, so the two differ whenever an egress pool fell back; egress
+dials are summed the same way), the final candidate's
 egress kind (`direct`, or the last dialed pool
 member's kind; empty when a pool exhausted without dialing anything), and full
 request latency. Provider fallback and same-candidate retries still emit
@@ -1138,11 +1550,15 @@ What each level carries:
   snapshot generation the request bound to — correlating reloads with
   behavior). Requests that reached the upstream also carry the egress
   report (`egress_attempts`, `egress_kind`, `egress_target`,
-  `egress_exhausted`) and the provider walk's
-  (`provider_attempts` — upstream exchanges, same-candidate retries
-  included; `retries_total`; `final_provider`; `final_candidate`, the
-  relayed candidate's 1-based chain position; plus `provider_exhausted` when
-  every budgeted candidate failed without answering). The event is emitted
+  `egress_exhausted`) and the recovery walk's
+  (`policy_hash`, `policy_generation`, the counters `candidates_entered`,
+  `candidate_attempts`, `retry_attempts`, `egress_attempts` and
+  `upstream_exchanges`, `final_provider` and `final_candidate`, the relayed
+  candidate's 1-based chain position, plus
+  `provider_exhausted` when every budgeted candidate failed without
+  answering). `provider_attempts` counts provider-level attempts and
+  `upstream_exchanges` counts real outbound exchanges — they differ whenever
+  an egress pool falls back. The event is emitted
   when the request finishes, under the
   level in effect at that moment — a reload mid-request can therefore
   change whether it appears. Also `config_reloaded` (`generation`,
@@ -1167,7 +1583,11 @@ What each level carries:
   `error_cause` `caller_canceled` or `caller_deadline_exceeded`, outcome
   `client_disconnected`, and no error envelope, since the client is
   gone), and an upstream 4xx — the `upstream_http_error` evidence event
-  described below — one warning per transition into a failed config
+  described below — a candidate whose exchange envelope refused another dial
+  (`candidate_exchange_budget_spent`, `error_class` `provider_exhausted` over
+  `error_cause` `exchange_budget`: a refusal, not a failed endpoint, so no
+  endpoint is blamed and no `egress_attempt_failed` accompanies it) — one
+  warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —
   plus `second_signal_forced_exit` and drain overflow.
@@ -1220,14 +1640,19 @@ and the fingerprint. Every attempt-bearing lifecycle event
 (`upstream_request_started`, `upstream_response_received`,
 `upstream_request_failed`, `provider_attempt_failed`, the evidence event)
 also carries the attempt identity described under
-[Provider fallback and retries](#provider-fallback-and-retries): the nested
-`provider_attempt` (a one-based count of upstream EXCHANGES across the whole
-request — numerically the old candidate index when no retry fires) and, on
+[Provider recovery policy](#provider-recovery-policy): the nested
+`provider_attempt` (a one-based count of provider-level attempts across the
+whole request — numerically the old candidate index when no retry fires),
+`provider_attempts` and `upstream_exchanges` (the first counts provider-level
+attempts, the second the real outbound exchanges — they differ whenever an
+egress pool falls back), `policy_rule_id` (the rule or code-owned invariant
+that decided the attempt), `request_exchange_budget_remaining`, and, on
 the events after a dial, `egress_attempt` (`upstream_request_started` fires
 before one, so it carries the provider indexes only), plus `candidate_index`
 (1-based chain position), `candidate_attempt`
 (1-based within the candidate), `retry_index` (`candidate_attempt − 1`;
-`0` = the initial attempt), `disposition` (`retry` | `fallback` |
+`0` = the initial attempt), `upstream_exchange` (the one-based real exchange
+index, counted where the dial happens), `disposition` (`retry` | `fallback` |
 `terminal`), `reason` (a closed token set: `http_408`,
 `http_425`, `http_429`, `http_5xx`, `http_<code>` for every other status
 below 500 — fallback-only and terminal rows alike — the transport cause
@@ -1378,8 +1803,8 @@ Decided, and not coming back without a design discussion:
   (see [Provider transports](#provider-transports)); what stays out is
   automatic egress rotation over time, active health probes, per-request
   egress selection, and retries after response commitment or caller-driven
-  retry knobs (the retry policy is per model, from YAML — statuses of
-  uncommitted answers are retryable by design).
+  retry knobs (the recovery policy is resolved from YAML, per request — an
+  operator cannot let a client ask for a retry).
 - **TLS configuration** — upstream and proxy TLS verify chain and host with
   system roots; custom TLS setup (client certificates, custom CA pools,
   `insecure-skip-verify`) is not coming. (Ambient
@@ -1394,13 +1819,14 @@ Decided, and not coming back without a design discussion:
 
 ```
 cmd/openai-compatible-injector/  entrypoint + version/healthcheck/keys subcommands
-internal/config/                 bootstrap, runtime YAML (models, providers, transports), snapshot store, poller
+internal/config/                 bootstrap, runtime YAML (models, providers, transports, recovery policy), snapshot store, poller
 internal/auth/                   client identity: static + partner key store, decision cache, SQL migrations
 internal/migrate/                shared module-scoped SQL migration runner
 internal/usage/                  factual upstream usage capture, async pipeline, PostgreSQL repository
 internal/inject/                 pure request/response transforms (probe, chat, responses, rewrite, thinking usage)
-internal/transport/              outbound paths: Doer seam, direct client, proxy (http/https/socks5/socks5h), pool registry
-internal/proxy/                  handler, client auth gate, SSE copy, error envelopes
+internal/recovery/               recovery policy domain: typed failure matrix, layered resolution, retry/fallback mechanics, exchange budget
+internal/transport/              outbound paths: Doer seam, direct client, proxy (http/https/socks5/socks5h), pool registry, exchange-budget seam
+internal/proxy/                  handler, client auth gate, SSE copy, error envelopes, candidate walk driven by the recovery engine
 internal/server/                 listener + graceful shutdown
 e2e/                             black-box subprocess suite
 config.example.yaml              documented runtime config template
