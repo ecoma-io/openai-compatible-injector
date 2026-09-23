@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -92,7 +93,16 @@ func TestClassifyAttemptCauseTokens(t *testing.T) {
 		{"nil error", live, nil, Failure{Class: ClassNone}},
 		{"refused", live, refused, Failure{Class: ClassConnection, Cause: CauseConnectionRefused, SendState: SendStateNotSent}},
 		{"refused through url.Error", live, &url.Error{Op: "Post", URL: "http://x", Err: refused}, Failure{Class: ClassConnection, Cause: CauseConnectionRefused, SendState: SendStateNotSent}},
-		{"plain dial failure", live, errors.New("dial tcp: i/o timeout"), Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateNotSent}},
+		// The send state reads the failing WIRE OP, never the class: a plain
+		// error carries no op, so it is conservative however its text reads.
+		// (The text is irrelevant by contract — classification is typed.)
+		{"unrecognised shape", live, errors.New("dial tcp: i/o timeout"), Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"bare EOF after the body", live, io.EOF, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"truncated response", live, io.ErrUnexpectedEOF, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"dial timeout never connected", live, &net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded, SendState: SendStateNotSent}},
+		{"read on an established connection", live, &net.OpError{Op: "read", Err: syscall.ECONNRESET}, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"write on an established connection", live, &net.OpError{Op: "write", Err: syscall.EPIPE}, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"proxy tunnel never formed", live, &net.OpError{Op: "proxyconnect", Err: errors.New("proxyconnect tcp: dial tcp: i/o timeout")}, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateNotSent}},
 		{"tls verification", live, &tls.CertificateVerificationError{Err: errors.New("x509: unknown authority")}, Failure{Class: ClassConnection, Cause: CauseTLS, SendState: SendStateNotSent}},
 		{"net timeout", live, &fakeNetError{timeout: true}, Failure{Class: ClassTimeout, Cause: CauseNetworkTimeout, SendState: SendStateUnknown}},
 		{"context deadline in chain", live, context.DeadlineExceeded, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded, SendState: SendStateUnknown}},

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -236,11 +238,21 @@ func countOf(order []int, v int) int {
 	return n
 }
 
+// dialErr builds the shape a real refused/failed CONNECT produces — a
+// *net.OpError on the dial op (see sendstate_test.go, which pins the real
+// stack's shapes). The pool's send-state gate reads the WIRE OP, never the
+// class, so a bare synthetic error is send_unknown by design and can no
+// longer stand in for "the connection was never established" in these
+// tests.
+func dialErr(msg string) error {
+	return &net.OpError{Op: "dial", Net: "tcp", Err: errors.New(msg)}
+}
+
 // TestPoolWeightNeverSteersFallback pins the weight boundary: weight only
 // chooses the FIRST endpoint; once it fails, the fallback walks declaration
 // order (the unweighted member is next, not the heavy one).
 func TestPoolWeightNeverSteersFallback(t *testing.T) {
-	dead := &stubEndpoint{script: []stubResult{{err: errors.New("boom")}}}
+	dead := &stubEndpoint{script: []stubResult{{err: dialErr("boom")}}}
 	standby := &stubEndpoint{script: []stubResult{okResult(`{"ok":true}`)}}
 	members := []Member{
 		{Endpoint: Config{}, Streaming: true, Weight: 10},
@@ -341,7 +353,7 @@ func TestPoolAllIneligibleIsExhausted(t *testing.T) {
 		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, never, never)
 
 	resp, info, err := pd.Execute(execReq(true, strings.Repeat("x", 100)))
-	if err == nil || !errors.Is(err, errExhausted) {
+	if err == nil || !errors.Is(err, ErrExhausted) {
 		t.Fatalf("err = %v, want the exhaustion sentinel", err)
 	}
 	if resp != nil {
@@ -361,7 +373,7 @@ func TestPoolAllIneligibleIsExhausted(t *testing.T) {
 // endpoint's transport failure falls to the next member and the answer
 // comes back through it.
 func TestPoolFallsBackOnPreResponseFailure(t *testing.T) {
-	dead := &stubEndpoint{script: []stubResult{{err: errors.New("connection refused")}}}
+	dead := &stubEndpoint{script: []stubResult{{err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}}}
 	live := &stubEndpoint{script: []stubResult{okResult(`{"ok":true}`)}}
 	pd, _ := newTestPool(poolMembers(Config{}, Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, dead, live)
@@ -378,8 +390,10 @@ func TestPoolFallsBackOnPreResponseFailure(t *testing.T) {
 	if info.Attempts != 2 || info.Target != "direct" {
 		t.Errorf("info = %+v", info)
 	}
-	// A connection-class failure proved no connection ever carried the
-	// request, which is exactly what licenses the egress fallback.
+	// The failure is a refused dial — positive evidence the connection was
+	// never established, which is exactly what licenses the egress fallback.
+	// The class bucket ("connection") is NOT what decides it: a reset on an
+	// established connection lands in the same bucket and must not replay.
 	if len(info.Failures) != 1 || info.Failures[0].SendState != "definitely_not_sent" {
 		t.Errorf("failures = %+v, want one definitely_not_sent record", info.Failures)
 	}
@@ -389,8 +403,8 @@ func TestPoolFallsBackOnPreResponseFailure(t *testing.T) {
 // members with max-attempts 2 produce exactly two dials and the second's
 // error.
 func TestPoolMaxAttemptsCapsDistinctDials(t *testing.T) {
-	e1 := &stubEndpoint{script: []stubResult{{err: errors.New("first down")}}}
-	e2 := &stubEndpoint{script: []stubResult{{err: errors.New("second down")}}}
+	e1 := &stubEndpoint{script: []stubResult{{err: dialErr("first down")}}}
+	e2 := &stubEndpoint{script: []stubResult{{err: dialErr("second down")}}}
 	e3 := &stubEndpoint{script: []stubResult{okResult("{}")}}
 	pd, _ := newTestPool(poolMembers(Config{}, Config{}, Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 2}, HealthPolicy{Enabled: false}, nil, e1, e2, e3)
@@ -469,7 +483,7 @@ func TestPoolResponseIsLiveUntilClosed(t *testing.T) {
 	// Body not yet consumed: while it stays open, the member is at capacity
 	// and a second request must skip it (and find nothing else → exhausted).
 	_, info2, err2 := pd.Execute(execReq(false, "{}"))
-	if !errors.Is(err2, errExhausted) || !info2.Exhausted {
+	if !errors.Is(err2, ErrExhausted) || !info2.Exhausted {
 		t.Fatalf("second request while body open: err=%v info=%+v, want exhaustion", err2, info2)
 	}
 	if solo.hitCount() != 1 {
@@ -525,9 +539,9 @@ func withBudget(ar *AttemptRequest, b ExchangeBudget) *AttemptRequest {
 // that dial's evidence, and stops with BudgetExhausted — the fallback policy
 // still had two members to offer, the envelope had nothing.
 func TestPoolBudgetStopsTheLoopAfterOneExchange(t *testing.T) {
-	e1 := &stubEndpoint{script: []stubResult{{err: errors.New("first down")}}}
-	e2 := &stubEndpoint{script: []stubResult{{err: errors.New("second down")}}}
-	e3 := &stubEndpoint{script: []stubResult{{err: errors.New("third down")}}}
+	e1 := &stubEndpoint{script: []stubResult{{err: dialErr("first down")}}}
+	e2 := &stubEndpoint{script: []stubResult{{err: dialErr("second down")}}}
+	e3 := &stubEndpoint{script: []stubResult{{err: dialErr("third down")}}}
 	members := []Member{
 		{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1},
 		{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1},
@@ -565,9 +579,9 @@ func TestPoolBudgetStopsTheLoopAfterOneExchange(t *testing.T) {
 // the second endpoint's error — the envelope ended the walk, not
 // max-attempts.
 func TestPoolBudgetCapsTheWalkAtTwoExchanges(t *testing.T) {
-	e1 := &stubEndpoint{script: []stubResult{{err: errors.New("first down")}}}
-	e2 := &stubEndpoint{script: []stubResult{{err: errors.New("second down")}}}
-	e3 := &stubEndpoint{script: []stubResult{{err: errors.New("third down")}}}
+	e1 := &stubEndpoint{script: []stubResult{{err: dialErr("first down")}}}
+	e2 := &stubEndpoint{script: []stubResult{{err: dialErr("second down")}}}
+	e3 := &stubEndpoint{script: []stubResult{{err: dialErr("third down")}}}
 	pd, _ := newTestPool(poolMembers(Config{}, Config{}, Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, e1, e2, e3)
 
@@ -594,9 +608,9 @@ func TestPoolBudgetCapsTheWalkAtTwoExchanges(t *testing.T) {
 // field: no budget attached means the walk is exactly as wide as the fallback
 // policy says, unchanged from before the seam existed.
 func TestPoolNilBudgetDialsTheWholeChain(t *testing.T) {
-	e1 := &stubEndpoint{script: []stubResult{{err: errors.New("first down")}}}
-	e2 := &stubEndpoint{script: []stubResult{{err: errors.New("second down")}}}
-	e3 := &stubEndpoint{script: []stubResult{{err: errors.New("third down")}}}
+	e1 := &stubEndpoint{script: []stubResult{{err: dialErr("first down")}}}
+	e2 := &stubEndpoint{script: []stubResult{{err: dialErr("second down")}}}
+	e3 := &stubEndpoint{script: []stubResult{{err: dialErr("third down")}}}
 	pd, _ := newTestPool(poolMembers(Config{}, Config{}, Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, e1, e2, e3)
 
@@ -649,6 +663,18 @@ func TestPoolBudgetRefusedBeforeAnyDialIsNotEndpointExhaustion(t *testing.T) {
 	_ = resp2.Body.Close()
 	if solo.hitCount() != 1 {
 		t.Errorf("permit leaked after a refused dial: member dialed %d times", solo.hitCount())
+	}
+
+	// No LEASE leaked either. This path returns before any dial, and a lease
+	// left standing at the pool state keeps it from ever satisfying the
+	// registry's retire condition — the retired generation would linger with
+	// its idle connections open. A state that has released everything counts
+	// zero here.
+	pd.st.mu.Lock()
+	leases := pd.st.leases
+	pd.st.mu.Unlock()
+	if leases != 0 {
+		t.Errorf("leases = %d after the requests drained, want 0", leases)
 	}
 }
 
@@ -754,10 +780,6 @@ func TestPoolCallerDeadlineIsTerminalNoFallback(t *testing.T) {
 	_ = info
 }
 
-// TestPoolProviderLocalTimeoutFallsBack pins the other half: with the
-// caller's context still live, a timeout-shaped endpoint failure is the
-// endpoint's — it strikes health, carries canonical timeout evidence, and
-// falls back within budget.
 // TestPoolSendUnknownTimeoutNeverReplays pins the load-bearing boundary: a
 // timeout on an established connection may have reached the upstream, so no
 // layer below the injector may replay it. The pool dials no second member,
@@ -795,7 +817,7 @@ func TestPoolSendUnknownTimeoutNeverReplays(t *testing.T) {
 // skipped without a dial, and after the cooldown it is dialed again.
 func TestPoolHealthCooldownSkipsThenRecovers(t *testing.T) {
 	clk := newFakeClock()
-	flaky := &stubEndpoint{script: []stubResult{{err: errors.New("refused")}, okResult("{}")}}
+	flaky := &stubEndpoint{script: []stubResult{{err: dialErr("refused")}, okResult("{}")}}
 	backup := &stubEndpoint{script: []stubResult{okResult("{}")}}
 	pd, _ := newTestPool(poolMembers(Config{}, Config{}), RoundRobin,
 		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: true, FailureThreshold: 1, Cooldown: 30 * time.Second}, clk.Now, flaky, backup)
@@ -981,7 +1003,7 @@ func TestPoolAttemptInfoCarriesEndpointIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dead := &stubEndpoint{script: []stubResult{{err: errors.New("boom")}}}
+	dead := &stubEndpoint{script: []stubResult{{err: dialErr("boom")}}}
 	live := &stubEndpoint{script: []stubResult{okResult("{}")}}
 	members := poolMembers(Config{Kind: Proxy, ProxyURL: proxyURL}, Config{})
 	pd, _ := newTestPool(members, RoundRobin,

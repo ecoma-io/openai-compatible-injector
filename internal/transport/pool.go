@@ -9,11 +9,14 @@ import (
 	"time"
 )
 
-// errExhausted is returned when a pool dialed nothing: every member was
+// ErrExhausted is returned when a pool dialed nothing: every member was
 // statically ineligible for the request, in a health cooldown, or at its
 // concurrency cap. It is a pool-level condition, not an endpoint failure —
-// no member can be blamed, so it carries no cause. Static text only.
-var errExhausted = errors.New("egress pool: no eligible endpoint available")
+// no member can be blamed, so it carries no cause. Static text only, and it
+// is exported for exactly that reason: the proxy's no-echo allow-list names
+// it instead of collapsing this sentinel into generic text, so the operator
+// keeps "every member was unavailable" on the exhaustion line.
+var ErrExhausted = errors.New("egress pool: no eligible endpoint available")
 
 // poolDoer is the Doer/Executor for one EgressPool transport. It is
 // stateless glue: the scheduler position, health state, concurrency
@@ -259,10 +262,11 @@ func (st *poolState) end() {
 
 // Execute runs the eligibility → schedule → bounded-attempt loop. The
 // contract: any response ends the loop (statuses are answers, never
-// triggers); only pre-response failures classified as proxy/connection/
-// timeout fall back; the caller's own cancellation aborts everything
-// without penalizing any member; zero dials is exhaustion, not an endpoint
-// error.
+// triggers); only pre-response failures proven to have carried no request
+// byte fall back (see SendState — a refused or unreachable dial does, a
+// timeout or reset on an established connection does not); the caller's own
+// cancellation aborts everything without penalizing any member; zero dials
+// is exhaustion, not an endpoint error.
 //
 // When the request supplies an exchange budget the loop is additionally
 // bounded by it: each real dial claims one unit immediately before it, a
@@ -348,6 +352,11 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			// AFTER a real dial keeps its last endpoint error in force,
 			// which is exactly the case the zero-dial sentinel is for.
 			if attempts == 0 {
+				// The lease taken at entry is released on EVERY return: a
+				// state that never drops back to zero can never satisfy the
+				// registry's retire condition, so its teardown would be
+				// deferred forever and the evicted generation would linger.
+				st.end()
 				return nil, info, nil
 			}
 			break
@@ -411,7 +420,7 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 	st.end()
 	if attempts == 0 {
 		info.Exhausted = true
-		return nil, info, errExhausted
+		return nil, info, ErrExhausted
 	}
 	// At least one real attempt: the last error is an endpoint failure and
 	// reaches the handler's existing transport-error path (sanitized there

@@ -1075,7 +1075,13 @@ walk:
 					class, cause = "egress_exhausted", recovery.CauseNoEligibleEndpoint
 				}
 				lastFailureCause = cause
-				if !f.CallerTerminated {
+				// The send state is evidence about a DIALED attempt, so it is
+				// recorded only when one happened. A pool that skipped every
+				// member dialed nothing for it to describe, and the sentinel
+				// that reports that is not an endpoint failure at all — its
+				// classification must not be read as wire evidence. The
+				// exhaustion line already says it: egress_exhausted.
+				if dialedAttempt(pooled, egress) && !f.CallerTerminated {
 					lastSendState = f.SendState.String()
 				}
 				// The observation the engine decides on. A caller-terminated
@@ -1370,7 +1376,7 @@ walk:
 					// any error-chain classification can call it an upstream
 					// body failure.
 					outcome = "client_disconnected"
-					log.Warn().Err(rerr).Str("public_model", model).
+					log.Warn().Err(sanitizeUpstreamError(rerr, &upstream)).Str("public_model", model).
 						Str("phase", "client_write").Msg("relay_copy_failed")
 					complete()
 					return
@@ -1388,9 +1394,11 @@ walk:
 				})
 				lastRuleID = dec.RuleID
 				act := walkAction(dec.Action, i+1 < len(m.Chain))
-				event := withPolicyFields(withAttemptFields(log.Warn().Err(rerr).Str("public_model", model).
+				event := withPolicyFields(withAttemptFields(log.Warn().Err(sanitizeUpstreamError(rerr, &upstream)).Str("public_model", model).
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status).
+					Str("error_class", "upstream_error").
+					Str("error_cause", "body_read_failed").
 					Str("failure_origin", "protocol"),
 					providerAttempts, i+1, attempt, elapsed),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
@@ -1438,10 +1446,17 @@ walk:
 				})
 				lastRuleID = dec.RuleID
 				act := walkAction(dec.Action, i+1 < len(m.Chain))
+				// No error object rides this event on purpose: the body was
+				// read whole, it simply is not usable. The pair below names
+				// which way it is unusable — the same closed-set token the
+				// matrix row keyed on, and the same error_class the 502
+				// envelope reports when the walk finalizes here.
 				event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status).
 					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))).
+					Str("error_class", "upstream_invalid_response").
+					Str("error_cause", protocolCause).
 					Str("failure_origin", "protocol"),
 					providerAttempts, i+1, attempt, elapsed),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
@@ -1619,13 +1634,19 @@ walk:
 			// the client side (write error, or the canceled request context
 			// surfacing through the upstream read) is a disconnect; anything
 			// else died reading the upstream.
+			// Same split as the SSE path: the client-side branch carries this
+			// package's own clientWriteError (static text), the upstream one
+			// carries whatever the transport surfaced — which may quote the
+			// upstream's bytes, so only that branch takes the no-echo rule.
 			level, phase := log.Error(), "upstream_read"
+			eventErr := sanitizeUpstreamError(err, lastUpstream)
 			if clientSide(err) {
 				level, phase, outcome = log.Warn(), "client_write", "client_disconnected"
+				eventErr = err
 			} else {
 				outcome = "upstream_read_failed"
 			}
-			level.Err(err).Str("public_model", model).Str("phase", phase).
+			level.Err(eventErr).Str("public_model", model).Str("phase", phase).
 				Msg("relay_copy_failed")
 			complete()
 			return
@@ -1696,6 +1717,13 @@ walk:
 		if err != nil {
 			phase := "upstream_read"
 			outcome = "stream_truncated"
+			// Only the upstream_read phase carries a peer-derived error, and
+			// that is the one the no-echo rule governs: a truncated read
+			// surfaces the transport's own parse failures, which interpolate
+			// the upstream's bytes. The other two cases are this package's
+			// typed errors with static text — collapsing them would replace
+			// "the client went away" with "upstream transport error".
+			eventErr := sanitizeUpstreamError(err, lastUpstream)
 			var swe *streamWriteError
 			switch {
 			case errors.As(err, &swe), clientSide(err):
@@ -1707,14 +1735,16 @@ walk:
 				// paths apply, while the WARN keeps the truncation's phase.
 				phase = "client_write"
 				outcome = "client_disconnected"
+				eventErr = err
 			case errors.Is(err, ErrSSELineTooLong) || errors.Is(err, ErrSSEEventTooLarge):
 				// The upstream crossed a bounded-relay cap: a hostile or
 				// broken peer, stopped cleanly at the wall. The logged
 				// error carries counts only, never the bytes themselves.
 				phase = "upstream_limit"
 				outcome = "stream_limit_exceeded"
+				eventErr = err
 			}
-			log.Warn().Err(err).Str("public_model", model).Str("phase", phase).
+			log.Warn().Err(eventErr).Str("public_model", model).Str("phase", phase).
 				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
 				Int("keep_alive_pings", pings).
 				Msg("stream_truncated")
@@ -1811,12 +1841,14 @@ func withPolicyFields(ev *zerolog.Event, ruleID, policyHash string, generation u
 }
 
 // withAttemptFields adds the per-attempt identity every evidence event
-// carries: the one-based global exchange index (provider_attempt), the
+// carries: the one-based PROVIDER attempt (provider_attempt) — which is NOT
+// the exchange count, since one provider attempt may fan out across several
+// pooled egress dials, each of those being its own upstream_exchange — the
 // candidate's one-based chain position, the attempt's place in that
 // candidate's own budget (retry_index = candidate_attempt−1), and how long
 // the attempt took to reach its outcome.
-func withAttemptFields(ev *zerolog.Event, global, candIndex, candAttempt int, elapsed time.Duration) *zerolog.Event {
-	return ev.Int("provider_attempt", global).
+func withAttemptFields(ev *zerolog.Event, providerAttempt, candIndex, candAttempt int, elapsed time.Duration) *zerolog.Event {
+	return ev.Int("provider_attempt", providerAttempt).
 		Int("candidate_index", candIndex).
 		Int("candidate_attempt", candAttempt).
 		Int("retry_index", candAttempt-1).
@@ -1857,6 +1889,20 @@ func origin(u *url.URL) string {
 	return u.Scheme + "://" + u.Host
 }
 
+// dialedAttempt reports whether the attempt that just failed reached the
+// wire. The direct path always dialed — its Do error is the dial's own — and
+// a pooled path dialed when the pool reports at least one attempt; a pool
+// that skipped every member (static gates, health, concurrency) returns its
+// exhaustion sentinel with zero attempts, and that sentinel is a pool-level
+// condition rather than an endpoint's failure. Reading its classification as
+// wire evidence would attach a send state to a dial that never happened.
+func dialedAttempt(pooled bool, info *transport.AttemptInfo) bool {
+	if !pooled || info == nil {
+		return true
+	}
+	return info.Attempts > 0
+}
+
 // sanitizeUpstreamError rebuilds a client.Do error without the full request
 // URL: *url.Error.Error() quotes it verbatim, query string included. The
 // nested url parse/escape errors quote raw bytes too (the offending escape
@@ -1865,7 +1911,17 @@ func origin(u *url.URL) string {
 // known to be echo-free: the transport's response-parsing failures (a
 // malformed MIME header line, a bad chunk size) quote the upstream's own
 // bytes verbatim, and those reach no log line at any level (#37).
+//
+// The no-echo rule is TOTAL: a value that arrives without a request URL
+// attached (an upstream body read surfacing through net/textproto, a pool's
+// attempt error, a wrapped shape this function does not know) is held to the
+// same allow-list rather than passed through on the assumption that only
+// client.Do errors reach here. Text that is not provably echo-free collapses
+// to static text; the error_class/error_cause tokens carry the meaning.
 func sanitizeUpstreamError(err error, endpoint *url.URL) error {
+	if err == nil {
+		return nil
+	}
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		inner := ue.Err
@@ -1880,6 +1936,9 @@ func sanitizeUpstreamError(err error, endpoint *url.URL) error {
 			inner = errors.New("upstream transport error")
 		}
 		return &url.Error{Op: ue.Op, URL: origin(endpoint), Err: inner}
+	}
+	if !transportErrorTextSafe(err) {
+		return errors.New("upstream transport error")
 	}
 	return err
 }
@@ -1902,6 +1961,12 @@ func transportErrorTextSafe(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// The transport package's own sentinels are `errors.New` literals — static
+	// by construction — and reach this allow-list explicitly, because a pool
+	// that dialed nothing is the one exhaustion an operator reads by name.
+	if errors.Is(err, transport.ErrExhausted) {
 		return true
 	}
 	var pae *transport.ProxyAuthError

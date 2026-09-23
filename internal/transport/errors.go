@@ -83,10 +83,11 @@ func (c Class) String() string {
 
 // Classify buckets a Do error. The request provably got no response —
 // that is what a Do error means — but "no response" is not "never sent":
-// only the connection-class and proxy-class buckets establish that no
-// connection ever carried the request. The canceled check comes first so a
-// cancellation racing a proxy failure classifies as the caller's event,
-// not the endpoint's.
+// this bucket is deliberately coarse (ClassConnection is the catch-all), so
+// it must not be read as a statement about the wire. sendStateOf carries
+// that axis separately, from the failing operation rather than the class.
+// The canceled check comes first so a cancellation racing a proxy failure
+// classifies as the caller's event, not the endpoint's.
 func Classify(err error) Class {
 	if err == nil {
 		return ClassNone
@@ -128,14 +129,15 @@ type Failure struct {
 }
 
 // SendState records whether a failed attempt provably never left the
-// client. Only connection-establishment failures are definitely-not-sent:
-// no TCP connection, TLS handshake, or proxy tunnel ever existed to carry
-// the request bytes. Every other failure — a timeout on an established
-// connection above all — is send-unknown, because the upstream may already
-// be processing a request whose answer never came back.
+// client. Only a failure in the CONNECTION-ESTABLISHMENT phase is
+// definitely-not-sent: no TCP connection, TLS handshake, or proxy tunnel
+// ever existed to carry the request bytes. Every other failure — a timeout
+// or a reset on an established connection above all — is send-unknown,
+// because the upstream may already be processing a request whose answer
+// never came back.
 //
-// The zero value is the conservative one: an unclassified failure is
-// treated as possibly-transmitted, never as provably-unsent.
+// The zero value is the conservative one: a failure that is not proven
+// pre-send is treated as possibly-transmitted, never as provably-unsent.
 type SendState int
 
 const (
@@ -156,21 +158,54 @@ func (s SendState) String() string {
 	return "send_unknown"
 }
 
-// sendStateOf maps a classified failure to its send state. The cause
-// vocabulary already carries the axis: connection-class causes
-// (connection_refused / tls / dial) and proxy-class causes are
-// connection-establishment failures, while timeout-class failures are the
-// ones that can arrive after the request went out. REFUSED and TLS are the
-// load-bearing cases — a refused TCP connect and a failed TLS handshake
-// both provably precede the HTTP request — so a refused or unreachable
-// egress still falls back while a timeout never does.
-func sendStateOf(class Class) SendState {
-	switch class {
-	case ClassConnection, ClassProxyConnect, ClassProxyAuth:
+// sendStateOf reports whether a failed attempt provably preceded any
+// request byte, judged from the failing WIRE OPERATION rather than from the
+// class.
+//
+// The class is deliberately not the input: ClassConnection is the
+// classifier's catch-all, and it reaches failures on an ESTABLISHED
+// connection — a socket reset while the answer was awaited, an EOF after
+// the body was written, an HTTP/1.x transport broken mid-headers. Those
+// prove the opposite of what the bucket's name suggests: the request was
+// delivered and may already have been processed. Reading the bucket as
+// "never connected" would replay exactly the requests this axis exists to
+// protect.
+//
+// The positive evidence of "never sent" is one of:
+//
+//   - a proxy tunnel failure (typed auth or connect error) — the tunnel
+//     precedes the request;
+//   - a failed TLS handshake (typed verification error) — so does the
+//     handshake;
+//   - a *net.OpError whose op is "dial" or "proxyconnect" — the failure is
+//     a failure to ESTABLISH the connection, whatever class it landed in.
+//     A blackholed egress belongs here: its error is timeout-shaped, but
+//     nothing was sent, so it is both fallback-eligible and safe to replay;
+//   - a bare refused syscall — only a connect attempt can produce it.
+//
+// A "read"/"write" op, an error with no op to read at all (a bare EOF, an
+// HTTP/2 stream error, a shape this package does not know), and every other
+// failure are send-unknown: the conservative answer, and the only one
+// defensible without evidence.
+func sendStateOf(err error) SendState {
+	var pa *ProxyAuthError
+	var pc *ProxyConnectError
+	var te *tls.CertificateVerificationError
+	if errors.As(err, &pa) || errors.As(err, &pc) || errors.As(err, &te) {
 		return SendStateNotSent
-	default:
+	}
+	var oe *net.OpError
+	if errors.As(err, &oe) {
+		switch oe.Op {
+		case "dial", "proxyconnect":
+			return SendStateNotSent
+		}
 		return SendStateUnknown
 	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return SendStateNotSent
+	}
+	return SendStateUnknown
 }
 
 // Cause tokens. Closed set, code-owned, never derived from error text —
@@ -214,7 +249,7 @@ func ClassifyAttempt(ctx context.Context, err error) Failure {
 		return Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true, SendState: SendStateUnknown}
 	}
 	class := Classify(err)
-	f := Failure{Class: class, SendState: sendStateOf(class)}
+	f := Failure{Class: class, SendState: sendStateOf(err)}
 	switch class {
 	case ClassProxyAuth:
 		f.Cause = "proxy_auth"

@@ -1668,6 +1668,18 @@ models:
 	if len(ev) != 1 || ev[0]["policy_rule_id"] != "protocol-oversized_response" || ev[0]["disposition"] != "fallback" {
 		t.Errorf("oversized evidence = %v, want protocol-oversized_response/fallback", ev)
 	}
+	// The unusable-answer event names the failure in the closed-set tokens the
+	// operator's matrix is written in, exactly like its sibling
+	// upstream_body_read_failed: which way the answer was unusable is the
+	// error_cause, so a file that splits the two causes apart is readable off
+	// the line that fired.
+	if ev[0]["error_class"] != "upstream_invalid_response" || ev[0]["error_cause"] != "oversized_response" {
+		t.Errorf("oversized evidence class/cause = %v/%v, want upstream_invalid_response/oversized_response",
+			ev[0]["error_class"], ev[0]["error_cause"])
+	}
+	if got := ev[0]["failure_origin"]; got != "protocol" {
+		t.Errorf("failure_origin = %v, want protocol", got)
+	}
 }
 
 // TestProviderWalkSpentCandidateEnvelopeStillFallsBack is the boundary
