@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.8.0...v0.9.0) (2026-09-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **proxy:** recover through a configurable policy engine ([#56](https://github.com/ecoma-io/openai-compatible-injector/issues/56))
+
+### Features
+
+* **proxy:** recover through a configurable policy engine ([#56](https://github.com/ecoma-io/openai-compatible-injector/issues/56)) ([4dd9a49](https://github.com/ecoma-io/openai-compatible-injector/commit/4dd9a49eb8a4ea0f0cae6b3ca9d6786b7f8478b2))
+
 ## [0.8.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.7.0...v0.8.0) (2026-09-23)
 
 
