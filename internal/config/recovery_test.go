@@ -575,6 +575,9 @@ func TestRecoveryRejections(t *testing.T) {
 		{"bad protocol-cause token", "recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {protocol-cause: " + marker + "}\n        action: retry\n", "unknown protocol cause token"},
 		{"bad caller-cause token", "recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {caller-cause: " + marker + "}\n        action: retry\n", "caller cause must be one of"},
 		{"two cause kinds", "recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {transport-cause: tls, protocol-cause: body_timeout}\n        action: retry\n", "a single cause kind"},
+		// A rule naming no class is held to the one-layer rule by inference:
+		// no observation carries a transport cause and an HTTP status at once.
+		{"mixed-layer free-form rule", "recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {status: 429, transport-cause: tls}\n        action: retry\n", "predicates from a single layer"},
 		{"disabled fallback with a reach", "recovery:\n  fallback:\n    enabled: false\n    max-candidates: 3\n", "fallback.max-candidates"},
 		// NaN survives every comparison, so a bare range check admits it and
 		// the spread arithmetic collapses to a zero wait. It must be named.

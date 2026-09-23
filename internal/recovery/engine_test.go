@@ -492,3 +492,124 @@ func TestEngineIsPureForTheSameInputs(t *testing.T) {
 		}
 	}
 }
+
+// TestEngineCandidateSpentFollowsThePolicy pins the decision for the one
+// refusal no observation describes: the transport declined to dial because
+// the candidate's own exchange envelope is spent. The policy still owns the
+// answer — the retry policy's on-exhausted action — so a spent candidate
+// falls back by default rather than pinning the chain, and its terminating
+// spelling ends the walk when that is what the file says.
+func TestEngineCandidateSpentFollowsThePolicy(t *testing.T) {
+	pol := Default()
+	pol.Budget.Candidate.MaxExchanges = 1
+	e, _ := newTestEngine(t, context.Background(), pol)
+	e.EnterCandidate(pol)
+	if !e.Budget().ConsumeExchange() {
+		t.Fatal("the candidate's first exchange was refused")
+	}
+	if e.Budget().Exhausted() != ExhaustionCandidate {
+		t.Fatalf("exhaustion = %v, want candidate", e.Budget().Exhausted())
+	}
+	d := e.CandidateSpent(CauseExchangeBudget)
+	if d.Action != ActionFallback || d.RuleID != RuleIDBudgetCandidate || d.Reason != CauseExchangeBudget {
+		t.Fatalf("spent candidate envelope: %+v, want a fallback under the candidate-budget identity", d)
+	}
+	if d.Delay != 0 {
+		t.Errorf("delay = %v, want none — a fallback never waits", d.Delay)
+	}
+
+	// The chain's reach is the fallback policy's, not the envelope's.
+	e2, _ := newTestEngine(t, context.Background(), pol)
+	e2.EnterCandidate(pol)
+	e2.Budget().ConsumeExchange()
+	if !e2.EnterCandidate(pol) {
+		t.Fatal("the second candidate was not enterable")
+	}
+	if got := e2.CandidatesEntered(); got != 2 {
+		t.Fatalf("candidates entered = %d, want 2", got)
+	}
+	if e2.Budget().Exhausted() != ExhaustionNone {
+		t.Fatalf("a fresh candidate's envelope starts spent: %v", e2.Budget().Exhausted())
+	}
+}
+
+// TestEngineCandidateSpentTerminalSpelling pins the other side of the same
+// decision: on-exhausted terminal makes a spent candidate end the walk, with
+// the envelope's own identity rather than a matrix rule's.
+func TestEngineCandidateSpentTerminalSpelling(t *testing.T) {
+	pol := Default()
+	pol.Budget.Candidate.MaxExchanges = 1
+	pol.Retry.OnExhausted = ActionTerminal
+	e, _ := newTestEngine(t, context.Background(), pol)
+	e.EnterCandidate(pol)
+	e.Budget().ConsumeExchange()
+	if d := e.CandidateSpent(CauseExchangeBudget); d.Action != ActionTerminal || d.RuleID != RuleIDBudgetCandidate {
+		t.Fatalf("spent candidate envelope under a terminal policy: %+v", d)
+	}
+}
+
+// TestEngineCandidateSpentRequestEnvelopeIsAlwaysTerminal pins the guard
+// that makes the request envelope un-buyable: however the policy reads, a
+// spent request envelope is terminal, because no candidate may spend an
+// exchange the request envelope has already refused.
+func TestEngineCandidateSpentRequestEnvelopeIsAlwaysTerminal(t *testing.T) {
+	pol := Default()
+	pol.Budget.Request.MaxExchanges = 1
+	pol.Budget.Candidate.MaxExchanges = 1
+	pol.Retry.OnExhausted = ActionFallback
+	e, _ := newTestEngine(t, context.Background(), pol)
+	e.EnterCandidate(pol)
+	if !e.Budget().ConsumeExchange() {
+		t.Fatal("the request's single exchange was refused")
+	}
+	if e.Budget().Exhausted() != ExhaustionRequest {
+		t.Fatalf("exhaustion = %v, want request", e.Budget().Exhausted())
+	}
+	if d := e.CandidateSpent(CauseExchangeBudget); d.Action != ActionTerminal || d.RuleID != RuleIDBudgetRequest {
+		t.Fatalf("spent request envelope: %+v, want terminal under the request-budget identity", d)
+	}
+}
+
+// TestRetryDelayCeilingsBindTheDirectiveNotTheSchedule pins which number each
+// bound governs. The backoff schedule is what the file asks for, bounded by
+// its own ceiling; an upstream Retry-After may only raise the wait, as far as
+// the retry-after ceiling lets it and never past the backoff ceiling. A
+// retry-after ceiling below the schedule therefore shortens the DIRECTIVE's
+// reach, not the schedule — and a policy that ignores the directive has
+// nothing to say about the wait at all.
+func TestRetryDelayCeilingsBindTheDirectiveNotTheSchedule(t *testing.T) {
+	cases := []struct {
+		name      string
+		enabled   bool
+		mode      RetryAfterMode
+		maxDelay  time.Duration
+		backoffUp time.Duration
+		directive time.Duration
+		want      time.Duration
+	}{
+		{"a ceiling below the schedule bounds the directive only", true, RetryAfterMax, 5 * time.Second, 30 * time.Second, 60 * time.Second, 10 * time.Second},
+		{"a directive above the schedule raises the wait", true, RetryAfterMax, 30 * time.Second, 30 * time.Second, 20 * time.Second, 20 * time.Second},
+		{"the directive ceiling bounds what the directive raises", true, RetryAfterMax, 12 * time.Second, 30 * time.Second, 60 * time.Second, 12 * time.Second},
+		{"the backoff ceiling bounds the raised wait too", true, RetryAfterMax, 30 * time.Second, 15 * time.Second, 20 * time.Second, 15 * time.Second},
+		{"a shorter directive never lowers the schedule", true, RetryAfterMax, 30 * time.Second, 30 * time.Second, time.Second, 10 * time.Second},
+		{"ignore discards the directive", true, RetryAfterIgnore, 5 * time.Second, 30 * time.Second, 60 * time.Second, 10 * time.Second},
+		{"a disabled block discards the directive", false, RetryAfterMax, 5 * time.Second, 30 * time.Second, 60 * time.Second, 10 * time.Second},
+	}
+	for _, c := range cases {
+		pol := Default()
+		pol.Retry.Backoff = BackoffPolicy{Initial: 10 * time.Second, Max: c.backoffUp, Jitter: 0}
+		pol.Retry.MaxElapsed = DefaultCandidateMaxElapsed
+		pol.RetryAfter = RetryAfterPolicy{Enabled: c.enabled, Mode: c.mode, MaxDelay: c.maxDelay}
+		e, _ := newTestEngine(t, context.Background(), pol)
+		e.EnterCandidate(pol)
+		o := httpObs(429, 1)
+		o.RetryAfter = c.directive
+		d := e.Observe(o)
+		if d.Action != ActionRetry {
+			t.Fatalf("%s: %+v, want a retry", c.name, d)
+		}
+		if d.Delay != c.want {
+			t.Errorf("%s: delay = %v, want %v", c.name, d.Delay, c.want)
+		}
+	}
+}

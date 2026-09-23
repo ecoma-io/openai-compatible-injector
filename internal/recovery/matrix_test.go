@@ -246,6 +246,12 @@ func TestNewMatrixRejectsContradictions(t *testing.T) {
 		{"two cause kinds", Rule{ID: "a", Match: Match{TransportCause: CauseTLS, ProtocolCause: ProtocolBodyTimeout}, Action: ActionRetry}},
 		{"http class with a transport cause", Rule{ID: "a", Match: Match{Class: FailureHTTP, TransportCause: CauseTLS}, Action: ActionRetry}},
 		{"transport class with an HTTP status", Rule{ID: "a", Match: Match{Class: FailureTransport, Status: 429}, Action: ActionRetry}},
+		// A rule that names no class is held to the same rule by inference: no
+		// observation carries a transport cause and an HTTP status at once, so
+		// the mix could never fire however it is spelled.
+		{"classless rule with a transport cause and a status", Rule{ID: "a", Match: Match{Status: 429, TransportCause: CauseTLS}, Action: ActionRetry}},
+		{"classless rule with a status class and a protocol cause", Rule{ID: "a", Match: Match{StatusClass: StatusClass5xx, ProtocolCause: ProtocolInvalidResponse}, Action: ActionRetry}},
+		{"classless rule with a status and a caller cause", Rule{ID: "a", Match: Match{Status: 429, CallerCause: CallerCanceled}, Action: ActionTerminal}},
 	}
 	for _, c := range cases {
 		if _, err := NewMatrix([]Rule{c.rule}, ActionTerminal); err == nil {

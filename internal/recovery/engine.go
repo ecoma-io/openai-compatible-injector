@@ -229,6 +229,27 @@ func (e *Engine) exhaustedRetry(ruleID, reason string) Decision {
 	return Decision{Action: ActionTerminal, RuleID: ruleID, Reason: reason}
 }
 
+// CandidateSpent decides what a candidate that may not spend another
+// exchange does next, for the one refusal no observation can describe: the
+// transport declined to dial because this candidate's own envelope is spent.
+// Nothing failed on the wire, so there is no failure for the matrix to
+// classify — but the policy still owns the answer, and the retry policy's
+// on-exhausted action is exactly the question "this candidate cannot do
+// more, what now": a fallback to the next candidate by default, a terminal
+// answer otherwise.
+//
+// A spent REQUEST envelope is terminal here whatever the policy says, and
+// this method enforces that rather than trusting the caller to ask the
+// budget first: no policy can buy an exchange the request envelope has
+// already refused, and a per-candidate number must never pin a chain the
+// operator configured to fall back.
+func (e *Engine) CandidateSpent(reason string) Decision {
+	if e.budget.Exhausted() == ExhaustionRequest {
+		return Decision{Action: ActionTerminal, RuleID: RuleIDBudgetRequest, Reason: reason}
+	}
+	return e.exhaustedRetry(RuleIDBudgetCandidate, reason)
+}
+
 // move forwards when the fallback budget still reaches a candidate, and ends
 // the walk when it does not.
 func (e *Engine) move(ruleID, reason string) Decision {
@@ -239,30 +260,37 @@ func (e *Engine) move(ruleID, reason string) Decision {
 }
 
 // retryDelay computes the bounded wait before the next attempt on this
-// candidate. Every cap is applied in order, and each one only ever makes the
-// wait shorter:
+// candidate:
 //
-//	backoff schedule (jittered)
-//	  → raised to the upstream's Retry-After, when the policy honors it
-//	  → ceilinged at the backoff maximum
-//	  → ceilinged at the retry-after policy's own maximum
+//	backoff schedule (jittered), ceilinged at the backoff maximum
+//	  → raised to the upstream's Retry-After, when the policy honors it,
+//	    ceilinged at the retry-after maximum and again at the backoff maximum
 //	  → shortened to the remaining retry window
 //	  → shortened to the caller's remaining deadline
 //
-// The result is never negative and never longer than any of the four
-// ceilings, so no upstream directive and no configuration can make this
-// proxy sleep past a bound the request itself did not grant.
+// The schedule's own ceiling and the two shortening steps only ever make the
+// wait shorter; the directive only ever raises it. So no upstream and no
+// configuration can make this proxy sleep past a bound the request itself did
+// not grant — and a retry-after ceiling below the schedule shortens the
+// DIRECTIVE's reach, never the wait the file asks for: a policy that ignores
+// the directive has nothing to say about a schedule the operator wrote.
 func (e *Engine) retryDelay(retryAfter time.Duration, attempts int, windowLeft time.Duration) time.Duration {
 	p := e.policy
 	delay := jitteredBackoff(p.Retry.Backoff, attempts, e.draw)
-	if p.RetryAfter.Enabled && p.RetryAfter.Mode == RetryAfterMax && retryAfter > delay {
-		delay = retryAfter
-	}
 	if delay > p.Retry.Backoff.Max {
 		delay = p.Retry.Backoff.Max
 	}
-	if p.RetryAfter.Enabled && p.RetryAfter.MaxDelay > 0 && delay > p.RetryAfter.MaxDelay {
-		delay = p.RetryAfter.MaxDelay
+	if p.RetryAfter.Enabled && p.RetryAfter.Mode == RetryAfterMax {
+		raised := retryAfter
+		if p.RetryAfter.MaxDelay > 0 && raised > p.RetryAfter.MaxDelay {
+			raised = p.RetryAfter.MaxDelay
+		}
+		if raised > p.Retry.Backoff.Max {
+			raised = p.Retry.Backoff.Max
+		}
+		if raised > delay {
+			delay = raised
+		}
 	}
 	if delay > windowLeft {
 		delay = windowLeft

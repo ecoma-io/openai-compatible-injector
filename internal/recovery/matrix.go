@@ -104,22 +104,40 @@ func (m Match) validate() error {
 	if m.Status != 0 && (m.Status < 100 || m.Status > 599) {
 		return errActionNotAllowed("a rule's status", "an HTTP status between 100 and 599")
 	}
+	// Every predicate but the class, the streaming flag and the two indexes
+	// belongs to exactly one failure layer. A rule may only carry predicates
+	// from one of them: there is no observation with a transport class and an
+	// HTTP status. The rule holds whether or not the rule names a class — a
+	// rule that names none is held to it by inference, so a predicate pair no
+	// observation can ever satisfy is rejected here rather than loading as a
+	// rule that silently never fires.
+	http := m.Status != 0 || m.StatusClass != StatusClassNone ||
+		m.ProviderErrorType != "" || m.ProviderErrorCode != ""
+	transport := m.TransportClass != TransportClassNone || m.TransportCause != ""
+	protocol := m.ProtocolCause != ""
+	caller := m.CallerCause != ""
+	layers := 0
+	for _, named := range [...]bool{http, transport, protocol, caller} {
+		if named {
+			layers++
+		}
+	}
+	if layers > 1 {
+		return errActionNotAllowed("a rule mixing predicates from more than one failure layer", "predicates from a single layer")
+	}
 	if m.Class == FailureAny {
 		return nil
 	}
-	// A rule that names a layer may only carry predicates belonging to it:
-	// there is no observation with a transport class and an HTTP status.
-	if m.Class != FailureHTTP && (m.Status != 0 || m.StatusClass != StatusClassNone ||
-		m.ProviderErrorType != "" || m.ProviderErrorCode != "") {
+	if m.Class != FailureHTTP && http {
 		return errActionNotAllowed("a rule's failure class and its HTTP predicates", "the same layer")
 	}
-	if m.Class != FailureTransport && (m.TransportClass != TransportClassNone || m.TransportCause != "") {
+	if m.Class != FailureTransport && transport {
 		return errActionNotAllowed("a rule's failure class and its transport predicates", "the same layer")
 	}
-	if m.Class != FailureProtocol && m.ProtocolCause != "" {
+	if m.Class != FailureProtocol && protocol {
 		return errActionNotAllowed("a rule's failure class and its protocol predicate", "the same layer")
 	}
-	if m.Class != FailureCaller && m.CallerCause != "" {
+	if m.Class != FailureCaller && caller {
 		return errActionNotAllowed("a rule's failure class and its caller predicate", "the same layer")
 	}
 	return nil
