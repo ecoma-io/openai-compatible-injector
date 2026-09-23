@@ -646,6 +646,59 @@ func TestRecoveryRejectsRequestBudgetInOverrides(t *testing.T) {
 	}
 }
 
+// TestRecoveryFallbackScopeIsTheRequest pins the walk-bound's scope: the
+// candidate-walk reach is a property of the REQUEST's primary policy, so a
+// provider- or candidate-level `recovery.fallback` block would merge,
+// validate, hash, and then do nothing — the engine's reach gate reads only
+// the primary policy's Fallback. A file stating one is rejected by position,
+// never silently accepted with misleading semantics. The global layer owns
+// the walk bound, and a model may state it too, because a model's override
+// resolves into that model's own primary candidate and genuinely steers that
+// model's walk.
+func TestRecoveryFallbackScopeIsTheRequest(t *testing.T) {
+	const block = "    recovery:\n      fallback:\n        max-candidates: 4\n"
+	rejects := []struct {
+		name string
+		data string
+	}{
+		{"provider", recoveryYAML("", block, "  m:\n    provider: pa\n    upstream-model: up-a\n")},
+		{
+			"candidate",
+			recoveryYAML("", "",
+				"  m:\n    providers:\n      - provider: pa\n        upstream-model: up-a\n"+
+					"        recovery:\n          fallback:\n            max-candidates: 4\n"),
+		},
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte(tc.data))
+			if err == nil {
+				t.Fatal("accepted, want rejection")
+			}
+			if !strings.Contains(err.Error(), "recovery.fallback") {
+				t.Fatalf("err = %v, want the fallback-scope position", err)
+			}
+		})
+	}
+
+	// The global and model positions accept the same block and it reaches the
+	// walk: the model's fallback steers its own primary candidate.
+	data := recoveryYAML(
+		"recovery:\n  fallback:\n    max-candidates: 4\n",
+		"",
+		"  m:\n    provider: pa\n    upstream-model: up-a\n"+
+			"    recovery:\n      fallback:\n        max-candidates: 6\n")
+	m := recoveryModel(t, data, "m")
+	if m.Recovery.Fallback.MaxCandidates != 6 {
+		t.Fatalf("model fallback = %+v, want the model's walk bound", m.Recovery.Fallback)
+	}
+	// The global-only chain of the same shape reaches the default reach for
+	// the model without a block of its own.
+	if got := recoveryModel(t, recoveryYAML("recovery:\n  fallback:\n    max-candidates: 4\n", "", "  m:\n    provider: pa\n    upstream-model: up-a\n"), "m"); got.Recovery.Fallback.MaxCandidates != 4 {
+		t.Fatalf("global fallback did not reach the model: %+v", got.Recovery.Fallback)
+	}
+}
+
 // TestRecoveryRejectedReloadKeepsLastKnownGood pins the reload contract on
 // the recovery block: a file whose recovery policy is rejected leaves the
 // previous snapshot serving, its generation unchanged, and its resolved
