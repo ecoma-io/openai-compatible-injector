@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.7.0...v0.8.0) (2026-09-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **proxy:** status-aware per-candidate retries and provider fallback ([#53](https://github.com/ecoma-io/openai-compatible-injector/issues/53))
+
+### Features
+
+* **proxy:** status-aware per-candidate retries and provider fallback ([#53](https://github.com/ecoma-io/openai-compatible-injector/issues/53)) ([371e66c](https://github.com/ecoma-io/openai-compatible-injector/commit/371e66c2316eb5e2aeb92eaa68b3accdc768b742))
+
 ## [0.7.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.6.0...v0.7.0) (2026-09-23)
 
 
