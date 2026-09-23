@@ -217,8 +217,25 @@ func TestProviderChainFallsBackOnTransportFailure(t *testing.T) {
 	if failed[0]["provider"] != "pa" || failed[0]["provider_attempt"] != float64(1) {
 		t.Errorf("provider_attempt_failed fields = %v %v, want pa/1", failed[0]["provider"], failed[0]["provider_attempt"])
 	}
-	if failed[0]["error_class"] != "dial" {
-		t.Errorf("error_class = %v, want dial", failed[0]["error_class"])
+	if failed[0]["error_class"] != "connection" {
+		t.Errorf("error_class = %v, want connection", failed[0]["error_class"])
+	}
+	if failed[0]["error_cause"] != "dial" {
+		t.Errorf("error_cause = %v, want dial", failed[0]["error_cause"])
+	}
+	if failed[0]["egress_attempt"] != float64(1) {
+		t.Errorf("egress_attempt = %v, want 1 (the direct dial)", failed[0]["egress_attempt"])
+	}
+	// The uniform per-dial evidence the single-endpoint path now emits: a
+	// direct failure carries the same egress_attempt_failed record a pool
+	// member's failure gets.
+	eg := logBuf.events(t, "egress_attempt_failed")
+	if len(eg) != 1 {
+		t.Fatalf("egress_attempt_failed events = %d, want 1", len(eg))
+	}
+	if eg[0]["egress_kind"] != "direct" || eg[0]["egress_target"] != "direct" || eg[0]["egress_attempt"] != float64(1) {
+		t.Errorf("direct egress evidence = %v/%v/%v, want direct/direct/1",
+			eg[0]["egress_kind"], eg[0]["egress_target"], eg[0]["egress_attempt"])
 	}
 	done := logBuf.events(t, "request_completed")
 	if len(done) != 1 {
@@ -372,7 +389,10 @@ func TestProviderChainTransformErrorNeverFallsBack(t *testing.T) {
 
 // TestProviderChainCancellationAbortsWalk pins the cancellation boundary:
 // when the client goes away mid-walk there is no fallback — nobody is left
-// to answer — and the outcome is the disconnect, not a 502.
+// to answer — and the outcome is the disconnect, not a 502. The request
+// context arrives genuinely canceled (doDisconnectedRequest): under the
+// ownership rule the context, not the error shape, decides what is the
+// caller's failure.
 func TestProviderChainCancellationAbortsWalk(t *testing.T) {
 	store := newChainStore(t, "")
 	pa := &fakeUpstream{err: context.Canceled}
@@ -380,7 +400,7 @@ func TestProviderChainCancellationAbortsWalk(t *testing.T) {
 	logBuf, log := captureLog(zerolog.InfoLevel)
 	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
-	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	rec := doDisconnectedRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want the bare recorder default (nothing written)", rec.Code)
 	}

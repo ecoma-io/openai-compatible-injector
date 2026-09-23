@@ -389,6 +389,15 @@ func (p *poolDoer) dial(ms *memberState, ar *AttemptRequest) (*http.Response, er
 // Executor seam (and for tests standing in for the handler). Request
 // handling uses Execute; Do buffers the body — every body on this proxy's
 // paths is buffered already.
+//
+// Do reports Streaming=false to Execute, because a *http.Request carries no
+// probed stream flag — that fact belongs to the caller's probe. A member
+// that excludes streaming requests is therefore NOT excluded on this path:
+// the streaming eligibility gate holds only where the handler hands the
+// pool its own request facts through Execute. Do exists so a pool can sit
+// behind the plain Doer seam without lying about its capability; routing
+// client traffic through it for a pool would silently bypass that gate and
+// is a defect, not a supported mode.
 func (p *poolDoer) Do(req *http.Request) (*http.Response, error) {
 	var body []byte
 	if req.Body != nil {

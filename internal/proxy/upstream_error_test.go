@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -104,9 +105,9 @@ func TestCaptureUpstreamErrorEvidence(t *testing.T) {
 		Header:     hdr,
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
-	ev, err := captureUpstreamErrorEvidence(resp)
-	if err != nil {
-		t.Fatalf("capture: %v", err)
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureOK {
+		t.Fatalf("capture: %v", cerr)
 	}
 	if ev.status != http.StatusServiceUnavailable || ev.class != "upstream_http_5xx" {
 		t.Errorf("status/class = %d/%q", ev.status, ev.class)
@@ -142,9 +143,9 @@ func TestCaptureUpstreamErrorEvidenceTruncated(t *testing.T) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader("0123456789abcdef")),
 	}
-	ev, err := captureUpstreamErrorEvidence(resp)
-	if err != nil {
-		t.Fatalf("capture: %v", err)
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureOK {
+		t.Fatalf("capture: %v", cerr)
 	}
 	if !ev.truncated {
 		t.Error("truncated = false, want true (body crossed the cap)")
@@ -190,9 +191,9 @@ func TestCaptureUpstreamErrorRateLimitBound(t *testing.T) {
 		Header:     hdr,
 		Body:       io.NopCloser(strings.NewReader(`{}`)),
 	}
-	ev, err := captureUpstreamErrorEvidence(resp)
-	if err != nil {
-		t.Fatalf("capture: %v", err)
+	ev, cerr := captureUpstreamErrorEvidence(context.Background(), resp)
+	if cerr != captureOK {
+		t.Fatalf("capture: %v", cerr)
 	}
 	if _, ok := ev.rateLimit["Retry-After"]; ok {
 		t.Errorf("oversized Retry-After harvested into evidence: %d bytes", maxRateLimitHeaderBytes+1)

@@ -60,6 +60,18 @@ func directResolver() transport.Resolver {
 
 func doRequest(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
+	req := buildRequest(t, method, path, body, headers)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// buildRequest constructs a request for the handler tests, defaulting to the
+// configured bearer so the suite's traffic passes the auth gate; a test that
+// passes its own Authorization (right, wrong, or deliberately absent as "")
+// opts out of the default.
+func buildRequest(t *testing.T, method, path, body string, headers map[string]string) *http.Request {
+	t.Helper()
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
@@ -68,12 +80,23 @@ func doRequest(t *testing.T, h http.Handler, method, path, body string, headers 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	// Default to the configured bearer so the suite's traffic passes the
-	// auth gate; a test that passes its own Authorization (right, wrong, or
-	// deliberately absent as "") opts out of the default.
 	if _, ok := headers["Authorization"]; !ok {
 		req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	}
+	return req
+}
+
+// doDisconnectedRequest runs the handler with an already-canceled request
+// context — the wire shape of a client that vanished before its request
+// reached the walk. The context-ownership rule keys on the request context
+// being done, so this is the honest construction for stubs that surface a
+// cancellation: a canceled return against a live context is, by contract, an
+// endpoint-owned failure.
+func doDisconnectedRequest(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := buildRequest(t, method, path, body, headers).WithContext(ctx)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -1024,8 +1047,11 @@ func TestClientCancelBeforeUpstreamAnswer(t *testing.T) {
 			if m["level"] != "warn" {
 				t.Errorf("level = %v, want warn", m["level"])
 			}
-			if m["error_class"] != "client_canceled" {
-				t.Errorf("error_class = %v, want client_canceled", m["error_class"])
+			if m["error_class"] != "canceled" {
+				t.Errorf("error_class = %v, want canceled", m["error_class"])
+			}
+			if m["error_cause"] != "caller_canceled" {
+				t.Errorf("error_cause = %v, want caller_canceled", m["error_cause"])
 			}
 		}
 	}
@@ -1237,10 +1263,12 @@ func TestSanitizeUpstreamErrorParseFailuresStatic(t *testing.T) {
 // TestUpstreamTimeoutClassified pins the timeout branch of the upstream
 // failure taxonomy: an upstream that accepts the connection and then goes
 // quiet past the header deadline surfaces as the 502 upstream_unreachable
-// envelope with error_class timeout — a genuine upstream failure, never a
-// client disconnect. The deadline is the client's own ResponseHeaderTimeout
-// (a hard local timer, not a race), so the test is deterministic; the shared
-// client's zero value is pinned separately (long-lived SSE must not have one).
+// envelope, with the walk-exhaustion class provider_exhausted and the
+// timeout carried as the bounded cause (deadline_exceeded) — a genuine
+// upstream failure, never a client disconnect. The deadline is the client's
+// own ResponseHeaderTimeout (a hard local timer, not a race), so the test is
+// deterministic; the shared client's zero value is pinned separately
+// (long-lived SSE must not have one).
 func TestUpstreamTimeoutClassified(t *testing.T) {
 	// Accepts connections, never answers. The handler cannot wait on
 	// r.Context(): the proxy forwards a body it never reads, and net/http
@@ -1276,8 +1304,11 @@ func TestUpstreamTimeoutClassified(t *testing.T) {
 		}
 		if m["message"] == "upstream_request_failed" {
 			sawClass = true
-			if m["error_class"] != "timeout" {
-				t.Errorf("error_class = %v, want timeout (%s)", m["error_class"], line)
+			if m["error_class"] != "provider_exhausted" {
+				t.Errorf("error_class = %v, want provider_exhausted (%s)", m["error_class"], line)
+			}
+			if m["error_cause"] != "deadline_exceeded" {
+				t.Errorf("error_cause = %v, want deadline_exceeded (%s)", m["error_cause"], line)
 			}
 			if lvl, _ := m["level"].(string); lvl != "error" {
 				t.Errorf("level = %v, want error (an upstream timeout is the upstream's failure)", m["level"])
@@ -1298,7 +1329,8 @@ func TestUpstreamTimeoutClassified(t *testing.T) {
 // TestUpstreamTLSFailureClassified pins the TLS branch: an upstream serving
 // a certificate the shared client cannot verify (httptest's self-signed pair
 // against the default verifier) fails the handshake and surfaces as the 502
-// upstream_unreachable envelope with error_class tls — deterministic, no
+// upstream_unreachable envelope — class provider_exhausted (the walk's only
+// candidate ran out) with tls as the bounded cause — deterministic, no
 // timing involved.
 func TestUpstreamTLSFailureClassified(t *testing.T) {
 	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1325,8 +1357,11 @@ func TestUpstreamTLSFailureClassified(t *testing.T) {
 		}
 		if m["message"] == "upstream_request_failed" {
 			sawClass = true
-			if m["error_class"] != "tls" {
-				t.Errorf("error_class = %v, want tls (%s)", m["error_class"], line)
+			if m["error_class"] != "provider_exhausted" {
+				t.Errorf("error_class = %v, want provider_exhausted (%s)", m["error_class"], line)
+			}
+			if m["error_cause"] != "tls" {
+				t.Errorf("error_cause = %v, want tls (%s)", m["error_cause"], line)
 			}
 			// The credential rule: scheme+host only, never the full URL with
 			// any path/query the endpoint carried.
@@ -1409,8 +1444,11 @@ func TestUpstreamHTTPErrorLogEvidence(t *testing.T) {
 	if ev["upstream_status"] != float64(http.StatusTooManyRequests) {
 		t.Errorf("upstream_status = %v, want 429", ev["upstream_status"])
 	}
-	if ev["error_class"] != "upstream_http_4xx" {
-		t.Errorf("error_class = %v, want upstream_http_4xx", ev["error_class"])
+	if ev["error_class"] != "upstream_error" {
+		t.Errorf("error_class = %v, want upstream_error", ev["error_class"])
+	}
+	if ev["error_cause"] != "upstream_http_4xx" {
+		t.Errorf("error_cause = %v, want upstream_http_4xx", ev["error_cause"])
 	}
 	if ev["error_shape"] != "json_error_object" {
 		t.Errorf("error_shape = %v, want json_error_object", ev["error_shape"])
@@ -1495,8 +1533,11 @@ func TestUpstreamHTTPError5xxSeverity(t *testing.T) {
 	if lvl, _ := ev["level"].(string); lvl != "error" {
 		t.Errorf("5xx level = %v, want error", ev["level"])
 	}
-	if ev["error_class"] != "upstream_http_5xx" {
-		t.Errorf("error_class = %v, want upstream_http_5xx", ev["error_class"])
+	if ev["error_class"] != "upstream_error" {
+		t.Errorf("error_class = %v, want upstream_error", ev["error_class"])
+	}
+	if ev["error_cause"] != "upstream_http_5xx" {
+		t.Errorf("error_cause = %v, want upstream_http_5xx", ev["error_cause"])
 	}
 	if ev["error_shape"] != "text" {
 		t.Errorf("error_shape = %v, want text", ev["error_shape"])
@@ -1775,10 +1816,13 @@ func TestUpstreamMalformedHeaderLineSanitized(t *testing.T) {
 }
 
 // TestUpstreamHTTPErrorHostileHeaderValuesJSONSafe pins the log pipeline for
-// header values an upstream fully controls: tabs, quotes, backslashes, and
-// obs-text bytes ride into the evidence event's fields and every log line
-// stays valid JSON — nothing an upstream writes into a header value can
-// forge or break the JSON-lines contract.
+// header values an upstream fully controls: a Content-Type with a hostile or
+// malformed parameter reduces to a bounded static token (the media type
+// alone when it parses, "invalid" when it does not — never the raw
+// upstream-controlled parameter bytes), a hostile rate-limit value rides
+// bounded as before, and every log line stays valid JSON — nothing an
+// upstream writes into a header value can forge or break the JSON-lines
+// contract.
 func TestUpstreamHTTPErrorHostileHeaderValuesJSONSafe(t *testing.T) {
 	// The equality-checked values stick to bytes that round-trip JSON
 	// escaping exactly (tab, quote, backslash); the obs-text byte (0x80,
@@ -1812,8 +1856,8 @@ func TestUpstreamHTTPErrorHostileHeaderValuesJSONSafe(t *testing.T) {
 	if ev == nil {
 		t.Fatalf("no upstream_http_error event:\n%s", logs.String())
 	}
-	if got, _ := ev["content_type"].(string); got != hostileCT {
-		t.Errorf("content_type = %q, want the hostile value carried intact (encoder-escaped)", got)
+	if got, _ := ev["content_type"].(string); got != "invalid" {
+		t.Errorf("content_type = %q, want the static invalid token (malformed parameter never carried)", got)
 	}
 	if got, _ := ev["retry_after"].(string); got != "30; \"x\\y\tz�\"" {
 		t.Errorf("retry_after = %q, want the hostile value with obs-text replaced by U+FFFD", got)

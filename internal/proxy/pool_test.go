@@ -177,7 +177,9 @@ func TestHandlerPoolExhaustionIs502UpstreamUnreachable(t *testing.T) {
 // TestHandlerClientCancelBeatsPoolExhaustion pins the precedence: a
 // cancellation that surfaces after the pool stopped on exhaustion (or
 // alongside it) is the client's event — outcome client_disconnected, no
-// 502 envelope attempted on a connection that is already gone.
+// 502 envelope attempted on a connection that is already gone. The request
+// context arrives genuinely canceled (doDisconnectedRequest): under the
+// ownership rule the context, not the error shape, decides.
 func TestHandlerClientCancelBeatsPoolExhaustion(t *testing.T) {
 	store := newPoolStore(t)
 	ex := &stubExecutor{
@@ -187,7 +189,7 @@ func TestHandlerClientCancelBeatsPoolExhaustion(t *testing.T) {
 	buf, logger := captureLog(zerolog.InfoLevel)
 	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, logger)
 
-	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
+	rec := doDisconnectedRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code == http.StatusBadGateway {
 		t.Error("cancellation surfaced as a 502 envelope")
 	}
@@ -291,12 +293,13 @@ func TestHandlerPoolExhaustionLoggedWithClass(t *testing.T) {
 	}
 }
 
-// TestUpstreamErrorClassTypedProxyErrors pins the classification ladder's
-// typed entries against REAL typed errors: a CONNECT-answering-407 proxy
-// produces the proxy_auth surface, a proxy that accepts and dies mid-
-// handshake produces proxy_connect — both through the url.Error wrap net/http
-// adds, and both with sanitizer text that carries no proxy output and no URL.
-func TestUpstreamErrorClassTypedProxyErrors(t *testing.T) {
+// TestClassifyAttemptTypedProxyErrors pins the classification ladder's
+// typed entries against REAL typed errors, under a live caller context: a
+// CONNECT-answering-407 proxy produces the proxy_auth surface, a proxy that
+// accepts and dies mid-handshake produces proxy_connect — both through the
+// url.Error wrap net/http adds, and both with sanitizer text that carries no
+// proxy output and no URL.
+func TestClassifyAttemptTypedProxyErrors(t *testing.T) {
 	// A proxy answering 407 to CONNECT: the auth-refusal surface.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -321,8 +324,8 @@ func TestUpstreamErrorClassTypedProxyErrors(t *testing.T) {
 	if authErr == nil {
 		t.Fatal("407 CONNECT tunneled; want a transport error")
 	}
-	if got := upstreamErrorClass(authErr); got != "proxy_auth" {
-		t.Errorf("auth class = %q, want proxy_auth", got)
+	if got := transport.ClassifyAttempt(context.Background(), authErr); got.Class.String() != "proxy_auth" || got.Cause != "proxy_auth" || got.CallerTerminated {
+		t.Errorf("auth classification = %+v, want proxy_auth/proxy_auth, not caller-owned", got)
 	}
 	if got := transportErrorTextSafe(errors.Unwrap(authErr)); !got {
 		t.Errorf("inner auth error deemed unsafe: %v", authErr)
@@ -360,8 +363,8 @@ func TestUpstreamErrorClassTypedProxyErrors(t *testing.T) {
 	if connErr == nil {
 		t.Fatal("dead proxy answered; want a transport error")
 	}
-	if got := upstreamErrorClass(connErr); got != "proxy_connect" {
-		t.Errorf("connect class = %q, want proxy_connect", got)
+	if got := transport.ClassifyAttempt(context.Background(), connErr); got.Class.String() != "proxy_connect" || got.Cause != "proxy_connect" || got.CallerTerminated {
+		t.Errorf("connect classification = %+v, want proxy_connect/proxy_connect, not caller-owned", got)
 	}
 }
 
