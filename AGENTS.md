@@ -261,11 +261,13 @@ false` pins the primary candidate while same-candidate retries still
   decided, or one of the reserved invariant identities — beside the frozen
   policy's `policy_hash` and `policy_generation`, so two requests can be
   told apart as "ran under the same policy" without putting the policy on a
-  log line. `provider_attempt` counts one-based provider-level attempts (the
-  candidate attempt; numerically the old candidate index when no retry
-  fires) and NO LONGER doubles as the exchange count: `upstream_exchange`
-  counts the real outbound exchanges, one-based and request-wide, and the
-  two differ exactly when an egress pool falls back — which is why they are
+  log line. `provider_attempt` counts one-based **logical** provider-level
+  attempts (the candidate attempt; numerically the old candidate index when
+  no retry fires) and NO LONGER doubles as the exchange count: a logical
+  attempt and an outbound exchange are separate axes, and one logical
+  attempt may be several exchanges whenever an egress pool falls back.
+  `upstream_exchange` counts the real outbound exchanges, one-based and
+  request-wide, and the two differ exactly then — which is why they are
   counted apart. `provider_attempts` on completions and usage events counts
   provider-level attempts while `upstream_exchanges` counts outbound
   exchanges, with `candidates_entered`, `candidate_attempts`,

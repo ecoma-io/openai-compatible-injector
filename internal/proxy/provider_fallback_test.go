@@ -1417,6 +1417,14 @@ func TestProviderChainProviderLocalTimeoutStillFallsBack(t *testing.T) {
 		t.Errorf("direct egress class/cause = %v/%v, want timeout/network_timeout",
 			eg[0]["error_class"], eg[0]["error_cause"])
 	}
+	// A timeout on an established connection may have reached the upstream,
+	// so it is send_unknown — and still the injector's to decide: the walk
+	// moves to the next provider, which is a different upstream, not a
+	// replay of the one that may already be working.
+	if eg[0]["failure_origin"] != "transport" || eg[0]["send_state"] != "send_unknown" {
+		t.Errorf("direct egress origin/send_state = %v/%v, want transport/send_unknown",
+			eg[0]["failure_origin"], eg[0]["send_state"])
+	}
 	failed := logBuf.events(t, "provider_attempt_failed")
 	if len(failed) != 1 {
 		t.Fatalf("provider_attempt_failed events = %d, want 1", len(failed))
@@ -1428,6 +1436,10 @@ func TestProviderChainProviderLocalTimeoutStillFallsBack(t *testing.T) {
 	if failed[0]["error_class"] != "timeout" || failed[0]["error_cause"] != "network_timeout" {
 		t.Errorf("provider_attempt_failed class/cause = %v/%v, want timeout/network_timeout",
 			failed[0]["error_class"], failed[0]["error_cause"])
+	}
+	if failed[0]["failure_origin"] != "transport" || failed[0]["send_state"] != "send_unknown" {
+		t.Errorf("provider_attempt_failed origin/send_state = %v/%v, want transport/send_unknown",
+			failed[0]["failure_origin"], failed[0]["send_state"])
 	}
 	done := logBuf.events(t, "request_completed")
 	if len(done) != 1 || done[0]["provider_attempts"] != float64(2) || done[0]["final_provider"] != "pb" {

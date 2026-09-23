@@ -1648,8 +1648,10 @@ and the fingerprint. Every attempt-bearing lifecycle event
 `upstream_request_failed`, `provider_attempt_failed`, the evidence event)
 also carries the attempt identity described under
 [Provider recovery policy](#provider-recovery-policy): the nested
-`provider_attempt` (a one-based count of provider-level attempts across the
-whole request — numerically the old candidate index when no retry fires),
+`provider_attempt` (a one-based count of logical provider-level attempts
+across the whole request — numerically the old candidate index when no retry
+fires; one logical attempt may span several outbound exchanges when an
+egress pool falls back),
 `provider_attempts` and `upstream_exchanges` (the first counts provider-level
 attempts, the second the real outbound exchanges — they differ whenever an
 egress pool falls back), `policy_rule_id` (the rule or code-owned invariant
