@@ -481,6 +481,212 @@ func TestPoolResponseIsLiveUntilClosed(t *testing.T) {
 	}
 }
 
+// ---- exchange budget ----
+
+// stubBudget is the consumer side of the exchange-budget seam: a fixed
+// allowance of claims, with the grants counted. The grant count is the number
+// of exchanges the pool was willing to start, so a test can compare it with
+// the independently instrumented dial count — the two must agree exactly, and
+// a claim that does not sit immediately before a dial breaks the agreement.
+type stubBudget struct {
+	mu        sync.Mutex
+	allowance int
+	granted   int
+}
+
+func (b *stubBudget) ConsumeExchange() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.granted >= b.allowance {
+		return false
+	}
+	b.granted++
+	return true
+}
+
+func (b *stubBudget) grants() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.granted
+}
+
+func withBudget(ar *AttemptRequest, b ExchangeBudget) *AttemptRequest {
+	ar.Budget = b
+	return ar
+}
+
+// TestPoolBudgetStopsTheLoopAfterOneExchange pins the post-dial refusal: a
+// one-exchange envelope over three failing members dials exactly once, keeps
+// that dial's evidence, and stops with BudgetExhausted — the fallback policy
+// still had two members to offer, the envelope had nothing.
+func TestPoolBudgetStopsTheLoopAfterOneExchange(t *testing.T) {
+	e1 := &stubEndpoint{script: []stubResult{{err: errors.New("first down")}}}
+	e2 := &stubEndpoint{script: []stubResult{{err: errors.New("second down")}}}
+	e3 := &stubEndpoint{script: []stubResult{{err: errors.New("third down")}}}
+	members := []Member{
+		{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1},
+		{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1},
+		{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1},
+	}
+	pd, _ := newTestPool(members, RoundRobin,
+		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, e1, e2, e3)
+
+	budget := &stubBudget{allowance: 1}
+	_, info, err := pd.Execute(withBudget(execReq(false, "{}"), budget))
+	if err == nil || !strings.Contains(err.Error(), "first down") {
+		t.Fatalf("err = %v, want the one dialed endpoint's failure", err)
+	}
+	if dials := e1.hitCount() + e2.hitCount() + e3.hitCount(); dials != 1 {
+		t.Errorf("dialed %d endpoints, want 1", dials)
+	}
+	if budget.grants() != 1 {
+		t.Errorf("budget granted %d exchanges, want 1", budget.grants())
+	}
+	if info.Attempts != 1 || !info.BudgetExhausted || info.Exhausted {
+		t.Errorf("info = %+v, want one attempt, budget-exhausted, not exhausted", info)
+	}
+	if len(info.Failures) != 1 {
+		t.Errorf("failures = %+v, want evidence for the one real dial", info.Failures)
+	}
+	// The refused fallback never reached the wire, so it holds no permit: a
+	// leaked one would shrink that member for every later request.
+	if cur := pd.st.members[1].lim.cur; cur != 0 {
+		t.Errorf("refused member holds %d permits, want 0", cur)
+	}
+}
+
+// TestPoolBudgetCapsTheWalkAtTwoExchanges pins the count above one: a
+// two-exchange envelope walks exactly two of the three members and closes on
+// the second endpoint's error — the envelope ended the walk, not
+// max-attempts.
+func TestPoolBudgetCapsTheWalkAtTwoExchanges(t *testing.T) {
+	e1 := &stubEndpoint{script: []stubResult{{err: errors.New("first down")}}}
+	e2 := &stubEndpoint{script: []stubResult{{err: errors.New("second down")}}}
+	e3 := &stubEndpoint{script: []stubResult{{err: errors.New("third down")}}}
+	pd, _ := newTestPool(poolMembers(Config{}, Config{}, Config{}), RoundRobin,
+		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, e1, e2, e3)
+
+	budget := &stubBudget{allowance: 2}
+	_, info, err := pd.Execute(withBudget(execReq(false, "{}"), budget))
+	if err == nil || !strings.Contains(err.Error(), "second down") {
+		t.Fatalf("err = %v, want the second dialed endpoint's failure", err)
+	}
+	if dials := e1.hitCount() + e2.hitCount() + e3.hitCount(); dials != 2 {
+		t.Errorf("dialed %d endpoints, want 2", dials)
+	}
+	if budget.grants() != 2 {
+		t.Errorf("budget granted %d exchanges, want 2", budget.grants())
+	}
+	if info.Attempts != 2 || !info.BudgetExhausted || info.Exhausted {
+		t.Errorf("info = %+v, want two attempts, budget-exhausted, not exhausted", info)
+	}
+	if len(info.Failures) != 2 {
+		t.Errorf("failures = %+v, want one record per real dial", info.Failures)
+	}
+}
+
+// TestPoolNilBudgetDialsTheWholeChain is the quiet direction of the new
+// field: no budget attached means the walk is exactly as wide as the fallback
+// policy says, unchanged from before the seam existed.
+func TestPoolNilBudgetDialsTheWholeChain(t *testing.T) {
+	e1 := &stubEndpoint{script: []stubResult{{err: errors.New("first down")}}}
+	e2 := &stubEndpoint{script: []stubResult{{err: errors.New("second down")}}}
+	e3 := &stubEndpoint{script: []stubResult{{err: errors.New("third down")}}}
+	pd, _ := newTestPool(poolMembers(Config{}, Config{}, Config{}), RoundRobin,
+		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, e1, e2, e3)
+
+	_, info, err := pd.Execute(execReq(false, "{}"))
+	if err == nil || !strings.Contains(err.Error(), "third down") {
+		t.Fatalf("err = %v, want the third dialed endpoint's failure", err)
+	}
+	if dials := e1.hitCount() + e2.hitCount() + e3.hitCount(); dials != 3 {
+		t.Errorf("dialed %d endpoints, want all 3", dials)
+	}
+	if info.Attempts != 3 || info.BudgetExhausted || info.Exhausted {
+		t.Errorf("info = %+v, want three plain attempts", info)
+	}
+}
+
+// TestPoolBudgetRefusedBeforeAnyDialIsExhaustion pins the zero-dial edge: an
+// envelope with no room left refuses the very first dial, so the request
+// reports the exhaustion sentinel WITH the budget flag — the caller tells the
+// two apart — and the permit the selection took for that dial comes back, so
+// the member is not left saturated behind a dial that never happened.
+func TestPoolBudgetRefusedBeforeAnyDialIsExhaustion(t *testing.T) {
+	solo := &stubEndpoint{script: []stubResult{okResult("{}")}}
+	members := []Member{{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1}}
+	pd, _ := newTestPool(members, RoundRobin,
+		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, solo)
+
+	budget := &stubBudget{allowance: 0}
+	resp, info, err := pd.Execute(withBudget(execReq(false, "{}"), budget))
+	if !errors.Is(err, errExhausted) {
+		t.Fatalf("err = %v, want the exhaustion sentinel", err)
+	}
+	if resp != nil {
+		t.Errorf("a refused dial returned a response")
+	}
+	if info.Attempts != 0 || !info.Exhausted || !info.BudgetExhausted {
+		t.Errorf("info = %+v, want zero attempts, exhausted and budget-exhausted", info)
+	}
+	if solo.hitCount() != 0 || budget.grants() != 0 {
+		t.Errorf("refused dial happened anyway: hits=%d grants=%d", solo.hitCount(), budget.grants())
+	}
+
+	// No permit leaked: the same pool still serves the next request.
+	resp2, _, err2 := pd.Execute(execReq(false, "{}"))
+	if err2 != nil {
+		t.Fatalf("after a refused dial: %v", err2)
+	}
+	_ = resp2.Body.Close()
+	if solo.hitCount() != 1 {
+		t.Errorf("permit leaked after a refused dial: member dialed %d times", solo.hitCount())
+	}
+}
+
+// TestPoolSkippedMemberConsumesNoBudget pins WHERE the claim sits. The
+// saturated member's only permit is held by an earlier request, so the
+// fallback step reaching it is skipped — passed over without a dial. A unit
+// spent on that skip would leave the envelope empty before the member behind
+// it, which is a dial the request should still get: the live member is dialed
+// and the flag stays clear.
+func TestPoolSkippedMemberConsumesNoBudget(t *testing.T) {
+	busy := &stubEndpoint{script: []stubResult{okResult("{}")}}
+	dead := &stubEndpoint{script: []stubResult{{err: errors.New("down")}}}
+	members := []Member{
+		{Endpoint: Config{}, Streaming: true, Weight: 1, MaxConcurrency: 1},
+		{Endpoint: Config{}, Streaming: true, Weight: 1},
+	}
+	pd, _ := newTestPool(members, RoundRobin,
+		FallbackPolicy{Enabled: true, MaxAttempts: 3}, HealthPolicy{Enabled: false}, nil, busy, dead)
+
+	// Occupy the capped member with a live body; the request after it must be
+	// served by the other member.
+	held, _, err := pd.Execute(execReq(false, "{}"))
+	if err != nil {
+		t.Fatalf("priming request: %v", err)
+	}
+	defer func() { _ = held.Body.Close() }()
+
+	budget := &stubBudget{allowance: 1}
+	_, info, err := pd.Execute(withBudget(execReq(false, "{}"), budget))
+	if err == nil || !strings.Contains(err.Error(), "down") {
+		t.Fatalf("err = %v, want the live member's failure", err)
+	}
+	if dead.hitCount() != 1 {
+		t.Errorf("live member dials = %d, want 1", dead.hitCount())
+	}
+	if busy.hitCount() != 1 {
+		t.Errorf("saturated member was dialed %d times, want only the priming dial", busy.hitCount())
+	}
+	if budget.grants() != 1 {
+		t.Errorf("budget granted %d exchanges, want 1 (a skip spends nothing)", budget.grants())
+	}
+	if info.Attempts != 1 || info.BudgetExhausted || info.Exhausted {
+		t.Errorf("info = %+v, want one attempt, no exhaustion", info)
+	}
+}
+
 // ---- cancellation ----
 
 // TestPoolCancellationAbortsAndSparesHealth pins the canceled class: the

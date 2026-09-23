@@ -263,6 +263,14 @@ func (st *poolState) end() {
 // timeout fall back; the caller's own cancellation aborts everything
 // without penalizing any member; zero dials is exhaustion, not an endpoint
 // error.
+//
+// When the request supplies an exchange budget the loop is additionally
+// bounded by it: each real dial claims one unit immediately before it, a
+// skipped member claims none, and a refusal stops the loop where it stands
+// with AttemptInfo.BudgetExhausted set. A refusal before the first dial is
+// still zero dials — the exhausted sentinel, carrying the budget flag so
+// the caller can tell the two apart; a refusal after at least one dial
+// leaves the last endpoint error in force.
 func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, error) {
 	st := p.st
 	st.begin()
@@ -320,6 +328,19 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			if !ms.lim.tryAcquire() {
 				continue
 			}
+		}
+		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+			// The request's exchange envelope is spent. This is not an
+			// endpoint failure: nothing was dialed, no member is struck,
+			// and the loop stops here. The caller sees BudgetExhausted and
+			// decides what the request is worth.
+			//
+			// The member's permit is handed back first: it was taken for a
+			// dial that never happens, so a refused exchange must not read
+			// as an in-flight request and shrink a capped member's capacity.
+			ms.lim.release()
+			info.BudgetExhausted = true
+			break
 		}
 		resp, err := p.dial(ms, ar)
 		attempts++
