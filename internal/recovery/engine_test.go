@@ -181,9 +181,7 @@ func TestEngineExchangeEnvelopeStopsRetryingButNotTheWalk(t *testing.T) {
 	pol.Budget.Candidate.MaxExchanges = 2
 	e, _ := newTestEngine(t, context.Background(), pol)
 	e.EnterCandidate(pol)
-	if !e.Budget().ConsumeExchange() || !e.Budget().ConsumeExchange() {
-		t.Fatal("the candidate's two exchanges were not allowed")
-	}
+	mustConsume(t, e.Budget(), 2)
 	d := e.Observe(httpObs(429, 1))
 	if d.Action != ActionFallback {
 		t.Fatalf("a spent candidate envelope got %+v, want a fallback", d)
@@ -213,9 +211,7 @@ func TestEngineSpentCandidateUnderTerminalRetryEndsTheWalk(t *testing.T) {
 	pol.Budget.Candidate.MaxExchanges = 2
 	e, _ := newTestEngine(t, context.Background(), pol)
 	e.EnterCandidate(pol)
-	if !e.Budget().ConsumeExchange() || !e.Budget().ConsumeExchange() {
-		t.Fatal("the candidate's two exchanges were not allowed")
-	}
+	mustConsume(t, e.Budget(), 2)
 	if d := e.Observe(httpObs(429, 1)); d.Action != ActionTerminal {
 		t.Fatalf("a spent candidate envelope under a terminal retry policy got %+v", d)
 	}

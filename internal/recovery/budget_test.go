@@ -13,7 +13,18 @@ func newTestClock() *testClock {
 
 func (c *testClock) now() time.Time          { return c.t }
 func (c *testClock) advance(d time.Duration) { c.t = c.t.Add(d) }
-func (c *testClock) set(t time.Time)         { c.t = t }
+
+// mustConsume asserts that the envelope funds n more exchanges. It exists so
+// multi-consume expectations read as one statement rather than an operator
+// chain.
+func mustConsume(t *testing.T, b *Budget, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if !b.ConsumeExchange() {
+			t.Fatalf("exchange %d of %d was refused with room to spare", i+1, n)
+		}
+	}
+}
 
 func TestBudgetConsumesPerExchange(t *testing.T) {
 	clk := newTestClock()
@@ -48,9 +59,7 @@ func TestBudgetNestsCandidateInsideRequest(t *testing.T) {
 	cand := Envelope{MaxExchanges: 2, MaxElapsed: time.Minute}
 
 	b.BeginCandidate(cand)
-	if !b.ConsumeExchange() || !b.ConsumeExchange() {
-		t.Fatal("the first candidate's two exchanges were not allowed")
-	}
+	mustConsume(t, b, 2)
 	if b.ConsumeExchange() {
 		t.Fatal("the candidate envelope allowed a third exchange")
 	}
@@ -66,18 +75,14 @@ func TestBudgetNestsCandidateInsideRequest(t *testing.T) {
 	if got := b.RequestExchanges(); got != 2 {
 		t.Fatalf("entering a candidate refilled the request envelope: %d", got)
 	}
-	if !b.ConsumeExchange() || !b.ConsumeExchange() {
-		t.Fatal("the second candidate's two exchanges were not allowed")
-	}
+	mustConsume(t, b, 2)
 	if got := b.Exhausted(); got != ExhaustionCandidate {
 		t.Fatalf("a spent candidate envelope should report the candidate: %v", got)
 	}
 
 	// A third candidate has its own room left, but the request does not.
 	b.BeginCandidate(cand)
-	if !b.ConsumeExchange() || !b.ConsumeExchange() {
-		t.Fatal("the third candidate's two exchanges were not allowed")
-	}
+	mustConsume(t, b, 2)
 	if got := b.Exhausted(); got != ExhaustionRequest {
 		t.Fatalf("the request ceiling should now bind: %v", got)
 	}
