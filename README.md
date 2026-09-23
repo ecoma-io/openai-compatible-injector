@@ -131,7 +131,9 @@ transports:
 # fall back, or terminate, how the same candidate is re-asked, how far the
 # candidate walk reaches, and how many real upstream exchanges one request may
 # spend. Overrides of the same shape sit on a providers entry, a models entry,
-# and one chain candidate; each layer merges onto the one before it.
+# and one chain candidate; each layer merges onto the one before it. Two
+# members are position-scoped and rejected elsewhere — `budget.request` only
+# here, `fallback` only here or on a model entry.
 recovery:
   matrix:
     http:
@@ -248,13 +250,19 @@ log-level: info # optional; debug | info | warn | error (absent = info)
 - `recovery` — optional block carrying the model recovery policy: the
   `matrix` (which failure retries, falls back, or terminates), `retries`,
   `fallback`, `budget`, and `retry-after`. The same block is accepted at the
-  top level (the global layer, and the only position that may state the
-  request-scoped `budget.request`), on a `providers` entry, here, and on one
+  top level (the global layer), on a `providers` entry, here, and on one
   chain candidate. The layers merge in the order global → provider → model →
   candidate, so an override states only what changes; an invalid, ambiguous,
   or over-cap block rejects the complete file. Absent, `null`, or `{}`
   inherits the layer beneath — the built-in default policy at the global
-  position. See [Provider recovery policy](#provider-recovery-policy).
+  position.
+  Two members are confined to the layers whose scope they describe, and
+  stating one anywhere else rejects the file rather than loading a block that
+  could not mean what it says: `budget.request` is the whole request's
+  envelope and belongs to the top-level block only, and `fallback` (the
+  candidate walk's reach) belongs to the layers that describe a whole chain —
+  the top level and a model entry. See
+  [Provider recovery policy](#provider-recovery-policy).
 - `retries` — the **legacy** spelling of the model layer's retry mechanics,
   normalized into the same policy engine as `recovery.retries`; stating both
   in one model entry is rejected rather than leaving the effective behavior
@@ -560,20 +568,37 @@ referenced by name from `providers`:
     tried first. The concurrency permit for the chosen member is acquired
     inside the same selection step, so two concurrent requests can never
     both take a member's last permit and both dial.
-  - **Bounded fallback, transport failures only.** When a dialed member
-    fails before any response arrives (connection, proxy connect, proxy
-    auth, timeout), the next eligible member is tried, up to
-    `max-attempts` distinct endpoints. A client cancellation — or an
-    expired caller deadline, which the request context reports the same
-    way — aborts everything: no fallback, no strike, no penalty. The
-    request context, not the error chain, decides ownership: a timeout
-    shape under a live context is the endpoint's failure and stays
-    fallback-eligible; the same shape under a done context is the
-    caller's and is terminal. **Any response — 429 and 5xx included —
-    ends the attempt loop**: an HTTP status is the upstream's answer,
-    never a fallback trigger and never a health strike.
-  - **Passive health.** `failure-threshold` consecutive fallback-eligible
-    failures open a `cooldown` during which the member is skipped. Recovery
+  - **Bounded fallback, provably-unsent failures only.** When a dialed
+    member fails with positive evidence that no request byte ever left this
+    process — a refused or unreachable dial, a TLS certificate-verification
+    failure, a proxy CONNECT or proxy-auth failure — the next eligible
+    member is tried, up to `max-attempts` distinct endpoints. Evidence, not
+    classification, is what decides it: the failure's _wire operation_ is
+    read, so a connect that timed out against a blackholed path counts as
+    unsent (nothing was written), while a reset, a bare EOF, or a timeout on
+    an established connection reads `send_unknown` — the peer may already
+    be processing a request whose answer never came back, and replaying it
+    on another egress would silently duplicate it. Send-unknown stops the
+    loop and travels up to the recovery policy, which owns replay; the
+    per-dial evidence line carries `send_state`, so "the pool stopped short
+    of its remaining members, and why" is one field away. The unsent set is
+    read off _typed_ failures only, so it is narrower than "the connection
+    was never established": a TLS handshake that fails for any reason other
+    than certificate verification — a fatal alert from the peer, a peer
+    answering the hello with plaintext HTTP, a peer that closes at accept —
+    is pre-send in fact but arrives in a shape Go also produces on an
+    established connection, so it reads `send_unknown` and the pool stops
+    rather than risk duplicating a request the type cannot rule out. A
+    client cancellation — or an expired caller deadline, which the request context
+    reports the same way — aborts everything: no fallback, no strike, no
+    penalty. The request context, not the error chain, decides ownership.
+    **Any response — 429 and 5xx included — ends the attempt loop**: an
+    HTTP status is the upstream's answer, never a fallback trigger and
+    never a health strike.
+  - **Passive health.** `failure-threshold` consecutive
+    `definitely_not_sent` failures open a `cooldown` during which the
+    member is skipped — a `send_unknown` failure proves nothing about the
+    endpoint and never strikes. Recovery
     needs no probe: any response proves the path delivered and resets the
     count.
   - **Zero eligible members** (all skipped or the fallback budget spent on
@@ -582,7 +607,8 @@ referenced by name from `providers`:
     and `egress_exhausted` so the pool's decision is visible per request.
     Each dialed-and-failed endpoint also emits one WARN
     `egress_attempt_failed` (kind, scheme+host target, canonical
-    `error_class` with its closed-set `error_cause`, attempt number) —
+    `error_class` with its closed-set `error_cause`, its `send_state`
+    (`definitely_not_sent` / `send_unknown`), attempt number) —
     evidence per attempt, even when a later member serves the request,
     with no error text and no credentials.
   - **Reload identity.** A pool whose policy bytes are unchanged across a
@@ -639,6 +665,29 @@ something different in each:
 | a `providers` entry's `recovery`                    | provider  | every model whose candidate routes through that provider |
 | a `models` entry's `recovery`                       | model     | that model                                               |
 | one entry of a model's `providers` chain `recovery` | candidate | that single hop                                          |
+
+Not every member is legal in every position. A member whose meaning is wider
+than the layer it would sit on is **rejected**, not silently ignored, because
+a block that cannot be honoured is worse than no block: it reads like a
+setting. Two members are scoped this way.
+
+`fallback` decides how far the request's candidate walk reaches — a property
+of the chain, not of any one hop. The walk's reach comes from the primary
+candidate's policy alone, so:
+
+- in the **global** and **model** positions it genuinely steers;
+- on a **candidate** (or on a provider that is not the primary's) it could
+  never matter at all;
+- on the **primary's own provider** it would steer today and stop steering the
+  moment that provider is used as a fallback for another model — the same
+  block, two behaviours, decided by a chain position the operator cannot see
+  from the provider entry.
+
+So `fallback` is accepted at the top level and on a model entry, and stating
+it on a `providers` entry or a chain candidate rejects the file.
+
+`budget.request` bounds the whole request, which is wider than any single
+layer beneath it; it is accepted in the top-level block only.
 
 Resolution runs once, at config load, in the order **global → provider → model
 → candidate** — narrowest last, so an override always beats what it overrides.
@@ -922,12 +971,18 @@ A refusal is not a failure and is never reported as one: nothing was dialed,
 no endpoint is blamed, and no `provider_attempt_failed` or
 `egress_attempt_failed` is emitted for it. The exhausted candidate's turn ends
 on a WARN `candidate_exchange_budget_spent` carrying `policy_rule_id`
-(`budget-candidate`, or `budget-request` when the request envelope is the one
-that refuses — which is terminal whatever `on-exhausted` says), the closed-set
-`error_cause: exchange_budget`, and the walk's position (`candidate_index`,
+`budget-candidate`, the closed-set `error_cause: exchange_budget`, the
+disposition the refusal produced, and the walk's position (`candidate_index`,
 `candidate_attempt`, `retry_index`, `provider_attempt`,
-`request_exchange_budget_remaining`). It carries no `upstream_exchange` and no
-`disposition`, because no exchange happened for it to have a place in.
+`request_exchange_budget_remaining`). It carries no `upstream_exchange`,
+because no exchange happened for it to index.
+
+A refusal by the REQUEST envelope is a different record, because it is a
+different answer: no policy can buy an exchange the request envelope has
+already refused, so the walk ends there rather than asking the retry
+policy's `on-exhausted`. It has no WARN of its own — the post-walk ERROR
+`upstream_request_failed` names it, with `policy_rule_id: budget-request`
+and `failure_origin: envelope`.
 
 **A configuration above a cap is rejected, never clamped.** The absolute caps
 are `64` and `32` exchanges and `5m`/`2m` elapsed for the request and candidate
@@ -1053,8 +1108,10 @@ walk's counters ride the completion record:
   all five, `request_exchange_budget_remaining` included.
 
 `provider_attempts` counts provider-level attempts; `upstream_exchanges` counts
-real outbound exchanges — and the two differ whenever an egress pool falls
-back, because one provider attempt that dials three members is three exchanges.
+real outbound exchanges — and the two are independent in BOTH directions,
+because one provider attempt that dials three members is three exchanges,
+while an attempt whose pool dials nothing at all is one attempt and zero
+exchanges.
 
 Each failed attempt logs one WARN `provider_attempt_failed`, and every received
 4xx/5xx — attempts a retry or fallback later discarded included — logs its
@@ -1067,7 +1124,10 @@ direct — logs one WARN `egress_attempt_failed` in the same vocabulary. An
 exchange the envelope refused before a dial is not a failure and gets its own
 WARN `candidate_exchange_budget_spent` instead, carrying
 `policy_rule_id`/`disposition`/`reason` and the walk's position but no
-`upstream_exchange` — there was no exchange for it to index. Details under
+`upstream_exchange` — there was no exchange for it to index. That record
+always names `budget-candidate`: a refusal by the REQUEST envelope is
+terminal whatever the policy says, so it ends the walk and is reported by
+the post-walk `upstream_request_failed` under `budget-request`. Details under
 [Logging](#logging).
 
 ### Invariants that are not configurable
@@ -1449,12 +1509,19 @@ non-SSE is recorded buffered), final client status and outcome,
 upstream-reported token counts, client wire byte counts, cumulative provider
 and egress attempt counters (`provider_attempts` counts provider-level
 attempts — same-candidate retries included — summed across every candidate of
-a fallback walk; `upstream_exchanges` counts the real outbound HTTP exchanges
-the walk spent, so the two differ whenever an egress pool fell back; egress
-dials are summed the same way), the final candidate's
+a fallback walk; `egress_attempts` counts the real outbound HTTP exchanges
+the walk spent, so the two are independent — an attempt that fanned out
+across a pool's members is fewer attempts than exchanges, one whose pool
+dialed nothing is more), the final candidate's
 egress kind (`direct`, or the last dialed pool
 member's kind; empty when a pool exhausted without dialing anything), and full
-request latency. Provider fallback and same-candidate retries still emit
+request latency. Two naming notes for anyone querying the table: the
+`egress_attempts` column holds the request-wide exchange total described
+above (the log record calls that quantity `upstream_exchanges`, and reserves
+its own `egress_attempts` field for the relayed candidate's pool report), and
+there is no `upstream_exchanges` column — a query says `egress_attempts`
+where the completion line says `upstream_exchanges`. Provider fallback and
+same-candidate retries still emit
 **one** event: it describes the
 candidate that answered, or the final attempted candidate if all paths failed.
 Failed attempts are represented only by the attempt counters.
@@ -1529,7 +1596,8 @@ What each level carries:
   (mode, whether the request signaled intent, whether synthesis is active —
   models with a `thinking-usage` block only), `request_transform_started`/
   `request_transform_completed` (byte counts around prompt injection),
-  `upstream_request_started` (origin + forwarded byte count),
+  `provider_attempt_started` (origin + forwarded byte count, emitted before
+  the attempt's first dial on both the direct and pooled paths),
   `upstream_response_received` (upstream status + content type). From there
   the lifecycle forks: a buffered response continues with
   `response_transform_started`/`response_transform_completed` (byte counts
@@ -1557,8 +1625,9 @@ What each level carries:
   candidate's 1-based chain position, plus
   `provider_exhausted` when every budgeted candidate failed without
   answering). `provider_attempts` counts provider-level attempts and
-  `upstream_exchanges` counts real outbound exchanges — they differ whenever
-  an egress pool falls back. The event is emitted
+  `upstream_exchanges` counts real outbound exchanges — the two are
+  independent, differing in either direction (a pooled attempt that fans out
+  is several exchanges, one that dials nothing is none). The event is emitted
   when the request finishes, under the
   level in effect at that moment — a reload mid-request can therefore
   change whether it appears. Also `config_reloaded` (`generation`,
@@ -1570,7 +1639,9 @@ What each level carries:
   `phase` field separating `client_write` from `upstream_read` and
   `upstream_limit`, and `relay_copy_failed` with phase `client_write` on
   the verbatim and buffered paths — the buffered case covers a client whose
-  cancel surfaces through the upstream body read, with no envelope written
+  cancel or expired deadline surfaces through the upstream body read, which
+  is read from the request context rather than the error chain, with no
+  envelope written
   to the connection that is already gone), a response that never landed because the client was
   already gone — a buffered body or any locally generated error envelope
   (`client_write_failed`, outcome `client_disconnected`, superseding the
@@ -1637,17 +1708,20 @@ bytes are dropped from the log — nothing an upstream controls can balloon a
 log line; the client-side relay is unaffected). The raw error body
 itself never appears at any level: it exists only as the count, the shape,
 and the fingerprint. Every attempt-bearing lifecycle event
-(`upstream_request_started`, `upstream_response_received`,
+(`provider_attempt_started`, `upstream_response_received`,
 `upstream_request_failed`, `provider_attempt_failed`, the evidence event)
 also carries the attempt identity described under
 [Provider recovery policy](#provider-recovery-policy): the nested
-`provider_attempt` (a one-based count of provider-level attempts across the
-whole request — numerically the old candidate index when no retry fires),
+`provider_attempt` (a one-based count of logical provider-level attempts
+across the whole request — numerically the old candidate index when no retry
+fires; one logical attempt may span several outbound exchanges when an
+egress pool falls back),
 `provider_attempts` and `upstream_exchanges` (the first counts provider-level
-attempts, the second the real outbound exchanges — they differ whenever an
-egress pool falls back), `policy_rule_id` (the rule or code-owned invariant
+attempts, the second the real outbound exchanges — independent axes that
+differ in either direction, since a pooled attempt may fan out across several
+members or reach none at all), `policy_rule_id` (the rule or code-owned invariant
 that decided the attempt), `request_exchange_budget_remaining`, and, on
-the events after a dial, `egress_attempt` (`upstream_request_started` fires
+the events after a dial, `egress_attempt` (`provider_attempt_started` fires
 before one, so it carries the provider indexes only), plus `candidate_index`
 (1-based chain position), `candidate_attempt`
 (1-based within the candidate), `retry_index` (`candidate_attempt − 1`;
@@ -1659,10 +1733,28 @@ below 500 — fallback-only and terminal rows alike — the transport cause
 tokens, and `upstream_invalid_response` /
 `upstream_body_timeout` / `upstream_body_read_failed` for unusable
 answers, which ride the unusable-answer events rather than
-`provider_attempt_failed`) and `elapsed_ms`. The evidence and body-read/invalid events carry
+`provider_attempt_failed`), `failure_origin` (`upstream_http` | `transport` |
+`protocol` | `caller` | `envelope` — the layer the failure belongs to) and
+`elapsed_ms`. Transport failures additionally carry `send_state`
+(`definitely_not_sent` | `send_unknown`): whether this dialed attempt
+provably never carried a request byte. It is evidence about a **dialed**
+attempt, so a pool that skipped every member reports none — that line says
+`egress_exhausted`, which is the whole truth about it. The evidence and
+body-read/invalid events carry
 the received HTTP status as `upstream_status` — a transport failure has no
 status to carry — so failures correlate by
 `request_id + candidate_index + candidate_attempt + egress_attempt`.
+
+Two naming notes, so a dashboard is not built on the wrong reading.
+`provider_attempt_started` replaced the former `upstream_request_started`
+(the slug now names what it announces), and it is emitted **before** the
+dial, so it announces an attempt whose outcome is not yet known — but the
+index it carries is the logical attempt counter's own, already incremented,
+not a projection of one. An attempt the exchange envelope refuses before
+any dial therefore still reports `provider_attempt = provider_attempts = N`,
+because it IS the Nth logical attempt; only `upstream_exchanges` stays
+where it was, because that counts real dials and none happened. The two
+counters are independent axes and neither is derived from the other.
 
 The credential rule is absolute: no log line, at any level, ever contains
 an `Authorization` value, a request or response body, an injection prompt,

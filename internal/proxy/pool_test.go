@@ -1,14 +1,18 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -268,7 +272,7 @@ func TestHandlerPoolLogFields(t *testing.T) {
 func TestHandlerPoolExhaustionLoggedWithClass(t *testing.T) {
 	store := newPoolStore(t)
 	ex := &stubExecutor{
-		err:  errors.New("egress pool: no eligible endpoint available"),
+		err:  transport.ErrExhausted,
 		info: transport.AttemptInfo{Exhausted: true},
 	}
 	buf, logger := captureLog(zerolog.ErrorLevel)
@@ -432,5 +436,312 @@ func TestHandlerEgressAttemptFailureEvents(t *testing.T) {
 	}
 	if evs := buf.events(t, "egress_attempt_failed"); len(evs) != 0 {
 		t.Errorf("plain path emitted %d attempt events", len(evs))
+	}
+}
+
+// TestProviderAttemptStartedPrecedesDial pins the lifecycle placement: the
+// provider-visible attempt is announced BEFORE the first exchange of that
+// attempt on both the pooled and the direct path, so an operator reading the
+// chain sees provider_attempt_started precede the response/evidence events of
+// the same attempt — never after the operation it names.
+func TestProviderAttemptStartedPrecedesDial(t *testing.T) {
+	store := newPoolStore(t)
+	ex := &stubExecutor{
+		info: transport.AttemptInfo{Attempts: 1, Kind: "proxy", Target: "http://127.0.0.1:20130"},
+	}
+	buf, logger := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x","choices":[]}`}}, nil, nil, logger)
+
+	// Pooled path.
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pooled status = %d", rec.Code)
+	}
+	assertStartedBeforeResponse(t, buf)
+
+	// Direct path.
+	buf.buf.Reset()
+	rec = doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"direct-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("direct status = %d", rec.Code)
+	}
+	assertStartedBeforeResponse(t, buf)
+}
+
+// assertStartedBeforeResponse scans the captured events of one request and
+// asserts every provider_attempt_started precedes the same attempt's
+// upstream_response_received, by event order.
+func assertStartedBeforeResponse(t *testing.T, buf *logBuffer) {
+	t.Helper()
+	type evTag struct {
+		msg   string
+		index int
+	}
+	var started []evTag
+	var responded []evTag
+	for i, line := range strings.Split(buf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("log line is not JSON: %q", line)
+		}
+		m, _ := ev["message"].(string)
+		switch m {
+		case "provider_attempt_started":
+			started = append(started, evTag{m, i})
+		case "upstream_response_received":
+			responded = append(responded, evTag{m, i})
+		}
+	}
+	if len(started) == 0 {
+		t.Fatal("no provider_attempt_started event captured")
+	}
+	if len(responded) == 0 {
+		t.Fatal("no upstream_response_received event captured")
+	}
+	if got := started[0].index; got > responded[0].index {
+		t.Errorf("provider_attempt_started index %d is after upstream_response_received index %d", got, responded[0].index)
+	}
+}
+
+// TestFailureOriginLabelsEvidence pins the failure_origin field on the
+// transport evidence: a dialed-and-failed pool member carries failure_origin
+// transport on its egress attempt record, and an exhausted pool's final
+// report does too, while the upstream_request_failed exhaustion record stays
+// envelope-free (it is the pool's egress report, not an envelope decision).
+func TestFailureOriginLabelsEvidence(t *testing.T) {
+	store := newPoolStore(t)
+	ex := &stubExecutor{
+		err:  transport.ErrExhausted,
+		info: transport.AttemptInfo{Exhausted: true},
+	}
+	buf, logger := captureLog(zerolog.ErrorLevel)
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, logger)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	// The pool dialed nothing, so no egress_attempt_failed; the final report
+	// at upstream_request_failed names the egress pool — failure_origin
+	// transport because the layer that ran out is the transport.
+	evs := buf.events(t, "upstream_request_failed")
+	if len(evs) != 1 {
+		t.Fatalf("upstream_request_failed events = %d, want 1", len(evs))
+	}
+	if evs[0]["failure_origin"] != "transport" {
+		t.Errorf("failure_origin = %v, want transport", evs[0]["failure_origin"])
+	}
+	// A zero-dial pool carries no send_state, deliberately: the state is
+	// evidence about a DIALED attempt, and this exhaustion sentinel is a
+	// pool-level condition, not an endpoint's failure. Reading it as wire
+	// evidence would attach a state to a dial that never happened —
+	// egress_exhausted already says everything true here.
+	if _, ok := evs[0]["send_state"]; ok {
+		t.Errorf("send_state = %v, want the field absent on a zero-dial exhaustion", evs[0]["send_state"])
+	}
+}
+
+// TestRequestBuildErrorIsLocalNotAnEndpointFailure pins the vocabulary of the
+// pooled path's one purely LOCAL failure: a request the transport could not
+// construct. Nothing was dialed, so no member may be named, struck, blamed or
+// given a wire state — and because the request itself is what is wrong, the
+// walk stops rather than asking another provider to fail on it too.
+func TestRequestBuildErrorIsLocalNotAnEndpointFailure(t *testing.T) {
+	store := newChainStoreRetries(t, "", "")
+	ex := &buildErrorExecutor{}
+	buf, logger := captureLog(zerolog.WarnLevel)
+	h := NewHandler(store, kindResolver{direct: ex, proxied: ex}, nil, nil, logger)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"chain-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body %s)", rec.Code, rec.Body.String())
+	}
+	evs := buf.events(t, "upstream_request_build_failed")
+	if len(evs) != 1 || evs[0]["error_class"] != "request_build" {
+		t.Fatalf("build failure records = %v, want one request_build event", evs)
+	}
+	// No endpoint was blamed and no wire state invented for a request that
+	// never left this process: no per-dial record, no per-attempt transport
+	// failure (which would carry an error_class and a send_state), and no
+	// exhaustion line naming an upstream.
+	for _, slug := range []string{"egress_attempt_failed", "provider_attempt_failed", "upstream_request_failed"} {
+		if n := len(buf.events(t, slug)); n != 0 {
+			t.Errorf("%s records = %d, want 0: this failure is local, not an endpoint's", slug, n)
+		}
+	}
+	// The walk stopped at the first candidate: a request this process cannot
+	// build is not one another provider would accept.
+	if ex.calls != 1 {
+		t.Errorf("pool executions = %d, want 1: the walk must stop on a local build failure", ex.calls)
+	}
+}
+
+// buildErrorExecutor reports the pool's local construction failure: the
+// attempt's request could not be built, so nothing was dialed.
+type buildErrorExecutor struct{ calls int }
+
+func (e *buildErrorExecutor) Execute(*transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+	e.calls++
+	return nil, transport.AttemptInfo{}, &transport.RequestBuildError{}
+}
+
+func (e *buildErrorExecutor) Do(*http.Request) (*http.Response, error) {
+	panic("handler called Do on an Executor-capable doer")
+}
+
+// TestSendStateNotInheritedByLaterZeroDialAttempt pins the send state's
+// ATTEMPT locality. A walk that fails candidate 1 on a provably-unsent dial
+// and then ends on candidate 2's zero-dial pool exhaustion must not publish
+// candidate 1's definitely_not_sent beside candidate 2's egress_exhausted:
+// that reads as "the pool proved its own dial never left", a claim about a
+// dial it never made, and the opposite of what the exhaustion sentinel
+// reports. The state is per attempt and reset alongside the egress index it
+// describes, so only an attempt that dialed can leave one behind.
+func TestSendStateNotInheritedByLaterZeroDialAttempt(t *testing.T) {
+	store := newChainStoreRetries(t, "", "")
+	refused := &fakeUpstream{err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
+	ex := &allIneligibleExecutor{}
+	buf, logger := captureLog(zerolog.WarnLevel)
+	h := NewHandler(store, kindResolver{direct: refused, proxied: ex}, nil, nil, logger)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"chain-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body %s)", rec.Code, rec.Body.String())
+	}
+	// Candidate 1's failure really is a transport failure with a real state —
+	// this test's premise, asserted so it cannot decay into a vacuous pass.
+	// Candidate 2's is the zero-dial pool condition, and it must publish no
+	// state at all: send_state describes a dial, and the pool made none. A
+	// state re-derived from the classification instead of from the attempt
+	// would appear here as the zero value, which is an invented fact about the
+	// wire rather than a conservative one.
+	fails := buf.events(t, "provider_attempt_failed")
+	if len(fails) != 2 {
+		t.Fatalf("provider_attempt_failed events = %d, want one per attempted candidate: %v", len(fails), fails)
+	}
+	if fails[0]["provider_attempt"] != float64(1) || fails[0]["send_state"] != "definitely_not_sent" {
+		t.Errorf("candidate 1 evidence = %v, want attempt 1 with definitely_not_sent", fails[0])
+	}
+	if got, ok := fails[1]["send_state"]; ok {
+		t.Errorf("candidate 2 evidence send_state = %v, want the field absent: that attempt dialed nothing", got)
+	}
+	// Candidate 2 dialed nothing: the terminal report names the pool's own
+	// condition and carries no wire state — least of all candidate 1's.
+	final := buf.events(t, "upstream_request_failed")
+	if len(final) != 1 {
+		t.Fatalf("upstream_request_failed events = %d, want 1", len(final))
+	}
+	if got, ok := final[0]["send_state"]; ok {
+		t.Errorf("exhaustion send_state = %v, want the field absent: the final attempt dialed nothing", got)
+	}
+	if final[0]["error_class"] != "egress_exhausted" || final[0]["error_cause"] != "no_eligible_endpoint" {
+		t.Errorf("exhaustion class/cause = %v/%v, want the zero-dial pool condition",
+			final[0]["error_class"], final[0]["error_cause"])
+	}
+	if ex.calls != 1 {
+		t.Errorf("candidate 2 executions = %d, want 1", ex.calls)
+	}
+}
+
+// TestSendStateRidesTransportEvidence pins the send-state axis on every
+// transport-failure surface: a failure that provably never left the client
+// (a refused dial) reads definitely_not_sent, while a failure on an
+// established connection — which may have reached the upstream — reads
+// send_unknown. The per-dial record, the per-attempt classification and the
+// post-walk exhaustion report all describe the same exchange, so all three
+// must agree.
+//
+// The failure values are the real wire shapes (see
+// internal/transport/sendstate_test.go), because the state is derived from
+// the failing OPERATION: a synthetic error with no op is send_unknown by
+// construction, and pinning one here would test the plumbing against a
+// shape production never emits.
+func TestSendStateRidesTransportEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		class     string
+		cause     string
+		wantState string
+	}{
+		{
+			"refused dial",
+			&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+			"connection", "connection_refused", "definitely_not_sent",
+		},
+		{
+			"reset on an established connection",
+			&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
+			"connection", "dial", "send_unknown",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newPoolStore(t)
+			ex := &stubExecutor{
+				err: tc.err,
+				info: transport.AttemptInfo{
+					Attempts: 1, Kind: "direct", Target: "direct",
+					Failures: []transport.AttemptFailure{{
+						Kind: "direct", Target: "direct",
+						Class: tc.class, Cause: tc.cause, SendState: tc.wantState,
+					}},
+				},
+			}
+			buf, logger := captureLog(zerolog.WarnLevel)
+			h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, logger)
+
+			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", rec.Code)
+			}
+			perDial := buf.events(t, "egress_attempt_failed")
+			if len(perDial) != 1 || perDial[0]["send_state"] != tc.wantState {
+				t.Errorf("egress_attempt_failed = %v, want send_state %s", perDial, tc.wantState)
+			}
+			perAttempt := buf.events(t, "provider_attempt_failed")
+			if len(perAttempt) != 1 || perAttempt[0]["send_state"] != tc.wantState {
+				t.Errorf("provider_attempt_failed = %v, want send_state %s", perAttempt, tc.wantState)
+			}
+			// The walk ends on that same failure, so the terminal report
+			// carries the state too.
+			final := buf.events(t, "upstream_request_failed")
+			if len(final) != 1 || final[0]["send_state"] != tc.wantState {
+				t.Errorf("upstream_request_failed = %v, want send_state %s", final, tc.wantState)
+			}
+		})
+	}
+}
+
+// TestFailureOriginHTTPLabelsUpstreamError pins failure_origin upstream_http
+// on the received-error evidence: a provider 429 answers through the
+// normalized error event with the upstream_http origin, never transport —
+// the status was an answer, not a dial failure.
+func TestFailureOriginHTTPLabelsUpstreamError(t *testing.T) {
+	stubRetryTiming(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited","type":"rate_limit_error"}}`)
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t, upstream.URL+"/v1")
+	var logs bytes.Buffer
+	h := NewHandler(store, directResolver(), nil, nil, zerolog.New(&logs))
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	ev := findLogEvent(t, logs.String(), "upstream_http_error")
+	if ev["failure_origin"] != "upstream_http" {
+		t.Errorf("failure_origin = %v, want upstream_http", ev["failure_origin"])
 	}
 }

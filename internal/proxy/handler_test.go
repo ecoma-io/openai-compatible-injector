@@ -1282,6 +1282,49 @@ func TestSanitizeUpstreamErrorParseFailuresStatic(t *testing.T) {
 	}
 }
 
+// TestSanitizeUpstreamErrorIsTotal pins the rule for values that arrive
+// WITHOUT a request URL attached: a body read surfacing through
+// net/textproto, a pool's attempt error, any wrapped shape this package does
+// not know. They are held to the same allow-list rather than passed through
+// on the assumption that only client.Do errors reach the log — the parse
+// failures quote the upstream's bytes wherever they surface. The
+// allow-listed shapes keep their text, so the total rule does not cost an
+// operator the cause: the transport package's own exhaustion sentinel is a
+// static literal and is named explicitly.
+func TestSanitizeUpstreamErrorIsTotal(t *testing.T) {
+	endpoint := &url.URL{Scheme: "http", Host: "up.example:1"}
+
+	bare := sanitizeUpstreamError(
+		errors.New(`net/textproto: malformed MIME header line: "X-Bad: SECRET_RAW_MARKER"`),
+		endpoint)
+	if msg := bare.Error(); strings.Contains(msg, "SECRET_RAW_MARKER") || strings.Contains(msg, "malformed") {
+		t.Errorf("bare parse failure echoes upstream bytes: %q", msg)
+	}
+	if bare.Error() != "upstream transport error" {
+		t.Errorf("bare parse failure = %q, want the static text", bare.Error())
+	}
+
+	refused := sanitizeUpstreamError(&net.OpError{
+		Op:   "dial",
+		Net:  "tcp",
+		Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+		Err:  syscall.ECONNREFUSED,
+	}, endpoint)
+	if !strings.Contains(refused.Error(), "connection refused") {
+		t.Errorf("bare dial error = %q, want the errno text kept", refused.Error())
+	}
+
+	// The pool's own sentinel survives verbatim: it is static by construction
+	// and it is the whole point of the exhaustion line.
+	if got := sanitizeUpstreamError(transport.ErrExhausted, endpoint); got.Error() != transport.ErrExhausted.Error() {
+		t.Errorf("exhaustion sentinel = %q, want it kept verbatim", got.Error())
+	}
+
+	if got := sanitizeUpstreamError(nil, endpoint); got != nil {
+		t.Errorf("nil error = %v, want nil", got)
+	}
+}
+
 // TestUpstreamTimeoutClassified pins the timeout branch of the upstream
 // failure taxonomy: an upstream that accepts the connection and then goes
 // quiet past the header deadline surfaces as the 502 upstream_unreachable

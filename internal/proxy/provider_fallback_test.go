@@ -1417,6 +1417,14 @@ func TestProviderChainProviderLocalTimeoutStillFallsBack(t *testing.T) {
 		t.Errorf("direct egress class/cause = %v/%v, want timeout/network_timeout",
 			eg[0]["error_class"], eg[0]["error_cause"])
 	}
+	// A timeout on an established connection may have reached the upstream,
+	// so it is send_unknown — and still the injector's to decide: the walk
+	// moves to the next provider, which is a different upstream, not a
+	// replay of the one that may already be working.
+	if eg[0]["failure_origin"] != "transport" || eg[0]["send_state"] != "send_unknown" {
+		t.Errorf("direct egress origin/send_state = %v/%v, want transport/send_unknown",
+			eg[0]["failure_origin"], eg[0]["send_state"])
+	}
 	failed := logBuf.events(t, "provider_attempt_failed")
 	if len(failed) != 1 {
 		t.Fatalf("provider_attempt_failed events = %d, want 1", len(failed))
@@ -1428,6 +1436,10 @@ func TestProviderChainProviderLocalTimeoutStillFallsBack(t *testing.T) {
 	if failed[0]["error_class"] != "timeout" || failed[0]["error_cause"] != "network_timeout" {
 		t.Errorf("provider_attempt_failed class/cause = %v/%v, want timeout/network_timeout",
 			failed[0]["error_class"], failed[0]["error_cause"])
+	}
+	if failed[0]["failure_origin"] != "transport" || failed[0]["send_state"] != "send_unknown" {
+		t.Errorf("provider_attempt_failed origin/send_state = %v/%v, want transport/send_unknown",
+			failed[0]["failure_origin"], failed[0]["send_state"])
 	}
 	done := logBuf.events(t, "request_completed")
 	if len(done) != 1 || done[0]["provider_attempts"] != float64(2) || done[0]["final_provider"] != "pb" {
@@ -1655,6 +1667,18 @@ models:
 	ev := logs.events(t, "upstream_invalid_response")
 	if len(ev) != 1 || ev[0]["policy_rule_id"] != "protocol-oversized_response" || ev[0]["disposition"] != "fallback" {
 		t.Errorf("oversized evidence = %v, want protocol-oversized_response/fallback", ev)
+	}
+	// The unusable-answer event names the failure in the closed-set tokens the
+	// operator's matrix is written in, exactly like its sibling
+	// upstream_body_read_failed: which way the answer was unusable is the
+	// error_cause, so a file that splits the two causes apart is readable off
+	// the line that fired.
+	if ev[0]["error_class"] != "upstream_invalid_response" || ev[0]["error_cause"] != "oversized_response" {
+		t.Errorf("oversized evidence class/cause = %v/%v, want upstream_invalid_response/oversized_response",
+			ev[0]["error_class"], ev[0]["error_cause"])
+	}
+	if got := ev[0]["failure_origin"]; got != "protocol" {
+		t.Errorf("failure_origin = %v, want protocol", got)
 	}
 }
 

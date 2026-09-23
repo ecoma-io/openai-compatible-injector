@@ -213,12 +213,36 @@ func buildRecoveryPartial(block *runtimeRecovery) (recovery.Partial, error) {
 }
 
 // buildRecoveryOverride translates an override-position recovery block: the
-// same shape as the global one minus the request-scoped envelope. The
-// rejection names the offending field and the position it belongs to, and
-// never the value.
+// same shape as the global one minus the request-scoped envelope and the
+// walk bound. Both rejections name the offending field and the position it
+// belongs to, and never the value.
+//
+// `recovery.fallback` is rejected here — at every call-in — because the
+// walk's reach is a property of the REQUEST's chain, not of any candidate:
+// the engine's enter-candidate gate reads only the primary policy's Fallback
+// (engine.go canEnter), and the primary is chain[0]. Accepting the block
+// below that layer would be misleading in BOTH directions, which is why this
+// is a rejection rather than a narrowing:
+//
+//   - on a non-primary candidate (or on a provider that is not the primary's)
+//     it would merge, validate, hash, and then do nothing at all;
+//   - on the primary's own provider or on candidate 1 it would steer — but
+//     only for as long as that provider stays the primary, which is a
+//     property of the requesting model, not of the provider. The same
+//     provider entry used as a fallback for a second model would carry a
+//     block that silently does nothing there.
+//
+// Neither reading is one an operator can hold while paged, so the walk bound
+// lives where chain reach is a real concept: the global position owns it, and
+// the model position states it through buildModelRecovery — which applies the
+// model's override to that model's own primary candidate and therefore
+// genuinely steers that model's walk.
 func buildRecoveryOverride(block *runtimeRecovery) (recovery.Partial, error) {
 	if block.Budget != nil && block.Budget.Request != nil {
 		return recovery.Partial{}, errors.New("recovery.budget.request is request-scoped and only valid in the top-level recovery block")
+	}
+	if block.Fallback != nil {
+		return recovery.Partial{}, errors.New("recovery.fallback is request-scoped (the candidate walk's reach) and only valid in the top-level recovery block or a model entry")
 	}
 	return buildRecoveryPartial(block)
 }
@@ -580,6 +604,17 @@ func buildRecoveryRetryAfter(ra *runtimeRecoveryRetryAfter) (*recovery.RetryAfte
 // depending on which one the code happened to read last — so a file that does
 // rejects. The returned partial is nil when the model states neither, so the
 // layer is skipped rather than re-validated for nothing.
+//
+// Unlike the provider and candidate positions, a model entry MAY state
+// `recovery.fallback`: the model layer resolves into the model's own primary
+// candidate (Chain[0].Recovery, mirrored as Model.Recovery), and the engine's
+// reach gate reads exactly that policy's Fallback — so a model-level block
+// genuinely steers that model's walk. The request-scoped `budget.request`
+// envelope stays rejected here like everywhere below the global layer.
+// buildRecoveryOverride's fallback rejection is bypassed rather than
+// duplicated, and its budget.request rejection still applies: build first for
+// the validations that must hold for a model block, then re-check the one
+// field that may differ from an override position.
 func buildModelRecovery(rm runtimeModel) (*recovery.Partial, error) {
 	if rm.Retries != nil && rm.Recovery != nil && rm.Recovery.Retries != nil {
 		return nil, errors.New("recovery.retries and the legacy retries block are mutually exclusive")
@@ -589,7 +624,10 @@ func buildModelRecovery(rm runtimeModel) (*recovery.Partial, error) {
 	}
 	var p recovery.Partial
 	if rm.Recovery != nil {
-		block, err := buildRecoveryOverride(rm.Recovery)
+		if rm.Recovery.Budget != nil && rm.Recovery.Budget.Request != nil {
+			return nil, errors.New("recovery.budget.request is request-scoped and only valid in the top-level recovery block")
+		}
+		block, err := buildRecoveryPartial(rm.Recovery)
 		if err != nil {
 			return nil, err
 		}

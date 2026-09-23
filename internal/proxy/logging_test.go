@@ -398,6 +398,22 @@ func (b *canceledBody) Read(p []byte) (int, error) {
 
 func (b *canceledBody) Close() error { return nil }
 
+// deadlineBody is the expired-deadline mirror of canceledBody: what the
+// transport surfaces through the upstream read when the caller's deadline
+// runs out mid-answer. Same ownership, same answer.
+type deadlineBody struct{ used bool }
+
+func (b *deadlineBody) Read(p []byte) (int, error) {
+	if b.used {
+		return 0, context.DeadlineExceeded
+	}
+	b.used = true
+	s := "partial"
+	return copy(p, s), nil
+}
+
+func (b *deadlineBody) Close() error { return nil }
+
 // shortResponseWriter reports fewer bytes written than it was given, with a
 // nil error — the io.Writer contract's second failure mode.
 type shortResponseWriter struct {
@@ -485,6 +501,20 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		// still a client-side disconnect: the context only cancels when the
 		// client goes away.
 		buf, h := verbatim(&canceledBody{})
+		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
+		if rec.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302", rec.Code)
+		}
+		expectDisconnected(t, buf, "relay_copy_failed")
+	})
+
+	t.Run("verbatim_expired_deadline", func(t *testing.T) {
+		// The expired-deadline mirror of the canceled context: the caller's
+		// deadline surfaces through the upstream read as
+		// context.DeadlineExceeded. Ownership is the request context's either
+		// way — the caller is gone just the same — so it is a disconnect, not
+		// an upstream read failure.
+		buf, h := verbatim(&deadlineBody{})
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 		if rec.Code != http.StatusFound {
 			t.Fatalf("status = %d, want 302", rec.Code)
@@ -657,7 +687,7 @@ func TestDebugLifecycleChain(t *testing.T) {
 	chain := []string{
 		"request_received", "probe_completed", "model_resolved",
 		"request_transform_started", "request_transform_completed",
-		"upstream_request_started", "upstream_response_received",
+		"provider_attempt_started", "upstream_response_received",
 		"response_transform_started", "response_transform_completed",
 		"client_write_completed", "request_completed",
 	}

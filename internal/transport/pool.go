@@ -9,11 +9,14 @@ import (
 	"time"
 )
 
-// errExhausted is returned when a pool dialed nothing: every member was
+// ErrExhausted is returned when a pool dialed nothing: every member was
 // statically ineligible for the request, in a health cooldown, or at its
 // concurrency cap. It is a pool-level condition, not an endpoint failure —
-// no member can be blamed, so it carries no cause. Static text only.
-var errExhausted = errors.New("egress pool: no eligible endpoint available")
+// no member can be blamed, so it carries no cause. Static text only, and it
+// is exported for exactly that reason: the proxy's no-echo allow-list names
+// it instead of collapsing this sentinel into generic text, so the operator
+// keeps "every member was unavailable" on the exhaustion line.
+var ErrExhausted = errors.New("egress pool: no eligible endpoint available")
 
 // poolDoer is the Doer/Executor for one EgressPool transport. It is
 // stateless glue: the scheduler position, health state, concurrency
@@ -259,10 +262,11 @@ func (st *poolState) end() {
 
 // Execute runs the eligibility → schedule → bounded-attempt loop. The
 // contract: any response ends the loop (statuses are answers, never
-// triggers); only pre-response failures classified as proxy/connection/
-// timeout fall back; the caller's own cancellation aborts everything
-// without penalizing any member; zero dials is exhaustion, not an endpoint
-// error.
+// triggers); only pre-response failures proven to have carried no request
+// byte fall back (see SendState — a refused or unreachable dial does, a
+// timeout or reset on an established connection does not); the caller's own
+// cancellation aborts everything without penalizing any member; zero dials
+// is exhaustion, not an endpoint error.
 //
 // When the request supplies an exchange budget the loop is additionally
 // bounded by it: each real dial claims one unit immediately before it, a
@@ -330,6 +334,20 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 				continue
 			}
 		}
+		// The attempt's request is built BEFORE the envelope is claimed. A
+		// request this transport cannot even construct is not a dial: building
+		// touches no socket, so nothing reaches the member, no exchange was
+		// spent on it, and the member cannot be blamed or struck for it. It
+		// leaves as a local failure of this attempt — typed, so the caller can
+		// tell it from an endpoint's failure and does not name one for it.
+		req, buildErr := buildAttempt(ar)
+		if buildErr != nil {
+			// The permit goes back with it: it was taken for a dial that never
+			// happens, so holding it would shrink a capped member's capacity.
+			ms.lim.release()
+			st.end()
+			return nil, info, &RequestBuildError{cause: buildErr}
+		}
 		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
 			// The request's exchange envelope will not fund this dial. This
 			// is not an endpoint failure: nothing was dialed, no member is
@@ -348,11 +366,16 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			// AFTER a real dial keeps its last endpoint error in force,
 			// which is exactly the case the zero-dial sentinel is for.
 			if attempts == 0 {
+				// The lease taken at entry is released on EVERY return: a
+				// state that never drops back to zero can never satisfy the
+				// registry's retire condition, so its teardown would be
+				// deferred forever and the evicted generation would linger.
+				st.end()
 				return nil, info, nil
 			}
 			break
 		}
-		resp, err := p.dial(ms, ar)
+		resp, err := ms.client.Do(req)
 		attempts++
 		info.Attempts = attempts
 		info.Kind = p.pool.Members[idx].Endpoint.kindName()
@@ -372,30 +395,46 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 		// The context the attempt ran under decides ownership: a caller
 		// cancellation or deadline that fired during the dial is terminal —
 		// no fallback, no strike, no evidence — while a failure against a
-		// still-live context is the endpoint's and keeps its bounded
-		// fallback eligibility (a provider-local timeout included).
+		// still-live context is the endpoint's.
 		f := ClassifyAttempt(ar.Ctx, err)
 		if f.CallerTerminated {
 			st.end()
 			return nil, info, err
 		}
-		ms.health.strike()
 		// Bounded per-attempt evidence for the access log: one record per
-		// actually dialed-and-failed endpoint, canonical class and closed-set
-		// cause only — never the error text, never more than maxAttempts
-		// records per request.
-		info.Failures = append(info.Failures, AttemptFailure{
-			Kind:   info.Kind,
-			Target: info.Target,
-			Class:  f.Class.String(),
-			Cause:  f.Cause,
-		})
+		// actually dialed-and-failed endpoint, canonical class, closed-set
+		// cause and send state only — never the error text, never more than
+		// maxAttempts records per request.
+		failure := AttemptFailure{
+			Kind:      info.Kind,
+			Target:    info.Target,
+			Class:     f.Class.String(),
+			Cause:     f.Cause,
+			SendState: f.SendState.String(),
+		}
+		// Send-unknown stops the loop. The endpoint answered nothing, but
+		// the request may still have reached it, so dialing the next member
+		// would silently duplicate a request the upstream may already be
+		// processing. This layer does not get to make that call: the pool
+		// neither strikes the endpoint (its health is unproven) nor spends
+		// another member, and the failure travels up to the injector's
+		// recovery policy — the only layer that owns replay — with the
+		// evidence carrying why.
+		if f.SendState == SendStateUnknown {
+			info.Failures = append(info.Failures, failure)
+			st.end()
+			return nil, info, err
+		}
+		// Definitely-not-sent: no connection ever carried the request, so a
+		// different egress can be tried with no duplicate-request risk.
+		ms.health.strike()
+		info.Failures = append(info.Failures, failure)
 		lastErr = err
 	}
 	st.end()
 	if attempts == 0 {
 		info.Exhausted = true
-		return nil, info, errExhausted
+		return nil, info, ErrExhausted
 	}
 	// At least one real attempt: the last error is an endpoint failure and
 	// reaches the handler's existing transport-error path (sanitized there
@@ -403,17 +442,20 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 	return nil, info, lastErr
 }
 
-// dial builds this attempt's request from the AttemptRequest — a fresh
-// request object per attempt (the caller's request, and any previous
-// attempt's consumed body, are never reused) — and executes it on the
-// member's own client.
-func (p *poolDoer) dial(ms *memberState, ar *AttemptRequest) (*http.Response, error) {
+// buildAttempt builds this attempt's request from the AttemptRequest — a
+// fresh request object per attempt (the caller's request, and any previous
+// attempt's consumed body, are never reused).
+//
+// It is a pure construction step with no wire operation in it, which is why
+// the attempt loop runs it BEFORE claiming an exchange: a request that cannot
+// be built never reaches a member, so it must not spend one.
+func buildAttempt(ar *AttemptRequest) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ar.Ctx, ar.Method, ar.URL.String(), bytes.NewReader(ar.Body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header = ar.Header.Clone()
-	return ms.client.Do(req)
+	return req, nil
 }
 
 // Do satisfies Doer for contexts that resolve a pool but do not use the

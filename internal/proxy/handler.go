@@ -222,7 +222,7 @@ func thinkingModeName(mode config.ThinkingMode) string {
 // Logging rides the same flow: the DEBUG lifecycle chain (request_received,
 // probe_completed, model_resolved, thinking_usage_resolved when the model
 // configures the feature, request_transform_started/completed,
-// upstream_request_started, upstream_response_received,
+// provider_attempt_started, upstream_response_received,
 // response_transform_started/completed, client_write_completed — and for
 // streams stream_started, periodic stream_event_progress, stream_completed),
 // one INFO request_completed per request with the wire facts (status,
@@ -311,14 +311,20 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// upstream answered non-SSE is relayed buffered, and the record says
 		// what happened, not what was asked.
 		streamed bool
-		// providerAttempts counts the walk's provider-level attempts — each
-		// candidate's initial attempt plus its same-candidate retries — and
-		// retriesTotal counts the retries among them. The two are counted
-		// separately, and retriesTotal is incremented where a retry actually
-		// starts, because deriving retries by subtracting entered candidates
-		// from attempts assumes every entered candidate attempted something:
-		// a candidate whose pool dials nothing is entered and attempts
-		// nothing, which would make the subtraction negative.
+		// providerAttempts counts the walk's LOGICAL provider-level attempts
+		// — each candidate attempt the walk began, whether or not the
+		// transport then managed to dial anything — and retriesTotal counts
+		// the re-asks among them. Both are incremented at the attempt's
+		// start, so retriesTotal can never report a re-ask the attempt
+		// counter does not contain.
+		//
+		// This is one of two independent axes, and the split is the point:
+		// upstream_exchanges counts real outbound dials and is claimed by
+		// the transport's budget at each one, so one pooled attempt may be
+		// several exchanges and an attempt the pool refuses before any dial
+		// is one attempt with zero exchanges. Neither number may be derived
+		// from the other — a logical attempt is what the recovery policy
+		// decides on, an exchange is what the wire carried.
 		// finalProvider is the identity (providers-table name, or endpoint
 		// origin) of the candidate whose answer was committed or, on
 		// exhaustion/disconnect, of the last one attempted.
@@ -356,8 +362,11 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// withProviders adds the walk's completion facts. candidate_attempts is
 	// the same total as provider_attempts seen from the other scope — one
 	// provider attempt IS one attempt on some candidate — while
-	// upstream_exchanges is the count of real dials and can be higher, since
-	// one pooled attempt may dial several members.
+	// upstream_exchanges is the count of real dials, an independent axis:
+	// higher than the attempts when one pooled attempt fans out across
+	// members, and lower — even zero — when an attempt was refused before
+	// any dial. provider_attempts therefore never drops to zero for an
+	// attempted candidate just because the transport dialed nothing.
 	// provider_attempts/retries_total stay as compatibility aliases of
 	// candidate_attempts/retry_attempts, the same way attempt aliases
 	// egress_attempt on the per-dial events; the new names are authoritative.
@@ -658,14 +667,6 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		invalid   int                   // answerInvalid flavor (invalid*)
 		cand      config.Candidate
 		candIndex int // one-based chain position
-		// committed marks a result the upstream has already produced, as
-		// opposed to a decision not to ask it. The walk commits one answer
-		// per request and does so before the first byte reaches the client,
-		// so nothing in this handler ever observes a failure on a committed
-		// result — the invariant holds structurally. The evidence still
-		// carries the fact, because the alternative is a policy that silently
-		// becomes able to retry after a relay has started.
-		committed bool
 		// egressKind is this attempt's own egress mode — the pool's last
 		// dialed member's kind, or direct. It rides along so a retained
 		// answer's usage record names ITS egress, not the last failed
@@ -710,6 +711,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// failure happened: re-classifying after the walk could let a client
 		// disconnect that raced the loop's end re-own an endpoint failure.
 		lastFailureCause string
+		// lastSendState carries that failure's send state alongside it: the
+		// exhaustion report says whether the walk ended on a request that
+		// provably never left (definitely_not_sent) or one that may already
+		// have reached an upstream (send_unknown). Empty when the walk ended
+		// on something that was not a transport failure.
+		lastSendState string
 		// lastRuleID is the identity of the decision that ended the last
 		// attempt — a matrix rule, or one of the engine's reserved invariant
 		// identities. It rides the exhaustion report so an operator can tell
@@ -817,25 +824,31 @@ walk:
 				return
 			}
 			copyForwardHeaders(req.Header, r.Header)
-			// Counted here, not at the loop head: these count provider-level
-			// ATTEMPTS, so a transform or request-build failure above — which
-			// never reaches a provider — must not report an attempt that never
-			// happened. attempt is candidate-local (its own retries included);
-			// providerAttempts is the walk's global provider-attempt index.
-			// Egress exchanges are claimed separately at each real dial by the
-			// budget, so a pooled attempt can honestly consume several.
+			// COUNTER AXIS 1 OF 2 — LOGICAL PROVIDER ATTEMPTS. One candidate
+			// attempt begins here: the candidate is entered, the request is
+			// built, and the transport is about to be asked. Counted here
+			// rather than at the loop head so a transform or request-build
+			// failure above — which never reaches a provider — reports no
+			// attempt that never happened; counted BEFORE the transport runs
+			// so the counter can never disagree with the provider_attempt
+			// marker emitted below, whether or not the transport ends up
+			// reaching the wire.
+			//
+			// It counts an ATTEMPT, not an exchange: an attempt is what the
+			// recovery policy decides on, and a pooled attempt that dials
+			// nothing (every member gated out, an exhausted envelope) is
+			// still an attempt the walk made and answered for. The count of
+			// real dials is a separate axis entirely — see upstream_exchanges,
+			// claimed by the budget at each dial. attempt is candidate-local
+			// (its own retries included); providerAttempts is the walk's
+			// global provider-attempt index, and the retry inside an attempt
+			// is counted beside it so retries_total can never report a re-ask
+			// the attempt counter does not contain.
 			attempt++
 			retryIndex := attempt - 1
-			// noteAttempt counts one provider-level attempt, and the retry
-			// inside it when there is one. Both are counted at the same place,
-			// after the transport confirmed the attempt reached a provider, so
-			// retries_total can never report a re-ask the attempt counter does
-			// not contain.
-			noteAttempt := func() {
-				providerAttempts++
-				if attempt > 1 {
-					retriesTotal++
-				}
+			providerAttempts++
+			if attempt > 1 {
+				retriesTotal++
 			}
 			// fallBackOnSpentCandidate answers the one refusal no observation
 			// can describe: the transport declined to dial because this
@@ -866,6 +879,7 @@ walk:
 					Str("error_class", "provider_exhausted").
 					Str("error_cause", recovery.CauseExchangeBudget).
 					Str("disposition", act.String()).
+					Str("failure_origin", "envelope").
 					Str("reason", dec.Reason).
 					Str("policy_rule_id", dec.RuleID).
 					Str("policy_hash", lastPolicyHash).
@@ -910,7 +924,35 @@ walk:
 			// refusal before a direct dial must not inherit the previous
 			// attempt's egress index into its final evidence.
 			lastEgressAttempt = 0
+			// And the send state is attempt-local for the same reason, reset
+			// alongside the index it describes. A pool that dials nothing this
+			// attempt must not republish the PREVIOUS attempt's wire evidence:
+			// an earlier dial's definitely_not_sent beside this attempt's
+			// egress_exhausted would read as "the pool proved nothing left",
+			// which is a claim about a dial it never made. Only an attempt that
+			// dialed sets it again below.
+			lastSendState = ""
 			if pooled {
+				// provider_attempt_started precedes the attempt's first dial:
+				// the pool may still refuse the attempt before ANY dial
+				// (eligibility gate, health, envelope), and the refusal's own
+				// event — candidate_exchange_budget_spent or
+				// provider_attempt_failed — names the reason, so the marker
+				// stays honest: an attempt that begins is what it names, and
+				// the index it carries is the counter's own, already counted
+				// above, not an optimistic guess at what the counter will say
+				// if a dial happens to succeed. A zero-dial attempt therefore
+				// reports provider_attempt = provider_attempts = N with
+				// upstream_exchanges unchanged: the attempt is a logical fact,
+				// the exchange is a wire fact, and neither implies the other.
+				log.Debug().Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Int64("bytes_out", int64(len(out))).
+					Int("provider_attempt", providerAttempts).
+					Int("candidate_index", i+1).
+					Int("candidate_attempt", attempt).
+					Int("retry_index", retryIndex).
+					Msg("provider_attempt_started")
 				var info transport.AttemptInfo
 				resp, info, uerr = ex.Execute(&transport.AttemptRequest{
 					Ctx:       r.Context(),
@@ -923,25 +965,13 @@ walk:
 				})
 				egress = &info
 				lastEgressAttempt = info.Attempts
-				// The provider attempt is counted here — AFTER the pool is
-				// back and only when it dialed — so the counters name
-				// exchanges that reached a provider. A refusal inside the
-				// pool's loop leaves info.Attempts at its pre-refusal value
-				// in one case only (the envelope refusing the very next dial
-				// after this Execute's first real one, which returns the last
-				// endpoint error rather than an empty result), so the guard
-				// is what counts, not the flag.
-				if info.Attempts > 0 {
-					noteAttempt()
-					log.Debug().Str("provider", cand.Label()).
-						Str("upstream", origin(&upstream)).
-						Int64("bytes_out", int64(len(out))).
-						Int("provider_attempt", providerAttempts).
-						Int("candidate_index", i+1).
-						Int("candidate_attempt", attempt).
-						Int("retry_index", retryIndex).
-						Msg("upstream_request_started")
-				}
+				// The provider attempt was counted before Execute, and
+				// deliberately not again here: info.Attempts is this
+				// attempt's EGRESS count (how many members the pool dialed),
+				// a different axis that the budget already claimed at each
+				// dial. Gating the attempt counter on it — as this code once
+				// did — made a zero-dial attempt report the contradictory
+				// pair provider_attempt_started = N, provider_attempts = N-1.
 				// Per-attempt evidence, bounded by the fallback budget: one WARN
 				// per dialed-and-failed endpoint, correlated by this request's
 				// request_id and its one-based provider/egress attempt indexes.
@@ -951,11 +981,15 @@ walk:
 				// for egress_attempt; the new field is authoritative. No decision
 				// produced these records — the dial failed before any disposition
 				// was reached — so policy_rule_id is empty here by construction.
+				// failure_origin is transport: these are dial failures, not
+				// answers.
 				for j, fl := range info.Failures {
 					event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 						Str("provider", cand.Label()).
 						Str("egress_kind", fl.Kind).Str("egress_target", fl.Target).
+						Str("failure_origin", "transport").
 						Str("error_class", fl.Class).Str("error_cause", fl.Cause).
+						Str("send_state", fl.SendState).
 						Int("egress_attempt", j+1).
 						Int("attempt", j+1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
@@ -996,6 +1030,22 @@ walk:
 					}
 				}
 			} else {
+				// provider_attempt_started precedes the single dial of a
+				// direct transport, matching the pooled path's placement and
+				// carrying the counter's own index, counted at the attempt's
+				// start above. The envelope claim follows: a refusal fires
+				// candidate_exchange_budget_spent with its own identity, and
+				// the pair stays honest in either direction — the attempt is
+				// reported whether or not the envelope let the dial happen,
+				// while upstream_exchanges moves only when one did.
+				log.Debug().Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Int64("bytes_out", int64(len(out))).
+					Int("provider_attempt", providerAttempts).
+					Int("candidate_index", i+1).
+					Int("candidate_attempt", attempt).
+					Int("retry_index", retryIndex).
+					Msg("provider_attempt_started")
 				// The exchange envelope is claimed here for a single-endpoint
 				// candidate: the transport claims its own dials, and this path is
 				// one dial. A refusal is not a transport failure — nothing was
@@ -1009,15 +1059,6 @@ walk:
 					}
 					break
 				}
-				noteAttempt()
-				log.Debug().Str("provider", cand.Label()).
-					Str("upstream", origin(&upstream)).
-					Int64("bytes_out", int64(len(out))).
-					Int("provider_attempt", providerAttempts).
-					Int("candidate_index", i+1).
-					Int("candidate_attempt", attempt).
-					Int("retry_index", retryIndex).
-					Msg("upstream_request_started")
 				resp, uerr = d.Do(req)
 				lastEgressAttempt = 1
 			}
@@ -1038,6 +1079,31 @@ walk:
 			// transport failure never re-asks the same endpoint: the retry
 			// budgets are for answers, not for dead sockets.
 			if uerr != nil {
+				// A request this process failed to CONSTRUCT is a local fault,
+				// not an endpoint's: the pool never dialed, so no member may be
+				// blamed, struck, or named with a wire state. It is reported
+				// under the single-endpoint path's own build vocabulary and
+				// stops the walk — the request itself is what is wrong, so no
+				// other candidate does better with it — matching the transform
+				// error above.
+				//
+				// Unlike that path, the attempt here is already counted and its
+				// provider_attempt_started already emitted: a pool builds per
+				// member, inside Execute, which is past the marker. The attempt
+				// stays counted rather than being retroactively denied, because
+				// the marker and the counter may never disagree.
+				var rbe *transport.RequestBuildError
+				if errors.As(uerr, &rbe) {
+					log.Error().Str("model", model).
+						Str("upstream", origin(&upstream)).
+						Str("error_class", "request_build").
+						Int("provider_attempt", providerAttempts).
+						Int("candidate_index", i+1).
+						Msg("upstream_request_build_failed")
+					outcome = "upstream_unreachable"
+					reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+					return
+				}
 				lastUerr = uerr
 				f := transport.ClassifyAttempt(r.Context(), uerr)
 				class, cause := f.Class.String(), f.Cause
@@ -1048,15 +1114,37 @@ walk:
 					class, cause = "egress_exhausted", recovery.CauseNoEligibleEndpoint
 				}
 				lastFailureCause = cause
+				// The send state is evidence about a DIALED attempt, so it is
+				// recorded only when one happened. A pool that skipped every
+				// member dialed nothing for it to describe, and the sentinel
+				// that reports that is not an endpoint failure at all — its
+				// classification must not be read as wire evidence. The
+				// exhaustion line already says it: egress_exhausted.
+				//
+				// This is also the ONE value every record for this attempt
+				// publishes — the per-dial record, provider_attempt_failed and
+				// the post-walk exhaustion report all read it back rather than
+				// re-deriving it from f, so a state that was not earned by a
+				// dial can never be attached to a record by a second code path
+				// that forgot the guard.
+				if dialedAttempt(pooled, egress) && !f.CallerTerminated {
+					lastSendState = f.SendState.String()
+				}
 				// The observation the engine decides on. A caller-terminated
 				// failure leaves the transport vocabulary entirely: its owner
 				// is the request context, never the wire, and the engine
 				// hard-stops on that class whatever the matrix says.
 				obs := recovery.Observation{
-					Class:            recovery.FailureTransport,
-					TransportClass:   transportClassOf(f.Class),
-					TransportCause:   f.Cause,
-					Streaming:        stream,
+					Class:          recovery.FailureTransport,
+					TransportClass: transportClassOf(f.Class),
+					TransportCause: f.Cause,
+					Streaming:      stream,
+					// A committed answer means the upstream already produced
+					// this result — as opposed to a decision not to ask it. The
+					// walk commits one answer per request, before the first byte
+					// reaches the client, so nothing here can observe a failure
+					// on a committed result: the invariant holds structurally,
+					// and the engine may not retry one.
 					Committed:        answer != nil,
 					CandidateIndex:   i + 1,
 					CandidateAttempt: attempt,
@@ -1095,7 +1183,8 @@ walk:
 						Str("error_class", class).
 						Str("error_cause", cause).
 						Str("disposition", act.String()).
-						Str("reason", dec.Reason)
+						Str("reason", dec.Reason).
+						Str("failure_origin", "caller")
 					if lastEgressAttempt > 0 {
 						event = event.Int("egress_attempt", lastEgressAttempt)
 					}
@@ -1115,7 +1204,9 @@ walk:
 					event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 						Str("provider", cand.Label()).
 						Str("egress_kind", "direct").Str("egress_target", "direct").
+						Str("failure_origin", "transport").
 						Str("error_class", class).Str("error_cause", cause).
+						Str("send_state", lastSendState).
 						Int("egress_attempt", 1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+1, eng.Budget().RequestRemaining())
@@ -1134,8 +1225,16 @@ walk:
 					Str("upstream", origin(&upstream)).
 					Str("error_class", class).
 					Str("error_cause", cause).
+					Str("failure_origin", "transport").
 					Str("disposition", act.String()).
 					Str("reason", dec.Reason)
+				// A zero-dial attempt has no wire state to report — the pool
+				// dialed nothing, so a state here would be evidence about a
+				// request that was never sent anywhere. lastSendState is empty
+				// exactly then.
+				if lastSendState != "" {
+					event = event.Str("send_state", lastSendState)
+				}
 				if lastEgressAttempt > 0 {
 					event = event.Int("egress_attempt", lastEgressAttempt)
 				}
@@ -1250,7 +1349,8 @@ walk:
 						providerAttempts, i+1, attempt, elapsed),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 						Str("disposition", act.String()).
-						Str("reason", dec.Reason)
+						Str("reason", dec.Reason).
+						Str("failure_origin", "upstream_http")
 					for _, f := range evidenceRateLimitFields {
 						if v := ev.rateLimit[f.header]; v != "" {
 							event = event.Str(f.field, v)
@@ -1267,10 +1367,12 @@ walk:
 					w := log.Warn().Str("public_model", model)
 					if cerr == captureDeadline {
 						w = w.Str("error_class", "upstream_error_body_timeout").
-							Str("error_cause", "capture_deadline_exceeded")
+							Str("error_cause", "capture_deadline_exceeded").
+							Str("failure_origin", "protocol")
 					} else {
 						w = w.Str("error_class", "upstream_error").
-							Str("error_cause", "body_read_failed")
+							Str("error_cause", "body_read_failed").
+							Str("failure_origin", "protocol")
 					}
 					w = withPolicyFields(withAttemptFields(w, providerAttempts, i+1, attempt, elapsed),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
@@ -1311,7 +1413,7 @@ walk:
 				// SSE answer: the headers are the commitment. The body is
 				// not read here — it streams after the walk, and anything
 				// that kills it later truncates the committed stream.
-				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, committed: true}
+				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
 				break walk
 			}
 
@@ -1332,7 +1434,7 @@ walk:
 					// any error-chain classification can call it an upstream
 					// body failure.
 					outcome = "client_disconnected"
-					log.Warn().Err(rerr).Str("public_model", model).
+					log.Warn().Err(sanitizeUpstreamError(rerr, &upstream)).Str("public_model", model).
 						Str("phase", "client_write").Msg("relay_copy_failed")
 					complete()
 					return
@@ -1350,9 +1452,12 @@ walk:
 				})
 				lastRuleID = dec.RuleID
 				act := walkAction(dec.Action, i+1 < len(m.Chain))
-				event := withPolicyFields(withAttemptFields(log.Warn().Err(rerr).Str("public_model", model).
+				event := withPolicyFields(withAttemptFields(log.Warn().Err(sanitizeUpstreamError(rerr, &upstream)).Str("public_model", model).
 					Str("upstream", origin(&upstream)).
-					Int("upstream_status", status),
+					Int("upstream_status", status).
+					Str("error_class", "upstream_error").
+					Str("error_cause", "body_read_failed").
+					Str("failure_origin", "protocol"),
 					providerAttempts, i+1, attempt, elapsed),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
@@ -1399,10 +1504,18 @@ walk:
 				})
 				lastRuleID = dec.RuleID
 				act := walkAction(dec.Action, i+1 < len(m.Chain))
+				// No error object rides this event on purpose: the body was
+				// read whole, it simply is not usable. The pair below names
+				// which way it is unusable — the same closed-set token the
+				// matrix row keyed on, and the same error_class the 502
+				// envelope reports when the walk finalizes here.
 				event := withPolicyFields(withAttemptFields(log.Warn().Str("public_model", model).
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status).
-					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))),
+					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))).
+					Str("error_class", "upstream_invalid_response").
+					Str("error_cause", protocolCause).
+					Str("failure_origin", "protocol"),
 					providerAttempts, i+1, attempt, elapsed),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
@@ -1425,7 +1538,7 @@ walk:
 			}
 			// A valid 2xx answer: committed. The body rides the answer
 			// struct to the rewrite; no retry follows commitment.
-			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1, committed: true}
+			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
 			break walk
 		}
 	}
@@ -1462,6 +1575,11 @@ walk:
 		providerExhausted = true
 		class, cause := "provider_exhausted", lastFailureCause
 		ruleID := lastRuleID
+		// The walk exhausted through one of three origins: the exchange
+		// envelope refused another dial (envelope), a pool could not dial at
+		// all (transport), or repeated transport failures spent the budgets
+		// (transport).
+		failureOrigin := "transport"
 		switch {
 		case budgetStopped || (egress != nil && egress.BudgetExhausted):
 			// The exchange envelope, not a provider, ended the walk: the next
@@ -1471,6 +1589,7 @@ walk:
 			// scope when the request's ceiling was the binding one, candidate
 			// scope otherwise — and neither is a matrix rule.
 			class, cause = "provider_exhausted", recovery.CauseExchangeBudget
+			failureOrigin = "envelope"
 			if eng.Budget().Exhausted() == recovery.ExhaustionRequest {
 				ruleID = recovery.RuleIDBudgetRequest
 			} else {
@@ -1487,8 +1606,14 @@ walk:
 			Str("upstream", origin(lastUpstream)).
 			Str("error_class", class).
 			Str("error_cause", cause).
+			Str("failure_origin", failureOrigin).
 			Str("policy_rule_id", ruleID).
 			Int("provider_attempt", providerAttempts)
+		// The send state rides only a transport-origin exhaustion: an
+		// envelope refusal dialed nothing, and an answer was committed.
+		if failureOrigin == "transport" && lastSendState != "" {
+			event = event.Str("send_state", lastSendState)
+		}
 		if lastEgressAttempt > 0 {
 			event = event.Int("egress_attempt", lastEgressAttempt)
 		}
@@ -1567,13 +1692,19 @@ walk:
 			// the client side (write error, or the canceled request context
 			// surfacing through the upstream read) is a disconnect; anything
 			// else died reading the upstream.
+			// Same split as the SSE path: the client-side branch carries this
+			// package's own clientWriteError (static text), the upstream one
+			// carries whatever the transport surfaced — which may quote the
+			// upstream's bytes, so only that branch takes the no-echo rule.
 			level, phase := log.Error(), "upstream_read"
+			eventErr := sanitizeUpstreamError(err, lastUpstream)
 			if clientSide(err) {
 				level, phase, outcome = log.Warn(), "client_write", "client_disconnected"
+				eventErr = err
 			} else {
 				outcome = "upstream_read_failed"
 			}
-			level.Err(err).Str("public_model", model).Str("phase", phase).
+			level.Err(eventErr).Str("public_model", model).Str("phase", phase).
 				Msg("relay_copy_failed")
 			complete()
 			return
@@ -1644,6 +1775,13 @@ walk:
 		if err != nil {
 			phase := "upstream_read"
 			outcome = "stream_truncated"
+			// Only the upstream_read phase carries a peer-derived error, and
+			// that is the one the no-echo rule governs: a truncated read
+			// surfaces the transport's own parse failures, which interpolate
+			// the upstream's bytes. The other two cases are this package's
+			// typed errors with static text — collapsing them would replace
+			// "the client went away" with "upstream transport error".
+			eventErr := sanitizeUpstreamError(err, lastUpstream)
 			var swe *streamWriteError
 			switch {
 			case errors.As(err, &swe), clientSide(err):
@@ -1655,14 +1793,16 @@ walk:
 				// paths apply, while the WARN keeps the truncation's phase.
 				phase = "client_write"
 				outcome = "client_disconnected"
+				eventErr = err
 			case errors.Is(err, ErrSSELineTooLong) || errors.Is(err, ErrSSEEventTooLarge):
 				// The upstream crossed a bounded-relay cap: a hostile or
 				// broken peer, stopped cleanly at the wall. The logged
 				// error carries counts only, never the bytes themselves.
 				phase = "upstream_limit"
 				outcome = "stream_limit_exceeded"
+				eventErr = err
 			}
-			log.Warn().Err(err).Str("public_model", model).Str("phase", phase).
+			log.Warn().Err(eventErr).Str("public_model", model).Str("phase", phase).
 				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
 				Int("keep_alive_pings", pings).
 				Msg("stream_truncated")
@@ -1759,12 +1899,14 @@ func withPolicyFields(ev *zerolog.Event, ruleID, policyHash string, generation u
 }
 
 // withAttemptFields adds the per-attempt identity every evidence event
-// carries: the one-based global exchange index (provider_attempt), the
+// carries: the one-based PROVIDER attempt (provider_attempt) — which is NOT
+// the exchange count, since one provider attempt may fan out across several
+// pooled egress dials, each of those being its own upstream_exchange — the
 // candidate's one-based chain position, the attempt's place in that
 // candidate's own budget (retry_index = candidate_attempt−1), and how long
 // the attempt took to reach its outcome.
-func withAttemptFields(ev *zerolog.Event, global, candIndex, candAttempt int, elapsed time.Duration) *zerolog.Event {
-	return ev.Int("provider_attempt", global).
+func withAttemptFields(ev *zerolog.Event, providerAttempt, candIndex, candAttempt int, elapsed time.Duration) *zerolog.Event {
+	return ev.Int("provider_attempt", providerAttempt).
 		Int("candidate_index", candIndex).
 		Int("candidate_attempt", candAttempt).
 		Int("retry_index", candAttempt-1).
@@ -1805,6 +1947,20 @@ func origin(u *url.URL) string {
 	return u.Scheme + "://" + u.Host
 }
 
+// dialedAttempt reports whether the attempt that just failed reached the
+// wire. The direct path always dialed — its Do error is the dial's own — and
+// a pooled path dialed when the pool reports at least one attempt; a pool
+// that skipped every member (static gates, health, concurrency) returns its
+// exhaustion sentinel with zero attempts, and that sentinel is a pool-level
+// condition rather than an endpoint's failure. Reading its classification as
+// wire evidence would attach a send state to a dial that never happened.
+func dialedAttempt(pooled bool, info *transport.AttemptInfo) bool {
+	if !pooled || info == nil {
+		return true
+	}
+	return info.Attempts > 0
+}
+
 // sanitizeUpstreamError rebuilds a client.Do error without the full request
 // URL: *url.Error.Error() quotes it verbatim, query string included. The
 // nested url parse/escape errors quote raw bytes too (the offending escape
@@ -1813,7 +1969,17 @@ func origin(u *url.URL) string {
 // known to be echo-free: the transport's response-parsing failures (a
 // malformed MIME header line, a bad chunk size) quote the upstream's own
 // bytes verbatim, and those reach no log line at any level (#37).
+//
+// The no-echo rule is TOTAL: a value that arrives without a request URL
+// attached (an upstream body read surfacing through net/textproto, a pool's
+// attempt error, a wrapped shape this function does not know) is held to the
+// same allow-list rather than passed through on the assumption that only
+// client.Do errors reach here. Text that is not provably echo-free collapses
+// to static text; the error_class/error_cause tokens carry the meaning.
 func sanitizeUpstreamError(err error, endpoint *url.URL) error {
+	if err == nil {
+		return nil
+	}
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		inner := ue.Err
@@ -1828,6 +1994,9 @@ func sanitizeUpstreamError(err error, endpoint *url.URL) error {
 			inner = errors.New("upstream transport error")
 		}
 		return &url.Error{Op: ue.Op, URL: origin(endpoint), Err: inner}
+	}
+	if !transportErrorTextSafe(err) {
+		return errors.New("upstream transport error")
 	}
 	return err
 }
@@ -1850,6 +2019,12 @@ func transportErrorTextSafe(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// The transport package's own sentinels are `errors.New` literals — static
+	// by construction — and reach this allow-list explicitly, because a pool
+	// that dialed nothing is the one exhaustion an operator reads by name.
+	if errors.Is(err, transport.ErrExhausted) {
 		return true
 	}
 	var pae *transport.ProxyAuthError
@@ -1993,15 +2168,21 @@ func (e *clientWriteError) Error() string {
 func (e *clientWriteError) Unwrap() error { return e.err }
 
 // clientSide reports whether a relay error happened on the client side: an
-// explicit write failure, or the request context surfacing canceled through
-// the upstream read — the context cancels when the client goes away, never
-// on an upstream hiccup.
+// explicit write failure, or the request context surfacing through the
+// upstream read — the context ends when the client goes away or its deadline
+// expires, never on an upstream hiccup.
+//
+// Cancellation and an expired deadline are the SAME ownership answer here, as
+// they are everywhere else in this service: ownership is read from the
+// request context, never from the error chain. Reporting an expired caller
+// deadline as an upstream read failure would blame the provider for a
+// request nobody is waiting for any more.
 func clientSide(err error) bool {
 	var cwe *clientWriteError
 	if errors.As(err, &cwe) {
 		return true
 	}
-	return errors.Is(err, context.Canceled)
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // copyVerbatim relays src to dst byte for byte with the same io.Copy

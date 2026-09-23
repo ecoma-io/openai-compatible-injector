@@ -48,14 +48,24 @@ func egressChatOK(w http.ResponseWriter, _ *http.Request) {
 // ---- in-package egress stubs ----
 
 // deadEgress is an egress endpoint that accepts every TCP connection and
-// closes it at once — the pre-response transport failure a pool falls back
-// on. The accept counter is the only observable record of a dial: nothing
-// answers, so no upstream-side count can exist.
+// closes it at once — a hop that dies before it can carry anything. The
+// accept counter is the only observable record of a dial: nothing answers,
+// so no upstream-side count can exist. Use proxyURL for the member URL.
 type deadEgress struct {
 	ln    net.Listener
 	mu    sync.Mutex
 	dials int
 }
+
+// proxyURL is the URL a pool member must be configured with to exercise
+// this endpoint. The scheme is load-bearing rather than cosmetic: an HTTP
+// forward proxy member is handed the REQUEST itself, so its Accept-then-
+// close failure is send-unknown — the injector cannot prove the member did
+// not read what it wrote — and the pool must not replay it. Only a failure
+// in the tunnel phase provably precedes the request, and the SOCKS5
+// handshake is where that evidence lives (its I/O failures are the typed
+// ProxyConnectError the send-state rule reads).
+func (d *deadEgress) proxyURL() string { return "socks5://" + d.addr() }
 
 func newDeadEgress(t *testing.T) *deadEgress {
 	t.Helper()
@@ -517,7 +527,7 @@ func TestEgressPoolMaxAttemptsCapsDistinctDials(t *testing.T) {
 	poolBody := poolMembersLine("down-a", "down-b", "relay") +
 		"    fallback:\n      max-attempts: 2\n"
 	body := egressYAML(
-		map[string]string{"down-a": "http://" + d1.addr(), "down-b": "http://" + d2.addr(), "relay": fp.srv.URL},
+		map[string]string{"down-a": d1.proxyURL(), "down-b": d2.proxyURL(), "relay": fp.srv.URL},
 		nil,
 		map[string]string{"pool-egress": poolBody},
 		up.url(), "bystander-up")
@@ -727,7 +737,7 @@ func TestEgressPoolHealthCooldownSkipsAndRecovers(t *testing.T) {
 		"    fallback:\n      max-attempts: 2\n" +
 		"    health:\n      failure-threshold: 2\n      cooldown: 1s\n"
 	body := egressYAML(
-		map[string]string{"dead-relay": "http://" + dead.addr(), "live-relay": live.srv.URL},
+		map[string]string{"dead-relay": dead.proxyURL(), "live-relay": live.srv.URL},
 		nil,
 		map[string]string{"pool-egress": poolBody},
 		up.url(), "bystander-up")
@@ -833,6 +843,15 @@ func TestEgressPoolClientCancelAbortsCleanly(t *testing.T) {
 	mu.Lock()
 	hold = true
 	mu.Unlock()
+	// The held upstream answers only when this test ENDS. Releasing it
+	// earlier races the assertions below: the injector would receive the 200
+	// and complete a request the client had already canceled — the write to a
+	// half-closed client socket succeeds, so nothing there marks the
+	// disconnect — and the test would read `outcome: completed` for a cancel
+	// it did observe client-side. Parked at the end, the only way the request
+	// can settle while those assertions read the log is the disconnect they
+	// mean to pin. (Reproduced under CPU load before this: issue #60.)
+	defer close(release)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	type outcome struct {
@@ -872,13 +891,14 @@ func TestEgressPoolClientCancelAbortsCleanly(t *testing.T) {
 		t.Fatal("the canceled request never returned to the client")
 	}
 
-	// Let the held upstream go so later requests answer fast, then pin the
-	// abort's shape: no fallback dial, the disconnect outcome, and the
-	// canceled class with its caller_canceled cause on the WARN.
+	// Stop holding NEW requests so the rotation checks below answer fast (the
+	// one already blocked inside the upstream stays blocked until the defer
+	// above releases it), then pin the abort's shape: no fallback dial, the
+	// disconnect outcome, and the canceled class with its caller_canceled
+	// cause on the WARN.
 	mu.Lock()
 	hold = false
 	mu.Unlock()
-	close(release)
 
 	if fpSpare.count() != 0 {
 		t.Errorf("spare member dialed %d times after cancellation — a cancel must not fall back", fpSpare.count())
@@ -1075,7 +1095,7 @@ func TestEgressLogsNeverCarryProxyCredentials(t *testing.T) {
 	deadAuth := egressSecretHTTPUser + ":" + egressSecretHTTPPass + "@" + dead.addr()
 	relayURL := "http://" + httpAuth
 	socksURL := "socks5://" + socksAuth
-	deadURL := "http://" + deadAuth
+	deadURL := "socks5://" + deadAuth
 
 	poolBodies := map[string]string{
 		"ok-pool":       poolMembersLine("auth-relay", "auth-socks"),

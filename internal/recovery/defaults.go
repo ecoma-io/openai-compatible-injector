@@ -87,8 +87,16 @@ func Default() Policy {
 
 	// A transport failure means the path did not deliver — the provider was
 	// never asked. Moving to another candidate is the cheapest correct
-	// answer, and at the egress level the pool has already exhausted its own
-	// bounded fallback before this rule sees anything.
+	// answer.
+	//
+	// This rule is reached for every transport failure, and it is the ONLY
+	// layer that replays: a pool never re-sends a request that may already
+	// have reached its member (it stops and hands the failure up), so a
+	// send-unknown failure arrives here instead. That is deliberate — the
+	// walk is the replay authority, and the operator's policy is where the
+	// decision belongs — but it means a chain whose candidates share an
+	// upstream base-url does re-send, by this rule. Narrow the matrix if
+	// that is not what a given deployment wants.
 	for _, c := range []TransportClass{
 		TransportClassConnection, TransportClassTimeout,
 		TransportClassProxyConnect, TransportClassProxyAuth,

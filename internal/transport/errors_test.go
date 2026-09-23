@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -90,20 +91,29 @@ func TestClassifyAttemptCauseTokens(t *testing.T) {
 		want Failure
 	}{
 		{"nil error", live, nil, Failure{Class: ClassNone}},
-		{"refused", live, refused, Failure{Class: ClassConnection, Cause: CauseConnectionRefused}},
-		{"refused through url.Error", live, &url.Error{Op: "Post", URL: "http://x", Err: refused}, Failure{Class: ClassConnection, Cause: CauseConnectionRefused}},
-		{"plain dial failure", live, errors.New("dial tcp: i/o timeout"), Failure{Class: ClassConnection, Cause: CauseDial}},
-		{"tls verification", live, &tls.CertificateVerificationError{Err: errors.New("x509: unknown authority")}, Failure{Class: ClassConnection, Cause: CauseTLS}},
-		{"net timeout", live, &fakeNetError{timeout: true}, Failure{Class: ClassTimeout, Cause: CauseNetworkTimeout}},
-		{"context deadline in chain", live, context.DeadlineExceeded, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded}},
-		{"os deadline in chain", live, os.ErrDeadlineExceeded, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded}},
-		{"proxy auth", live, &ProxyAuthError{msg: "socks5: proxy authentication failed"}, Failure{Class: ClassProxyAuth, Cause: "proxy_auth"}},
-		{"proxy connect", live, &ProxyConnectError{msg: "socks5: general failure"}, Failure{Class: ClassProxyConnect, Cause: CauseProxyConnect}},
-		{"proxy connect timeout", live, &ProxyConnectError{msg: "socks5: dial proxy", cause: &fakeNetError{timeout: true}}, Failure{Class: ClassProxyConnect, Cause: CauseProxyTimeout}},
-		{"canceled shape, live context", live, context.Canceled, Failure{Class: ClassCanceled}},
-		{"caller canceled", canceledCtx(t), errors.New("dial tcp: connection refused"), Failure{Class: ClassCanceled, Cause: CauseCallerCanceled, CallerTerminated: true}},
-		{"caller deadline beats timeout shape", deadlineCtx(t), context.DeadlineExceeded, Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true}},
-		{"caller deadline beats refused", deadlineCtx(t), refused, Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true}},
+		{"refused", live, refused, Failure{Class: ClassConnection, Cause: CauseConnectionRefused, SendState: SendStateNotSent}},
+		{"refused through url.Error", live, &url.Error{Op: "Post", URL: "http://x", Err: refused}, Failure{Class: ClassConnection, Cause: CauseConnectionRefused, SendState: SendStateNotSent}},
+		// The send state reads the failing WIRE OP, never the class: a plain
+		// error carries no op, so it is conservative however its text reads.
+		// (The text is irrelevant by contract — classification is typed.)
+		{"unrecognised shape", live, errors.New("dial tcp: i/o timeout"), Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"bare EOF after the body", live, io.EOF, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"truncated response", live, io.ErrUnexpectedEOF, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"dial timeout never connected", live, &net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded, SendState: SendStateNotSent}},
+		{"read on an established connection", live, &net.OpError{Op: "read", Err: syscall.ECONNRESET}, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"write on an established connection", live, &net.OpError{Op: "write", Err: syscall.EPIPE}, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateUnknown}},
+		{"proxy tunnel never formed", live, &net.OpError{Op: "proxyconnect", Err: errors.New("proxyconnect tcp: dial tcp: i/o timeout")}, Failure{Class: ClassConnection, Cause: CauseDial, SendState: SendStateNotSent}},
+		{"tls verification", live, &tls.CertificateVerificationError{Err: errors.New("x509: unknown authority")}, Failure{Class: ClassConnection, Cause: CauseTLS, SendState: SendStateNotSent}},
+		{"net timeout", live, &fakeNetError{timeout: true}, Failure{Class: ClassTimeout, Cause: CauseNetworkTimeout, SendState: SendStateUnknown}},
+		{"context deadline in chain", live, context.DeadlineExceeded, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded, SendState: SendStateUnknown}},
+		{"os deadline in chain", live, os.ErrDeadlineExceeded, Failure{Class: ClassTimeout, Cause: CauseDeadlineExceeded, SendState: SendStateUnknown}},
+		{"proxy auth", live, &ProxyAuthError{msg: "socks5: proxy authentication failed"}, Failure{Class: ClassProxyAuth, Cause: "proxy_auth", SendState: SendStateNotSent}},
+		{"proxy connect", live, &ProxyConnectError{msg: "socks5: general failure"}, Failure{Class: ClassProxyConnect, Cause: CauseProxyConnect, SendState: SendStateNotSent}},
+		{"proxy connect timeout", live, &ProxyConnectError{msg: "socks5: dial proxy", cause: &fakeNetError{timeout: true}}, Failure{Class: ClassProxyConnect, Cause: CauseProxyTimeout, SendState: SendStateNotSent}},
+		{"canceled shape, live context", live, context.Canceled, Failure{Class: ClassCanceled, SendState: SendStateUnknown}},
+		{"caller canceled", canceledCtx(t), errors.New("dial tcp: connection refused"), Failure{Class: ClassCanceled, Cause: CauseCallerCanceled, CallerTerminated: true, SendState: SendStateUnknown}},
+		{"caller deadline beats timeout shape", deadlineCtx(t), context.DeadlineExceeded, Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true, SendState: SendStateUnknown}},
+		{"caller deadline beats refused", deadlineCtx(t), refused, Failure{Class: ClassCanceled, Cause: CauseCallerDeadlineExceeded, CallerTerminated: true, SendState: SendStateUnknown}},
 	} {
 		got := ClassifyAttempt(tc.ctx, tc.err)
 		if got != tc.want {

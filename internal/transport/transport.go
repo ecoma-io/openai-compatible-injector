@@ -305,17 +305,20 @@ type AttemptRequest struct {
 // endpoint inside one Execute: the endpoint's kind and scheme+host target
 // (the same log-safe surface AttemptInfo.Target uses — userinfo never
 // enters), the typed failure class ("connection", "proxy_connect",
-// "proxy_auth", "timeout") and its bounded cause token ("connection_refused",
-// "tls", "dial", ...). The error text never rides along: classes and causes
-// are derived from typed errors and stdlib sentinels, not message parsing,
-// and the raw error stays inside the pool. AttemptInfo.Failures carries at
-// most the fallback budget's worth of these — one per dialed-and-failed
-// endpoint, nothing for skipped members.
+// "proxy_auth", "timeout"), its bounded cause token ("connection_refused",
+// "tls", "dial", ...), and the send state ("definitely_not_sent" /
+// "send_unknown") that says whether the request bytes could have reached
+// the endpoint. The error text never rides along: classes, causes and
+// send states are derived from typed errors and stdlib sentinels, not
+// message parsing, and the raw error stays inside the pool.
+// AttemptInfo.Failures carries at most the fallback budget's worth of
+// these — one per dialed-and-failed endpoint, nothing for skipped members.
 type AttemptFailure struct {
-	Kind   string
-	Target string
-	Class  string
-	Cause  string
+	Kind      string
+	Target    string
+	Class     string
+	Cause     string
+	SendState string
 }
 
 // AttemptInfo reports what one Execute did: how many distinct endpoints
