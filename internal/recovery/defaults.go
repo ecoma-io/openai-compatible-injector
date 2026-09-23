@@ -27,13 +27,24 @@ const (
 	// binds a default deployment — it exists to bound what a configuration
 	// can multiply into.
 	DefaultRequestMaxExchanges = 32
-	// DefaultRequestMaxElapsed bounds the request-wide recovery envelope.
-	DefaultRequestMaxElapsed = 30 * time.Second
+	// DefaultRequestMaxElapsed bounds the request-wide recovery envelope. It
+	// sits at the request cap on purpose: an unstated envelope is a backstop
+	// against a runaway walk, never a tuning knob, so it must not bind a walk
+	// the operator asked for. See DefaultCandidateMaxElapsed for why the
+	// unstated defaults are this generous.
+	DefaultRequestMaxElapsed = MaxRequestElapsedCap
 	// DefaultCandidateMaxExchanges is the default per-candidate exchange
 	// envelope.
 	DefaultCandidateMaxExchanges = 16
-	// DefaultCandidateMaxElapsed bounds one candidate's recovery envelope.
-	DefaultCandidateMaxElapsed = 15 * time.Second
+	// DefaultCandidateMaxElapsed bounds one candidate's recovery envelope. It
+	// sits at the candidate cap, and that is load-bearing rather than
+	// generous: this envelope must be at least the widest retry window a
+	// deployment can legitimately state, and the legacy retries block — which
+	// still has to load — allowed a window of up to two minutes. An unstated
+	// envelope that rejected a stated retry window would make a previously
+	// valid file unloadable, so the default covers everything the vocabulary
+	// allows and an operator who wants a tighter walk states one.
+	DefaultCandidateMaxElapsed = MaxCandidateElapsedCap
 	// DefaultRetryAfterMaxDelay is this policy's own ceiling on an
 	// upstream's Retry-After directive. It sits above the default backoff
 	// ceiling, so by default the backoff ceiling is what binds — exactly the

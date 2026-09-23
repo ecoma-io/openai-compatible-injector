@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
 )
 
@@ -87,7 +88,8 @@ func decodeConfigError(err error) error {
 
 // runtime file schema. Strictness has two layers: top-level keys are
 // validated against the raw YAML (only "models", "api-key", "log-level",
-// "sse-keep-alive", "providers", "transports", and "provider-fallback" are
+// "sse-keep-alive", "providers", "transports", "provider-fallback" and
+// "recovery" are
 // legal — this is what keeps the bootstrap plane out of the runtime file:
 // listen, config file, poll interval, ... any file that tries to define
 // them fails validation, whatever their value's shape), and a KnownFields
@@ -130,11 +132,17 @@ type runtimeFile struct {
 	// unreferenced.
 	Transports map[string]runtimeTransport `yaml:"transports"`
 	// ProviderFallback mirrors the optional top-level provider-fallback
-	// block: the policy bounding how many provider candidates one request
-	// may walk when earlier ones fail without answering. The pointer
+	// block: the legacy spelling of the candidate-walk bound, normalized
+	// into the global recovery layer's fallback policy. The pointer
 	// distinguishes an absent or null block (defaults) from a present one,
 	// which is validated even when it disables the feature.
 	ProviderFallback *runtimeProviderFallback `yaml:"provider-fallback"`
+	// Recovery mirrors the optional top-level recovery block: the global
+	// layer of the provider recovery policy. It is the only position that
+	// may state the request-scoped budget.request envelope; a provider, a
+	// model, and a chain candidate each carry an override layer of the same
+	// shape.
+	Recovery *runtimeRecovery `yaml:"recovery"`
 }
 
 // runtimeProviderFallback mirrors the optional top-level provider-fallback
@@ -148,8 +156,9 @@ type runtimeProviderFallback struct {
 // runtimeProvider mirrors one providers entry: where requests go
 // (base-url) and how they get there (a named transport; omitted → direct).
 type runtimeProvider struct {
-	BaseURL   string `yaml:"base-url"`
-	Transport string `yaml:"transport"`
+	BaseURL   string           `yaml:"base-url"`
+	Transport string           `yaml:"transport"`
+	Recovery  *runtimeRecovery `yaml:"recovery"`
 }
 
 // runtimeTransport mirrors one transports entry. Type is direct, proxy, or
@@ -287,13 +296,15 @@ type runtimeModel struct {
 	UpstreamModel   string                `yaml:"upstream-model"`
 	InjectionPrompt string                `yaml:"injection-prompt"`
 	ThinkingUsage   *runtimeThinkingUsage `yaml:"thinking-usage"`
-	// Retries is the optional per-model status retry policy: the budget
-	// (retry count, elapsed window, backoff) every candidate of this model
-	// walks under when an upstream answers with a retryable HTTP status.
-	// It is a property of the PUBLIC model, like the injection prompt —
-	// every candidate receives the same policy, and the budget is enforced
-	// per candidate, never shared across models.
+	// Retries is the legacy spelling of the per-model retry mechanics: the
+	// budget (retry count, elapsed window, backoff) every candidate of this
+	// model walks under. It normalizes into the model recovery layer and
+	// stays accepted for compatibility; stating it next to recovery.retries
+	// rejects the file rather than silently preferring one.
 	Retries *runtimeRetries `yaml:"retries"`
+	// Recovery is the optional model-level recovery override: the layer
+	// between the provider override and the candidate override.
+	Recovery *runtimeRecovery `yaml:"recovery"`
 	// Providers is the optional ordered candidate chain: each entry is one
 	// provider candidate (a providers-table reference plus the upstream
 	// model name to send there). Mutually exclusive with provider and
@@ -306,8 +317,9 @@ type runtimeModel struct {
 // injection prompt and thinking-usage stay model-level — they are
 // properties of the public model, shared by every candidate.
 type runtimeModelCandidate struct {
-	Provider      string `yaml:"provider"`
-	UpstreamModel string `yaml:"upstream-model"`
+	Provider      string           `yaml:"provider"`
+	UpstreamModel string           `yaml:"upstream-model"`
+	Recovery      *runtimeRecovery `yaml:"recovery"`
 }
 
 // runtimeThinkingUsage mirrors the optional per-model thinking-usage block.
@@ -360,13 +372,13 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	}
 	for k := range raw {
 		if k == "models" || k == "api-key" || k == "log-level" || k == "sse-keep-alive" ||
-			k == "providers" || k == "transports" || k == "provider-fallback" {
+			k == "providers" || k == "transports" || k == "provider-fallback" || k == "recovery" {
 			continue
 		}
 		// The key itself is not named: error text reaches logs verbatim, and
 		// a pasted credential can land in a key position just as well as a
 		// value position.
-		return nil, errors.New("unknown top-level key (only models, api-key, log-level, sse-keep-alive, providers, transports and provider-fallback are legal)")
+		return nil, errors.New("unknown top-level key (only models, api-key, log-level, sse-keep-alive, providers, transports, provider-fallback and recovery are legal)")
 	}
 	var rf runtimeFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -401,6 +413,20 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		return nil, err
 	}
 
+	// The global recovery layer, resolved once against the package defaults:
+	// every candidate's policy starts here, and a global contradiction is
+	// reported without a model entry attached to it. Resolving it eagerly
+	// also means an invalid global block is rejected even where no model
+	// exists to observe it.
+	globalPartial, err := buildGlobalRecovery(rf.Recovery, rf.ProviderFallback)
+	if err != nil {
+		return nil, err
+	}
+	globalRecovery, err := recovery.Resolve(recovery.Default(), recovery.Layer{Name: "global", Partial: globalPartial})
+	if err != nil {
+		return nil, err
+	}
+
 	models := make(map[string]Model, len(rf.Models))
 	seen := make(map[string]struct{}, len(rf.Models))
 	// Entries are validated in sorted-key order so the rejection's ordinal
@@ -425,7 +451,7 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 			return nil, fmt.Errorf("model entry %d: name collides with another entry after trimming whitespace", ordinal)
 		}
 		seen[name] = struct{}{}
-		m, err := buildModel(name, rf.Models[rawName], providers)
+		m, err := buildModel(name, rf.Models[rawName], providers, globalRecovery)
 		if err != nil {
 			return nil, fmt.Errorf("model entry %d: %w", ordinal, err)
 		}
@@ -463,11 +489,6 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	}
 
 	keepAlive, err := buildSSEKeepAlive(rf.SSEKeepAlive)
-	if err != nil {
-		return nil, err
-	}
-
-	fallback, err := buildProviderFallback(rf.ProviderFallback)
 	if err != nil {
 		return nil, err
 	}
@@ -511,156 +532,15 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		apiKey:     key,
 		logLevel:   level,
 		keepAlive:  keepAlive,
-		fallback:   fallback,
 		transports: transportSet,
 	}, nil
 }
 
-// Provider-fallback bounds. The default budget lets one request walk a
-// two-candidate chain; the cap keeps a misconfigured chain from turning a
-// client timeout into a provider-fanout amplifier.
-const (
-	defaultProviderFallbackAttempts = 2
-	maxProviderFallbackAttempts     = 8
-)
-
-// buildProviderFallback validates the optional top-level provider-fallback
-// block into the policy the handler walks chains under. Absent or null
-// selects the defaults (enabled, two attempts); a present block is
-// validated even when it disables the feature, so a typo next to
-// `enabled: false` cannot slip through on the assumption nobody reads it.
-func buildProviderFallback(rf *runtimeProviderFallback) (ProviderFallbackPolicy, error) {
-	p := ProviderFallbackPolicy{
-		Enabled:     true,
-		MaxAttempts: defaultProviderFallbackAttempts,
-	}
-	if rf == nil {
-		return p, nil
-	}
-	if rf.Enabled != nil {
-		p.Enabled = *rf.Enabled
-	}
-	if rf.MaxAttempts != nil {
-		n := *rf.MaxAttempts
-		if n < 1 {
-			return ProviderFallbackPolicy{}, errors.New("provider-fallback: max-attempts must be at least 1")
-		}
-		if n > maxProviderFallbackAttempts {
-			return ProviderFallbackPolicy{}, fmt.Errorf("provider-fallback: max-attempts is unreasonably large (at most %d)", maxProviderFallbackAttempts)
-		}
-		p.MaxAttempts = n
-	}
-	return p, nil
-}
-
-// Per-model retry bounds. One same-candidate retry is the default: a
-// transient 429/5xx is worth one quiet re-ask before the walk moves on, and
-// the cap keeps a misconfigured budget from turning one client request into
-// an upstream hammer. The elapsed window bounds a candidate's whole retry
-// sequence in time, so a slow-drip provider cannot hold a request past the
-// window no matter how its statuses invite retries.
-const (
-	defaultRetryMaxRetries = 1
-	maxRetryRetries        = 8
-	// maxRetryElapsed bounds the per-candidate retry window: well above the
-	// default backoff ceiling (2s × a handful of retries), far below any
-	// client's patience.
-	defaultRetryMaxElapsed = 10 * time.Second
-	minRetryMaxElapsed     = time.Second
-	maxRetryMaxElapsed     = 2 * time.Minute
-	// minBackoffInitial keeps a zero/negative initial delay from producing
-	// a hot retry loop; one millisecond is still effectively immediate.
-	minBackoffInitial     = time.Millisecond
-	defaultBackoffInitial = 250 * time.Millisecond
-	defaultBackoffMax     = 2 * time.Second
-	// defaultBackoffJitter spreads concurrent retries so a provider
-	// recovering from a rate limit is not re-hit by a synchronized herd.
-	defaultBackoffJitter = 0.1
-)
-
-// buildRetryPolicy validates the optional per-model retries block into the
-// policy every candidate of the model walks under. Absent or null selects
-// the defaults (one same-candidate retry, 10s window, 250ms→2s backoff at
-// 0.1 jitter) — the status matrix applies by default; this block sizes it,
-// it does not gate it. A present block is fully validated field by field,
-// including combinations (initial > max), and every message is fixed text:
-// durations and numbers can carry pasted material just like any other
-// value position, and error text reaches logs verbatim.
-func buildRetryPolicy(rr *runtimeRetries) (RetryPolicy, error) {
-	p := RetryPolicy{
-		MaxRetries: defaultRetryMaxRetries,
-		MaxElapsed: defaultRetryMaxElapsed,
-		Backoff: BackoffPolicy{
-			Initial: defaultBackoffInitial,
-			Max:     defaultBackoffMax,
-			Jitter:  defaultBackoffJitter,
-		},
-	}
-	if rr == nil {
-		return p, nil
-	}
-	if rr.MaxRetries != nil {
-		n := *rr.MaxRetries
-		if n < 0 {
-			return RetryPolicy{}, errors.New("retries: max-retries must be at least 0")
-		}
-		if n > maxRetryRetries {
-			return RetryPolicy{}, fmt.Errorf("retries: max-retries is unreasonably large (at most %d)", maxRetryRetries)
-		}
-		p.MaxRetries = n
-	}
-	if rr.MaxElapsed != "" {
-		d, err := time.ParseDuration(rr.MaxElapsed)
-		if err != nil {
-			return RetryPolicy{}, errors.New("retries: max-elapsed must be a valid duration (e.g. 10s, 1m)")
-		}
-		if d < minRetryMaxElapsed {
-			return RetryPolicy{}, errors.New("retries: max-elapsed must be at least 1s")
-		}
-		if d > maxRetryMaxElapsed {
-			return RetryPolicy{}, fmt.Errorf("retries: max-elapsed is unreasonably large (at most %s)", maxRetryMaxElapsed)
-		}
-		p.MaxElapsed = d
-	}
-	if rr.Backoff == nil {
-		return p, nil
-	}
-	rb := rr.Backoff
-	if rb.Initial != "" {
-		d, err := time.ParseDuration(rb.Initial)
-		if err != nil {
-			return RetryPolicy{}, errors.New("retries: backoff.initial must be a valid duration (e.g. 250ms)")
-		}
-		if d < minBackoffInitial {
-			return RetryPolicy{}, errors.New("retries: backoff.initial must be positive")
-		}
-		p.Backoff.Initial = d
-	}
-	if rb.Max != "" {
-		d, err := time.ParseDuration(rb.Max)
-		if err != nil {
-			return RetryPolicy{}, errors.New("retries: backoff.max must be a valid duration (e.g. 2s)")
-		}
-		if d < p.Backoff.Initial {
-			// An omitted initial keeps its 250ms default here; an explicit
-			// initial above the max is a contradiction, not a value to fix.
-			return RetryPolicy{}, errors.New("retries: backoff.max must be at least backoff.initial")
-		}
-		p.Backoff.Max = d
-	} else if p.Backoff.Initial > p.Backoff.Max {
-		// Max omitted, initial raised above the 2s default: the initial is
-		// the honest floor for the ceiling, so the ceiling follows it.
-		p.Backoff.Max = p.Backoff.Initial
-	}
-	if rb.Jitter != nil {
-		j := *rb.Jitter
-		if math.IsNaN(j) || j < 0 || j > 1 {
-			return RetryPolicy{}, errors.New("retries: backoff.jitter must be a number between 0 and 1")
-		}
-		p.Backoff.Jitter = j
-	}
-	return p, nil
-}
+// defaultProviderFallbackAttempts is the candidate reach the legacy
+// provider-fallback block documents when max-attempts is unstated: the
+// primary plus one. The cap and the retry bounds live in the recovery
+// domain now, which owns the single effective policy.
+const defaultProviderFallbackAttempts = 2
 
 // buildTransports validates the optional named-transports table. Entries
 // are validated in sorted-key order so the rejection's ordinal is
@@ -956,10 +836,16 @@ func buildPoolMembers(rms []runtimePoolMember, built map[string]transport.Config
 }
 
 // providerEntry is one validated providers-table entry: the upstream base
-// URL plus the outbound transport its requests execute through.
+// URL, the outbound transport its requests execute through, and the recovery
+// override every model routed through this provider inherits.
 type providerEntry struct {
 	endpoint  *url.URL
 	transport transport.Config
+	// recovery is the provider's override layer, nil when the entry states no
+	// recovery block. It is validated here — like every other providers-table
+	// field, including for an unreferenced entry — so a broken override can
+	// never wait for a model to reference it.
+	recovery *recovery.Partial
 }
 
 // buildProviders validates the optional providers table against the
@@ -1007,7 +893,15 @@ func buildProviders(rp map[string]runtimeProvider, transports map[string]transpo
 			}
 			tc = cfg
 		}
-		out[name] = providerEntry{endpoint: u, transport: tc}
+		var rp *recovery.Partial
+		if entry.Recovery != nil {
+			partial, err := buildRecoveryOverride(entry.Recovery)
+			if err != nil {
+				return nil, fmt.Errorf("provider entry %d: %w", ordinal, err)
+			}
+			rp = &partial
+		}
+		out[name] = providerEntry{endpoint: u, transport: tc, recovery: rp}
 	}
 	return out, nil
 }
@@ -1156,7 +1050,7 @@ func isBearerTokenChar(c byte) bool {
 		c == '~' || c == '+' || c == '/'
 }
 
-func buildModel(name string, rm runtimeModel, providers map[string]providerEntry) (Model, error) {
+func buildModel(name string, rm runtimeModel, providers map[string]providerEntry, globalRecovery recovery.Policy) (Model, error) {
 	// Where the request goes. Three mutually exclusive shapes:
 	//
 	//   - the providers chain (a model-level providers list) — the whole
@@ -1219,9 +1113,41 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 	if err != nil {
 		return Model{}, err
 	}
-	retries, err := buildRetryPolicy(rm.Retries)
+	modelRecovery, err := buildModelRecovery(rm)
 	if err != nil {
 		return Model{}, err
+	}
+	// The candidate overrides ride alongside the chain: the list entry and
+	// the chain entry are the same position, so they are indexed together.
+	// A non-chain model never reaches this loop — its single candidate has
+	// no list entry to carry an override.
+	candidateRecovery := make([]*recovery.Partial, len(chain))
+	for i := range chain {
+		if i >= len(rm.Providers) || rm.Providers[i].Recovery == nil {
+			continue
+		}
+		partial, err := buildRecoveryOverride(rm.Providers[i].Recovery)
+		if err != nil {
+			return Model{}, fmt.Errorf("providers candidate %d: %w", i+1, err)
+		}
+		candidateRecovery[i] = &partial
+	}
+	// Every candidate resolves its own policy: the global layer, its
+	// provider's override, the model's override, then its own. Resolution is
+	// per candidate rather than per model because a chain may route through
+	// several providers, and a candidate override speaks for exactly one.
+	for i := range chain {
+		var providerRecovery *recovery.Partial
+		if ref := chain[i].Provider; ref != "" {
+			if p, ok := providers[ref]; ok {
+				providerRecovery = p.recovery
+			}
+		}
+		policy, err := resolveCandidateRecovery(globalRecovery, providerRecovery, modelRecovery, candidateRecovery[i])
+		if err != nil {
+			return Model{}, fmt.Errorf("provider candidate %d: %w", i+1, err)
+		}
+		chain[i].Recovery = policy
 	}
 	return Model{
 		Public:          name,
@@ -1230,7 +1156,7 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 		UpstreamModel:   chain[0].UpstreamModel,
 		InjectionPrompt: rm.InjectionPrompt,
 		ThinkingUsage:   tu,
-		Retries:         retries,
+		Recovery:        chain[0].Recovery,
 		Transport:       chain[0].Transport,
 		Chain:           chain,
 	}, nil

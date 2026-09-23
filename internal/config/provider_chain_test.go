@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"openai-compatible-injector/internal/recovery"
 )
 
 // chainRuntime is the minimal chain harness: providers pa/pb/pc (pa on a
@@ -113,9 +115,11 @@ func TestLoadRuntimeProviderChainShape(t *testing.T) {
 		t.Errorf("transports closure = %d entries (%v), want the deduped direct+proxy pair", len(ts), kinds)
 	}
 
-	pf := snap.ProviderFallback()
-	if !pf.Enabled || pf.MaxAttempts != 3 {
-		t.Errorf("ProviderFallback() = %+v, want enabled at 3 attempts", pf)
+	// The legacy provider-fallback block normalizes into the model's
+	// effective fallback policy: enabled, reaching three candidates.
+	fb := m.Recovery.Fallback
+	if !fb.Enabled || fb.MaxCandidates != 3 || fb.OnExhausted != recovery.ActionTerminal {
+		t.Errorf("Recovery.Fallback = %+v, want enabled at 3 candidates", fb)
 	}
 }
 
@@ -151,10 +155,12 @@ func TestLoadRuntimeProviderChainRejections(t *testing.T) {
 	}
 }
 
-// TestLoadRuntimeProviderFallbackPolicy pins the top-level policy block:
-// absent selects the defaults (enabled, two attempts), a present block is
-// validated even when it disables the feature, and the attempt budget is
-// bounded.
+// TestLoadRuntimeProviderFallbackPolicy pins the legacy top-level policy
+// block as normalized into the effective fallback policy: absent selects the
+// defaults (enabled, two candidates), a present block is validated even when
+// it disables the feature, and the candidate reach is bounded. Disabling the
+// walk states a one-candidate reach, because a disabled fallback policy that
+// still claimed a longer reach would be a contradiction.
 func TestLoadRuntimeProviderFallbackPolicy(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -166,12 +172,13 @@ func TestLoadRuntimeProviderFallbackPolicy(t *testing.T) {
 		{name: "absent", block: "", enabled: true, max: 2},
 		{name: "null", block: "provider-fallback:\n", enabled: true, max: 2},
 		{name: "explicit defaults", block: "provider-fallback:\n  enabled: true\n  max-attempts: 2\n", enabled: true, max: 2},
-		{name: "disabled", block: "provider-fallback:\n  enabled: false\n", enabled: false, max: 2},
+		{name: "disabled", block: "provider-fallback:\n  enabled: false\n", enabled: false, max: 1},
 		{name: "single attempt", block: "provider-fallback:\n  max-attempts: 1\n", enabled: true, max: 1},
 		{name: "cap", block: "provider-fallback:\n  max-attempts: 8\n", enabled: true, max: 8},
-		{name: "zero attempts", block: "provider-fallback:\n  max-attempts: 0\n", reject: "at least 1"},
-		{name: "over cap", block: "provider-fallback:\n  max-attempts: 9\n", reject: "at most 8"},
-		{name: "negative", block: "provider-fallback:\n  max-attempts: -2\n", reject: "at least 1"},
+		{name: "zero attempts", block: "provider-fallback:\n  max-attempts: 0\n", reject: "fallback.max-candidates"},
+		{name: "over cap", block: "provider-fallback:\n  max-attempts: 9\n", reject: "fallback.max-candidates"},
+		{name: "negative", block: "provider-fallback:\n  max-attempts: -2\n", reject: "fallback.max-candidates"},
+		{name: "disabled with a reach", block: "provider-fallback:\n  enabled: false\n  max-attempts: 3\n", reject: "fallback.max-candidates"},
 	}
 	for _, tc := range cases {
 		data := chainRuntime("    provider: pa\n    upstream-model: up-a\n", tc.block)
@@ -188,9 +195,10 @@ func TestLoadRuntimeProviderFallbackPolicy(t *testing.T) {
 			t.Errorf("%s: rejected: %v", tc.name, err)
 			continue
 		}
-		pf := snap.ProviderFallback()
-		if pf.Enabled != tc.enabled || pf.MaxAttempts != tc.max {
-			t.Errorf("%s: policy = %+v, want enabled=%v max=%d", tc.name, pf, tc.enabled, tc.max)
+		m, _ := snap.Model("m")
+		fb := m.Recovery.Fallback
+		if fb.Enabled != tc.enabled || fb.MaxCandidates != tc.max {
+			t.Errorf("%s: fallback = %+v, want enabled=%v max-candidates=%d", tc.name, fb, tc.enabled, tc.max)
 		}
 	}
 }
