@@ -168,7 +168,15 @@ func TestEngineCommittedIsAbsolute(t *testing.T) {
 	}
 }
 
-func TestEngineExchangeEnvelopeStopsTheWalk(t *testing.T) {
+// TestEngineExchangeEnvelopeStopsRetryingButNotTheWalk is the boundary
+// between the two envelopes. A spent CANDIDATE envelope forbids one more
+// exchange on that candidate — so a retryable status cannot be re-asked —
+// but the walk itself is still free: the request-wide envelope funds the
+// next candidate, whose own envelope opens fresh, and the retry rule's
+// exhaustion policy still says where a spent candidate goes. Reporting this
+// as terminal would let a candidate-scoped ceiling silently override the
+// fallback the policy asked for.
+func TestEngineExchangeEnvelopeStopsRetryingButNotTheWalk(t *testing.T) {
 	pol := Default()
 	pol.Budget.Candidate.MaxExchanges = 2
 	e, _ := newTestEngine(t, context.Background(), pol)
@@ -177,8 +185,39 @@ func TestEngineExchangeEnvelopeStopsTheWalk(t *testing.T) {
 		t.Fatal("the candidate's two exchanges were not allowed")
 	}
 	d := e.Observe(httpObs(429, 1))
-	if d.Action != ActionTerminal || d.RuleID != RuleIDBudgetCandidate {
-		t.Fatalf("a spent candidate envelope got %+v", d)
+	if d.Action != ActionFallback {
+		t.Fatalf("a spent candidate envelope got %+v, want a fallback", d)
+	}
+	if e.Budget().Exhausted() != ExhaustionCandidate {
+		t.Fatalf("exhaustion = %v, want candidate", e.Budget().Exhausted())
+	}
+	// The next candidate opens its own envelope: the request still has room,
+	// so the fallback is executable rather than a claim.
+	if !e.EnterCandidate(pol) {
+		t.Fatal("the second candidate was not enterable")
+	}
+	if got := e.Budget().Exhausted(); got != ExhaustionNone {
+		t.Fatalf("a fresh candidate started spent: %v", got)
+	}
+	if !e.Budget().ConsumeExchange() {
+		t.Fatal("the second candidate's first exchange was refused")
+	}
+}
+
+// TestEngineSpentCandidateUnderTerminalRetryEndsTheWalk pins the other half
+// of the candidate envelope: when the retry policy says a spent candidate is
+// terminal, the envelope stop and the policy agree, and the walk ends.
+func TestEngineSpentCandidateUnderTerminalRetryEndsTheWalk(t *testing.T) {
+	pol := Default()
+	pol.Retry.OnExhausted = ActionTerminal
+	pol.Budget.Candidate.MaxExchanges = 2
+	e, _ := newTestEngine(t, context.Background(), pol)
+	e.EnterCandidate(pol)
+	if !e.Budget().ConsumeExchange() || !e.Budget().ConsumeExchange() {
+		t.Fatal("the candidate's two exchanges were not allowed")
+	}
+	if d := e.Observe(httpObs(429, 1)); d.Action != ActionTerminal {
+		t.Fatalf("a spent candidate envelope under a terminal retry policy got %+v", d)
 	}
 }
 

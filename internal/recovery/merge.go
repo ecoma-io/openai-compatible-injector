@@ -187,6 +187,10 @@ func mergeMatrix(base Matrix, p MatrixPartial) (Matrix, error) {
 	for i, r := range rules {
 		at[r.ID] = i
 	}
+	// A same-identity pair inside one layer would fold silently — one rule
+	// would replace the other — and a layer that names the same row twice is
+	// a mistake the operator needs to see: reported by position, never by
+	// identity.
 	seen := make(map[string]int, len(p.Rules))
 	for i, r := range p.Rules {
 		if prev, dup := seen[r.ID]; dup {
@@ -207,8 +211,3 @@ func mergeMatrix(base Matrix, p MatrixPartial) (Matrix, error) {
 	}
 	return NewMatrix(rules, def)
 }
-
-// NewMatrix would fold a same-identity pair inside one layer silently (one
-// rule would replace the other), and a layer that names the same row twice
-// is a mistake the operator needs to see — reported by position, never by
-// identity.

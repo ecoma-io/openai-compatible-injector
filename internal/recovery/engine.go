@@ -165,9 +165,10 @@ func (e *Engine) canEnter() bool {
 //  1. a committed response ends everything;
 //  2. a dead caller ends everything — judged from the request context and
 //     from the failure's own class, never from the error text;
-//  3. a spent exchange envelope ends everything;
-//  4. the matrix decides, and the retry and fallback budgets size what it
-//     decided.
+//  3. a spent request envelope ends everything, because no candidate can
+//     start another exchange;
+//  4. the matrix decides; a spent candidate envelope can stop only another
+//     retry on THAT candidate, never a fallback to a fresh candidate.
 func (e *Engine) Observe(o Observation) Decision {
 	reason := Reason(o)
 	if o.Committed {
@@ -176,15 +177,19 @@ func (e *Engine) Observe(o Observation) Decision {
 	if o.Class == FailureCaller || e.ctx.Err() != nil {
 		return Decision{Action: ActionTerminal, RuleID: RuleIDCaller, Reason: reason}
 	}
-	switch e.budget.Exhausted() {
-	case ExhaustionRequest:
+	if e.budget.Exhausted() == ExhaustionRequest {
 		return Decision{Action: ActionTerminal, RuleID: RuleIDBudgetRequest, Reason: reason}
-	case ExhaustionCandidate:
-		return Decision{Action: ActionTerminal, RuleID: RuleIDBudgetCandidate, Reason: reason}
 	}
 	action, ruleID := e.policy.Matrix.Match(o)
 	switch action {
 	case ActionRetry:
+		// Candidate envelopes reset on EnterCandidate. Spending this one's
+		// envelope therefore forbids only another same-candidate exchange;
+		// its retry exhaustion policy still decides whether the walk may move
+		// to a fresh candidate while the request-wide envelope has room.
+		if e.budget.Exhausted() == ExhaustionCandidate {
+			return e.exhaustedRetry(ruleID, reason)
+		}
 		return e.retry(o, ruleID, reason)
 	case ActionFallback:
 		return e.move(ruleID, reason)
