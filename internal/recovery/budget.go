@@ -139,6 +139,24 @@ func (b *Budget) Remaining() int {
 	return n
 }
 
+// RequestRemaining is how many further exchanges the REQUEST-wide envelope
+// allows, ignoring the candidate's own. It is what the completion record
+// reports: after a walk ends, the candidate envelope is usually spent (that
+// is often why the walk ended), so the tighter-of-the-two Remaining would
+// answer "none left" for every ordinary request and tell an operator nothing
+// about the headroom the request itself was given. This one answers the
+// question the evidence asks — how much of the request-wide ceiling the
+// request did not use.
+func (b *Budget) RequestRemaining() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := b.req.MaxExchanges - b.reqUsed
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 // RequestExchanges is how many exchanges this request has actually spent.
 // It is the ground truth behind the `upstream_exchanges` evidence field:
 // counted where the dials happen, so no handler bookkeeping can drift from

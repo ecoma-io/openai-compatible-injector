@@ -313,6 +313,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		streamed bool
 		// providerAttempts counts the walk's provider-level attempts — each
 		// candidate's initial attempt plus its same-candidate retries — and
+		// retriesTotal counts the retries among them. The two are counted
+		// separately, and retriesTotal is incremented where a retry actually
+		// starts, because deriving retries by subtracting entered candidates
+		// from attempts assumes every entered candidate attempted something:
+		// a candidate whose pool dials nothing is entered and attempts
+		// nothing, which would make the subtraction negative.
 		// finalProvider is the identity (providers-table name, or endpoint
 		// origin) of the candidate whose answer was committed or, on
 		// exhaustion/disconnect, of the last one attempted.
@@ -322,6 +328,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// committed (an answer is always committed for the current
 		// candidate), else the last attempted one.
 		providerAttempts  int
+		retriesTotal      int
 		finalProvider     string
 		providerExhausted bool
 		lastCandIndex     int
@@ -346,25 +353,37 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("egress_target", egress.Target).
 			Bool("egress_exhausted", egress.Exhausted)
 	}
-	// withProviders adds the walk's completion facts. A walk that entered n
-	// candidates and performed a provider-level attempts made exactly
-	// a−n same-candidate retries — one candidate is entered per fallback
-	// step, so the subtraction needs no counter of its own to drift from.
+	// withProviders adds the walk's completion facts. candidate_attempts is
+	// the same total as provider_attempts seen from the other scope — one
+	// provider attempt IS one attempt on some candidate — while
+	// upstream_exchanges is the count of real dials and can be higher, since
+	// one pooled attempt may dial several members.
 	// provider_attempts/retries_total stay as compatibility aliases of
 	// candidate_attempts/retry_attempts, the same way attempt aliases
 	// egress_attempt on the per-dial events; the new names are authoritative.
+	//
+	// request_exchange_budget_remaining reports the REQUEST-wide envelope's
+	// headroom, not the tighter of the two: a finished walk has usually spent
+	// its candidate envelope, so the tighter number would read zero for every
+	// ordinary request.
+	//
+	// A walk that entered a candidate but dialed nothing still carries its
+	// walk facts: the gate is the engine, not the exchange count, because a
+	// zero-dial walk had a policy decide it and the operator needs the same
+	// identity — final_provider, policy_hash, provider_exhausted — that any
+	// other walk reports.
 	withProviders := func(ev *zerolog.Event) *zerolog.Event {
-		if providerAttempts == 0 || eng == nil {
+		if eng == nil || eng.CandidatesEntered() == 0 {
 			return ev
 		}
 		entered := eng.CandidatesEntered()
-		retries := providerAttempts - entered
 		ev = ev.Int("provider_attempts", providerAttempts).
-			Int("retries_total", retries).
+			Int("retries_total", retriesTotal).
 			Int("candidate_attempts", providerAttempts).
-			Int("retry_attempts", retries).
+			Int("retry_attempts", retriesTotal).
 			Int("candidates_entered", entered).
 			Int("upstream_exchanges", exchanges()).
+			Int("request_exchange_budget_remaining", eng.Budget().RequestRemaining()).
 			Str("policy_hash", lastPolicyHash).
 			Uint64("policy_generation", snap.Gen()).
 			Int("final_candidate", lastCandIndex).
@@ -807,6 +826,59 @@ walk:
 			// budget, so a pooled attempt can honestly consume several.
 			attempt++
 			retryIndex := attempt - 1
+			// noteAttempt counts one provider-level attempt, and the retry
+			// inside it when there is one. Both are counted at the same place,
+			// after the transport confirmed the attempt reached a provider, so
+			// retries_total can never report a re-ask the attempt counter does
+			// not contain.
+			noteAttempt := func() {
+				providerAttempts++
+				if attempt > 1 {
+					retriesTotal++
+				}
+			}
+			// fallBackOnSpentCandidate answers the one refusal no observation
+			// can describe: the transport declined to dial because this
+			// candidate's own exchange envelope is spent. It asks the engine —
+			// whose answer is the retry policy's on-exhausted action — and
+			// reports whether the walk may move on.
+			//
+			// A refusal by the REQUEST envelope is not this case: it is
+			// terminal whatever the policy says, it is reported by the
+			// post-walk record under the request identity, and this returns
+			// false so the caller stops the walk exactly as it always has.
+			//
+			// The record carries no upstream_exchange index, because the
+			// refusal claimed no exchange: naming one would invent an exchange
+			// that never happened. provider_attempt carries the attempts made
+			// so far — the same number the other events' one-based index is
+			// derived from — and request_exchange_budget_remaining is the
+			// headroom the refusal left for the rest of the walk.
+			fallBackOnSpentCandidate := func() bool {
+				if eng.Budget().Exhausted() == recovery.ExhaustionRequest {
+					return false
+				}
+				dec := eng.CandidateSpent(recovery.CauseExchangeBudget)
+				act := walkAction(dec.Action, i+1 < len(m.Chain))
+				log.Warn().
+					Str("public_model", model).
+					Str("provider", cand.Label()).
+					Str("error_class", "provider_exhausted").
+					Str("error_cause", recovery.CauseExchangeBudget).
+					Str("disposition", act.String()).
+					Str("reason", dec.Reason).
+					Str("policy_rule_id", dec.RuleID).
+					Str("policy_hash", lastPolicyHash).
+					Uint64("policy_generation", snap.Gen()).
+					Int("provider_attempt", providerAttempts).
+					Int("candidate_index", i+1).
+					Int("candidate_attempt", attempt).
+					Int("retry_index", retryIndex).
+					Int("request_exchange_budget_remaining", eng.Budget().RequestRemaining()).
+					Int64("elapsed_ms", eng.Now().Sub(attemptStart).Milliseconds()).
+					Msg("candidate_exchange_budget_spent")
+				return act == recovery.ActionFallback
+			}
 			// This request has now reached the provider path. Any subsequent
 			// dial failure still yields one event with the walk's final facts.
 			meterEvent = true
@@ -860,7 +932,7 @@ walk:
 				// endpoint error rather than an empty result), so the guard
 				// is what counts, not the flag.
 				if info.Attempts > 0 {
-					providerAttempts++
+					noteAttempt()
 					log.Debug().Str("provider", cand.Label()).
 						Str("upstream", origin(&upstream)).
 						Int64("bytes_out", int64(len(out))).
@@ -887,19 +959,41 @@ walk:
 						Int("egress_attempt", j+1).
 						Int("attempt", j+1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
-						"", lastPolicyHash, snap.Gen(), exchangeBefore+j+1, eng.Budget().Remaining())
+						"", lastPolicyHash, snap.Gen(), exchangeBefore+j+1, eng.Budget().RequestRemaining())
 					event.Msg("egress_attempt_failed")
 				}
 				if info.BudgetExhausted {
-					// The envelope refused the pool's next dial. The walk is
-					// over and the post-walk report names the envelope rather
-					// than an endpoint: no member was struck for a dial that
-					// never started, and the pool handed the refused member's
-					// permit back before returning. A refusal keeps any last
-					// endpoint error in force, which is why the precedence
-					// between this and the zero-dial exhaustion case matters.
-					budgetStopped = true
-					break walk
+					// The envelope refused the pool's next dial, so no member
+					// was struck for a dial that never started and the pool
+					// handed the refused member's permit back before
+					// returning.
+					//
+					// Which envelope refused it decides the walk. A spent
+					// REQUEST envelope ends everything: no candidate may spend
+					// another exchange, so the walk stops with the envelope
+					// named rather than an endpoint. A spent CANDIDATE envelope
+					// forbids only another exchange on THIS candidate, and the
+					// walk keeps its ordinary options — a dial did fail here
+					// (the pool returns that last error with the flag set), so
+					// the failure is observed and decided like any other, and
+					// the engine turns a retry into the retry policy's
+					// on-exhausted action. A per-candidate number must never
+					// silently pin a chain the operator configured to fall
+					// back.
+					if eng.Budget().Exhausted() == recovery.ExhaustionRequest {
+						budgetStopped = true
+						break walk
+					}
+					if uerr == nil {
+						// The refusal came before this attempt's first dial,
+						// so there is no failure to observe: the engine is
+						// asked the candidate-envelope question directly.
+						if !fallBackOnSpentCandidate() {
+							budgetStopped = true
+							break walk
+						}
+						break
+					}
 				}
 			} else {
 				// The exchange envelope is claimed here for a single-endpoint
@@ -909,10 +1003,13 @@ walk:
 				// the walk stops with the envelope named, exactly as it does for
 				// a pool that refused a dial.
 				if !eng.Budget().ConsumeExchange() {
-					budgetStopped = true
-					break walk
+					if !fallBackOnSpentCandidate() {
+						budgetStopped = true
+						break walk
+					}
+					break
 				}
-				providerAttempts++
+				noteAttempt()
 				log.Debug().Str("provider", cand.Label()).
 					Str("upstream", origin(&upstream)).
 					Int64("bytes_out", int64(len(out))).
@@ -1003,7 +1100,7 @@ walk:
 						event = event.Int("egress_attempt", lastEgressAttempt)
 					}
 					event = withPolicyFields(withAttemptFields(event, providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
-						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().Remaining())
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining())
 					event.Msg("upstream_request_failed")
 					complete()
 					return
@@ -1021,7 +1118,7 @@ walk:
 						Str("error_class", class).Str("error_cause", cause).
 						Int("egress_attempt", 1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
-						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+1, eng.Budget().Remaining())
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+1, eng.Budget().RequestRemaining())
 					event.Msg("egress_attempt_failed")
 				}
 				// Transport-level failure with the client still present: one
@@ -1043,7 +1140,7 @@ walk:
 					event = event.Int("egress_attempt", lastEgressAttempt)
 				}
 				event = withPolicyFields(withAttemptFields(event, providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
-					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().Remaining())
+					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining())
 				event.Msg("provider_attempt_failed")
 				if !waitOut(dec) {
 					return
@@ -1151,7 +1248,7 @@ walk:
 						Str("error_fingerprint", ev.fingerprint).
 						Int("egress_attempt", lastEgressAttempt),
 						providerAttempts, i+1, attempt, elapsed),
-						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().Remaining()).
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 						Str("disposition", act.String()).
 						Str("reason", dec.Reason)
 					for _, f := range evidenceRateLimitFields {
@@ -1176,7 +1273,7 @@ walk:
 							Str("error_cause", "body_read_failed")
 					}
 					w = withPolicyFields(withAttemptFields(w, providerAttempts, i+1, attempt, elapsed),
-						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().Remaining()).
+						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 						Str("disposition", act.String()).
 						Str("reason", dec.Reason).
 						Int("upstream_status", status)
@@ -1257,7 +1354,7 @@ walk:
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status),
 					providerAttempts, i+1, attempt, elapsed),
-					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().Remaining()).
+					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
 					Str("reason", dec.Reason)
 				event.Msg("upstream_body_read_failed")
@@ -1307,7 +1404,7 @@ walk:
 					Int("upstream_status", status).
 					Str("content_type", logSafeContentType(resp.Header.Get(contentTypeHeader))),
 					providerAttempts, i+1, attempt, elapsed),
-					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().Remaining()).
+					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
 					Str("reason", dec.Reason)
 				event.Msg("upstream_invalid_response")
@@ -1649,8 +1746,10 @@ func transportClassOf(c transport.Class) recovery.TransportClass {
 // when no decision did — a dial that failed before any disposition was
 // reached), the effective policy hash and snapshot generation the attempt
 // ran under, the one-based index of the real outbound exchange across the
-// whole request, and how much of the request's exchange envelope was left
-// after the attempt.
+// whole request, and how much of the REQUEST-wide exchange envelope was left
+// after the attempt — the envelope the field is named for, never the tighter
+// of the two: a candidate that has spent its own envelope would otherwise
+// report zero headroom on a request with most of its budget untouched.
 func withPolicyFields(ev *zerolog.Event, ruleID, policyHash string, generation uint64, exchange, remaining int) *zerolog.Event {
 	return ev.Str("policy_rule_id", ruleID).
 		Str("policy_hash", policyHash).

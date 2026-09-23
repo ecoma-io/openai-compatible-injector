@@ -1466,7 +1466,12 @@ func TestProviderWalkEngineRecoveryActions(t *testing.T) {
 		if len(evs) != 1 || evs[0]["disposition"] != "retry" || evs[0]["policy_rule_id"] != "http-429" || evs[0]["reason"] != "http_429" {
 			t.Errorf("429 evidence = %v, want retry/status-429/http_429", evs)
 		}
-		if evs[0]["policy_hash"] == "" || evs[0]["policy_generation"] != float64(0) || evs[0]["upstream_exchange"] != float64(1) || evs[0]["request_exchange_budget_remaining"] != float64(15) {
+		// 31, not 15: the field is named for the REQUEST envelope, and the
+		// default request envelope is 32 while the candidate's is 16. A field
+		// reporting the tighter of the two would answer with the candidate's
+		// remainder under a request's name, hiding three quarters of the
+		// headroom the request was granted.
+		if evs[0]["policy_hash"] == "" || evs[0]["policy_generation"] != float64(0) || evs[0]["upstream_exchange"] != float64(1) || evs[0]["request_exchange_budget_remaining"] != float64(31) {
 			t.Errorf("retry observability = %v", evs[0])
 		}
 		done := logs.events(t, "request_completed")

@@ -666,12 +666,23 @@ func TestE2ERecoveryExchangeBudgetCapsPoolDials(t *testing.T) {
 	if capped[0]["provider_exhausted"] != true {
 		t.Errorf("eb-capped provider_exhausted = %v, want true", capped[0]["provider_exhausted"])
 	}
+	// The completion record reports the REQUEST-wide headroom, not the tighter
+	// number: eb-capped spent its candidate envelope (that is why the walk
+	// stopped) and still has 30 of the default 32 request exchanges left. A
+	// completion that reported the tighter envelope would read 0 here and
+	// could not tell the two walks apart.
+	if capped[0]["request_exchange_budget_remaining"] != float64(30) {
+		t.Errorf("eb-capped request_exchange_budget_remaining = %v, want 30", capped[0]["request_exchange_budget_remaining"])
+	}
 	open := completionsFor(t, p, "eb-open")
 	if len(open) != 1 {
 		t.Fatalf("eb-open completions = %d, want 1", len(open))
 	}
 	if open[0]["upstream_exchanges"] != float64(3) {
 		t.Errorf("eb-open upstream_exchanges = %v, want 3", open[0]["upstream_exchanges"])
+	}
+	if open[0]["request_exchange_budget_remaining"] != float64(29) {
+		t.Errorf("eb-open request_exchange_budget_remaining = %v, want 29", open[0]["request_exchange_budget_remaining"])
 	}
 
 	// The refusal names the envelope, never an endpoint: the floor-priced
@@ -807,5 +818,95 @@ func TestE2ERecoveryRetryRotatesEgressWithoutProviderFallback(t *testing.T) {
 	if http4xx[0]["upstream_status"] != float64(429) || http4xx[0]["disposition"] != "retry" {
 		t.Errorf("429 evidence = status %v / disposition %v, want 429 / retry",
 			http4xx[0]["upstream_status"], http4xx[0]["disposition"])
+	}
+}
+
+// TestE2ERecoverySpentCandidateEnvelopeStillFallsBack pins the candidate
+// envelope's boundary on the wire: it bounds ONE candidate's exchanges and
+// nothing else. The primary is a pool whose members are all dead, so the
+// candidate's two exchange units are spent on two failed dials; the walk
+// must then reach the healthy backup, whose own envelope is fresh, rather
+// than reporting the request exhausted. A per-candidate number that pinned
+// the chain would silently overrule the fallback policy the file states.
+func TestE2ERecoverySpentCandidateEnvelopeStillFallsBack(t *testing.T) {
+	backup := newFakeUpstream(t)
+	backup.setHandler(markerJSONHandler("sc-backup", "sc-up"))
+
+	sections := []string{
+		`transports:
+  sc-pool:
+    type: pool
+    members: [sc-dead-a, sc-dead-b, sc-dead-c]
+  sc-dead-a:
+    type: proxy
+    proxy: http://127.0.0.1:1
+  sc-dead-b:
+    type: proxy
+    proxy: http://127.0.0.1:2
+  sc-dead-c:
+    type: proxy
+    proxy: http://127.0.0.1:3
+`,
+		fmt.Sprintf(`providers:
+  sc-primary:
+    base-url: http://127.0.0.1:1/v1
+    transport: sc-pool
+  sc-backup:
+    base-url: %s/v1
+`, backup.url()),
+		`models:
+  sc-model:
+    recovery:
+      retries:
+        max-retries: 0
+      budget:
+        candidate:
+          max-exchanges: 2
+    providers:
+      - provider: sc-primary
+        upstream-model: sc-up
+      - provider: sc-backup
+        upstream-model: sc-up
+`,
+	}
+	p := startSubprocess(t, startOpts{yaml: recoveryFile(sections...), logLevel: "info"})
+
+	code, _, body := postJSON(t, p.addr, "/v1/chat/completions", poolChatBody("sc-model", "hi"), nil)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body %s — the backup candidate should have answered", code, body)
+	}
+	if id := decodeMap(t, body)["id"]; id != "sc-backup" {
+		t.Fatalf("response id = %v, want the backup's sc-backup", id)
+	}
+	if got := backup.count(); got != 1 {
+		t.Errorf("backup dials = %d, want 1 (entered after the primary's envelope was spent)", got)
+	}
+
+	waitForEventCount(t, p, "request_completed", 1)
+	evs := completionsFor(t, p, "sc-model")
+	if len(evs) != 1 {
+		t.Fatalf("completions = %d, want 1", len(evs))
+	}
+	for k, want := range map[string]any{
+		"outcome":            "completed",
+		"candidates_entered": float64(2),
+		"candidate_attempts": float64(2),
+		"retries_total":      float64(0),
+		"upstream_exchanges": float64(3),
+		"final_provider":     "sc-backup",
+		"final_candidate":    float64(2),
+	} {
+		if evs[0][k] != want {
+			t.Errorf("completion %s = %v, want %v", k, evs[0][k], want)
+		}
+	}
+	// A provider answered, so the walk is not exhausted.
+	if _, set := evs[0]["provider_exhausted"]; set {
+		t.Errorf("provider_exhausted set on a walk a provider answered")
+	}
+	// The spent envelope is visible as two dialed-and-failed endpoints, and
+	// the refusal that ended that candidate blamed no endpoint.
+	if got := dialFailuresFor(t, p, "sc-model"); got != 2 {
+		t.Errorf("dial failures = %d, want 2 (the candidate envelope refuses the third dial)", got)
 	}
 }

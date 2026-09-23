@@ -158,3 +158,52 @@ func TestBudgetIsTheExchangeTruth(t *testing.T) {
 		t.Fatalf("remaining = %d, want the tighter envelope's remainder (11)", got)
 	}
 }
+
+// TestBudgetRequestRemainingIgnoresTheCandidateEnvelope pins the distinction
+// the completion record depends on: Remaining answers "can the walk do one
+// more of anything", RequestRemaining answers "how much of the request-wide
+// ceiling is left". After an exhausted candidate the first is zero and the
+// second is not — and a finished walk that reported only the first would tell
+// an operator nothing about the headroom their request was granted.
+func TestBudgetRequestRemainingIgnoresTheCandidateEnvelope(t *testing.T) {
+	clk := newTestClock()
+	b := NewBudget(Envelope{MaxExchanges: 32, MaxElapsed: time.Minute}, clk.now)
+	b.BeginCandidate(Envelope{MaxExchanges: 2, MaxElapsed: time.Minute})
+	mustConsume(t, b, 2)
+	if got := b.Remaining(); got != 0 {
+		t.Fatalf("remaining = %d, want the spent candidate envelope to bind it", got)
+	}
+	if got := b.RequestRemaining(); got != 30 {
+		t.Fatalf("request remaining = %d, want the request envelope's own remainder (30)", got)
+	}
+	if got := b.Exhausted(); got != ExhaustionCandidate {
+		t.Fatalf("exhaustion = %v, want candidate", got)
+	}
+	// A fresh candidate restores headroom on the tighter envelope too, which
+	// is why the request-wide number is the one worth reporting as history.
+	b.BeginCandidate(Envelope{MaxExchanges: 2, MaxElapsed: time.Minute})
+	if got := b.RequestRemaining(); got != 30 {
+		t.Fatalf("request remaining after a fresh candidate = %d, want 30", got)
+	}
+	if got := b.Remaining(); got != 2 {
+		t.Fatalf("remaining after a fresh candidate = %d, want 2", got)
+	}
+}
+
+// TestBudgetRequestRemainingFloorsAtZero guards the evidence field against a
+// negative reading. A request envelope cannot be overspent through the seam,
+// but the accessor must not depend on that to stay a sane number.
+func TestBudgetRequestRemainingFloorsAtZero(t *testing.T) {
+	clk := newTestClock()
+	b := NewBudget(Envelope{MaxExchanges: 1, MaxElapsed: time.Minute}, clk.now)
+	b.BeginCandidate(Envelope{MaxExchanges: 4, MaxElapsed: time.Minute})
+	mustConsume(t, b, 1)
+	// The request envelope is checked first, so the candidate's spare units
+	// are unreachable here: the seat is refused, never overspent.
+	if b.ConsumeExchange() {
+		t.Fatal("a candidate envelope bought an exchange the request envelope refused")
+	}
+	if got := b.RequestRemaining(); got != 0 {
+		t.Fatalf("request remaining = %d, want 0", got)
+	}
+}
