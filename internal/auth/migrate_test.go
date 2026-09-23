@@ -3,10 +3,10 @@ package auth
 import (
 	"context"
 	"database/sql"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 )
 
@@ -23,41 +23,13 @@ func TestEmbeddedMigrationsAreWellFormed(t *testing.T) {
 	}
 	previous := 0
 	for _, m := range migrations {
-		if m.version <= previous {
-			t.Errorf("migration %s is not strictly ascending (previous %d)", m.name, previous)
+		if m.Version <= previous {
+			t.Errorf("migration %s is not strictly ascending (previous %d)", m.Name, previous)
 		}
-		if strings.TrimSpace(m.body) == "" {
-			t.Errorf("migration %s has an empty body", m.name)
+		if strings.TrimSpace(m.Body) == "" {
+			t.Errorf("migration %s has an empty body", m.Name)
 		}
-		previous = m.version
-	}
-}
-
-func TestLoadMigrationsRejectsBrokenSets(t *testing.T) {
-	valid := fstest.MapFS{
-		"migrations/0001_first.sql":  &fstest.MapFile{Data: []byte("SELECT 1;")},
-		"migrations/0002_second.sql": &fstest.MapFile{Data: []byte("SELECT 2;")},
-	}
-	if _, err := loadMigrationsFrom(valid); err != nil {
-		t.Fatalf("valid set rejected: %v", err)
-	}
-
-	cases := map[string]fstest.MapFS{
-		"duplicate version": {
-			"migrations/0001_a.sql": &fstest.MapFile{Data: []byte("SELECT 1;")},
-			"migrations/0001_b.sql": &fstest.MapFile{Data: []byte("SELECT 1;")},
-		},
-		"bad name": {
-			"migrations/first.sql": &fstest.MapFile{Data: []byte("SELECT 1;")},
-		},
-		"empty body": {
-			"migrations/0001_empty.sql": &fstest.MapFile{Data: []byte("  \n")},
-		},
-	}
-	for name, fsys := range cases {
-		if _, err := loadMigrationsFrom(fsys); err == nil {
-			t.Errorf("%s: broken migration set accepted", name)
-		}
+		previous = m.Version
 	}
 }
 
@@ -67,11 +39,39 @@ func TestLoadMigrationsRejectsBrokenSets(t *testing.T) {
 
 func integrationDB(t *testing.T) string {
 	t.Helper()
-	url := os.Getenv("OAICR_TEST_DATABASE_URL")
-	if url == "" {
+	rawURL := os.Getenv("OAICR_TEST_DATABASE_URL")
+	if rawURL == "" {
 		t.Skip("OAICR_TEST_DATABASE_URL not set; skipping PostgreSQL integration test")
 	}
-	return url
+	return isolatedTestURL(t, rawURL, "auth")
+}
+
+// isolatedTestURL separates this package's disposable PostgreSQL fixtures
+// from other package test binaries, which Go runs concurrently by default.
+func isolatedTestURL(t *testing.T, rawURL, schema string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse OAICR_TEST_DATABASE_URL: %v", err)
+	}
+	name := "oaicr_" + schema + "_test"
+	admin, err := sql.Open("pgx", rawURL)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA IF NOT EXISTS `+name); err != nil {
+		_ = admin.Close()
+		t.Fatalf("create test schema: %v", err)
+	}
+	if err := admin.Close(); err != nil {
+		t.Fatalf("close test database: %v", err)
+	}
+	q := u.Query()
+	q.Set("search_path", name)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func resetSchema(t *testing.T, url string) {
@@ -206,7 +206,7 @@ func TestEnsureSchemaIsIdempotent(t *testing.T) {
 		t.Fatalf("verify open: %v", err)
 	}
 	defer func() { _ = verify.Close() }()
-	rows, err := verify.QueryContext(ctx, `SELECT version FROM schema_migrations`)
+	rows, err := verify.QueryContext(ctx, `SELECT version FROM schema_migrations WHERE module = 'auth'`)
 	if err != nil {
 		t.Fatalf("verify query: %v", err)
 	}
@@ -224,8 +224,8 @@ func TestEnsureSchemaIsIdempotent(t *testing.T) {
 		t.Fatalf("loadMigrations: %v", err)
 	}
 	for _, m := range migrations {
-		if seen[m.version] != 1 {
-			t.Fatalf("migration %d recorded %d times, want exactly 1", m.version, seen[m.version])
+		if seen[m.Version] != 1 {
+			t.Fatalf("migration %d recorded %d times, want exactly 1", m.Version, seen[m.Version])
 		}
 	}
 }
@@ -265,8 +265,13 @@ func TestEnsureSchemaLeavesUnknownVersionsAlone(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := setup.ExecContext(ctx, `
-		CREATE TABLE schema_migrations (version integer NOT NULL PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());
-		INSERT INTO schema_migrations (version, name) VALUES (9999, '0009_from_the_future.sql');`); err != nil {
+		CREATE TABLE schema_migrations (
+			module     varchar(63) NOT NULL,
+			version    integer     NOT NULL,
+			name       text        NOT NULL,
+			applied_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (module, version));
+		INSERT INTO schema_migrations (module, version, name) VALUES ('auth', 9999, '0009_from_the_future.sql');`); err != nil {
 		t.Fatalf("seed future history: %v", err)
 	}
 	_ = setup.Close()

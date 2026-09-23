@@ -92,7 +92,7 @@ func TestRequestCompletedLogLifecycle(t *testing.T) {
 	defer upstream.Close()
 
 	buf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me", testAPIKey), directResolver(), nil, log)
+	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me", testAPIKey), directResolver(), nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","stream":false,"messages":"SECRET_REQUEST_BODY"}`, nil)
@@ -160,7 +160,7 @@ func TestRequestCompletedOutcomes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			buf, log := captureLog(zerolog.InfoLevel)
-			h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), directResolver(), nil, log)
+			h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), directResolver(), nil, nil, log)
 
 			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", tc.body, nil)
 			if rec.Code != int(tc.wantStatus) {
@@ -227,7 +227,7 @@ func TestStreamTruncationPhaseLogging(t *testing.T) {
 		// Info level: both the WARN truncation and the INFO completion line
 		// must appear at the default level.
 		buf, log := captureLog(zerolog.InfoLevel)
-		h := NewHandler(newTestStore(t, upstream.URL), directResolver(), nil, log)
+		h := NewHandler(newTestStore(t, upstream.URL), directResolver(), nil, nil, log)
 
 		// A recorder that stops accepting writes mid-stream — the client
 		// disconnected.
@@ -264,7 +264,7 @@ func TestStreamTruncationPhaseLogging(t *testing.T) {
 			Body:       &errBody{data: []byte("data: {\"model\":\"upstream-name\",\"x\":1}\n\n")},
 			Request:    &http.Request{Method: http.MethodPost},
 		}}}
-		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, log)
+		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, nil, log)
 
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 			`{"model":"test-model","stream":true}`, nil)
@@ -299,7 +299,7 @@ func TestStreamTruncationPhaseLogging(t *testing.T) {
 			Body:       &canceledBody{},
 			Request:    &http.Request{Method: http.MethodPost},
 		}}}
-		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, log)
+		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, nil, log)
 
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 			`{"model":"test-model","stream":true}`, nil)
@@ -361,7 +361,7 @@ func TestRelayCopyFailureLogged(t *testing.T) {
 		Body:       &errBody{data: []byte("partial")},
 		Request:    &http.Request{Method: http.MethodPost},
 	}}}
-	h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, log)
+	h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model"}`, nil)
@@ -429,7 +429,7 @@ func TestRelayOutcomeClassification(t *testing.T) {
 			Body:       body,
 			Request:    &http.Request{Method: http.MethodPost},
 		}}}
-		return buf, NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, log)
+		return buf, NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, nil, log)
 	}
 	expectDisconnected := func(t *testing.T, buf *logBuffer, slug string) {
 		t.Helper()
@@ -504,7 +504,7 @@ func TestRelayOutcomeClassification(t *testing.T) {
 			Body:       &errBody{data: []byte(`{"model":"upstream-name","partial`)},
 			Request:    &http.Request{Method: http.MethodPost},
 		}}}
-		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, log)
+		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, nil, log)
 
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 		if rec.Code != http.StatusBadGateway {
@@ -527,7 +527,7 @@ func TestRelayOutcomeClassification(t *testing.T) {
 		defer upstream.Close()
 
 		buf, log := captureLog(zerolog.InfoLevel)
-		h := NewHandler(promptStore(t, upstream.URL, "prompt", testAPIKey), directResolver(), nil, log)
+		h := NewHandler(promptStore(t, upstream.URL, "prompt", testAPIKey), directResolver(), nil, nil, log)
 		dying := &dyingRecorder{limit: 0}
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model"}`))
 		req.Header.Set("Authorization", "Bearer "+testAPIKey)
@@ -554,7 +554,7 @@ func TestRelayOutcomeClassification(t *testing.T) {
 			Body:       &canceledBody{},
 			Request:    &http.Request{Method: http.MethodPost},
 		}}}
-		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, log)
+		h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), fixedDoer{client}, nil, nil, log)
 
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 			`{"model":"test-model"}`, nil)
@@ -582,7 +582,7 @@ func TestUnauthorizedOutcomeLogged(t *testing.T) {
 	defer upstream.Close()
 
 	buf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(promptStore(t, upstream.URL, "prompt", testAPIKey), directResolver(), nil, log)
+	h := NewHandler(promptStore(t, upstream.URL, "prompt", testAPIKey), directResolver(), nil, nil, log)
 
 	const presented = "totally-wrong-SECRET-value"
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
@@ -638,7 +638,7 @@ func TestDebugLifecycleChain(t *testing.T) {
 	defer upstream.Close()
 
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me", "SECRET_AUTH_VALUE"), directResolver(), nil, log)
+	h := NewHandler(promptStore(t, upstream.URL, "SECRET_PROMPT_VALUE inject me", "SECRET_AUTH_VALUE"), directResolver(), nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","messages":"SECRET_REQUEST_BODY"}`,
@@ -723,7 +723,7 @@ func TestStreamProgressHeartbeat(t *testing.T) {
 	defer upstream.Close()
 
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(newTestStore(t, upstream.URL), directResolver(), nil, log)
+	h := NewHandler(newTestStore(t, upstream.URL), directResolver(), nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","stream":true}`, nil)
@@ -798,7 +798,7 @@ func (p *pipeRecorder) WriteHeader(int)             {}
 // traffic.
 func TestMethodNotAllowedOutsideLifecycle(t *testing.T) {
 	buf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), directResolver(), nil, log)
+	h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), directResolver(), nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodGet, "/v1/chat/completions", "", nil)
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -816,7 +816,7 @@ func TestBodyTooLargeOutcome(t *testing.T) {
 	defer func() { maxRequestBodyBytes = oldCap }()
 
 	buf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), directResolver(), nil, log)
+	h := NewHandler(newTestStore(t, "http://127.0.0.1:1/v1"), directResolver(), nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","overflow":"xxxxxxxxxxxxxxxxxxxxxxxx"}`, nil)
@@ -925,7 +925,7 @@ func TestErrorEnvelopeWriteFailureOutcome(t *testing.T) {
 			if tc.client != nil {
 				client = tc.client(t)
 			}
-			h := NewHandler(tc.store(t), fixedDoer{client}, nil, log)
+			h := NewHandler(tc.store(t), fixedDoer{client}, nil, nil, log)
 
 			// The client died before anything could be written: every
 			// envelope write attempt fails on the spot.

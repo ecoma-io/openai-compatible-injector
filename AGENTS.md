@@ -20,7 +20,9 @@ Owned decomposition:
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `internal/config`                | Bootstrap env parsing (`LoadBootstrap`), runtime YAML (`LoadRuntime`, strict decode via `yaml.v3` known fields, required client `api-key`, log level via `ParseLogLevel`), providers/transports tables incl. the pool schema (`buildModel`/`buildProviders`/`buildTransports` two-pass + pool policy builders, no-echo rejections, duplicate resolved-endpoint member rejection via `endpointKey`, RFC 1929 credential bound in `parseProxyURL`), egress-closure snapshot retention over model CHAINS (every candidate's transport), provider candidate chains (`runtimeModelCandidate`/`buildChain`), the `provider-fallback` policy builder, snapshot store (`Store`/`Snapshot`, atomic pointer), content-hash poller (`Poller`, `onPublish` hook) |
 | `internal/inject`                | Pure request/response transforms: `Probe` (model + stream detection), `Chat`, `Responses`, `RewriteChatModel`/`RewriteResponsesModel` (byte-preserving, API-scoped), thinking plan + usage synthesizers (`ThinkingPlanFor`, `SynthesizeChat/ResponsesThinkingUsage`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `internal/auth`                  | Client identity: `Principal`/`Reason`/`Authenticator`/`Provider` seam, `StaticProvider` (snapshot-bound shared key, padded constant-time compare), `PartnerProvider` (store-backed, bounded positive/negative decision cache — errors never cached), crypto-random token/keyID minting + SHA-256-at-rest hashing, PostgreSQL key store (`PGStore`: lookup/create/list/revoke, off-path batched `last_used_at` flusher), embedded forward-only SQL migrations (`EnsureSchema`/`ValidateSchema` via `information_schema`)                                                                                                                                                                                                                              |
+| `internal/auth`                  | Client identity: `Principal`/`Reason`/`Authenticator`/`Provider` seam, `StaticProvider` (snapshot-bound shared key, padded constant-time compare), `PartnerProvider` (store-backed, bounded positive/negative decision cache — errors never cached), crypto-random token/keyID minting + SHA-256-at-rest hashing, PostgreSQL key store (`PGStore`: lookup/create/list/revoke, off-path batched `last_used_at` flusher)                                                                                                                                                                                                                                                                                                                               |
+| `internal/migrate`               | Shared SQL-first module-scoped migration runner: embedded-set parsing, legacy auth-ledger adoption, advisory-lock serialization, `information_schema` column-contract validation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `internal/usage`                 | Factual upstream usage capture (pre-rewrite), durable PostgreSQL event repository and reporting query seam, bounded asynchronous batch pipeline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `internal/transport`             | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct client (cloned default transport tuning), proxy client (`http.ProxyURL` or hand-rolled SOCKS5 dialer preserving socks5-vs-socks5h DNS semantics), typed proxy errors + `Classify`, egress pool runtime (`pool.go`: eligibility, scheduling, bounded fallback, health, permits, leases), `Registry` (content-keyed clients + per-identity pool state, retained on publish)                                                                                                                                                                                                                                                                                                                 |
 | `internal/proxy`                 | HTTP handler wiring, client bearer authentication/Authorization stripping (auth delegated to the `auth.Provider` seam — static or partner), error envelopes, SSE copying (`CopySSE`), provider candidate walk (bounded by the snapshot's provider-fallback policy, transport-failure-only), composed response rewriter (`rewriteOut`: model rename + thinking-usage synthesis); executes upstream calls through the model's resolved `transport.Doer` — `Executor` (pool) branch handing request facts and reporting `egress_attempts`/`egress_kind`/`egress_target`/`egress_exhausted`                                                                                                                                                              |
 | `internal/server`                | Listener lifecycle and graceful shutdown (`Server.Run`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
@@ -31,9 +33,10 @@ Owned decomposition:
 
 - **Two config planes.** Bootstrap settings (`OAICR_LISTEN`,
   `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`,
-  `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL` — every environment
-  variable the service reads is `OAICR_`-prefixed; no unprefixed fallback
-  exists) come from the environment and
+  `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL`,
+  `OAICR_USAGE_DATABASE_URL` — every environment variable the service reads
+  is `OAICR_`-prefixed; no unprefixed fallback exists) come from the
+  environment and
   are enforced by the runtime file's strict decoding: a runtime file
   defining them is rejected. The runtime file must be a single YAML
   document — a `---`-separated second document is a rejection (a decoder
@@ -44,7 +47,10 @@ Owned decomposition:
   at 15s and accepts a duration of at least 1s. The auth database URL is
   infrastructure, not policy: empty = static mode, non-empty = partner
   mode; it never hot-reloads and the DSN is never logged (not even its
-  length — it embeds a password).
+  length — it embeds a password). The usage database URL is likewise
+  bootstrap-only: empty = metering off (no connection); non-empty = migrated,
+  validated PostgreSQL-backed metering, asynchronous after startup; its DSN
+  is never logged.
 - **The router decides WHICH provider; the transport decides HOW the
   request reaches it.** The handler resolves a model's flattened
   `transport.Config` through the `transport.Resolver` seam once per request
@@ -239,14 +245,37 @@ Owned decomposition:
   `client_disconnected` with no envelope. Dial failure is 502
   `upstream_unreachable`; unmapped model is 404 `model_not_found` and is
   NEVER forwarded.
+- **Usage metering is optional, factual, and off the critical path.** With
+  `OAICR_USAGE_DATABASE_URL` empty there is no connection or event. When set,
+  startup migrates/validates the PostgreSQL store; each request that reaches
+  the provider path hands exactly one event to a bounded async pipeline.
+  Capture raw upstream usage before response rewrite/thinking synthesis;
+  absent usage stays SQL NULL; streamed usage is last-readable-object wins,
+  never a sum; a per-member unreadable count is that member unstated, never
+  a discarded object. The event carries the walk's cumulative counters —
+  provider attempts plus egress dials summed across every candidate — with
+  `EgressKind` naming the final candidate's egress mode ("direct", the last
+  dialed pool member's kind, empty when a pool exhausted without dialing),
+  and `Stream` records the mode actually relayed, not the probe's
+  prediction. Failed attempts appear only in those counters. The queue
+  drops explicitly/accountably under pressure; each flush carries a bounded
+  deadline so every accepted event resolves into inserted-or-dropped, an
+  expired drain waits a bounded grace for the in-flight insert before the
+  repository closes, and `usage_meter_final` reports the totals after the
+  shutdown drain — database failure never delays or mutates a client
+  response. The shared migration ledger has module-scoped versions;
+  deployed legacy auth rows are retained as `auth`, and advisory locks
+  serialize bootstrap/migration races.
 - **Never log or leak credentials.** No `Authorization`, keys, request
-  bodies, or injection prompts in logs or error text. A quote of these is
-  a security defect (SECURITY.md), not a typo.
+  bodies, or injection prompts in logs or error text; the usage DSN, raw
+  provider bodies, and driver errors also never appear. A quote of these is a
+  security defect (SECURITY.md), not a typo.
 - **Graceful shutdown.** One signal channel: first SIGINT/SIGTERM →
   `Shutdown(grace)` → force `Close()` on overflow → `CloseIdleConnections` →
-  exit 0. Second signal forces exit 1; signals after the drain are ignored
-  so a late duplicate cannot overwrite the exit code. Compose
-  `stop_grace_period` (60s) > default `OAICR_SHUTDOWN_GRACE` (55s).
+  drain the accepted usage-event queue within its bounded close window → exit 0. Second signal forces exit 1 — defers never run, so the usage meter's
+  final accounting is that path's deliberate casualty; signals after the
+  drain are ignored so a late duplicate cannot overwrite the exit code.
+  Compose `stop_grace_period` (60s) > default `OAICR_SHUTDOWN_GRACE` (55s).
 - **Logging hot-reloads like config, and leaks nothing at any level.**
   A top-level `log-level` key lives in the runtime YAML
   (`debug|info|warn|error`, exact-match — the org's other Go services share
@@ -292,9 +321,10 @@ Owned decomposition:
 ## Testing
 
 - Unit tests co-located under `internal/`, stdlib only, deterministic.
-  Exception: `internal/auth`'s PostgreSQL integration tests (store
-  lifecycle, migration idempotence, foreign-schema fail-closed,
-  forward-only history) run against a real server only when
+  Exception: `internal/auth`, `internal/migrate`, and `internal/usage` have
+  PostgreSQL integration tests (store lifecycle, migration idempotence,
+  legacy-ledger adoption, concurrent migration serialization, foreign-schema
+  fail-closed, forward-only history) that run against a real server only when
   `OAICR_TEST_DATABASE_URL` names a dedicated disposable test database —
   unset, they skip (and CI stays hermetic).
 - E2E (`e2e/`) is a black-box suite over the built binary with in-process
@@ -320,8 +350,8 @@ Owned decomposition:
 ## Harness-agnostic conventions
 
 - Go ≥ 1.25 (toolchain owned by `go.mod`); deps zerolog v1.35.1 +
-  gopkg.in/yaml.v3 + jackc/pgx v5 (database/sql driver, partner key
-  store only), stdlib tests only; no Makefile — commands live in
+  gopkg.in/yaml.v3 + jackc/pgx v5 (database/sql driver for partner keys and
+  usage events), stdlib tests only; no Makefile — commands live in
   CONTRIBUTING.md and ci.yml.
 - Conventional Commits via lefthook + commitlint (scopes: inject, proxy,
   server, config, cmd, e2e, docs, deps, ci, workspace, release). Signed

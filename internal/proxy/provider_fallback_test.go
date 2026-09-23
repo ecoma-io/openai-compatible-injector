@@ -156,7 +156,7 @@ func TestProviderChainFirstCandidateSucceeds(t *testing.T) {
 	pa := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-a","choices":[]}`}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -191,7 +191,7 @@ func TestProviderChainFallsBackOnTransportFailure(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -244,7 +244,7 @@ func TestProviderChainHTTPStatusIsTerminal(t *testing.T) {
 		pa := &fakeUpstream{status: status, body: `{"error":{"message":"provider says no"}}`}
 		pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 		logBuf, log := captureLog(zerolog.InfoLevel)
-		h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
+		h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
 		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 		if rec.Code != status {
@@ -279,7 +279,7 @@ func TestProviderChainExhaustion(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{err: dialError("b.example")}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -316,7 +316,7 @@ func TestProviderChainFallbackDisabled(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -378,7 +378,7 @@ func TestProviderChainCancellationAbortsWalk(t *testing.T) {
 	pa := &fakeUpstream{err: context.Canceled}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -415,7 +415,7 @@ func TestProviderChainStreamingCommitment(t *testing.T) {
 	}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"chain-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -495,7 +495,7 @@ func TestProviderChainBindsToItsSnapshot(t *testing.T) {
 		}
 	}
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, res, nil, log)
+	h := NewHandler(store, res, nil, nil, log)
 
 	type result struct {
 		code int
@@ -614,7 +614,7 @@ models:
 	reg := transport.NewRegistry()
 	reg.Retain(snap.Transports())
 	logBuf, log := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, reg, nil, log)
+	h := NewHandler(store, reg, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusBadGateway {

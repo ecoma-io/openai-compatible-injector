@@ -4,8 +4,8 @@ A minimal OpenAI-compatible **request/response injector proxy**. Clients talk
 to it as if it were an OpenAI endpoint — authenticating with the single
 `api-key` from the runtime config — and it forwards to configured upstream
 providers, renaming the model and injecting a per-model system prompt into
-every request. Hot-reloadable model mapping, no telemetry, one static
-binary.
+every request. Hot-reloadable model mapping, optional durable factual usage
+metering, one static binary.
 
 ```
  client ──POST /v1/chat/completions (Bearer api-key)──▶ injector ──forward (model→upstream-model, prompt injected, credential consumed)──▶ upstream provider
@@ -71,24 +71,25 @@ service consumes no unprefixed names of its own.
 
 Division of responsibility:
 
-| Concern                                                                                                              | Where it lives          |
-| -------------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL` | Environment (bootstrap) |
-| `api-key` (the shared inbound client credential)                                                                     | YAML file (runtime)     |
-| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,providers}`                                  | YAML file (runtime)     |
-| `provider-fallback.{enabled,max-attempts}`                                                                           | YAML file (runtime)     |
-| `sse-keep-alive.{enabled,interval}`                                                                                  | YAML file (runtime)     |
-| `log-level`                                                                                                          | YAML file (runtime)     |
+| Concern                                                                                                                                          | Where it lives          |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- |
+| `OAICR_LISTEN`, `OAICR_CONFIG_FILE`, `OAICR_CONFIG_POLL_INTERVAL`, `OAICR_SHUTDOWN_GRACE`, `OAICR_AUTH_DATABASE_URL`, `OAICR_USAGE_DATABASE_URL` | Environment (bootstrap) |
+| `api-key` (the shared inbound client credential)                                                                                                 | YAML file (runtime)     |
+| `models.<name>.{endpoint,upstream-model,injection-prompt,thinking-usage,providers}`                                                              | YAML file (runtime)     |
+| `provider-fallback.{enabled,max-attempts}`                                                                                                       | YAML file (runtime)     |
+| `sse-keep-alive.{enabled,interval}`                                                                                                              | YAML file (runtime)     |
+| `log-level`                                                                                                                                      | YAML file (runtime)     |
 
 ### Bootstrap environment
 
-| Variable                     | Default                 | Meaning                                                                                                                                                                                                         |
-| ---------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OAICR_LISTEN`               | `:8080`                 | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                                                                |
-| `OAICR_CONFIG_FILE`          | `/config/config.yaml`   | Path of the runtime YAML file, read at boot then polled                                                                                                                                                         |
-| `OAICR_CONFIG_POLL_INTERVAL` | `1s`                    | How often the file's content hash is re-checked                                                                                                                                                                 |
-| `OAICR_SHUTDOWN_GRACE`       | `55s`                   | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain)                                         |
-| `OAICR_AUTH_DATABASE_URL`    | _(empty — static mode)_ | PostgreSQL/TimescaleDB connection string of the partner key store. Absent keeps static mode; set, the process boots into partner mode (see "Partner API keys"). The value is never logged — not even its length |
+| Variable                     | Default                  | Meaning                                                                                                                                                                                                                                                                                |
+| ---------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OAICR_LISTEN`               | `:8080`                  | Address the HTTP listener binds (`host:port`; wildcard accepted)                                                                                                                                                                                                                       |
+| `OAICR_CONFIG_FILE`          | `/config/config.yaml`    | Path of the runtime YAML file, read at boot then polled                                                                                                                                                                                                                                |
+| `OAICR_CONFIG_POLL_INTERVAL` | `1s`                     | How often the file's content hash is re-checked                                                                                                                                                                                                                                        |
+| `OAICR_SHUTDOWN_GRACE`       | `55s`                    | Drain budget on SIGTERM/SIGINT before connections are force-closed; must be greater than zero — `0` is rejected at boot (a zero grace would silently disable the drain)                                                                                                                |
+| `OAICR_AUTH_DATABASE_URL`    | _(empty — static mode)_  | PostgreSQL/TimescaleDB connection string of the partner key store. Absent keeps static mode; set, the process boots into partner mode (see "Partner API keys"). The value is never logged — not even its length                                                                        |
+| `OAICR_USAGE_DATABASE_URL`   | _(empty — metering off)_ | PostgreSQL/TimescaleDB connection string of the durable usage-event store. Empty makes no database connection and preserves normal proxy traffic; set, startup migrates and validates the store before serving (see "Usage metering"). The value is never logged — not even its length |
 
 There is no `LOG_LEVEL` environment variable — it was removed together with
 the introduction of `log-level` in the runtime file, which hot-reloads.
@@ -233,8 +234,9 @@ The file is validated strictly, in two layers:
   `api-key`, `log-level`, `sse-keep-alive`, `providers`, `transports`, and
   `provider-fallback` are legal. This is the bootstrap-plane rule — a file
   that tries to define `listen`, `config-file`, `config-poll-interval` or
-  `shutdown-grace` is rejected whatever its value's shape (a strict struct
-  decode alone misses a bootstrap key whose value is an empty map).
+  `shutdown-grace`, `auth-database-url`, or `usage-database-url` is rejected
+  whatever its value's shape (a strict struct decode alone misses a bootstrap
+  key whose value is an empty map).
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `provider`,
   `upstream-model`, `injection-prompt`, `thinking-usage` and `providers`
@@ -860,6 +862,59 @@ hash and the table read selects no hash column. `last_used_at` is updated
 off the request path (batched, best-effort) — it is advisory metadata, and
 losing touches under load never affects a request.
 
+## Usage metering
+
+Usage metering is deliberately **optional** and fact-only. Set
+`OAICR_USAGE_DATABASE_URL` to a PostgreSQL or TimescaleDB connection string to
+enable it. Startup connects, applies the embedded forward-only migration, and
+validates the `usage_events` table before accepting traffic. Empty (the
+default) means no database connection, no event records, and unchanged proxy
+behavior. The DSN is bootstrap infrastructure: it does not hot-reload and is
+never logged, including its length.
+
+Each request that reaches the provider path produces at most one durable event
+asynchronously, with an event ID, request time and request ID, partner/key
+identity (when partner auth is enabled), bound config generation, public model,
+provider and upstream model, API surface, the relayed stream mode (what the
+response actually was — a `stream: true` request whose upstream answered
+non-SSE is recorded buffered), final client status and outcome,
+upstream-reported token counts, client wire byte counts, cumulative provider
+and egress attempt counters (summed across every candidate of a fallback
+walk), the final candidate's egress kind (`direct`, or the last dialed pool
+member's kind; empty when a pool exhausted without dialing anything), and full
+request latency. Provider fallback still emits **one** event: it describes the
+candidate that answered, or the final attempted candidate if all paths failed.
+Failed attempts are represented only by the attempt counters.
+
+The request handler only makes a non-blocking handoff to a bounded in-memory
+queue. A dedicated batch writer inserts rows using parameterized SQL; it
+retries a bounded number of times within a per-flush deadline, then explicitly
+drops and reports a batch if the store remains unavailable — every accepted
+event resolves into inserted-or-dropped, never a silent remainder. Metering
+loss never delays, fails, or modifies a client response. Shutdown stops intake
+after the HTTP drain and flushes the accepted backlog within its bounded close
+window, then reports the totals as an INFO `usage_meter_final`; an expired
+window waits a bounded extra grace for an in-flight insert before the pool
+closes. Operators can observe `usage_flush_completed`, `usage_flush_failed`,
+and `usage_events_dropped`, and read pipeline stats for queue depth, inserts,
+drops, failures, retries, flushes, and last successful flush timing. (A
+second forced signal exits without running defers — that abandonment of the
+drain, and of this accounting, is the operator's explicit choice.)
+
+Token facts come only from the raw upstream response before the proxy rewrites
+model aliases or simulates thinking usage. Missing upstream `usage` remains
+SQL `NULL`, not zero. For streams, the last readable API-scoped usage object
+wins; chunks are never summed. One wrongly typed count makes that member
+unstored (a stringified `"128"` or integral `1e3` still reads) — it never
+discards the members that did decode. Consequently, synthesized
+`reasoning_tokens` are never stored as provider usage. This layer intentionally
+has no pricing, currency, invoicing, or quota enforcement.
+
+Auth and usage schemas share a module-scoped `schema_migrations` ledger. An
+existing partner-key deployment with the former global-version ledger upgrades
+in place: its historical rows are retained as the `auth` module before the
+`usage` module records its own migrations. No request-path DDL exists.
+
 ## Safety and credentials
 
 - Static mode: the configured `api-key` is the one shared inbound client
@@ -990,7 +1045,10 @@ or upstream URL detail beyond scheme+host. Endpoint query strings (which
 providers use for API keys) survive even a dial failure's error text —
 errors are sanitized before logging — and upstream error bodies are no
 exception: the raw bytes of a 4xx/5xx never reach a log line at any level,
-only their count, shape, and fingerprint. The planted-secret E2E suite
+only their count, shape, and fingerprint. Usage metering follows the same
+rule: it stores only the factual event columns listed above, never an inbound
+credential, request body, prompt, provider error body, or database URL; its
+store failures log only a stable error class. The planted-secret E2E suite
 (`TestLoggingNeverLeaksSecrets`) holds this rule under success, streaming,
 rejection, dial-failure, and provider-echo traffic at maximum verbosity.
 
@@ -1017,7 +1075,8 @@ On SIGTERM or SIGINT the service stops accepting new connections and drains:
 1. `http.Server.Shutdown(grace)` — in-flight requests and streams get up to
    `OAICR_SHUTDOWN_GRACE` (default 55s) to complete.
 2. If the budget runs out, `Close()` force-terminates the remainder.
-3. Idle keep-alive connections are closed; the process exits `0`.
+3. If usage metering is enabled, its accepted event backlog is then flushed through its bounded close window; events that cannot be persisted are explicitly counted and reported.
+4. Idle keep-alive connections are closed; the process exits `0`.
 
 A second signal while draining forces an immediate `exit 1`. Compose's
 `stop_grace_period: 60s` is deliberately larger than the default drain
@@ -1133,6 +1192,8 @@ Decided, and not coming back without a design discussion:
 cmd/openai-compatible-injector/  entrypoint + version/healthcheck/keys subcommands
 internal/config/                 bootstrap, runtime YAML (models, providers, transports), snapshot store, poller
 internal/auth/                   client identity: static + partner key store, decision cache, SQL migrations
+internal/migrate/                shared module-scoped SQL migration runner
+internal/usage/                  factual upstream usage capture, async pipeline, PostgreSQL repository
 internal/inject/                 pure request/response transforms (probe, chat, responses, rewrite, thinking usage)
 internal/transport/              outbound paths: Doer seam, direct client, proxy (http/https/socks5/socks5h), pool registry
 internal/proxy/                  handler, client auth gate, SSE copy, error envelopes

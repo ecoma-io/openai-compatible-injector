@@ -13,6 +13,7 @@ import (
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/proxy"
 	"openai-compatible-injector/internal/transport"
+	"openai-compatible-injector/internal/usage"
 )
 
 // Server owns the HTTP server and the outbound transport registry. Its
@@ -29,12 +30,13 @@ type Server struct {
 // New builds a Server with the proxy handler bound to the given store and
 // transport registry, served on addr. grace is the shutdown drain deadline:
 // after it elapses, in-flight requests are force-closed. authProvider is
-// passed through to the handler unchanged (nil = static mode).
-func New(store *config.Store, doers *transport.Registry, authProvider auth.Provider, addr string, grace time.Duration, log zerolog.Logger) *Server {
+// passed through to the handler unchanged (nil = static mode), as is meter
+// (nil = metering off).
+func New(store *config.Store, doers *transport.Registry, authProvider auth.Provider, meter usage.Ingest, addr string, grace time.Duration, log zerolog.Logger) *Server {
 	return &Server{
 		http: &http.Server{
 			Addr:              addr,
-			Handler:           proxy.NewHandler(store, doers, authProvider, log),
+			Handler:           proxy.NewHandler(store, doers, authProvider, meter, log),
 			ReadHeaderTimeout: 10 * time.Second,
 			// Without an IdleTimeout a client that opens a keep-alive
 			// connection and goes quiet pins a goroutine and a file

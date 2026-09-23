@@ -6,7 +6,8 @@
 # URLs the operator does not want in the tree.
 #
 # Bootstrap settings (OAICR_LISTEN, OAICR_CONFIG_FILE,
-# OAICR_CONFIG_POLL_INTERVAL, OAICR_SHUTDOWN_GRACE) come from the
+# OAICR_CONFIG_POLL_INTERVAL, OAICR_SHUTDOWN_GRACE,
+# OAICR_AUTH_DATABASE_URL, OAICR_USAGE_DATABASE_URL) come from the
 # environment and do NOT belong in this file.
 # A runtime file that tries to define them is rejected by strict decoding —
 # when a bad reload is writing, the last-known-good config keeps serving;

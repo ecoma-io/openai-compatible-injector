@@ -70,6 +70,7 @@ func TestLoadRuntimeRejectsBootstrapKeys(t *testing.T) {
 		{"config", "config: {}\nmodels: {}\n"},
 		{"poll", "poll-interval: 1s\nmodels: {}\n"},
 		{"shutdown", "shutdown-grace: 1s\nmodels: {}\n"},
+		{"usage database", "usage-database-url: postgresql://operator:secret@db/usage\nmodels: {}\n"},
 		{"unknown key", "bananas: true\nmodels: {}\n"},
 		{"bad model key", "models:\n  a:\n    listen: :8080\n    endpoint: https://h/v1\n    upstream-model: m\n"},
 	}
