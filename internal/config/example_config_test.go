@@ -51,11 +51,8 @@ func TestExampleConfigLoads(t *testing.T) {
 	// material: every documented key value stays an obvious placeholder.
 	for _, k := range cred.Spec.Keys {
 		if !strings.HasPrefix(k.Value, "sk-example-") {
-			t.Fatalf("example key %s carries non-placeholder material %q", k.ID, redactExampleValue(k.Value))
+			// The failure names the violation, never the value it found.
+			t.Fatalf("example key %s carries non-placeholder material", k.ID)
 		}
 	}
 }
-
-// redactExampleValue keeps a failure message from printing whatever a future
-// edit put in the template — the test names the violation, not the value.
-func redactExampleValue(string) string { return "(value redacted)" }

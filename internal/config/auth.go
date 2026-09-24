@@ -129,7 +129,7 @@ func buildAuth(ra *runtimeAuth, ordinal int) (*credential.Provider, error) {
 			rl.MaxCooldown = d
 		}
 		if rl.Cooldown > rl.MaxCooldown {
-			return nil, errors.New(prefix + " rate-limit cooldown must not exceed rate-limit max-cooldown")
+			return nil, fmt.Errorf("%s rate-limit cooldown must not exceed the effective max-cooldown (configured %s, default %s)", prefix, rl.Cooldown, maxAuthCooldownCap)
 		}
 	}
 	return &credential.Provider{Spec: spec, RateLimit: rl}, nil
