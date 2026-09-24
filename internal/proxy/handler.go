@@ -49,10 +49,6 @@ const (
 	// into an error body.
 	envelopeAuthMissing = `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeAuthInvalid = `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`
-	// internalEnvelope is a defensive fallback if marshaling the model list
-	// itself fails — unreachable for the fixed shape, but never the raw
-	// upstream bytes and never a client-supplied fragment.
-	internalEnvelope = `{"error":{"message":"internal error","type":"internal_error","param":null,"code":null}}`
 )
 
 // client headers forwarded upstream. Every other client header is dropped
@@ -2390,14 +2386,10 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 		Object string      `json:"object"`
 		Data   []modelItem `json:"data"`
 	}
-	body, err := json.Marshal(modelsList{Object: "list", Data: data})
-	if err != nil {
-		outcome = "internal_error"
-		reject(http.StatusInternalServerError, internalEnvelope)
-		return
-	}
-	// The full JSON response is generated locally, so no error propagation is
+	// json.Marshal cannot fail for this fixed string-and-integer shape. The
+	// full JSON response is generated locally, so no error propagation is
 	// possible after a successful write — a failed write is client-owned.
+	body, _ := json.Marshal(modelsList{Object: "list", Data: data})
 	sw.Header().Set(contentTypeHeader, envelopeJSONType)
 	sw.WriteHeader(http.StatusOK)
 	if _, err := sw.Write(body); err != nil {
