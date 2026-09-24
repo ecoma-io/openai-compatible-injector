@@ -26,6 +26,8 @@ const (
 	secretTokenQuery  = "SECRET_TOKEN_QUERY"
 	secretSchemePaste = "secretschemepaste" // lowercase, no underscore: url.Parse lowercases schemes, so the echoed form must still match the marker
 	secretAPIKey      = "SECRET_APIKEY_VALUE"
+	secretCredValue   = "SECRET_CREDKEY_VALUE"
+	secretCredID      = "SECRET_CREDKEY_ID"
 )
 
 // allConfigSecrets is the full marker inventory the sweep asserts absent.
@@ -33,10 +35,11 @@ var allConfigSecrets = []string{
 	secretLevelURL, secretTopKeyURL, secretModelKey, secretScalar,
 	secretSecondDoc, secretEscapePath, secretDuplicate, secretAnchorAlias,
 	secretModelName, secretTokenQuery, secretSchemePaste, secretAPIKey,
+	secretCredValue, secretCredID,
 }
 
 // rejectedCaseCount is the number of echo positions rejectedYAML renders.
-const rejectedCaseCount = 14
+const rejectedCaseCount = 16
 
 // rejectedYAML renders one rejected runtime file per echo position. Every
 // case must stay driven by the reload sweep below: a marker that is declared
@@ -75,6 +78,14 @@ func rejectedYAML(i int) string {
 		// reason (bad endpoint scheme): the rejection names the model ordinal,
 		// never the key
 		return "api-key: " + secretAPIKey + "\nmodels:\n  m:\n    endpoint: ftp://h/v1\n    upstream-model: up\n"
+	case 14: // secret credential VALUE in a list-typed position inside an
+		// auth block (decode-time type error; the message names the types,
+		// never the value)
+		return "api-key: k\nproviders:\n  p:\n    base-url: http://127.0.0.1:1/v1\n    transport: t\n    auth:\n      type: api_key\n      keys:\n        - id: k1\n          value: [" + secretCredValue + "]\ntransports:\n  t:\n    type: direct\nmodels:\n  m:\n    provider: p\n    upstream-model: up\n"
+	case 15: // duplicate credential key ids whose id IS the secret marker
+		// (semantic rejection; the message says the ids must be unique and
+		// never quotes one)
+		return "api-key: k\nproviders:\n  p:\n    base-url: http://127.0.0.1:1/v1\n    transport: t\n    auth:\n      type: api_key\n      keys:\n        - id: " + secretCredID + "\n          value: v1\n        - id: " + secretCredID + "\n          value: v2\ntransports:\n  t:\n    type: direct\nmodels:\n  m:\n    provider: p\n    upstream-model: up\n"
 	default:
 		panic("no such rejected yaml case")
 	}

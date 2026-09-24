@@ -102,9 +102,30 @@ models:
   echo:
     endpoint: %s/v1
     upstream-model: up-echo
+  keyed:
+    provider: keyed
+    upstream-model: up-live
+
+transports:
+  direct-egress:
+    type: direct
+providers:
+  keyed:
+    base-url: %s/v1
+    transport: direct-egress
+    auth:
+      type: api_key
+      header: Authorization
+      prefix: "Bearer "
+      strategy: round_robin
+      keys:
+        - id: keyed-one
+          value: SECRET_UPSTREAM_KEY_ONE
+        - id: keyed-two
+          value: SECRET_UPSTREAM_KEY_TWO
 
 log-level: %s
-`, e2eAPIKey, liveURL, echoURL, level)
+`, e2eAPIKey, liveURL, echoURL, echoURL, level)
 }
 
 // secretBody carries planted markers in the client payload.
@@ -425,6 +446,17 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 		t.Fatalf("dead endpoint status = %d, want 502", status)
 	}
 
+	// The keyed model runs the same gauntlet with upstream credentials in
+	// play: one success (the completion line names the key by id), then —
+	// once the echo-500 handler below is installed — attempts that produce
+	// upstream_http_error / provider_attempt_failed events while a
+	// credential is attached. Every key VALUE must stay out of stderr; only
+	// the configured ids may appear.
+	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions",
+		`{"model":"keyed","messages":[{"role":"user","content":"SECRET_REQUEST_BODY"}]}`, headers); status != http.StatusOK {
+		t.Fatalf("keyed success status = %d, want 200", status)
+	}
+
 	// Upstream 500 echoing the secrets back: the error is normalized, so the
 	// echo reaches neither the client (canonical envelope) nor the logs.
 	upstream.setHandler(func(w http.ResponseWriter, r *http.Request) {
@@ -437,6 +469,11 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 	status, _, respBody := postJSON(t, p.addr, "/v1/chat/completions", secretBody, headers)
 	if status != http.StatusInternalServerError {
 		t.Fatalf("echo status = %d, want 500 (got body %s)", status, respBody)
+	}
+	status, _, respBody = postJSON(t, p.addr, "/v1/chat/completions",
+		`{"model":"keyed","messages":[{"role":"user","content":"x"}]}`, headers)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("keyed echo status = %d, want 500 (got body %s)", status, respBody)
 	}
 	for _, secret := range []string{"SECRET_AUTH_VALUE", "SECRET_REQUEST_BODY", "SECRET_PROMPT_VALUE", "SECRET_API_KEY"} {
 		if strings.Contains(string(respBody), secret) {
@@ -470,6 +507,7 @@ func TestLoggingNeverLeaksSecrets(t *testing.T) {
 	for _, secret := range []string{
 		"SECRET_AUTH_VALUE", "SECRET_REQUEST_BODY", "SECRET_PROMPT_VALUE",
 		"SECRET_API_KEY", "SECRET_ENDPOINT_TOKEN",
+		"SECRET_UPSTREAM_KEY_ONE", "SECRET_UPSTREAM_KEY_TWO",
 	} {
 		if strings.Contains(stderr, secret) {
 			t.Errorf("stderr contains %q — logging leak", secret)
@@ -627,8 +665,8 @@ func TestLifecycleLogMatrix(t *testing.T) {
 	if ev["generation"].(float64) != 1 {
 		t.Errorf("config_reloaded generation = %v, want 1", ev["generation"])
 	}
-	if ev["model_count"].(float64) != 3 {
-		t.Errorf("config_reloaded model_count = %v, want 3", ev["model_count"])
+	if ev["model_count"].(float64) != 4 {
+		t.Errorf("config_reloaded model_count = %v, want 4 (live, dead, echo, keyed)", ev["model_count"])
 	}
 	if ev["log_level"] != "warn" {
 		t.Errorf("config_reloaded log_level = %v, want warn", ev["log_level"])
