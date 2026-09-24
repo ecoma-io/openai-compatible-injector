@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.11.0...v0.12.0) (2026-09-24)
+
+
+### Features
+
+* **config:** narrow strip-fields reserved keys to exact proxy-written paths ([#67](https://github.com/ecoma-io/openai-compatible-injector/issues/67)) ([c7e12d6](https://github.com/ecoma-io/openai-compatible-injector/commit/c7e12d650ca223f1aec31fdb115cc7f465073335))
+* **proxy:** serve configured models ([#69](https://github.com/ecoma-io/openai-compatible-injector/issues/69)) ([191bd8d](https://github.com/ecoma-io/openai-compatible-injector/commit/191bd8d139f6875543848e2f8e288c1d6e922ecf))
+
 ## [0.11.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.10.0...v0.11.0) (2026-09-24)
 
 
