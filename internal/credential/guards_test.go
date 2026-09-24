@@ -17,25 +17,47 @@ import (
 	"testing"
 )
 
+// packageFiles parses the directory's non-test Go files. ParseFile over an
+// explicit listing (not the deprecated ParseDir) — the directory holds one
+// package with no build-tagged production files, so file-level parsing is
+// exact.
+func packageFiles(t *testing.T, dir string) (*token.FileSet, []*ast.File) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		t.Fatalf("no production Go files found in %s", dir)
+	}
+	return fset, files
+}
+
 // packageImports parses the directory's non-test Go files and returns their
 // import paths. Test files are out of scope: the invariant is about the
 // production package, and a test may legitimately build an httptest server
 // without the package gaining dialing capability.
 func packageImports(t *testing.T, dir string) map[string]struct{} {
 	t.Helper()
-	pkgs, err := parser.ParseDir(token.NewFileSet(), dir, func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse %s: %v", dir, err)
-	}
+	_, files := packageFiles(t, dir)
 	imports := make(map[string]struct{})
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, imp := range file.Imports {
-				path := strings.Trim(imp.Path.Value, `"`)
-				imports[path] = struct{}{}
-			}
+	for _, file := range files {
+		for _, imp := range file.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			imports[path] = struct{}{}
 		}
 	}
 	return imports
@@ -63,28 +85,20 @@ func TestPackageNeverWaits(t *testing.T) {
 		"Since":     true, // the caller's clock is the only clock
 		"Now":       true,
 	}
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse package: %v", err)
-	}
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				sel, ok := n.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				ident, ok := sel.X.(*ast.Ident)
-				if !ok || ident.Name != "time" || !banned[sel.Sel.Name] {
-					return true
-				}
-				t.Errorf("%s: time.%s — the pool never observes wall-clock time itself; every deadline comes from the caller's `now` argument", fset.Position(sel.Pos()), sel.Sel.Name)
+	fset, files := packageFiles(t, ".")
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
 				return true
-			})
-		}
+			}
+			ident, ok := sel.X.(*ast.Ident)
+			if !ok || ident.Name != "time" || !banned[sel.Sel.Name] {
+				return true
+			}
+			t.Errorf("%s: time.%s — the pool never observes wall-clock time itself; every deadline comes from the caller's `now` argument", fset.Position(sel.Pos()), sel.Sel.Name)
+			return true
+		})
 	}
 }
 

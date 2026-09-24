@@ -192,6 +192,53 @@ providers:
   opencode:
     base-url: https://api.opencode.example/v1
     transport: direct-egress
+    # Optional. Upstream API-key authentication: every attempt routed
+    # through this provider carries one of these credentials in the named
+    # request header, composed as <prefix><value>. The block belongs to the
+    # PROVIDER (all its models share the pool); a model entry or endpoint
+    # form cannot declare one.
+    #
+    # Fields:
+    #   type:     api_key — the only accepted value today.
+    #   header:   the RFC 7230 field-name the credential is sent in
+    #             (Authorization, X-API-Key, ...). Required.
+    #   prefix:   placed before the value ("Bearer " or ""). Optional,
+    #             default empty.
+    #   strategy: round_robin — the only accepted value today. Optional,
+    #             default round_robin.
+    #   keys:     1..256 entries; id (an operator-chosen name from
+    #             [A-Za-z0-9._:-], the only form that reaches logs) and
+    #             value (the secret material itself). Ids must be unique.
+    #
+    # Rotation: the pool hands each attempt the next ready key, so
+    # concurrent requests spread across accounts. A key whose upstream
+    # answer is 429 is marked rate-limited and left out of rotation — the
+    # cooldown is the upstream's Retry-After directive when usable, capped
+    # by max-cooldown, otherwise cooldown; the recovery policy (not the
+    # pool) still decides whether and when the request retries. A retry of
+    # the SAME candidate on a non-429 failure keeps its key; an egress
+    # switch inside one attempt keeps it too.
+    #
+    # Secrecy: values live in this file, in memory, and on the outgoing
+    # wire — never in an error, a log line, a reload event, or a metric
+    # label. Reloads keep a provider's rotation state while its auth block
+    # (including every key value) is byte-identical; any change starts a
+    # fresh pool.
+    #
+    # The values below are placeholders — replace them with your own.
+    auth:
+      type: api_key
+      header: Authorization
+      prefix: "Bearer "
+      strategy: round_robin
+      rate-limit:
+        cooldown: 2s # default cooldown when the upstream sends no usable Retry-After
+        max-cooldown: 60s # ceiling on what an upstream Retry-After may request
+      keys:
+        - id: primary
+          value: sk-example-primary
+        - id: secondary
+          value: sk-example-secondary
     # Optional provider-level override: every model routed through this
     # provider inherits it. Only the stated fields change; the backoff
     # ceiling, the windows and the matrix deep-merge from the global layer.
