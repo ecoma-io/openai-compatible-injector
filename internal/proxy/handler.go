@@ -833,6 +833,7 @@ walk:
 		lastCand = cand
 		lastPolicyHash = cand.RecoveryHash
 		egress = nil
+		lastCredentialID = "" // a candidate without a credential pool must not inherit the previous one's id
 		candStart := eng.Now()
 
 		// The candidate view: same public model, same injection prompt,

@@ -28,6 +28,7 @@ const (
 	secretAPIKey      = "SECRET_APIKEY_VALUE"
 	secretCredValue   = "SECRET_CREDKEY_VALUE"
 	secretCredID      = "SECRET_CREDKEY_ID"
+	secretCredScalar  = "SECRET_CREDBLOCK_SCALAR"
 )
 
 // allConfigSecrets is the full marker inventory the sweep asserts absent.
@@ -35,11 +36,11 @@ var allConfigSecrets = []string{
 	secretLevelURL, secretTopKeyURL, secretModelKey, secretScalar,
 	secretSecondDoc, secretEscapePath, secretDuplicate, secretAnchorAlias,
 	secretModelName, secretTokenQuery, secretSchemePaste, secretAPIKey,
-	secretCredValue, secretCredID,
+	secretCredValue, secretCredID, secretCredScalar,
 }
 
 // rejectedCaseCount is the number of echo positions rejectedYAML renders.
-const rejectedCaseCount = 16
+const rejectedCaseCount = 18
 
 // rejectedYAML renders one rejected runtime file per echo position. Every
 // case must stay driven by the reload sweep below: a marker that is declared
@@ -86,6 +87,13 @@ func rejectedYAML(i int) string {
 		// (semantic rejection; the message says the ids must be unique and
 		// never quotes one)
 		return "api-key: k\nproviders:\n  p:\n    base-url: http://127.0.0.1:1/v1\n    transport: t\n    auth:\n      type: api_key\n      keys:\n        - id: " + secretCredID + "\n          value: v1\n        - id: " + secretCredID + "\n          value: v2\ntransports:\n  t:\n    type: direct\nmodels:\n  m:\n    provider: p\n    upstream-model: up\n"
+	case 16: // secret scalar where the auth MAPPING belongs — the one wrong-shape
+		// position where a yaml TypeError can echo node content (the
+		// sanitizer reduces it to line numbers; this case catches a
+		// sanitizer regression)
+		return "api-key: k\nproviders:\n  p:\n    base-url: http://127.0.0.1:1/v1\n    transport: t\n    auth: " + secretCredScalar + "\ntransports:\n  t:\n    type: direct\nmodels:\n  m:\n    provider: p\n    upstream-model: up\n"
+	case 17: // secret scalar where the auth key LIST belongs (same echo shape)
+		return "api-key: k\nproviders:\n  p:\n    base-url: http://127.0.0.1:1/v1\n    transport: t\n    auth:\n      type: api_key\n      keys: " + secretCredScalar + "\ntransports:\n  t:\n    type: direct\nmodels:\n  m:\n    provider: p\n    upstream-model: up\n"
 	default:
 		panic("no such rejected yaml case")
 	}

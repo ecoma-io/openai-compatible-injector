@@ -706,3 +706,39 @@ func TestCredentialSSECommitEndsRotation(t *testing.T) {
 		t.Fatalf("completion = %v, want one naming the committing key", done)
 	}
 }
+
+// TestCredentialIDDoesNotBleedAcrossCandidates pins the attribution rule
+// reviewer C flagged: upstream_credential_id names the credential of the
+// ATTEMPT the event describes — a later credential-less candidate neither
+// inherits the previous candidate's id on its own events nor on the
+// completion line.
+func TestCredentialIDDoesNotBleedAcrossCandidates(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusUnauthorized, body: `{}`}, // 401 -> fallback (default matrix)
+	}}
+	pb := &authScript{steps: []credStep{okAnswer()}}
+	creds := credential.NewRegistry()
+	buf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, creds, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	// The 401 attempt's own event names pa's key.
+	failed := buf.events(t, "upstream_http_error")
+	if len(failed) != 1 || failed[0]["upstream_credential_id"] != "kilo-1" {
+		t.Fatalf("401 event = %v, want one naming pa's key", failed)
+	}
+	// The completion describes pb, which never acquired a credential: the
+	// id must be absent entirely, not stale from pa.
+	done := buf.events(t, "request_completed")
+	if len(done) != 1 {
+		t.Fatalf("completion events = %d, want 1", len(done))
+	}
+	if id, present := done[0]["upstream_credential_id"]; present {
+		t.Fatalf("completion carries stale upstream_credential_id %v after falling back to a credential-less candidate", id)
+	}
+}
