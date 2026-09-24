@@ -771,6 +771,11 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// have reached an upstream (send_unknown). Empty when the walk ended
 		// on something that was not a transport failure.
 		lastSendState string
+		// lastAttemptBlocked records whether the walk's final attempt was
+		// one the credential pool blocked before any dial: the exhaustion
+		// report must name the credential layer, never a transport that
+		// did not own the terminal attempt.
+		lastAttemptBlocked bool
 		// lastRuleID is the identity of the decision that ended the last
 		// attempt — a matrix rule, or one of the engine's reserved invariant
 		// identities. It rides the exhaustion report so an operator can tell
@@ -932,6 +937,7 @@ walk:
 			if attempt > 1 {
 				retriesTotal++
 			}
+			lastAttemptBlocked = false
 			// fallBackOnSpentCandidate answers the one refusal no observation
 			// can describe: the transport declined to dial because this
 			// candidate's own exchange envelope is spent. It asks the engine —
@@ -1008,6 +1014,15 @@ walk:
 					// exhausted, the policy's on-exhausted action moves the
 					// walk on or ends it. No busy loop, no synthesized
 					// response, no invented counter.
+					//
+					// The attempt dialed nothing, so the per-attempt egress
+					// evidence of an earlier dial is dropped here: a record
+					// that ends on THIS attempt must not republish its dial
+					// indexes, send state, or pool report.
+					lastAttemptBlocked = true
+					lastEgressAttempt = 0
+					lastSendState = ""
+					egress = nil
 					obs := recovery.Observation{
 						Class:            recovery.FailureCredential,
 						CredentialCause:  recovery.CredentialCooldown,
@@ -1783,6 +1798,14 @@ walk:
 			} else {
 				ruleID = recovery.RuleIDBudgetCandidate
 			}
+		case lastAttemptBlocked:
+			// The walk ended on an attempt the credential pool blocked
+			// before any dial: no endpoint and no transport owns the
+			// terminal attempt — the credential layer does. The engine's
+			// credential-cooldown decision already names the rule; the
+			// class names the layer that ran out.
+			class, cause = "credential_exhausted", recovery.CredentialCooldown
+			failureOrigin = "credential"
 		case egress != nil && egress.Exhausted:
 			// A pool that dialed nothing: every member was skipped, so no
 			// endpoint owns the failure.
@@ -1807,6 +1830,17 @@ walk:
 		}
 		event.Bool("provider_exhausted", true).
 			Msg("upstream_request_failed")
+		if r.Context().Err() != nil {
+			// The caller left before the walk ended — a wait cut short, or
+			// a blocked attempt terminalized under the engine's caller
+			// hard-stop. There is nobody left to answer, so the disconnect
+			// owns the outcome: a 502 would misreport a client-side event
+			// as an upstream failure, exactly as on the transport path.
+			// The ERROR above stays the walk's truthful record.
+			outcome = "client_disconnected"
+			complete()
+			return
+		}
 		outcome = "upstream_unreachable"
 		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
 		return

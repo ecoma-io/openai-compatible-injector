@@ -745,7 +745,12 @@ How it composes with the architecture:
   acquires the next ready key, so a provider with three keys and a 429
   walks them in rotation. The request's own retry remains a recovery
   decision — a policy whose `429` row says `terminal` still marks the key,
-  but does not retry.
+  but does not retry. When an attempt finds no ready key, the wait before
+  the re-ask rides the same `retry-after` policy as upstream directives:
+  the pool's earliest-ready time is folded in as the observation's
+  directive and re-capped by `max-delay` — `mode: ignore` (or a tight
+  ceiling) makes the walk re-ask after bare backoff instead of waiting out
+  the cooldown, spending one retry unit per cycle until `on-exhausted`.
 - **Reload identity is content-keyed, like transports.** An auth block
   whose bytes (header, prefix, strategy, ids and values) are unchanged
   across a reload keeps its rotation state; any change is a fresh pool.

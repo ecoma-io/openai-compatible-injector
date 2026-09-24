@@ -281,6 +281,9 @@ func TestCredentialAllCoolingFallsThroughWithoutDialing(t *testing.T) {
 	if done[0]["retries_total"] != float64(1) {
 		t.Errorf("retries_total = %v, want 1 (the blocked re-ask is a real retry)", done[0]["retries_total"])
 	}
+	if started := buf.events(t, "provider_attempt_started"); len(started) != 1 {
+		t.Errorf("provider_attempt_started events = %d, want 1 (a blocked attempt never reaches a transport)", len(started))
+	}
 	if done[0]["final_provider"] != "pb" {
 		t.Errorf("final_provider = %v, want pb", done[0]["final_provider"])
 	}
@@ -740,5 +743,109 @@ func TestCredentialIDDoesNotBleedAcrossCandidates(t *testing.T) {
 	}
 	if id, present := done[0]["upstream_credential_id"]; present {
 		t.Fatalf("completion carries stale upstream_credential_id %v after falling back to a credential-less candidate", id)
+	}
+}
+
+// newCredSingleStore is a one-candidate chain whose provider carries an
+// auth block: a blocked terminal has no candidate to fall to, so the walk
+// exhausts on the credential layer itself.
+func newCredSingleStore(t *testing.T, paAuth string) *config.Store {
+	t.Helper()
+	snap, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + "\n" + `
+transports:
+  t1:
+    type: direct
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t1
+` + paAuth + `models:
+  chain-model:
+    provider: pa
+    upstream-model: up-a
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	return config.NewStore(snap)
+}
+
+// TestCredentialExhaustionNamesCredentialOrigin pins the exhaustion
+// report's attribution (reviewer B, minor 1+2): a walk that ends on a
+// blocked attempt reports the credential layer — class credential_exhausted,
+// cause cooldown, origin credential — and republishes no egress dial
+// evidence for an attempt that dialed nothing.
+func TestCredentialExhaustionNamesCredentialOrigin(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredSingleStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{okAnswer()}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	pool.MarkRateLimited(credFrozen, "kilo-1", time.Minute)
+	pool.MarkRateLimited(credFrozen, "kilo-2", time.Minute)
+	buf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, &singleDoerResolver{d: pa}, creds, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want the canonical 502", rec.Code)
+	}
+	if got := pa.calls(); len(got) != 0 {
+		t.Fatalf("the cooling provider was dialed %d times, want 0", len(got))
+	}
+	failed := buf.events(t, "upstream_request_failed")
+	if len(failed) != 1 {
+		t.Fatalf("upstream_request_failed events = %d, want 1: %s", len(failed), buf.String())
+	}
+	ev := failed[0]
+	if ev["error_class"] != "credential_exhausted" || ev["error_cause"] != "cooldown" || ev["failure_origin"] != "credential" {
+		t.Fatalf("exhaustion class/cause/origin = %v/%v/%v, want credential_exhausted/cooldown/credential",
+			ev["error_class"], ev["error_cause"], ev["failure_origin"])
+	}
+	if ev["policy_rule_id"] != "credential-cooldown" {
+		t.Errorf("policy_rule_id = %v, want the default credential row", ev["policy_rule_id"])
+	}
+	for _, stale := range []string{"egress_attempt", "send_state", "egress_kind", "egress_target"} {
+		if _, has := ev[stale]; has {
+			t.Errorf("exhaustion report carries %q for an attempt that dialed nothing", stale)
+		}
+	}
+	done := buf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "upstream_unreachable" {
+		t.Fatalf("completion = %v, want one upstream_unreachable outcome", done)
+	}
+}
+
+// TestCredentialBlockedTerminalOnDeadCaller pins the caller-ownership fix
+// (reviewer B, minor 3): a ctx hard-stop terminal on a blocked attempt
+// leaves nobody to answer — the outcome is the disconnect, and the stale
+// 502 upstream_unreachable envelope is never written.
+func TestCredentialBlockedTerminalOnDeadCaller(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredSingleStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{okAnswer()}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	pool.MarkRateLimited(credFrozen, "kilo-1", time.Minute)
+	pool.MarkRateLimited(credFrozen, "kilo-2", time.Minute)
+	buf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, &singleDoerResolver{d: pa}, creds, nil, nil, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := doRequestWithContext(t, h, ctx, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if got := pa.calls(); len(got) != 0 {
+		t.Fatalf("the cooling provider was dialed %d times, want 0", len(got))
+	}
+	failed := buf.events(t, "upstream_request_failed")
+	if len(failed) != 1 || failed[0]["policy_rule_id"] != "caller" {
+		t.Fatalf("exhaustion events = %v, want one under the caller rule", failed)
+	}
+	done := buf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
+		t.Fatalf("completion = %v, want a client_disconnected outcome", done)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("a dead caller received a body: %q", rec.Body.String())
 	}
 }
