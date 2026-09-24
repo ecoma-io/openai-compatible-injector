@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -48,6 +49,10 @@ const (
 	// into an error body.
 	envelopeAuthMissing = `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeAuthInvalid = `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`
+	// internalEnvelope is a defensive fallback if marshaling the model list
+	// itself fails — unreachable for the fixed shape, but never the raw
+	// upstream bytes and never a client-supplied fragment.
+	internalEnvelope = `{"error":{"message":"internal error","type":"internal_error","param":null,"code":null}}`
 )
 
 // client headers forwarded upstream. Every other client header is dropped
@@ -130,6 +135,7 @@ func NewHandler(store *config.Store, doers transport.Resolver, authProvider auth
 	// plain-text default.
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 	mux.HandleFunc("/v1/responses", h.responses)
+	mux.HandleFunc("/v1/models", h.models)
 	// The catch-all keeps the same promise for unknown paths — trailing
 	// slashes, wrong case, anything unmatched: an OpenAI SDK client always
 	// gets a parseable JSON error body, never the mux's plain text.
@@ -2304,4 +2310,63 @@ func newRequestID() string {
 		return "0000000000000000"
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// models is GET /v1/models. It lists public models from the snapshot's
+// model mapping. Auth is required; non-GET → 405. Each model object has
+// only id and created (0).
+func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
+		return
+	}
+	snap := h.store.Load()
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok {
+		_ = writeEnvelope(w, http.StatusUnauthorized, envelopeAuthMissing)
+		return
+	}
+	_, reason, aerr := h.auth.For(snap).Authenticate(r.Context(), token)
+	if aerr != nil {
+		h.log.Warn().Str("error_class", auth.StoreErrorClass(aerr)).Msg("auth_backend_failed")
+	}
+	if reason != auth.ReasonOK {
+		_ = writeEnvelope(w, http.StatusUnauthorized, envelopeAuthInvalid)
+		return
+	}
+
+	// Public model names, sorted for determinism. No upstream call: the
+	// mapping is the catalog, and proxying the upstream's list would
+	// advertise names the mapping does not cover.
+	models := snap.Models()
+	ids := make([]string, 0, len(models))
+	for k := range models {
+		ids = append(ids, k)
+	}
+	// Using sort, keep deterministic.
+	sort.Strings(ids)
+
+	// Wire shape: each entry carries only id and created (the injector has
+	// no creation metadata, so created is always 0). The struct keeps the
+	// field order stable on the wire.
+	type modelItem struct {
+		ID      string `json:"id"`
+		Created int64  `json:"created"`
+	}
+	data := make([]modelItem, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, modelItem{ID: id, Created: 0})
+	}
+	type modelsList struct {
+		Object string      `json:"object"`
+		Data   []modelItem `json:"data"`
+	}
+	b, err := json.Marshal(modelsList{Object: "list", Data: data})
+	if err != nil {
+		_ = writeEnvelope(w, http.StatusInternalServerError, internalEnvelope)
+		return
+	}
+	w.Header().Set(contentTypeHeader, envelopeJSONType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
 }
