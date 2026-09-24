@@ -105,16 +105,16 @@ func TestValidValue(t *testing.T) {
 	}
 }
 
-func TestParseStrategy(t *testing.T) {
-	s, err := ParseStrategy("round_robin")
+func TestParseStrategyUnexported(t *testing.T) {
+	s, err := parseStrategy("round_robin")
 	if err != nil || s != StrategyRoundRobin {
-		t.Fatalf("ParseStrategy(round_robin) = %q, %v", s, err)
+		t.Fatalf("parseStrategy(round_robin) = %q, %v", s, err)
 	}
-	if _, err := ParseStrategy("least_connections"); err == nil {
-		t.Fatal("ParseStrategy(least_connections) = nil error, want rejection")
+	if _, err := parseStrategy("least_connections"); err == nil {
+		t.Fatal("parseStrategy(least_connections) = nil error, want rejection")
 	}
-	if _, err := ParseStrategy(""); err == nil {
-		t.Fatal("ParseStrategy(\"\") = nil error, want rejection")
+	if _, err := parseStrategy(""); err == nil {
+		t.Fatal("parseStrategy(\"\") = nil error, want rejection")
 	}
 }
 

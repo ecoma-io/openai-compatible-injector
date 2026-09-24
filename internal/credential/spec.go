@@ -34,9 +34,9 @@ type Strategy string
 // accepted value.
 const StrategyRoundRobin Strategy = "round_robin"
 
-// ParseStrategy validates the `strategy` field's spelling. The error text is
+// parseStrategy validates the `strategy` field's spelling. The error text is
 // a fixed literal: it names the accepted value, never the input.
-func ParseStrategy(s string) (Strategy, error) {
+func parseStrategy(s string) (Strategy, error) {
 	if Strategy(s) == StrategyRoundRobin {
 		return StrategyRoundRobin, nil
 	}
@@ -47,12 +47,8 @@ func ParseStrategy(s string) (Strategy, error) {
 // validation path can echo file bytes into an error. Values land here only
 // from the config loader, which already rejects at the line level; this is
 // defense in depth for anything that calls the package validators directly.
-func redact(s string) string {
-	const marker = "(input redacted)"
-	if len(s) == 0 {
-		return marker
-	}
-	return marker
+func redact(string) string {
+	return "(input redacted)"
 }
 
 // Bounds for the auth block's string fields. A value over its bound rejects

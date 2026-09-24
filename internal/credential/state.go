@@ -47,11 +47,6 @@ func NewPool(spec Spec) *Pool {
 	}
 }
 
-// Spec returns the immutable configuration this pool rotates over.
-func (p *Pool) Spec() Spec {
-	return p.spec
-}
-
 // Acquire returns the credential the next attempt carries.
 //
 // preferred names the key the caller's previous attempt on this candidate
@@ -99,6 +94,13 @@ func (p *Pool) Acquire(now time.Time, preferred string) (Key, bool) {
 // now is not a rate limit). Marking an unknown id is a no-op: an in-flight
 // request's pool is pinned, so under normal operation the id exists, and a
 // defensive no-op beats inventing an error the walk would have to handle.
+//
+// The mark is monotonic: an existing, later deadline is never shortened.
+// Two concurrent requests can hold the same key, and the weaker of two
+// upstream answers must not cut short what the stronger one reported —
+// letting Retry-After: 1 overwrite Retry-After: 60 would send the key back
+// into a rate-limited account early. Re-admission waits out the longest
+// mark, and that wait is bounded by the provider's max-cooldown.
 func (p *Pool) MarkRateLimited(now time.Time, keyID string, cooldown time.Duration) {
 	if cooldown <= 0 {
 		return
@@ -107,7 +109,11 @@ func (p *Pool) MarkRateLimited(now time.Time, keyID string, cooldown time.Durati
 	defer p.mu.Unlock()
 	for _, k := range p.spec.Keys {
 		if k.ID == keyID {
-			p.cooling[keyID] = now.Add(cooldown)
+			deadline := now.Add(cooldown)
+			if until, cooling := p.cooling[keyID]; cooling && until.After(deadline) {
+				return
+			}
+			p.cooling[keyID] = deadline
 			return
 		}
 	}

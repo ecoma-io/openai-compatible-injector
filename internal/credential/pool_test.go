@@ -183,14 +183,20 @@ func TestMarkRateLimitedEdgeInputs(t *testing.T) {
 	if _, ok := p.NextReady(base); ok {
 		t.Fatal("unknown-id mark created state")
 	}
-	// Re-marking shortens nothing: a later deadline replaces, an earlier
-	// deadline still replaces too (the last mark wins — the caller observes
-	// the freshest upstream answer).
+	// The mark is monotonic: a later mark extends, a weaker one never
+	// shortens — a concurrent holder's Retry-After: 1 must not overwrite a
+	// Retry-After: 60 already on the key and send it back into a
+	// rate-limited account early.
 	p.MarkRateLimited(base, "k1", time.Minute)
 	p.MarkRateLimited(base.Add(time.Second), "k1", time.Minute)
 	got, ok := p.NextReady(base.Add(time.Second))
 	if !ok || !got.Equal(base.Add(time.Second+time.Minute)) {
-		t.Fatalf("re-mark NextReady = %v,%v", got, ok)
+		t.Fatalf("extending mark NextReady = %v,%v", got, ok)
+	}
+	p.MarkRateLimited(base.Add(2*time.Second), "k1", time.Second)
+	got, ok = p.NextReady(base.Add(2 * time.Second))
+	if !ok || !got.Equal(base.Add(time.Second+time.Minute)) {
+		t.Fatalf("weakening mark shortened the cooldown: NextReady = %v,%v", got, ok)
 	}
 }
 
@@ -200,9 +206,6 @@ func TestNewPoolCopiesSpec(t *testing.T) {
 	spec.Keys[0].ID = "mutated"
 	if k, _ := p.Acquire(base, ""); k.ID != "k1" {
 		t.Fatalf("pool aliased the caller's spec: first key = %q", k.ID)
-	}
-	if got := p.Spec().Keys[0].ID; got != "k1" {
-		t.Fatalf("Spec() reflects the caller's mutation: %q", got)
 	}
 }
 
