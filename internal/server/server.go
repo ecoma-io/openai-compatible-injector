@@ -11,6 +11,7 @@ import (
 
 	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
+	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/proxy"
 	"openai-compatible-injector/internal/transport"
 	"openai-compatible-injector/internal/usage"
@@ -31,12 +32,15 @@ type Server struct {
 // transport registry, served on addr. grace is the shutdown drain deadline:
 // after it elapses, in-flight requests are force-closed. authProvider is
 // passed through to the handler unchanged (nil = static mode), as is meter
-// (nil = metering off).
-func New(store *config.Store, doers *transport.Registry, authProvider auth.Provider, meter usage.Ingest, addr string, grace time.Duration, log zerolog.Logger) *Server {
+// (nil = metering off) and creds (nil = no upstream credentials; the
+// credential registry needs no shutdown handling — a Pool is pure state
+// with nothing to close, and in-flight requests hold their pool pointers
+// through the drain).
+func New(store *config.Store, doers *transport.Registry, creds *credential.Registry, authProvider auth.Provider, meter usage.Ingest, addr string, grace time.Duration, log zerolog.Logger) *Server {
 	return &Server{
 		http: &http.Server{
 			Addr:              addr,
-			Handler:           proxy.NewHandler(store, doers, authProvider, meter, log),
+			Handler:           proxy.NewHandler(store, doers, creds, authProvider, meter, log),
 			ReadHeaderTimeout: 10 * time.Second,
 			// Without an IdleTimeout a client that opens a keep-alive
 			// connection and goes quiet pins a goroutine and a file

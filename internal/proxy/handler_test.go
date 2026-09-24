@@ -43,7 +43,7 @@ func newTestStore(t *testing.T, endpoint string) *config.Store {
 func newTestHandler(t *testing.T, store *config.Store) http.Handler {
 	t.Helper()
 	log := zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled)
-	return NewHandler(store, directResolver(), nil, nil, log)
+	return NewHandler(store, directResolver(), nil, nil, nil, log)
 }
 
 // fixedDoer adapts one Doer (an *http.Client, or a stub) as a Resolver
@@ -213,7 +213,7 @@ func TestUpstreamFailureLogsRedactEndpoint(t *testing.T) {
 	store := newTestStore(t, endpoint)
 	var logs bytes.Buffer
 	log := zerolog.New(&logs)
-	h := NewHandler(store, directResolver(), nil, nil, log)
+	h := NewHandler(store, directResolver(), nil, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -1029,7 +1029,7 @@ func TestClientCancelBeforeUpstreamAnswer(t *testing.T) {
 	defer close(release)
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1097,7 +1097,7 @@ func TestStreamLineLimitOutcome(t *testing.T) {
 	defer up.Close()
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model","stream":true}`, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (status committed before the truncation)", rec.Code)
@@ -1152,7 +1152,7 @@ func TestConcurrentReloadAndTraffic(t *testing.T) {
 		t.Fatalf("LoadRuntime: %v", err)
 	}
 	store := config.NewStore(snap)
-	h := NewHandler(store, directResolver(), nil, nil, zerolog.Nop())
+	h := NewHandler(store, directResolver(), nil, nil, nil, zerolog.Nop())
 
 	stop := make(chan struct{})
 	pubDone := make(chan struct{})
@@ -1352,7 +1352,7 @@ func TestUpstreamTimeoutClassified(t *testing.T) {
 	client.Transport.(*http.Transport).ResponseHeaderTimeout = 150 * time.Millisecond
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, silent.URL+"/v1"), fixedDoer{client}, nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, silent.URL+"/v1"), fixedDoer{client}, nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -1405,7 +1405,7 @@ func TestUpstreamTLSFailureClassified(t *testing.T) {
 
 	var logs bytes.Buffer
 	// The shared client does not trust httptest's self-signed certificate.
-	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -1495,7 +1495,7 @@ func TestUpstreamHTTPErrorLogEvidence(t *testing.T) {
 	// The endpoint's query string carries a planted credential marker.
 	store := newTestStore(t, upstream.URL+"/v1?api-key=SECRET_ENDPOINT_TOKEN&deployment=x")
 	var logs bytes.Buffer
-	h := NewHandler(store, directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(store, directResolver(), nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","messages":[{"role":"user","content":"SECRET_REQUEST_BODY"}]}`, nil)
@@ -1589,7 +1589,7 @@ func TestUpstreamHTTPError5xxSeverity(t *testing.T) {
 	defer upstream.Close()
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
@@ -1630,7 +1630,7 @@ func TestUpstreamHTTPErrorBodyBounded(t *testing.T) {
 	defer upstream.Close()
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 
 	if rec.Code != http.StatusTooManyRequests {
@@ -1683,7 +1683,7 @@ func TestUpstreamHTTPErrorBodyReadFailure502(t *testing.T) {
 	defer s.Close()
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, s.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, s.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 
 	if rec.Code != http.StatusBadGateway {
@@ -1784,7 +1784,7 @@ func TestUpstreamHTTPErrorStalledCaptureRetriesThenFallsBack(t *testing.T) {
 	pa := &stallingErrorUpstream{t: t, status: http.StatusServiceUnavailable}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	var logs bytes.Buffer
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, zerolog.New(&logs))
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -1842,7 +1842,7 @@ func TestUpstreamHTTPErrorStalledCaptureRetainedAnswersInvalid(t *testing.T) {
 	pa := &stallingErrorUpstream{t: t, status: http.StatusServiceUnavailable}
 	pb := &fakeUpstream{err: dialError("b.example")}
 	var logs bytes.Buffer
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, zerolog.New(&logs))
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -1872,7 +1872,7 @@ func TestUpstreamHTTPErrorCallerEndedDuringCapture(t *testing.T) {
 	pa := newStalledErrorBody(t, http.StatusServiceUnavailable)
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`}
 	var logs bytes.Buffer
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, zerolog.New(&logs))
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, nil, zerolog.New(&logs))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rec := httptest.NewRecorder()
@@ -1929,7 +1929,7 @@ func TestUpstreamHTTPErrorClientDisconnectDuringBodyRead(t *testing.T) {
 	// logBuffer (mutex-guarded): the poll below reads from the test goroutine
 	// while ServeHTTP logs on its own, and -race runs in CI.
 	logs := &logBuffer{}
-	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, zerolog.New(logs))
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(logs))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2006,7 +2006,7 @@ func TestUpstreamErrorProviderTokensBounded(t *testing.T) {
 			defer upstream.Close()
 
 			var logs bytes.Buffer
-			h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+			h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 			if rec.Code != http.StatusTooManyRequests {
 				t.Fatalf("status = %d, want 429", rec.Code)
@@ -2059,7 +2059,7 @@ func TestUpstreamMalformedHeaderLineSanitized(t *testing.T) {
 	}()
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, "http://"+ln.Addr().String()+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, "http://"+ln.Addr().String()+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -2103,7 +2103,7 @@ func TestUpstreamHTTPErrorHostileHeaderValuesJSONSafe(t *testing.T) {
 	defer upstream.Close()
 
 	var logs bytes.Buffer
-	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(newTestStore(t, upstream.URL+"/v1"), directResolver(), nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"test-model"}`, nil)
 	if rec.Code != http.StatusTooManyRequests {

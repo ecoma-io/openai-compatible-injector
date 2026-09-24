@@ -18,6 +18,7 @@ import (
 
 	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
+	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/server"
 	"openai-compatible-injector/internal/transport"
 	"openai-compatible-injector/internal/usage"
@@ -133,6 +134,14 @@ func run() int {
 	// warm pool, and one that removes one drains only that pool's idle
 	// connections. Built before the poller and server so both can hold it.
 	doers := transport.NewRegistry()
+
+	// The process-wide credential registry beside it: one rotation pool per
+	// distinct provider credential configuration, keyed by spec content.
+	// The same lifecycle contract as the transport registry, minus the
+	// teardown — a Pool is pure state with nothing to close, so a reload
+	// that drops a provider's credentials simply drops the entry, and an
+	// in-flight request holding the pool finishes its walk untouched.
+	creds := credential.NewRegistry()
 
 	// Credential model. Static (the default) authenticates every client
 	// against the runtime YAML's api-key. Partner mode (OAICR_AUTH_DATABASE_URL
@@ -268,17 +277,22 @@ func run() int {
 	// transport set on the registry: doers the new config no longer
 	// references have their idle pooled connections closed (in-flight
 	// requests on them finish untouched), while unchanged transports keep
-	// their pools warm. The poller is seeded with the exact bytes loaded
+	// their pools warm. The credential registry is retained against the
+	// same snapshot: pools whose credential content the new config no
+	// longer carries are dropped (in-flight requests finish on them
+	// untouched), unchanged content keeps its rotation cursor and cooldown
+	// state warm. The poller is seeded with the exact bytes loaded
 	// above: its hash baseline is the boot content, not a fresh read of a
 	// file that may have changed in between.
 	levelHook := config.LogLevelHook(log)
 	onPublish := func(next *config.Snapshot) {
 		levelHook(next)
 		doers.Retain(next.Transports())
+		creds.Retain(next.Credentials())
 	}
 	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, onPublish).Run(ctx)
 
-	err = server.New(store, doers, authProvider, meter, b.Listen, b.ShutdownGrace, log).Run(ctx)
+	err = server.New(store, doers, creds, authProvider, meter, b.Listen, b.ShutdownGrace, log).Run(ctx)
 	// Ignore before announcing the drain done: from the instant Run returns
 	// the process is committed to its exit code, and a duplicate signal must
 	// fall on the ignored disposition, not the default handler's 143.

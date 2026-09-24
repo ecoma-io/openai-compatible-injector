@@ -122,7 +122,7 @@ func TestHandlerPoolExecutesThroughExecutor(t *testing.T) {
 	ex := &stubExecutor{
 		info: transport.AttemptInfo{Attempts: 1, Kind: "proxy", Target: "http://127.0.0.1:20130"},
 	}
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled))
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -174,7 +174,7 @@ func TestHandlerPoolExhaustionIs502UpstreamUnreachable(t *testing.T) {
 		err:  errors.New("egress pool: no eligible endpoint available"),
 		info: transport.AttemptInfo{Attempts: 0, Exhausted: true},
 	}
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled))
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, zerolog.New(zerolog.TestWriter{T: t}).Level(zerolog.Disabled))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -198,7 +198,7 @@ func TestHandlerClientCancelBeatsPoolExhaustion(t *testing.T) {
 		info: transport.AttemptInfo{Attempts: 0, Exhausted: true},
 	}
 	buf, logger := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, logger)
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, logger)
 
 	rec := doDisconnectedRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code == http.StatusBadGateway {
@@ -224,7 +224,7 @@ func TestHandlerPoolLogFields(t *testing.T) {
 		info: transport.AttemptInfo{Attempts: 2, Kind: "socks5", Target: "socks5://10.0.0.5:30121"},
 	}
 	buf, logger := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x"}`}}, nil, nil, logger)
+	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x"}`}}, nil, nil, nil, logger)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -276,7 +276,7 @@ func TestHandlerPoolExhaustionLoggedWithClass(t *testing.T) {
 		info: transport.AttemptInfo{Exhausted: true},
 	}
 	buf, logger := captureLog(zerolog.ErrorLevel)
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, logger)
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, logger)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -399,7 +399,7 @@ func TestHandlerEgressAttemptFailureEvents(t *testing.T) {
 		},
 	}
 	buf, logger := captureLog(zerolog.InfoLevel)
-	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x"}`}}, nil, nil, logger)
+	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x"}`}}, nil, nil, nil, logger)
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 through the serving member", rec.Code)
@@ -450,7 +450,7 @@ func TestProviderAttemptStartedPrecedesDial(t *testing.T) {
 		info: transport.AttemptInfo{Attempts: 1, Kind: "proxy", Target: "http://127.0.0.1:20130"},
 	}
 	buf, logger := captureLog(zerolog.DebugLevel)
-	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x","choices":[]}`}}, nil, nil, logger)
+	h := NewHandler(store, &kindDoerResolver{pool: ex, direct: &stubDoer{code: http.StatusOK, body: `{"id":"x","choices":[]}`}}, nil, nil, nil, logger)
 
 	// Pooled path.
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
@@ -519,7 +519,7 @@ func TestFailureOriginLabelsEvidence(t *testing.T) {
 		info: transport.AttemptInfo{Exhausted: true},
 	}
 	buf, logger := captureLog(zerolog.ErrorLevel)
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, logger)
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, logger)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -554,7 +554,7 @@ func TestRequestBuildErrorIsLocalNotAnEndpointFailure(t *testing.T) {
 	store := newChainStoreRetries(t, "", "")
 	ex := &buildErrorExecutor{}
 	buf, logger := captureLog(zerolog.WarnLevel)
-	h := NewHandler(store, kindResolver{direct: ex, proxied: ex}, nil, nil, logger)
+	h := NewHandler(store, kindResolver{direct: ex, proxied: ex}, nil, nil, nil, logger)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"chain-model","messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -607,7 +607,7 @@ func TestSendStateNotInheritedByLaterZeroDialAttempt(t *testing.T) {
 	refused := &fakeUpstream{err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
 	ex := &allIneligibleExecutor{}
 	buf, logger := captureLog(zerolog.WarnLevel)
-	h := NewHandler(store, kindResolver{direct: refused, proxied: ex}, nil, nil, logger)
+	h := NewHandler(store, kindResolver{direct: refused, proxied: ex}, nil, nil, nil, logger)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"chain-model","messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -694,7 +694,7 @@ func TestSendStateRidesTransportEvidence(t *testing.T) {
 				},
 			}
 			buf, logger := captureLog(zerolog.WarnLevel)
-			h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, logger)
+			h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, logger)
 
 			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 			if rec.Code != http.StatusBadGateway {
@@ -733,7 +733,7 @@ func TestFailureOriginHTTPLabelsUpstreamError(t *testing.T) {
 
 	store := newTestStore(t, upstream.URL+"/v1")
 	var logs bytes.Buffer
-	h := NewHandler(store, directResolver(), nil, nil, zerolog.New(&logs))
+	h := NewHandler(store, directResolver(), nil, nil, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)

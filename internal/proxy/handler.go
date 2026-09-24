@@ -23,6 +23,7 @@ import (
 
 	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
+	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/inject"
 	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
@@ -118,12 +119,18 @@ type openAIErrorBody struct {
 // events, byte-identical behavior); a non-nil pipeline records one factual
 // event per request that reaches the provider path, written off the
 // response path — Record never blocks and never fails a request.
-func NewHandler(store *config.Store, doers transport.Resolver, authProvider auth.Provider, meter usage.Ingest, log zerolog.Logger) http.Handler {
+//
+// creds selects the upstream-credential model: nil keeps every candidate
+// unauthenticated upstream (byte-identical behavior); a non-nil resolver
+// hands each credential-bearing candidate its rotation pool, and the walk
+// acquires one key per attempt, re-acquires on cooldown, and marks keys
+// rate-limited on a 429 — see the credential seam at the attempt loop.
+func NewHandler(store *config.Store, doers transport.Resolver, creds CredentialResolver, authProvider auth.Provider, meter usage.Ingest, log zerolog.Logger) http.Handler {
 	provider := auth.Provider(auth.StaticProvider{})
 	if authProvider != nil {
 		provider = authProvider
 	}
-	h := &injectorHandler{store: store, doers: doers, auth: provider, meter: meter, log: log}
+	h := &injectorHandler{store: store, doers: doers, creds: creds, auth: provider, meter: meter, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.healthz)
 	// The routes are method-agnostic patterns so that wrong methods reach
@@ -142,6 +149,7 @@ func NewHandler(store *config.Store, doers transport.Resolver, authProvider auth
 type injectorHandler struct {
 	store *config.Store
 	doers transport.Resolver
+	creds CredentialResolver
 	auth  auth.Provider
 	meter usage.Ingest
 	log   zerolog.Logger
@@ -315,6 +323,14 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// entered candidate: the policy the last attempt ran under, which is
 		// what the completion evidence names.
 		lastPolicyHash string
+		// lastCredentialID is the id of the credential the most recent
+		// attempt went out with — the answering attempt's key on success,
+		// the last failed one's on exhaustion, empty when the candidate
+		// carries no credential pool. It feeds the completion record's
+		// upstream_credential_id, which names the CONFIGURED key id — never
+		// the key value, and never the caller's partner key id (a different
+		// axis that rides KeyID on the usage record).
+		lastCredentialID string
 		// streamed is the mode the response was actually relayed in, which
 		// the probe's stream flag only predicts: a stream=true request whose
 		// upstream answered non-SSE is relayed buffered, and the record says
@@ -406,6 +422,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Uint64("policy_generation", snap.Gen()).
 			Int("final_candidate", lastCandIndex).
 			Str("final_provider", finalProvider)
+		// The configured key id the answering (or last-attempted) credential
+		// went out under — a rotation fact, never a secret and never the
+		// caller's partner key id. Empty, and omitted, without credentials.
+		if lastCredentialID != "" {
+			ev = ev.Str("upstream_credential_id", lastCredentialID)
+		}
 		if providerExhausted {
 			ev = ev.Bool("provider_exhausted", true)
 		}
@@ -698,6 +720,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// answer's usage record names ITS egress, not the last failed
 		// candidate's.
 		egressKind string
+		// credKey is the id of the credential this attempt went out with,
+		// empty on a candidate without a pool. It rides for the same reason
+		// egressKind does: a retained answer's completion record must name
+		// the key that PRODUCED it, not whichever key the last failed
+		// attempt used.
+		credKey string
 	}
 	// answerInvalid flavors: what made a 200-shaped response unusable.
 	// They share the 502 upstream_invalid_response envelope but not the
@@ -779,14 +807,14 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// or the typed invalid flavor when the capture itself failed or
 	// stalled. Both the finalize and the retention routes go through it, so
 	// the answer the client sees is the same shape however the walk ends.
-	answerFor := func(cerr captureError, ev upstreamErrorEvidence, resp *http.Response, status int, cand config.Candidate, i int, egressKind string) *walkAnswer {
+	answerFor := func(cerr captureError, ev upstreamErrorEvidence, resp *http.Response, status int, cand config.Candidate, i int, egressKind, credKey string) *walkAnswer {
 		if cerr == captureOK {
-			return &walkAnswer{kind: answerHTTPError, ev: ev, header: resp.Header, status: status, cand: cand, candIndex: i + 1, egressKind: egressKind}
+			return &walkAnswer{kind: answerHTTPError, ev: ev, header: resp.Header, status: status, cand: cand, candIndex: i + 1, egressKind: egressKind, credKey: credKey}
 		}
 		if cerr == captureDeadline {
-			return &walkAnswer{kind: answerInvalid, invalid: invalidBodyTimeout, cand: cand, candIndex: i + 1, egressKind: egressKind}
+			return &walkAnswer{kind: answerInvalid, invalid: invalidBodyTimeout, cand: cand, candIndex: i + 1, egressKind: egressKind, credKey: credKey}
 		}
-		return &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, egressKind: egressKind}
+		return &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, egressKind: egressKind, credKey: credKey}
 	}
 walk:
 	for i := range m.Chain {
@@ -825,6 +853,23 @@ walk:
 		// are re-derived from the candidate in scope so this hop's provider
 		// list — present when the model states none — gates its own chunks.
 		stripKeys = inject.StripPatterns(stripSegments(m.Strip))
+
+		// The candidate's credential pool, resolved once per candidate and
+		// held for its whole walk: rotation and cooldown state survives
+		// every retry of this candidate and is never rebuilt mid-request,
+		// even across a reload. Nil when the candidate carries no auth
+		// block — the entire credential seam below is skipped and the
+		// attempt runs byte for byte as it always has.
+		var pool *credential.Pool
+		if cand.Cred != nil && h.creds != nil {
+			pool = h.creds.Pool(cand.Cred)
+		}
+		// credKey is the sticky key id: the key the candidate's attempts go
+		// out with until something moves them off it. A same-candidate retry
+		// re-acquires preferring the key it just used (a 500 must re-ask
+		// with the same key, not rotate), while a key marked rate-limited
+		// makes the next Acquire hand back a different ready key.
+		credKey := ""
 
 		attempt := 0
 		for {
@@ -933,6 +978,91 @@ walk:
 			// dial failure still yields one event with the walk's final facts.
 			meterEvent = true
 			lastUpstream = &upstream
+
+			// THE CREDENTIAL SEAM. One key per attempt, acquired before the
+			// transport is resolved: the attempt below dials with the key
+			// this hands back, and every retry re-acquires. Nothing here
+			// dials, sleeps unbounded, or invents an outcome — when no ready
+			// key exists the engine DECIDES, through the same
+			// observation → decision → bounded wait → action path every
+			// other failure takes.
+			//
+			// The header is composed here and only here: header name, prefix
+			// and key value come from the validated spec, and the value
+			// never reaches a log, an error, or the transport layer — req is
+			// the request the transport sends as-is (the pooled path clones
+			// it per member, carrying the credential along).
+			if pool != nil {
+				if k, ok := pool.Acquire(eng.Now(), credKey); ok {
+					credKey = k.ID
+					lastCredentialID = k.ID
+					req.Header.Set(cand.Cred.Spec.Header, cand.Cred.Spec.Prefix+k.Value)
+				} else {
+					// No ready key: every key of this provider is cooling
+					// under a 429 mark. The observation rides the earliest
+					// ready time as its Retry-After — the matrix re-caps it
+					// like any directive before the wait, so a long provider
+					// cooldown cannot stretch one retry's sleep — and the
+					// candidate's REAL retry budget bounds the whole cycle:
+					// exhausted, the policy's on-exhausted action moves the
+					// walk on or ends it. No busy loop, no synthesized
+					// response, no invented counter.
+					obs := recovery.Observation{
+						Class:            recovery.FailureCredential,
+						CredentialCause:  recovery.CredentialCooldown,
+						Streaming:        stream,
+						Committed:        answer != nil,
+						CandidateIndex:   i + 1,
+						CandidateAttempt: attempt,
+						RetryIndex:       retryIndex,
+						Elapsed:          eng.Now().Sub(candStart).Milliseconds(),
+					}
+					if next, ok := pool.NextReady(eng.Now()); ok {
+						obs.RetryAfter = next.Sub(eng.Now())
+					}
+					dec := eng.Observe(obs)
+					lastRuleID = dec.RuleID
+					act := walkAction(dec.Action, i+1 < len(m.Chain))
+					// The refusal dialed nothing, so the event carries no
+					// upstream_exchange index — naming one would invent an
+					// exchange that never happened, exactly as for an
+					// envelope refusal. upstream_credential_id names the key
+					// the previous attempt went out with (the one Acquire
+					// preferred); absent on a first attempt that found the
+					// pool already cold.
+					event := log.Warn().
+						Str("public_model", model).
+						Str("provider", cand.Label()).
+						Str("error_class", "credential").
+						Str("error_cause", recovery.CredentialCooldown).
+						Str("failure_origin", "credential").
+						Str("disposition", act.String()).
+						Str("reason", dec.Reason).
+						Str("policy_rule_id", dec.RuleID).
+						Str("policy_hash", lastPolicyHash).
+						Uint64("policy_generation", snap.Gen()).
+						Int("provider_attempt", providerAttempts).
+						Int("candidate_index", i+1).
+						Int("candidate_attempt", attempt).
+						Int("retry_index", retryIndex).
+						Int("request_exchange_budget_remaining", eng.Budget().RequestRemaining()).
+						Int64("elapsed_ms", eng.Now().Sub(attemptStart).Milliseconds())
+					if credKey != "" {
+						event = event.Str("upstream_credential_id", credKey)
+					}
+					event.Msg("credential_unavailable")
+					if !waitOut(dec) {
+						return
+					}
+					if act == recovery.ActionRetry {
+						continue
+					}
+					if act == recovery.ActionFallback {
+						break
+					}
+					break walk
+				}
+			}
 
 			// The outbound hop: the candidate's provider transport, resolved
 			// from the request's snapshot. Any HTTP status — 429, 5xx, an
@@ -1226,7 +1356,7 @@ walk:
 					}
 					event = withPolicyFields(withAttemptFields(event, providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining())
-					event.Msg("upstream_request_failed")
+					withCredentialFields(event, credKey).Msg("upstream_request_failed")
 					complete()
 					return
 				}
@@ -1276,7 +1406,7 @@ walk:
 				}
 				event = withPolicyFields(withAttemptFields(event, providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining())
-				event.Msg("provider_attempt_failed")
+				withCredentialFields(event, credKey).Msg("provider_attempt_failed")
 				if !waitOut(dec) {
 					return
 				}
@@ -1398,7 +1528,7 @@ walk:
 					if ev.providerCode != "" {
 						event = event.Str("provider_error_code", ev.providerCode)
 					}
-					event.Msg("upstream_http_error")
+					withCredentialFields(event, credKey).Msg("upstream_http_error")
 				} else {
 					w := log.Warn().Str("public_model", model)
 					if cerr == captureDeadline {
@@ -1415,7 +1545,7 @@ walk:
 						Str("disposition", act.String()).
 						Str("reason", dec.Reason).
 						Int("upstream_status", status)
-					w.Msg("upstream_body_read_failed")
+					withCredentialFields(w, credKey).Msg("upstream_body_read_failed")
 				}
 				if !waitOut(dec) {
 					return
@@ -1428,20 +1558,20 @@ walk:
 					// remember that answer: if every remaining candidate
 					// then fails before answering, this one becomes the
 					// client's response.
-					retained = answerFor(cerr, ev, resp, status, cand, i, kindHere)
+					retained = answerFor(cerr, ev, resp, status, cand, i, kindHere, credKey)
 					break
 				}
 				// Finalize: the last received HTTP answer wins. Only the
 				// retained facts survive the walk — the evidence struct and
 				// the relay headers, never the raw bytes.
-				answer = answerFor(cerr, ev, resp, status, cand, i, kindHere)
+				answer = answerFor(cerr, ev, resp, status, cand, i, kindHere, credKey)
 				break walk
 			}
 
 			if status >= http.StatusMultipleChoices || status == http.StatusNoContent || status == http.StatusNotModified {
 				// Verbatim answer: redirects (3xx, never followed) and the
 				// two body-less statuses. Committed as-is, body untouched.
-				answer = &walkAnswer{kind: answerVerbatim, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+				answer = &walkAnswer{kind: answerVerbatim, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey}
 				break walk
 			}
 
@@ -1449,7 +1579,7 @@ walk:
 				// SSE answer: the headers are the commitment. The body is
 				// not read here — it streams after the walk, and anything
 				// that kills it later truncates the committed stream.
-				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey}
 				break walk
 			}
 
@@ -1498,7 +1628,7 @@ walk:
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
 					Str("reason", dec.Reason)
-				event.Msg("upstream_body_read_failed")
+				withCredentialFields(event, credKey).Msg("upstream_body_read_failed")
 				if !waitOut(dec) {
 					return
 				}
@@ -1509,10 +1639,10 @@ walk:
 					// The read failed, but the upstream answered 2xx — keep
 					// the shape: later candidates failing before answering
 					// fall back to this answer over a synthesized 502.
-					retained = &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, egressKind: kindHere}
+					retained = &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, egressKind: kindHere, credKey: credKey}
 					break
 				}
-				answer = &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1}
+				answer = &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, credKey: credKey}
 				break walk
 			}
 			if len(bodyBytes) > int(maxBufferedResponseBytes) || !json.Valid(bodyBytes) {
@@ -1556,7 +1686,7 @@ walk:
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
 					Str("reason", dec.Reason)
-				event.Msg("upstream_invalid_response")
+				withCredentialFields(event, credKey).Msg("upstream_invalid_response")
 				if !waitOut(dec) {
 					return
 				}
@@ -1566,15 +1696,15 @@ walk:
 				if act == recovery.ActionFallback {
 					// Same as the read failure: a 2xx arrived, only the body
 					// is unusable — the shape stays the retained answer.
-					retained = &walkAnswer{kind: answerInvalid, invalid: invalidBody, cand: cand, candIndex: i + 1, egressKind: kindHere}
+					retained = &walkAnswer{kind: answerInvalid, invalid: invalidBody, cand: cand, candIndex: i + 1, egressKind: kindHere, credKey: credKey}
 					break
 				}
-				answer = &walkAnswer{kind: answerInvalid, invalid: invalidBody, cand: cand, candIndex: i + 1}
+				answer = &walkAnswer{kind: answerInvalid, invalid: invalidBody, cand: cand, candIndex: i + 1, credKey: credKey}
 				break walk
 			}
 			// A valid 2xx answer: committed. The body rides the answer
 			// struct to the rewrite; no retry follows commitment.
-			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1}
+			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey}
 			break walk
 		}
 	}
@@ -1598,6 +1728,10 @@ walk:
 		// answering, but its policy did not produce the retained response and
 		// must not overwrite the answer's policy identity.
 		lastPolicyHash = answer.cand.RecoveryHash
+		// And the same for the credential: the answer's own key, recorded
+		// on the answer when it was produced, not the last failed
+		// attempt's.
+		lastCredentialID = answer.credKey
 		ansEgressKind = answer.egressKind
 	}
 	if answer == nil {
@@ -1959,6 +2093,20 @@ func withAttemptFields(ev *zerolog.Event, providerAttempt, candIndex, candAttemp
 		Int("candidate_attempt", candAttempt).
 		Int("retry_index", candAttempt-1).
 		Int64("elapsed_ms", elapsed.Milliseconds())
+}
+
+// withCredentialFields adds the id of the upstream credential one
+// attempt-scoped event's attempt went out with: a rotation fact the
+// operator correlates 429 marks and per-key behavior against. The id is
+// configuration data validated to bounded token characters — never the
+// key value, never a caller's partner key id (a different axis), and
+// omitted entirely on candidates without a credential pool, whose events
+// keep their historical shape.
+func withCredentialFields(ev *zerolog.Event, credKey string) *zerolog.Event {
+	if credKey == "" {
+		return ev
+	}
+	return ev.Str("upstream_credential_id", credKey)
 }
 
 // modelNotFoundEnvelope builds the 404 envelope whose message interpolates
