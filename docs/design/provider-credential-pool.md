@@ -79,10 +79,14 @@ Per-request, per-candidate:
   policy's. Rotation is an emergent property of acquisition, not a decision.
 - **No ready key** (all cooling): the pool reports state, never waits. The
   recovery layer owns what happens next through a typed decision seam —
-  **open**: exact seam shape (new observation cause reusing the directive/cap
-  machinery vs. on-exhausted semantics) is being finalized against the
-  engine audit. Hard requirements either way: no fake exchange consumption,
-  no fake attempt counters, no dial without a credential, no busy loop, no
+  **decided**: a new credential failure class (`FailureCredential` /
+  `CredentialCooldown`) rides the engine's ordinary observation path, with
+  the pool's earliest-ready time folded in as the observation's
+  `RetryAfter` — so the existing directive/cap machinery bounds the wait
+  and the operator's matrix (default row: retry) owns the decision. Hard
+  requirements, all pinned by tests: no fake exchange consumption, no fake
+  attempt counters (a blocked attempt counts, dials nothing, emits no
+  started marker), no dial without a credential, no busy loop, no
   unbounded sleep; candidate windows and caller deadlines bind exactly as
   they do for backoff waits.
 
