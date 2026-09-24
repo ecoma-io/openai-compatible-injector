@@ -204,8 +204,8 @@ providers:
     #             (Authorization, X-API-Key, ...). Required.
     #   prefix:   placed before the value ("Bearer " or ""). Optional,
     #             default empty.
-    #   strategy: round_robin — the only accepted value today. Optional,
-    #             default round_robin.
+    #   strategy: round_robin — the only accepted value today. Required:
+    #             there is no default, the file must state it.
     #   keys:     1..256 entries; id (an operator-chosen name from
     #             [A-Za-z0-9._:-], the only form that reaches logs) and
     #             value (the secret material itself). Ids must be unique.

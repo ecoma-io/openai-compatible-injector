@@ -702,8 +702,8 @@ providers:
         # X-API-Key, ...)
       prefix: "Bearer " # optional, default "" — placed before the value
       strategy:
-        round_robin # optional, default round_robin — the only
-        # accepted value today
+        round_robin # required — the only accepted value today; the
+        # file states it, there is no default
       rate-limit: # optional, defaults cooldown 2s / max 60s
         cooldown:
           2s #   default cooldown when the upstream sends no
