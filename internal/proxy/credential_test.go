@@ -14,6 +14,7 @@ import (
 
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/credential"
+	"openai-compatible-injector/internal/transport"
 )
 
 // The credential seam: one key per attempt, acquired before the transport
@@ -486,5 +487,222 @@ func TestCredentialValuesNeverLogged(t *testing.T) {
 	failed := buf.events(t, "upstream_http_error")
 	if len(failed) != 1 || failed[0]["upstream_credential_id"] != "kilo-1" {
 		t.Fatalf("upstream_http_error = %v, want exactly one naming kilo-1", failed)
+	}
+}
+
+// newCredChainStoreBlocks is newCredChainStore with a model-level YAML
+// fragment (retries blocks and the like) inserted under chain-model.
+func newCredChainStoreBlocks(t *testing.T, paAuth, modelExtra string) *config.Store {
+	t.Helper()
+	snap, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + "\n" + `
+transports:
+  t1:
+    type: direct
+  t2:
+    type: proxy
+    proxy: http://127.0.0.1:9090
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t1
+` + paAuth + `  pb:
+    base-url: https://b.example/v1
+    transport: t2
+models:
+  chain-model:
+` + modelExtra + `
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pb
+        upstream-model: up-b
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	return config.NewStore(snap)
+}
+
+// newCredPoolStore is the pool-transport store with a two-key auth block on
+// its provider — the egress-pool branch of the seam with credentials on.
+func newCredPoolStore(t *testing.T) *config.Store {
+	t.Helper()
+	snap, err := config.LoadRuntime([]byte(`
+api-key: ` + testAPIKey + `
+transports:
+  relay:
+    type: proxy
+    proxy: http://127.0.0.1:20130
+  pool-egress:
+    type: pool
+    members: [relay]
+providers:
+  kilo:
+    base-url: https://api.kilo.example/v1
+    transport: pool-egress
+    auth:
+      type: api_key
+      header: Authorization
+      prefix: "Bearer "
+      strategy: round_robin
+      keys:
+        - id: kilo-1
+          value: sk-test-one
+        - id: kilo-2
+          value: sk-test-two
+models:
+  pool-model:
+    provider: kilo
+    upstream-model: pm
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	return config.NewStore(snap)
+}
+
+// twoMemberExecutor stands for a pool that moves to its second member
+// WITHIN one attempt: member one's dial provably fails before the request
+// byte (replay-safe), member two answers 200. Each member's receipt of the
+// Authorization header is recorded — the credential seam's egress-switch
+// invariant lives here.
+type twoMemberExecutor struct {
+	mu   sync.Mutex
+	auth []string
+}
+
+func (e *twoMemberExecutor) Execute(ar *transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+	// One Execute is one handler attempt; the pool's member walk lives
+	// entirely inside it. Member one's dial provably fails before any
+	// request byte (replay-safe), so the pool replays on member two with
+	// the SAME request — same bytes, same headers, same key.
+	for member := 0; ; member++ {
+		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+			return nil, transport.AttemptInfo{BudgetExhausted: true, Attempts: member}, errors.New("exchange budget exhausted")
+		}
+		e.mu.Lock()
+		e.auth = append(e.auth, ar.Header.Get("Authorization"))
+		e.mu.Unlock()
+		if member == 0 {
+			continue // member one refused; the pool moves on
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"x","choices":[]}`)),
+		}, transport.AttemptInfo{Attempts: 2, Kind: "pool", Target: "member-two"}, nil
+	}
+}
+
+func (e *twoMemberExecutor) receipts() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.auth...)
+}
+
+func (e *twoMemberExecutor) Do(*http.Request) (*http.Response, error) {
+	panic("handler called Do on an Executor-capable doer")
+}
+
+// TestCredentialEgressSwitchKeepsSameKey pins the axis boundary: an egress
+// switch inside ONE attempt moves the PATH, never the ACCOUNT — every
+// member the pool dials receives the same acquired key.
+func TestCredentialEgressSwitchKeepsSameKey(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredPoolStore(t)
+	ex := &twoMemberExecutor{}
+	creds := credential.NewRegistry()
+	h := NewHandler(store, &singleDoerResolver{d: ex}, creds, nil, nil, quietLogger())
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	got := ex.receipts()
+	if len(got) != 2 {
+		t.Fatalf("member receipts = %v, want two dials in one attempt", got)
+	}
+	if got[0] != "Bearer sk-test-one" || got[1] != "Bearer sk-test-one" {
+		t.Errorf("egress switch changed the key: %v", got)
+	}
+}
+
+// TestCredentialRotationAcrossBudget pins rotation under an explicit retry
+// budget: with three keys and max-retries 2, two consecutive 429s walk
+// kilo-1 → kilo-2 → kilo-3 and the third attempt answers. Each marked key
+// cools on its own default; the last key stays clean.
+func TestCredentialRotationAcrossBudget(t *testing.T) {
+	stubRetryTiming(t)
+	threeKeys := `    auth:
+      type: api_key
+      header: Authorization
+      prefix: "Bearer "
+      strategy: round_robin
+      keys:
+        - id: kilo-1
+          value: sk-test-one
+        - id: kilo-2
+          value: sk-test-two
+        - id: kilo-3
+          value: sk-test-three
+`
+	store := newCredChainStoreBlocks(t, threeKeys, "    retries:\n      max-retries: 2\n")
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, body: `{}`},
+		{status: http.StatusTooManyRequests, body: `{}`},
+		okAnswer(),
+	}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, quietLogger())
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	got := pa.calls()
+	if len(got) != 3 || got[0] != "Bearer sk-test-one" || got[1] != "Bearer sk-test-two" || got[2] != "Bearer sk-test-three" {
+		t.Fatalf("rotation sequence = %v, want kilo-1, kilo-2, kilo-3", got)
+	}
+	for _, id := range []string{"kilo-1", "kilo-2"} {
+		if pool.CoolingUntil(id).IsZero() {
+			t.Errorf("%s was not marked by its 429", id)
+		}
+	}
+	if until := pool.CoolingUntil("kilo-3"); !until.IsZero() {
+		t.Errorf("kilo-3 was marked: %v", until)
+	}
+}
+
+// TestCredentialSSECommitEndsRotation pins the commitment boundary on a
+// credential-bearing candidate: the SSE headers are the commitment — the
+// key they were authenticated with is the request's last credential fact,
+// and nothing after them (rotation included) can move the walk.
+func TestCredentialSSECommitEndsRotation(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{{
+		status: http.StatusOK,
+		body:   "data: {\"model\":\"up-a\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+		header: http.Header{"Content-Type": []string{"text/event-stream"}},
+	}}}
+	creds := credential.NewRegistry()
+	buf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"chain-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "data:") {
+		t.Fatalf("answer was not relayed as SSE: %s", rec.Body.String())
+	}
+	if got := pa.calls(); len(got) != 1 || got[0] != "Bearer sk-test-one" {
+		t.Fatalf("SSE receipts = %v, want one authenticated attempt", got)
+	}
+	done := buf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["upstream_credential_id"] != "kilo-1" {
+		t.Fatalf("completion = %v, want one naming the committing key", done)
 	}
 }
