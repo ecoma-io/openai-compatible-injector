@@ -2316,22 +2316,52 @@ func newRequestID() string {
 // model mapping. Auth is required; non-GET → 405. Each model object has
 // only id and created (0).
 func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	if r.Method != http.MethodGet {
+		// Keep the 405-before-401 ordering and outside-lifecycle semantics of
+		// the model-serving POST routes.
+		h.log.Debug().Str("api", "models").Str("method", r.Method).
+			Str("path", r.URL.Path).Str("remote_addr", r.RemoteAddr).
+			Msg("request_method_not_allowed")
 		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
 		return
 	}
+
 	snap := h.store.Load()
+	defer func() { _ = r.Body.Close() }()
+	sw := &statusWriter{ResponseWriter: w}
+	log := h.log.With().Str("request_id", newRequestID()).Str("api", "models").Logger()
+	log.Debug().Str("method", r.Method).Str("path", r.URL.Path).
+		Str("remote_addr", r.RemoteAddr).Msg("request_received")
+
+	outcome := "listed"
+	complete := func() {
+		log.Info().Int("status", sw.status).Str("outcome", outcome).
+			Bool("stream", false).Int64("bytes_in", 0).Int64("bytes_out", sw.bytes).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Uint64("config_generation", snap.Gen()).Msg("request_completed")
+	}
+	reject := func(status int, body string) {
+		if err := writeEnvelope(sw, status, body); err != nil {
+			outcome = "client_disconnected"
+			log.Warn().Err(err).Int64("bytes_out", sw.bytes).Msg("client_write_failed")
+		}
+		complete()
+	}
+
 	token, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
-		_ = writeEnvelope(w, http.StatusUnauthorized, envelopeAuthMissing)
+		outcome = "unauthorized"
+		reject(http.StatusUnauthorized, envelopeAuthMissing)
 		return
 	}
 	_, reason, aerr := h.auth.For(snap).Authenticate(r.Context(), token)
 	if aerr != nil {
-		h.log.Warn().Str("error_class", auth.StoreErrorClass(aerr)).Msg("auth_backend_failed")
+		log.Warn().Str("error_class", auth.StoreErrorClass(aerr)).Msg("auth_backend_failed")
 	}
 	if reason != auth.ReasonOK {
-		_ = writeEnvelope(w, http.StatusUnauthorized, envelopeAuthInvalid)
+		outcome = "unauthorized"
+		reject(http.StatusUnauthorized, envelopeAuthInvalid)
 		return
 	}
 
@@ -2343,7 +2373,6 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 	for k := range models {
 		ids = append(ids, k)
 	}
-	// Using sort, keep deterministic.
 	sort.Strings(ids)
 
 	// Wire shape: each entry carries only id and created (the injector has
@@ -2361,12 +2390,19 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 		Object string      `json:"object"`
 		Data   []modelItem `json:"data"`
 	}
-	b, err := json.Marshal(modelsList{Object: "list", Data: data})
+	body, err := json.Marshal(modelsList{Object: "list", Data: data})
 	if err != nil {
-		_ = writeEnvelope(w, http.StatusInternalServerError, internalEnvelope)
+		outcome = "internal_error"
+		reject(http.StatusInternalServerError, internalEnvelope)
 		return
 	}
-	w.Header().Set(contentTypeHeader, envelopeJSONType)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(b)
+	// The full JSON response is generated locally, so no error propagation is
+	// possible after a successful write — a failed write is client-owned.
+	sw.Header().Set(contentTypeHeader, envelopeJSONType)
+	sw.WriteHeader(http.StatusOK)
+	if _, err := sw.Write(body); err != nil {
+		outcome = "client_disconnected"
+		log.Warn().Err(err).Int64("bytes_out", sw.bytes).Msg("client_write_failed")
+	}
+	complete()
 }
