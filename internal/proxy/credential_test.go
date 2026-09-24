@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/auth"
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/transport"
@@ -743,6 +744,80 @@ func TestCredentialIDDoesNotBleedAcrossCandidates(t *testing.T) {
 	}
 	if id, present := done[0]["upstream_credential_id"]; present {
 		t.Fatalf("completion carries stale upstream_credential_id %v after falling back to a credential-less candidate", id)
+	}
+}
+
+// TestCredentialAuthFailureDoesNotMarkOrRotate: the default matrix sends
+// 401/403 to fallback WITHOUT any credential-side consequence — these are
+// auth answers about the request, not rate-limit facts about the account,
+// and phase one deliberately leaves 401→rotate out of scope. The key must
+// come out of the walk exactly as it went in: no cooldown on any key, and
+// the only cursor movement the ordinary use-advance.
+func TestCredentialAuthFailureDoesNotMarkOrRotate(t *testing.T) {
+	stubRetryTiming(t)
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		store := newCredChainStore(t, credAuthBlock)
+		pa := &authScript{steps: []credStep{{status: status, body: `{}`}}}
+		pb := &authScript{steps: []credStep{okAnswer()}}
+		creds := credential.NewRegistry()
+		pool := credPool(t, store, creds)
+		h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, creds, nil, nil, quietLogger())
+
+		rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: got %d", status, rec.Code)
+		}
+		if got := pa.calls(); len(got) != 1 || got[0] != "Bearer sk-test-one" {
+			t.Fatalf("status %d: pa calls = %v, want exactly one kilo-1 dial", status, got)
+		}
+		for _, id := range []string{"kilo-1", "kilo-2"} {
+			if until := pool.CoolingUntil(id); !until.IsZero() {
+				t.Errorf("status %d: %s was marked, cools until %v", status, id, until)
+			}
+		}
+		if _, cooling := pool.NextReady(credFrozen); cooling {
+			t.Errorf("status %d: pool reports a cooling key, want none", status)
+		}
+		// What the next request would acquire: the cursor sits past kilo-1
+		// from the ordinary use-advance alone — nothing rotated ON the 401.
+		if k, ok := pool.Acquire(credFrozen, ""); !ok || k.ID != "kilo-2" {
+			t.Fatalf("status %d: next acquire = %q,%v, want kilo-2 via the plain cursor", status, k.ID, ok)
+		}
+	}
+}
+
+// TestUsagePartnerKeyIDIsNotUpstreamCredentialID: the caller's partner
+// identity and the upstream credential are different axes that happen to
+// share a request. The usage event keeps the partner's key id untouched by
+// rotation, while the walk's events name the upstream credential — the two
+// ids must never be confused for each other, in either direction.
+func TestUsagePartnerKeyIDIsNotUpstreamCredentialID(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{okAnswer()}}
+	creds := credential.NewRegistry()
+	provider := &stubAuthProvider{
+		principal: auth.Principal{PartnerID: "partner-alpha", KeyID: "pak_partner_9"},
+		reason:    auth.ReasonOK,
+	}
+	meter := &recordingMeter{}
+	buf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, provider, meter, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	ev := meter.single(t)
+	if ev.PartnerID != "partner-alpha" || ev.KeyID != "pak_partner_9" {
+		t.Fatalf("usage identity = %q/%q, want the partner's own pak_partner_9", ev.PartnerID, ev.KeyID)
+	}
+	done := buf.events(t, "request_completed")
+	if len(done) != 1 {
+		t.Fatalf("completion events = %d, want 1", len(done))
+	}
+	if id := done[0]["upstream_credential_id"]; id != "kilo-1" {
+		t.Fatalf("completion upstream_credential_id = %v, want the upstream credential kilo-1", id)
 	}
 }
 

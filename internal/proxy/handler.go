@@ -961,7 +961,7 @@ walk:
 				}
 				dec := eng.CandidateSpent(recovery.CauseExchangeBudget)
 				act := walkAction(dec.Action, i+1 < len(m.Chain))
-				log.Warn().
+				spentEvent := log.Warn().
 					Str("public_model", model).
 					Str("provider", cand.Label()).
 					Str("error_class", "provider_exhausted").
@@ -977,8 +977,11 @@ walk:
 					Int("candidate_attempt", attempt).
 					Int("retry_index", retryIndex).
 					Int("request_exchange_budget_remaining", eng.Budget().RequestRemaining()).
-					Int64("elapsed_ms", eng.Now().Sub(attemptStart).Milliseconds()).
-					Msg("candidate_exchange_budget_spent")
+					Int64("elapsed_ms", eng.Now().Sub(attemptStart).Milliseconds())
+				// The budget the envelope spent belongs to this attempt's
+				// credential too — the id names the key whose walk stopped
+				// here, and is omitted when the candidate carries no pool.
+				withCredentialFields(spentEvent, credKey).Msg("candidate_exchange_budget_spent")
 				return act == recovery.ActionFallback
 			}
 			// This request has now reached the provider path. Any subsequent
@@ -1176,7 +1179,7 @@ walk:
 						Int("attempt", j+1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
 						"", lastPolicyHash, snap.Gen(), exchangeBefore+j+1, eng.Budget().RequestRemaining())
-					event.Msg("egress_attempt_failed")
+					withCredentialFields(event, credKey).Msg("egress_attempt_failed")
 				}
 				if info.BudgetExhausted {
 					// The envelope refused the pool's next dial, so no member
@@ -1392,7 +1395,7 @@ walk:
 						Int("egress_attempt", 1),
 						providerAttempts, i+1, attempt, eng.Now().Sub(attemptStart)),
 						dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+1, eng.Budget().RequestRemaining())
-					event.Msg("egress_attempt_failed")
+					withCredentialFields(event, credKey).Msg("egress_attempt_failed")
 				}
 				// Transport-level failure with the client still present: one
 				// WARN per failed attempt — the *url.Error from client.Do
