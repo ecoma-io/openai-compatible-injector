@@ -482,7 +482,7 @@ func TestUsageTransformFailureNotMetered(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	h.serve(rec, req, "chat",
 		func([]byte, config.Model) ([]byte, error) { return nil, errors.New("test transform failure") },
-		inject.RewriteChatModel, inject.SynthesizeChatThinkingUsage, "/chat/completions")
+		inject.RewriteChatModel, inject.SynthesizeChatThinkingUsage, inject.StripChatFields, "/chat/completions")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}

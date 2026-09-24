@@ -37,7 +37,7 @@ func BenchmarkRewriteSSELine(b *testing.B) {
 			b.SetBytes(int64(len(tc.line)))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				rewriteSSELine(tc.line, sseRewriter("public-name"))
+				rewriteSSELine(tc.line, sseRewriter("public-name"), nil)
 			}
 		})
 	}
@@ -67,7 +67,7 @@ func BenchmarkCopySSE(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				src.Reset(in) // deterministic: no allocs, no state leak
-				if _, err := CopySSE(io.Discard, &src, sseRewriter("public-name"), func() {}); err != nil {
+				if _, err := CopySSE(io.Discard, &src, sseRewriter("public-name"), func() {}, nil); err != nil {
 					b.Fatalf("CopySSE: %v", err)
 				}
 			}
@@ -92,7 +92,7 @@ func BenchmarkCopySSELongLines(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		src.Reset(in)
-		if _, err := CopySSE(io.Discard, &src, sseRewriter("public-name"), func() {}); err != nil {
+		if _, err := CopySSE(io.Discard, &src, sseRewriter("public-name"), func() {}, nil); err != nil {
 			b.Fatalf("CopySSE: %v", err)
 		}
 	}

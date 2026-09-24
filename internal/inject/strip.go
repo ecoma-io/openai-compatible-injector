@@ -217,6 +217,17 @@ func stripObject(body []byte, start, end int, paths [][]string, depth int, desce
 // the Responses descent and a response.* path may reach the same member, and
 // both produce edits that overlap or coincide; collapsing them in one pass
 // keeps the splice contract — ordered, non-overlapping, exact union removal.
+//
+// The merged span is the MINIMUM start and MAXIMUM end of its members, not
+// the first member's span extended: when two CONSECUTIVE members are both
+// excised, the first removal takes the hasComma shape (its own key through
+// its own trailing comma) while the second takes the prevEnd-anchored shape
+// (the last survivor's value end through its value end). Those spans
+// overlap, and the union of the two removals — everything from the last
+// survivor's value end to the second member's value end — is what must go;
+// keeping the first member's key start would strip the survivor's trailing
+// comma into a dangling ",". Min-start also absorbs a nested edit inside a
+// member its own removal already covers.
 func coalesceRemovals(edits []edit) []edit {
 	out := edits[:0]
 	for _, e := range edits {
@@ -226,6 +237,9 @@ func coalesceRemovals(edits []edit) []edit {
 		}
 		last := &out[len(out)-1]
 		if e.start <= last.end {
+			if e.start < last.start {
+				last.start = e.start
+			}
 			if e.end > last.end {
 				last.end = e.end
 			}

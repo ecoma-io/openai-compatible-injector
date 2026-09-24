@@ -53,7 +53,11 @@ var (
 // rewriting data-line payloads via the API-scoped rewriter the caller
 // supplies (the model rewrite composed with, when its plan is active, the
 // thinking-usage synthesis — the stream must obey its API's rewrite scope
-// exactly like the buffered path).
+// exactly like the buffered path). stripKeys widens the data-line acceptance
+// gate: the stripped keys' first segments, so a line carrying a to-be-excised
+// provider field without a "model"/"usage" key is still handed to the
+// rewriter. It is the inject package's StripPatterns output; nil or empty is
+// today's gate exactly, so an unconfigured deployment is byte-identical.
 // It never buffers the whole stream: lines are read one at a time under
 // hard caps (MaxLineBytes per line, MaxEventBytes per in-flight event),
 // each line is written out immediately, and flush is invoked at every event
@@ -66,7 +70,8 @@ var (
 // when the payload (bytes after "data:" plus one optional space) contains
 // `"model"` or `"usage"` — the two keys the caller's rewriter owns (the
 // model rewrite always; the usage synthesis when its per-request plan is
-// active). Payload validation and the rewrite itself are delegated to the
+// active) — or any of stripKeys (the strip rewriter's first-segment keys).
+// Payload validation and the rewrite itself are delegated to the
 // caller's rewriter, whose acceptance rule is identical to the buffered
 // response path — a deliberate parity: a stream and a buffered body with
 // the same JSON are rewritten identically. When the synthesis is inactive
@@ -83,7 +88,7 @@ var (
 // error is returned so the caller can truncate the stream. A failure
 // writing to dst is returned wrapped in *streamWriteError — the client side
 // went away — so the caller can log the two truncation causes apart.
-func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func()) (StreamStats, error) {
+func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func(), stripKeys [][]byte) (StreamStats, error) {
 	var stats StreamStats
 	br := bufio.NewReaderSize(src, sseReadBuffer)
 	// pending counts the bytes of the event in flight — every line since
@@ -110,7 +115,7 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 						ErrSSEEventTooLarge, pending, MaxEventBytes)
 				}
 			}
-			out := rewriteSSELine(line, rewrite)
+			out := rewriteSSELine(line, rewrite, stripKeys)
 			n, werr := dst.Write(out)
 			// Account exactly what dst accepted — on a failed or torn write
 			// the stats say how much of the stream actually went out. A
@@ -214,11 +219,12 @@ func isEventBoundary(line []byte) bool {
 }
 
 // rewriteSSELine applies the data-line rewrite rule to a single raw line,
-// terminator included. Anything that is not a data line carrying a model or
-// usage key is returned unchanged. The rewriter is the composed function the
-// caller chose; its no-op contract (input returned unchanged when nothing
-// is in scope) is what the pointer-identity shortcut below relies on.
-func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
+// terminator included. Anything that is not a data line carrying a model,
+// usage, or strip key is returned unchanged. The rewriter is the composed
+// function the caller chose; its no-op contract (input returned unchanged
+// when nothing is in scope) is what the pointer-identity shortcut below
+// relies on.
+func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte, stripKeys [][]byte) []byte {
 	content, term := splitSSELineTerminator(line)
 	rest, ok := bytes.CutPrefix(content, sseDataPrefix)
 	if !ok {
@@ -231,7 +237,7 @@ func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
 		sep = payload[:1]
 		payload = payload[1:]
 	}
-	if !bytes.Contains(payload, sseModelKey) && !bytes.Contains(payload, sseUsageKey) {
+	if !bytes.Contains(payload, sseModelKey) && !bytes.Contains(payload, sseUsageKey) && !mentionsAnyKey(payload, stripKeys) {
 		return line
 	}
 	out := rewrite(payload)
@@ -241,7 +247,7 @@ func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
 	// and rules out an aliasing coincidence (same pointer, different span)
 	// being mistaken for identity.
 	if len(out) == len(payload) && &out[0] == &payload[0] {
-		// Skip the rebuild for lines that merely mention "model".
+		// Skip the rebuild for lines that merely mention a gate key.
 		return line
 	}
 	// Capacity is never precomputed as a length sum: that arithmetic is the
@@ -253,6 +259,19 @@ func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte) []byte {
 	buf = append(buf, out...)
 	buf = append(buf, term...)
 	return buf
+}
+
+// mentionsAnyKey reports whether payload contains any of the strip
+// first-segment key bytes. A nil or empty list returns false immediately —
+// the length check keeps the unconfigured path to exactly today's two
+// Contains probes in rewriteSSELine.
+func mentionsAnyKey(payload []byte, keys [][]byte) bool {
+	for _, k := range keys {
+		if bytes.Contains(payload, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // splitSSELineTerminator splits a raw line into content and its "\n" or

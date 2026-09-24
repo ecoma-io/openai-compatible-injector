@@ -315,12 +315,12 @@ func TestSSEUsageGate(t *testing.T) {
 
 	line := []byte("data: {\"usage\":{\"completion_tokens\":100}}\n")
 
-	out := rewriteSSELine(line, compose(active))
+	out := rewriteSSELine(line, compose(active), nil)
 	if got, want := string(out), "data: {\"usage\":{\"completion_tokens_details\":{\"reasoning_tokens\":75},\"completion_tokens\":100}}\n"; got != want {
 		t.Fatalf("active gate:\n got %s\nwant %s", got, want)
 	}
 
-	out = rewriteSSELine(line, compose(inactive))
+	out = rewriteSSELine(line, compose(inactive), nil)
 	if string(out) != string(line) {
 		t.Fatalf("inactive gate must keep the line byte-identical:\n got %s\nwant %s", out, line)
 	}

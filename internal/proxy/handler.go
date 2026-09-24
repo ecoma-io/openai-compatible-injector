@@ -158,11 +158,11 @@ func (h *injectorHandler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "chat", inject.Chat, inject.RewriteChatModel, inject.SynthesizeChatThinkingUsage, "/chat/completions")
+	h.serve(w, r, "chat", inject.Chat, inject.RewriteChatModel, inject.SynthesizeChatThinkingUsage, inject.StripChatFields, "/chat/completions")
 }
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "responses", inject.Responses, inject.RewriteResponsesModel, inject.SynthesizeResponsesThinkingUsage, "/responses")
+	h.serve(w, r, "responses", inject.Responses, inject.RewriteResponsesModel, inject.SynthesizeResponsesThinkingUsage, inject.StripResponsesFields, "/responses")
 }
 
 // notFound is the catch-all for paths no route matched. The interpolated
@@ -194,6 +194,13 @@ type rewriteFunc func(body []byte, public string) []byte
 // with the same API-scope split and byte-preserving discipline as
 // rewriteFunc.
 type synthesizeFunc func(body []byte, plan inject.ThinkingPlan) []byte
+
+// stripFunc is the API-scoped response strip (StripChatFields or
+// StripResponsesFields): the third, likewise optional transform that excises
+// configured provider-added members after the rewrite and synthesis have
+// run. It takes the config-provided segment lists — never the raw paths —
+// so the request path never re-parses.
+type stripFunc func(body []byte, paths [][]string) []byte
 
 // thinkingDraw is the share draw the plan resolver consults for ranged
 // ratios — a package var so tests can pin the draw-once contract without
@@ -229,7 +236,7 @@ func thinkingModeName(mode config.ThinkingMode) string {
 // outcome, duration, byte counts, snapshot generation), and WARN-level
 // failures split by phase. Metadata only — bodies, prompts, payloads, and
 // Authorization never enter any log event at any level.
-func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, synthesize synthesizeFunc, suffix string) {
+func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, synthesize synthesizeFunc, strip stripFunc, suffix string) {
 	start := time.Now()
 	if r.Method != http.MethodPost {
 		// Outside the request lifecycle: no snapshot is loaded and no
@@ -581,14 +588,31 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 				Msg("thinking_usage_resolved")
 		}
 	}
+	// The strip list binds to the request like everything else on the
+	// snapshot: the model's own list when it states one — forced onto every
+	// candidate at load — else the relayed candidate's provider list, which
+	// the candidate view below writes into m.Strip per candidate. The SSE
+	// gate's first-segment byte patterns derive from m.Strip the same way:
+	// initialized here from the model's own list (often nil), then refreshed
+	// in the candidate view whenever the walk swaps in a provider's list, so
+	// the stream finalizes on exactly the relayed candidate's patterns —
+	// never a pre-walk nil for a model whose providers strip. The relay reads
+	// them once, at the CopySSE call after the walk's outcome is known.
+	stripKeys := inject.StripPatterns(stripSegments(m.Strip))
 	// rewriteOut is the single response rewriter both response paths share —
 	// parity by construction: the model rewrite, then, when the plan is
-	// active, the usage synthesis. Under an inactive plan it is exactly
-	// today's model-rewrite closure, byte for byte.
+	// active, the usage synthesis, and finally the strip. The order is
+	// deliberate: rewrite and synthesis OWN model and usage, whose keys are
+	// reserved in the strip list, so the strip runs on the bytes that will
+	// actually be relayed. Under an inactive plan and an empty strip list it
+	// is exactly today's model-rewrite closure, byte for byte.
 	rewriteOut := func(payload []byte) []byte {
 		out := rewrite(payload, m.Public)
 		if plan.Active {
 			out = synthesize(out, plan)
+		}
+		if len(m.Strip) > 0 {
+			out = strip(out, stripSegments(m.Strip))
 		}
 		return out
 	}
@@ -784,11 +808,21 @@ walk:
 		// The candidate view: same public model, same injection prompt,
 		// same thinking plan — only the upstream identity changes. m is a
 		// per-request value copy (Snapshot.Model returns a value), so
-		// mutating it cannot touch the snapshot.
+		// mutating it cannot touch the snapshot. Strip is overwritten per
+		// candidate too: when the model states no model-level list, each hop
+		// answers under its own provider's list, and the rewrite reads the
+		// candidate in scope. A model-level list was already forced onto every
+		// candidate at load, so this assignment only ever narrows to the
+		// candidate's own when the model had nothing to say.
 		m.Provider = cand.Provider
 		m.Endpoint = cand.Endpoint
 		m.UpstreamModel = cand.UpstreamModel
 		m.Transport = cand.Transport
+		m.Strip = cand.Strip
+		// The SSE gate follows the same swap: the stream's strip patterns
+		// are re-derived from the candidate in scope so this hop's provider
+		// list — present when the model states none — gates its own chunks.
+		stripKeys = inject.StripPatterns(stripSegments(m.Strip))
 
 		attempt := 0
 		for {
@@ -1766,7 +1800,7 @@ walk:
 					Msg("stream_event_progress")
 			}
 			afterEvent()
-		})
+		}, stripKeys)
 		var pings int
 		if heartbeat != nil {
 			heartbeat.stopAndWait()
@@ -1842,6 +1876,18 @@ walk:
 	}
 	log.Debug().Int64("bytes_out", sw.bytes).Msg("client_write_completed")
 	complete()
+}
+
+// stripSegments flattens a configured strip list into the segment-list shape
+// the inject engine walks, without re-parsing: each StripPath already carries
+// its decoded segments. A nil or empty list has no segments and is handled
+// before this is ever called.
+func stripSegments(strips []config.StripPath) [][]string {
+	out := make([][]string, 0, len(strips))
+	for _, s := range strips {
+		out = append(out, s.Segments)
+	}
+	return out
 }
 
 // walkAction folds a decided action against the chain it will be executed
