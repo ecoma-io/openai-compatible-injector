@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.10.0...v0.11.0) (2026-09-24)
+
+
+### Features
+
+* **config,proxy:** strip configured JSON paths from upstream responses ([#63](https://github.com/ecoma-io/openai-compatible-injector/issues/63)) ([8fd3f40](https://github.com/ecoma-io/openai-compatible-injector/commit/8fd3f401867685fe8184d16b202c10f20a5278a5))
+
 ## [0.10.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.9.0...v0.10.0) (2026-09-23)
 
 
