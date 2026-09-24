@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
 )
@@ -103,6 +104,14 @@ type Candidate struct {
 	// model-level list replaces the provider list — see Model.Strip). Nil or
 	// empty means no stripping for answers from this candidate.
 	Strip []StripPath
+	// Cred is the candidate's upstream credential pool configuration — the
+	// provider's auth block, spec plus cooldown policy — or nil when the
+	// provider states no auth block and requests carry no injected
+	// credential. It is configuration, not state: which key the next
+	// attempt carries is decided per attempt through the credential
+	// registry keyed by Spec content. Nil keeps every request byte exactly
+	// as it was before credentials existed.
+	Cred *credential.Provider
 }
 
 // Label is the candidate's observability identity: the providers-table
@@ -183,8 +192,13 @@ type Snapshot struct {
 	// not just the primaries': a request that falls back must find its
 	// candidate's clients warm.
 	transports []transport.Config
-	logLevel   zerolog.Level
-	keepAlive  SSEKeepAlive
+	// credentials is the distinct set of upstream credential providers the
+	// models reference — the retain set the credential registry reconciles
+	// to on publish, deduplicated by spec content so two candidates sharing
+	// one provider's accounts share one pool and one rotation cursor.
+	credentials []*credential.Provider
+	logLevel    zerolog.Level
+	keepAlive   SSEKeepAlive
 }
 
 // Gen returns the snapshot's generation number (0 for the initial snapshot,
@@ -214,6 +228,17 @@ func (s *Snapshot) SSEKeepAlive() SSEKeepAlive { return s.keepAlive }
 // copy — the snapshot stays immutable.
 func (s *Snapshot) Transports() []transport.Config {
 	return append([]transport.Config(nil), s.transports...)
+}
+
+// Credentials returns the distinct upstream credential providers this
+// snapshot's models reference. The credential registry retains exactly
+// these on publish; a provider absent from the new snapshot has its pool
+// dropped while in-flight requests holding the old pool finish untouched —
+// a pool is pure state with nothing to close, so eviction is a map delete
+// and no deferred teardown. The slice is a copy — the snapshot stays
+// immutable.
+func (s *Snapshot) Credentials() []*credential.Provider {
+	return append([]*credential.Provider(nil), s.credentials...)
 }
 
 // Model resolves a public model name. The second return value reports

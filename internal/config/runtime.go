@@ -16,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
 )
@@ -160,6 +161,10 @@ type runtimeProvider struct {
 	BaseURL   string           `yaml:"base-url"`
 	Transport string           `yaml:"transport"`
 	Recovery  *runtimeRecovery `yaml:"recovery"`
+	// Auth is the optional upstream credential block. Present means every
+	// request routed through this provider carries a pool-managed API key;
+	// absent means the request's credential surface is untouched.
+	Auth *runtimeAuth `yaml:"auth"`
 	// StripFields is the optional list of response paths excised from any
 	// answer routed through this provider before it is relayed. A model
 	// referencing this provider inherits the list unless the model states its
@@ -537,12 +542,35 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		}
 	}
 
+	// The credential retain set: the distinct upstream credential providers
+	// the models reference, in first-use order over sorted model names,
+	// deduplicated by spec content key (not pointer). Two candidates whose
+	// providers configure byte-identical credentials share one pool — they
+	// are the same upstream accounts, so they share one rotation cursor and
+	// one cooldown state.
+	credentialSeen := make(map[string]struct{}, 1)
+	credentialSet := make([]*credential.Provider, 0, 1)
+	for _, name := range names {
+		for _, cand := range models[name].Chain {
+			if cand.Cred == nil {
+				continue
+			}
+			k := cand.Cred.ContentKey()
+			if _, dup := credentialSeen[k]; dup {
+				continue
+			}
+			credentialSeen[k] = struct{}{}
+			credentialSet = append(credentialSet, cand.Cred)
+		}
+	}
+
 	return &Snapshot{
-		models:     models,
-		apiKey:     key,
-		logLevel:   level,
-		keepAlive:  keepAlive,
-		transports: transportSet,
+		models:      models,
+		apiKey:      key,
+		logLevel:    level,
+		keepAlive:   keepAlive,
+		transports:  transportSet,
+		credentials: credentialSet,
 	}, nil
 }
 
@@ -860,6 +888,12 @@ type providerEntry struct {
 	// inherited by every model that references this provider without stating
 	// its own.
 	strip []StripPath
+	// cred is the provider's upstream credential pool configuration (spec
+	// plus cooldown policy), nil when the entry states no auth block. It is
+	// validated here — like every other providers-table field, including
+	// for an unreferenced entry — so a broken key list can never wait for a
+	// model to reference it.
+	cred *credential.Provider
 }
 
 // buildProviders validates the optional providers table against the
@@ -919,7 +953,11 @@ func buildProviders(rp map[string]runtimeProvider, transports map[string]transpo
 		if err != nil {
 			return nil, fmt.Errorf("provider entry %d: %w", ordinal, err)
 		}
-		out[name] = providerEntry{endpoint: u, transport: tc, recovery: rp, strip: strip}
+		cred, err := buildAuth(entry.Auth, ordinal)
+		if err != nil {
+			return nil, err
+		}
+		out[name] = providerEntry{endpoint: u, transport: tc, recovery: rp, strip: strip, cred: cred}
 	}
 	return out, nil
 }
@@ -1106,6 +1144,7 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 			Provider:  providerRef,
 			Endpoint:  p.endpoint,
 			Transport: p.transport,
+			Cred:      p.cred,
 		}}
 	case endpointSet:
 		u, err := parseOperatorURL("endpoint", rm.Endpoint)
@@ -1251,6 +1290,7 @@ func buildChain(cands []runtimeModelCandidate, providers map[string]providerEntr
 			Endpoint:      p.endpoint,
 			UpstreamModel: strings.TrimSpace(c.UpstreamModel),
 			Transport:     p.transport,
+			Cred:          p.cred,
 		})
 	}
 	return chain, nil
