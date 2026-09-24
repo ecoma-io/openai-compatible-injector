@@ -255,8 +255,11 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   The traversal is object-only (a path never descends through an array), the
   scope follows the API (chat: top-level object; responses: top-level plus one
   `response`-object descent), and stripping is byte-preserving — everything
-  outside an excised member is untouched. The reserved keys `model` and
-  `usage` are rejected at any depth (the proxy itself writes those). An absent
+  outside an excised member is untouched. The paths the proxy itself writes —
+  `model`, `usage`, and the two synthesized reasoning-count leaves, each
+  reserved in its bare and its `response.`-prefixed spelling — are rejected
+  at load, while provider-added members inside those objects (`usage.is_byok`,
+  `usage.cost`) stay addressable. An absent
   or null list means no stripping — responses stay byte-identical. A model
   that states a list replaces its provider's list; a model without one
   inherits each candidate's provider list per hop.
@@ -1347,13 +1350,41 @@ same list works across both surfaces:
   provider-added fields), with the full path list reapplied inside the
   descent — the single-descent rule.
 
-**The reserved keys.** `model` and `usage` are rejected in a strip list at
-any depth: the proxy itself writes those — the model rename in every path,
-the thinking-usage synthesis when its plan is active, the usage meter that
-reads pre-rewrite bytes — and a list that could strip them would carve a
-hole in data the service owns. The strip runs **last** in the composed
-rewriter (rename → synthesis → strip), precisely so those owned keys are
-untouchable by configuration.
+**The reserved paths.** The members the proxy itself writes into a relayed
+response are rejected in a strip list — but as an enumerated set of **exact
+paths**, not as forbidden segment names. That distinction is the whole point:
+`usage` is reserved, while `usage.is_byok`, `usage.cost` and
+`usage.cost_details.upstream_inference_cost` are not, so a provider's
+billing metadata inside the usage object stays reachable.
+
+| Reserved path                                      | Written by                                 |
+| -------------------------------------------------- | ------------------------------------------ |
+| `model`, `response.model`                          | the model rename                           |
+| `usage`, `response.usage`                          | the usage object the synthesis writes into |
+| `usage.completion_tokens_details.reasoning_tokens` | Chat thinking-usage synthesis              |
+| `usage.output_tokens_details.reasoning_tokens`     | Responses thinking-usage synthesis         |
+
+Each of those four members is reserved in **two spellings**, and both are
+needed. The Responses strip descends once into a top-level `response` object
+and reapplies the whole list there, so a bare `model` reaches the envelope's
+renamed model; and because the scan walks object keys, `response.model`
+reaches that same member from the top level with no descent involved at all.
+One list is interpreted under whichever API a request arrives on, so the rule
+is the union of the two — a path that is harmless on one surface can reach
+proxy-owned bytes on the other. `response` is reserved at one level only:
+the descent happens exactly once, so `response.response.model` is accepted.
+
+Listing a synthesis leaf's _parent_ (`usage.completion_tokens_details`) is
+allowed, and does what it says: it excises the synthesized count along with
+the provider's own `audio_tokens` / `image_tokens` siblings. The direct leaf
+is reserved so that outcome is never reached by accident, and the blast
+radius stays bounded by `thinking-usage` being opt-in per model.
+
+The strip runs **last** in the composed rewriter (rename → synthesis →
+strip), precisely so those owned members are untouchable by configuration.
+The usage **meter** is deliberately not part of this argument: it reads
+pre-rewrite bytes, so excising anything under `usage` cannot change what is
+attributed.
 
 **Streaming parity.** The same composed rewriter serves both relay paths.
 The SSE data-line gate, which admits a line only when its payload carries

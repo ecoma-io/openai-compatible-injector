@@ -300,9 +300,12 @@ models:
     # fields the client did not ask for (Kilo always returns `provider` and
     # `service_tier`); stripping removes them byte-preservingly. The scope
     # follows the API (chat: top-level; responses: top-level plus one
-    # response-object descent), the traversal is object-only (never through
-    # arrays), and the reserved keys `model` and `usage` are rejected because
-    # the proxy itself writes those. Absent or null (like the other models
+    # response-object descent), and the traversal is object-only (never
+    # through arrays). The paths the proxy itself writes (`model`, `usage`,
+    # and the two synthesized reasoning-count leaves, each in its bare and
+    # its `response.`-prefixed spelling) are rejected; provider-added members
+    # inside those objects, such as `usage.is_byok` or `usage.cost`, are not.
+    # Absent or null (like the other models
     # below) means no stripping — responses stay byte-identical. A model
     # that states a list replaces its provider's list; a model without one
     # inherits its provider's list per hop.

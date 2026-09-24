@@ -217,3 +217,107 @@ func TestStripFieldsReloadBinding(t *testing.T) {
 		t.Fatalf("post-reload provider survived: %s", body)
 	}
 }
+
+// TestStripFieldsUsageChildren pins the narrow reserved rule end to end on
+// the motivating case: the provider's billing metadata INSIDE the usage
+// object is addressable ("usage.is_byok", "usage.cost", "usage.cost_details")
+// while the token counts beside it, and the reasoning count the synthesis
+// writes among them, survive. Before the exact-path rule those children were
+// unreachable by configuration — a segment-level "usage" ban rejected the
+// whole list — so this is issue #65's motivating case.
+func TestStripFieldsUsageChildren(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"c1","model":"upstream-chat",`+
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}],`+
+			`"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110,`+
+			`"cost":0,"is_byok":false,"cost_details":{"upstream_inference_cost":0}}}`)
+	})
+	p := startSubprocess(t, startOpts{
+		yaml: runtimeYAML("strip-public", up.url()+"/v1", "upstream-chat", "",
+			"strip-fields:",
+			"  - usage.is_byok",
+			"  - usage.cost",
+			"  - usage.cost_details",
+			"thinking-usage:",
+			"  mode: always",
+		),
+	})
+
+	status, _, body := postJSON(t, p.addr, "/v1/chat/completions",
+		`{"model":"strip-public","messages":[]}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("status %d, want 200", status)
+	}
+	var parsed struct {
+		Usage map[string]json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("unmarshal %s: %v", body, err)
+	}
+	if parsed.Usage == nil {
+		t.Fatalf("usage object lost entirely: %s", body)
+	}
+	for _, gone := range []string{"is_byok", "cost", "cost_details"} {
+		if _, ok := parsed.Usage[gone]; ok {
+			t.Errorf("usage.%s survived stripping: %s", gone, body)
+		}
+	}
+	for _, kept := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
+		if _, ok := parsed.Usage[kept]; !ok {
+			t.Errorf("usage.%s was stripped, want it kept: %s", kept, body)
+		}
+	}
+	// The synthesis runs BEFORE the strip and its leaf is reserved, so the
+	// sibling excisions must not have touched it.
+	raw, ok := parsed.Usage["completion_tokens_details"]
+	if !ok {
+		t.Fatalf("synthesized usage.completion_tokens_details lost: %s", body)
+	}
+	var details struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	}
+	if err := json.Unmarshal(raw, &details); err != nil || details.ReasoningTokens != 75 {
+		t.Fatalf("synthesized reasoning_tokens = %+v (%v), want 75", details, err)
+	}
+}
+
+// TestStripFieldsUsageChildrenResponses pins the same rule inside the
+// envelope: one "usage.is_byok" entry reaches the usage object nested in a
+// top-level "response" through the single descent, while the token counts in
+// that same object survive.
+func TestStripFieldsUsageChildrenResponses(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"response.completed","response":{"id":"r",`+
+			`"model":"upstream-chat","usage":{"input_tokens":5,"output_tokens":20,"is_byok":false}},`+
+			`"sequence_number":1}`)
+	})
+	p := startSubprocess(t, startOpts{
+		yaml: stripYAML("strip-public", up.url()+"/v1", "upstream-chat", "usage.is_byok"),
+	})
+
+	status, _, body := postJSON(t, p.addr, "/v1/responses",
+		`{"model":"strip-public","input":""}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("status %d, want 200", status)
+	}
+	var parsed struct {
+		Response struct {
+			Usage map[string]json.RawMessage `json:"usage"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("unmarshal %s: %v", body, err)
+	}
+	if _, ok := parsed.Response.Usage["is_byok"]; ok {
+		t.Fatalf("response.usage.is_byok survived stripping: %s", body)
+	}
+	for _, kept := range []string{"input_tokens", "output_tokens"} {
+		if _, ok := parsed.Response.Usage[kept]; !ok {
+			t.Errorf("response.usage.%s was stripped, want it kept: %s", kept, body)
+		}
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1366,11 +1367,10 @@ func buildStripFields(raw []string) ([]StripPath, error) {
 // with the JSON unquoting rules (`'a”b'` → `a'b`). Unquoted segments split
 // on the dot. Every message is fixed text and never echoes the path.
 //
-// The reserved keys model and usage are rejected outright: stripping either
-// would delete data the proxy itself applies (the model rename here, and
-// the thinking-usage synthesis and metering), silently changing what a
-// client sees or what usage is attributed. A segment that contains a double
-// quote is rejected — it can never appear in the canonical key bytes the
+// A path naming a member the proxy itself writes is rejected — see
+// reservedStripPaths for that closed set and why it is enumerated rather
+// than derived from a segment name. A segment that contains a double quote
+// is rejected — it can never appear in the canonical key bytes the
 // byte-preserving scan matches, so it is dead config.
 func ParseStripPath(s string) ([]string, error) {
 	var segments []string
@@ -1445,11 +1445,17 @@ func ParseStripPath(s string) ([]string, error) {
 	if len(segments) > maxStripDepth {
 		return nil, errors.New("strip-fields: path descends too deep (maximum 8 segments)")
 	}
+	if err := rejectReservedStripPath(segments); err != nil {
+		return nil, err
+	}
 	return segments, nil
 }
 
 // validateStripSegment rejects a segment that could never match the
-// byte-level key scan or that would strip proxy-applied data.
+// byte-level key scan. Whether the path as a WHOLE is reserved is a
+// separate, path-level check (rejectReservedStripPath): the reserved set is
+// a list of exact paths, so a segment named "usage" is legal in every
+// position except the ones the proxy writes.
 func validateStripSegment(seg string) error {
 	if seg == "" {
 		return errors.New("strip-fields: path must not contain an empty segment")
@@ -1457,11 +1463,106 @@ func validateStripSegment(seg string) error {
 	if strings.ContainsRune(seg, '"') {
 		return errors.New("strip-fields: segment must not contain a double quote")
 	}
-	switch seg {
-	case "model":
-		return errors.New(`strip-fields: must not include "model"`)
-	case "usage":
-		return errors.New(`strip-fields: must not include "usage"`)
+	return nil
+}
+
+// reservedStripPaths is the CLOSED set of object-key paths a strip list may
+// not name, because the proxy itself writes them into the response it
+// relays. Excising one would delete data the service owns and silently
+// change what a client sees, so each is rejected at load.
+//
+// Three writers produce them, and every entry below is one of theirs:
+//
+//   - RewriteChatModel / RewriteResponsesModel — the model rename, at the
+//     top-level "model" and, in the Responses scope, at "response.model".
+//   - SynthesizeChatThinkingUsage — the synthesized reasoning count at
+//     "usage.completion_tokens_details.reasoning_tokens" on the top-level
+//     usage object (the Chat scope descends nowhere).
+//   - SynthesizeResponsesThinkingUsage — the same count under
+//     "output_tokens_details", written to BOTH the top-level usage object
+//     and the usage object inside the "response" envelope.
+//
+// The rule is deliberately an enumerated set of exact paths, not "reject
+// this segment wherever it appears". A segment-level rule cannot express
+// the distinction that matters: the proxy writes "usage" itself but not
+// "usage.cost", "usage.is_byok", or "usage.cost_details", which are exactly
+// the provider-added members strip-fields exists to remove.
+//
+// The set is FOUR proxy-owned members in TWO spellings each — bare, and
+// prefixed with "response" — and both spellings are needed because the same
+// in-scope member is reachable two ways:
+//
+//   - The Responses strip descends once into a top-level "response" object
+//     and reapplies the WHOLE list from its first segment there. So a bare
+//     "model" also reaches the envelope's renamed model, and a bare
+//     synthesis leaf reaches the envelope's usage object the same way.
+//   - The scan walks object keys, so a path may itself spell the descent:
+//     "response.model" resolves at the TOP level, straight into the
+//     envelope's member, with no descent rule involved.
+//
+// The second spelling is the one an enumeration written from the writers'
+// locations alone misses — the writers never name it, yet it lands on the
+// same bytes — so it is listed even where no single route reaches it
+// ("response.usage.completion_tokens_details.reasoning_tokens" needs a route
+// that both descends and uses the Chat shape, and none does). Uniformity
+// across the four members is the point: a set an operator and a future
+// writer can both reason about, rather than one whose gaps depend on which
+// API a model happens to be served on.
+//
+// The "response" prefix is reserved at ONE level only: the descent happens
+// exactly once, so "response.response.model" reaches nothing the proxy
+// writes and is allowed — the same single-descent rule the strip itself
+// applies.
+//
+// The whole "usage" OBJECT is reserved, but its children are not: the
+// meter reads pre-rewrite bytes, so excising "usage.cost" cannot change
+// what is attributed, and a client that asked for that stripping gets
+// exactly it. Listing a synthesis leaf's PARENT
+// ("usage.completion_tokens_details") is allowed too — it excises the
+// synthesized count along with the provider's own siblings, which is a
+// coherent reading of one path. The direct leaf is reserved so that outcome
+// is never reached by accident, and the blast radius stays bounded by
+// thinking-usage being opt-in per model.
+//
+// Adding a writer means adding its paths here. The guard against forgetting
+// is internal/inject's TestReservedStripPathsCoverProxyWrites, which drives
+// each entry against the real writers and fails if one stops reaching
+// proxy-written bytes.
+var reservedStripPaths = [][]string{
+	{"model"},
+	{"usage"},
+	{"response", "model"},
+	{"response", "usage"},
+	{"usage", "completion_tokens_details", "reasoning_tokens"},
+	{"usage", "output_tokens_details", "reasoning_tokens"},
+	{"response", "usage", "completion_tokens_details", "reasoning_tokens"},
+	{"response", "usage", "output_tokens_details", "reasoning_tokens"},
+}
+
+// ReservedStripPaths returns the reserved set, one path per entry, as a copy
+// the caller may keep. It exists so the coverage guard in internal/inject can
+// drive every entry against the real response writers: an entry is only
+// correct while it still names bytes the proxy writes, and a writer that
+// moves leaves the entry sounding like protection while protecting nothing.
+// That guard is why this is exported at all — validation itself needs no
+// caller.
+func ReservedStripPaths() [][]string {
+	out := make([][]string, 0, len(reservedStripPaths))
+	for _, p := range reservedStripPaths {
+		out = append(out, slices.Clone(p))
+	}
+	return out
+}
+
+// rejectReservedStripPath reports whether an already-parsed path names a
+// member the proxy writes. The rejection text is rendered from the table
+// entry itself, so it names the reserved member without ever echoing
+// operator input — error text reaches logs verbatim.
+func rejectReservedStripPath(segments []string) error {
+	for _, reserved := range reservedStripPaths {
+		if slices.Equal(segments, reserved) {
+			return fmt.Errorf("strip-fields: must not include %q", strings.Join(reserved, "."))
+		}
 	}
 	return nil
 }
