@@ -56,6 +56,16 @@ type SSEKeepAlive struct {
 	Interval time.Duration
 }
 
+// StripPath is one parsed response-strip path: the ordered object-key
+// segments a path descends, e.g. `usage.cache_read_input_tokens` → two
+// segments. Dotted source segments were written through single-quote JSON
+// quoting at config load, so segments arrive here already decoded (a `.`
+// inside a quoted segment is literal). The traversal is object-only: a
+// segment never descends through an array.
+type StripPath struct {
+	Segments []string
+}
+
 // Candidate is one provider hop in a model's routing chain: where the
 // request goes, under what upstream model name, over which outbound path,
 // and under which recovery policy. Chains are built immutable at config
@@ -88,6 +98,11 @@ type Candidate struct {
 	// candidates sharing a hash ran under the same rules and budgets, which
 	// is exactly what the evidence needs to say.
 	RecoveryHash string
+	// Strip is the response-strip list this candidate executes under. It is
+	// the candidate's provider's list, unless the model overrides it (a
+	// model-level list replaces the provider list — see Model.Strip). Nil or
+	// empty means no stripping for answers from this candidate.
+	Strip []StripPath
 }
 
 // Label is the candidate's observability identity: the providers-table
@@ -126,6 +141,12 @@ type Model struct {
 	// ThinkingUsage is the validated simulated thinking-usage synthesis
 	// config. The zero value means the feature is off for this model.
 	ThinkingUsage ThinkingUsage
+	// Strip is the model's response-strip list. When the model states its
+	// own strip-fields, this is that list, applied uniformly to every
+	// candidate's answer (model overrides provider). When it does not, this
+	// is nil and each candidate carries its provider's list (Candidate.Strip)
+	// — the handler reads per-hop. Nil or empty means no stripping.
+	Strip []StripPath
 	// Recovery is the model's primary-candidate recovery policy: the
 	// effective policy the handler builds its engine from without reaching
 	// into the chain. It always mirrors Chain[0].Recovery.

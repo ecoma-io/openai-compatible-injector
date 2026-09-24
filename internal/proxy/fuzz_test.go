@@ -80,8 +80,8 @@ func FuzzRewriteSSELine(f *testing.F) {
 	f.Fuzz(func(t *testing.T, line []byte) {
 		// Inactive plan: the composed rewriter degenerates to the model
 		// rewrite, byte for byte, whatever the line.
-		inactiveOut := rewriteSSELine(line, sseRewriter(public))
-		got := rewriteSSELine(line, composed)
+		inactiveOut := rewriteSSELine(line, sseRewriter(public), nil)
+		got := rewriteSSELine(line, composed, nil)
 
 		content, term := splitSSELineTerminator(line)
 		rest, isData := bytes.CutPrefix(content, sseDataPrefix)
@@ -140,4 +140,80 @@ func checkCandidate(t *testing.T, name string, line, got, term []byte) {
 	if !json.Valid(outPayload) {
 		t.Fatalf("%s: rewrite broke payload JSON validity:\n in  %q\n out %q", name, line, got)
 	}
+}
+
+// FuzzStripSSELine pins the strip rewriter's line invariants against
+// arbitrary line bytes: it never panics; a line that is not a data line, or
+// that mentions neither a "model"/"usage" key nor any strip first-segment
+// key, comes back byte-identical (nil stripKeys included); and any rebuilt
+// line keeps its framing and a valid-JSON payload. The rewriter under test
+// is the composed handler closure with the strip last, so model-rewrite and
+// strip share one line pass.
+func FuzzStripSSELine(f *testing.F) {
+	seeds := []string{
+		``,                                   // empty line
+		"\n",                                 // blank event boundary
+		"data:",                              // data prefix, no payload
+		"data: [DONE]\n",                     // terminator passthrough
+		"data: hello world\n",                // non-JSON payload
+		"data: {truncated\n",                 // truncated JSON payload
+		"data: {\"service_tier\":\"std\"}\n", // the strip-only gate
+		"data: {\"provider\":\"kilo\"}\n",    // the strip-only gate, another key
+		"data: {\"service_tier\":\"std\",\"choices\":[]}\n",         // strip + no model key
+		"data: {\"model\":\"x\",\"provider\":\"kilo\"}\n",           // model and strip together
+		"data: {\"a.b\":{\"c\":1},\"service_tier\":\"s\"}\n",        // quoted-dot key
+		"data: {\"response\":{\"service_tier\":\"std\"}}\n",         // responses descent with strip
+		"data: \"the \\\"service_tier\\\" key\"\n",                  // strip key inside a string value
+		"data: {\"content\":\"the service_tier said\"}\n",           // unquoted text decoy
+		"data: {\"model\":\"" + strings.Repeat("x", 8192) + "\"}\n", // huge string value
+	}
+	for _, s := range seeds {
+		f.Add([]byte(s))
+	}
+	rawSeeds := [][]byte{
+		[]byte("data: {\"service_tier\":\xff}\n"),
+		[]byte("data: {\"provider\":\"a\xffb\"}\n"),
+		[]byte("data\xff: {\"model\":\"x\"}\n"),
+		[]byte("data: \xff\n"),
+		[]byte("data: {\"provider\":\"x\"}\r"),
+	}
+	for _, b := range rawSeeds {
+		f.Add(b)
+	}
+
+	const public = "public-name"
+	stripKeys := []byte(`"service_tier"`)
+	composed := func(p []byte) []byte {
+		out := inject.RewriteChatModel(p, public)
+		return inject.StripChatFields(out, [][]string{{"service_tier"}})
+	}
+	f.Fuzz(func(t *testing.T, line []byte) {
+		got := rewriteSSELine(line, composed, [][]byte{stripKeys})
+
+		content, term := splitSSELineTerminator(line)
+		rest, isData := bytes.CutPrefix(content, sseDataPrefix)
+		if !isData {
+			if !bytes.Equal(got, line) {
+				t.Fatalf("non-data line mutated:\n in  %q\n out %q", line, got)
+			}
+			return
+		}
+		payload := rest
+		if len(payload) > 0 && payload[0] == ' ' {
+			payload = payload[1:]
+		}
+		if !bytes.Contains(payload, sseModelKey) && !bytes.Contains(payload, sseUsageKey) && !bytes.Contains(payload, stripKeys) {
+			if !bytes.Equal(got, line) {
+				t.Fatalf("data line without a \"model\", \"usage\", or strip key mutated:\n in  %q\n out %q", line, got)
+			}
+			return
+		}
+		if !json.Valid(payload) {
+			if !bytes.Equal(got, line) {
+				t.Fatalf("data line with an invalid-JSON payload mutated:\n in  %q\n out %q", line, got)
+			}
+			return
+		}
+		checkCandidate(t, "strip", line, got, term)
+	})
 }

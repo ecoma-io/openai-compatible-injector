@@ -160,6 +160,12 @@ func TestModelEntryErrorsLocateByOrdinalNeverByName(t *testing.T) {
 			yaml: "models:\n  \" " + nameMarker + "\":\n    endpoint: https://h/v1\n    upstream-model: m\n  " + nameMarker + ":\n    endpoint: https://h/v1\n    upstream-model: m\n",
 		},
 		{
+			// A strip-fields rejection names the entry by ordinal, never the
+			// configured path (a paste position that can carry anything).
+			name: "duplicate strip path with marker",
+			yaml: "models:\n  " + nameMarker + ":\n    endpoint: https://h/v1\n    upstream-model: m\n    strip-fields: [" + nameMarker + ", " + nameMarker + "]\n",
+		},
+		{
 			name: "whitespace-only name",
 			yaml: "models:\n  \"  \":\n    endpoint: https://h/v1\n    upstream-model: m\n",
 		},

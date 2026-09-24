@@ -293,6 +293,22 @@ models:
   echo-model:
     endpoint: https://api.provider.example/v1
     upstream-model: gpt-4o-mini
+    # Optional. Response field stripping: each entry is a dotted JSON path
+    # (with single-quoted segments for keys containing dots, spaces, or
+    # quotes) excised from this model's upstream 2xx responses before relay —
+    # buffered and streamed alike. Some providers decorate every answer with
+    # fields the client did not ask for (Kilo always returns `provider` and
+    # `service_tier`); stripping removes them byte-preservingly. The scope
+    # follows the API (chat: top-level; responses: top-level plus one
+    # response-object descent), the traversal is object-only (never through
+    # arrays), and the reserved keys `model` and `usage` are rejected because
+    # the proxy itself writes those. Absent or null (like the other models
+    # below) means no stripping — responses stay byte-identical. A model
+    # that states a list replaces its provider's list; a model without one
+    # inherits its provider's list per hop.
+    strip-fields:
+      - provider
+      - service_tier
 
   # A chain example: an ordered provider candidate list. The first entry
   # is the primary route; later entries are fallbacks reached when an

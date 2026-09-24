@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -476,5 +477,175 @@ func TestLoadRuntimeDocumentEdges(t *testing.T) {
 				t.Fatalf("accepted = %v (err %v), want accepted = %v", got, err, tt.want)
 			}
 		})
+	}
+}
+
+// TestParseStripPath pins the dotted-path grammar: unquoted segments split on
+// the dot, single-quoted segments carry literal dots and spaces and are
+// decoded under the JSON unquoting rules, and every malformed spelling is
+// rejected with fixed text (never echoing the path).
+func TestParseStripPath(t *testing.T) {
+	ok := []struct {
+		path string
+		want []string
+	}{
+		{"provider", []string{"provider"}},
+		{"service_tier", []string{"service_tier"}},
+		{"a.b", []string{"a", "b"}},
+		{"a.b.c.d", []string{"a", "b", "c", "d"}},
+		{"'parent name'.child", []string{"parent name", "child"}},
+		{"'A'.B", []string{"A", "B"}},
+		{"'a.b'.c", []string{"a.b", "c"}},
+		{"'a''b'.c", []string{"a'b", "c"}},
+		{"'single'.'quo ted'", []string{"single", "quo ted"}},
+	}
+	for _, tc := range ok {
+		got, err := ParseStripPath(tc.path)
+		if err != nil {
+			t.Errorf("ParseStripPath(%q): %v", tc.path, err)
+			continue
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("ParseStripPath(%q) = %v, want %v", tc.path, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("ParseStripPath(%q) = %v, want %v", tc.path, got, tc.want)
+				break
+			}
+		}
+	}
+	for _, path := range []string{
+		"",                              // empty
+		".a",                            // leading empty segment
+		"a.",                            // trailing empty segment
+		"a..b",                          // consecutive dots
+		"a.'b",                          // unterminated quote
+		"'a.b",                          // unterminated quote (at start)
+		"a.b'",                          // stray quote in unquoted segment
+		"a' b.c",                        // quote followed by space
+		"a.'b'.c'",                      // unterminated final quote
+		"'a''b",                         // escaped quote then unterminated
+		"usage.cache_read_input_tokens", // reserved usage segment
+		"a.model",                       // reserved model segment
+		"'b.c'.d.'e'.f.g.h.i.j.k",       // too deep
+	} {
+		if _, err := ParseStripPath(path); err == nil {
+			t.Errorf("ParseStripPath(%q) accepted, want rejection", path)
+		}
+	}
+}
+
+// TestLoadRuntimeStripFieldsValidation pins the rejections: an explicit empty
+// list, empty or unresolvable segments, duplicates, and the reserved keys
+// model and usage — all with fixed text that never echoes the offending path.
+func TestLoadRuntimeStripFieldsValidation(t *testing.T) {
+	entry := func(block string) string {
+		return "api-key: unit-test-key\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n    " + block
+	}
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"empty list", entry("strip-fields: []\n"), "requires at least one path"},
+		{"empty path", entry("strip-fields: [\"  \"]\n"), "path must not be empty"},
+		{"empty segment", entry("strip-fields: [a..b]\n"), "empty segment"},
+		{"stray quote", entry("strip-fields: [\"a'b.c\"]\n"), "quoted before the first quote character"},
+		{"duplicate", entry("strip-fields: [a.b, a.b]\n"), "duplicate path"},
+		{"duplicate after trim", entry("strip-fields: [\" a \", a]\n"), "duplicate path"},
+		{"reserved model", entry("strip-fields: [model]\n"), `must not include "model"`},
+		{"reserved nested model", entry("strip-fields: [a.model]\n"), `must not include "model"`},
+		{"reserved usage", entry("strip-fields: [usage]\n"), `must not include "usage"`},
+		{"reserved nested usage", entry("strip-fields: [a.usage]\n"), `must not include "usage"`},
+		{"double quote in segment", entry("strip-fields: [\"a\\\"b\"]\n"), "must not contain a double quote"},
+		{"too many paths", entry("strip-fields: " + manyPaths() + "\n"), "too many paths"},
+		{"too deep", entry("strip-fields: [a.b.c.d.e.f.g.h.i]\n"), "descends too deep"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want containing %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "SECRET") {
+				t.Errorf("error text echoes a value: %v", err)
+			}
+		})
+	}
+}
+
+// manyPaths renders seventeen distinct strip paths for the max-count reject.
+func manyPaths() string {
+	paths := make([]string, 0, 17)
+	for i := 1; i <= 17; i++ {
+		paths = append(paths, fmt.Sprintf("f%d", i))
+	}
+	return "[" + strings.Join(paths, ", ") + "]"
+}
+
+// TestLoadRuntimeStripFieldsNormalization pins the accept side: absent or
+// null is off (nil strip), a list is parsed into ordered segments, and the
+// model-override-provider layering — a model with its own list replaces its
+// provider's list, a model without one carries each candidate's provider
+// list per hop.
+func TestLoadRuntimeStripFieldsNormalization(t *testing.T) {
+	load := func(yaml string) Model {
+		t.Helper()
+		s, err := LoadRuntime([]byte(yaml))
+		if err != nil {
+			t.Fatalf("LoadRuntime: %v", err)
+		}
+		m, _ := s.Model("a")
+		return m
+	}
+	// The base carries the providers table with strip lists; every model
+	// references one of its entries.
+	base := "api-key: unit-test-key\ntransports:\n  t1: { type: direct }\n  t2: { type: direct }\nproviders:\n  pa:\n    base-url: https://a/v1\n    transport: t1\n    strip-fields: [provider]\n  pb:\n    base-url: https://b/v1\n    transport: t2\n    strip-fields: [service_tier, 'meta.extra']\n"
+
+	// Absent / null → nil strip, feature off.
+	m := load(base + "models:\n  a:\n    provider: pa\n    upstream-model: m\n")
+	if m.Strip != nil {
+		t.Errorf("absent strip-fields: Strip = %v, want nil", m.Strip)
+	}
+	m = load(base + "models:\n  a:\n    provider: pa\n    upstream-model: m\n    strip-fields: null\n")
+	if m.Strip != nil {
+		t.Errorf("null strip-fields: Strip = %v, want nil", m.Strip)
+	}
+
+	// A model with its own list replaces the provider's list.
+	m = load(base + "models:\n  a:\n    provider: pa\n    upstream-model: m\n    strip-fields: [provider, service_tier]\n")
+	if len(m.Strip) != 2 || m.Strip[0].Segments[0] != "provider" || m.Strip[1].Segments[0] != "service_tier" {
+		t.Errorf("model-level Strip = %v, want [provider service_tier]", m.Strip)
+	}
+	for _, c := range m.Chain {
+		if len(c.Strip) != 2 {
+			t.Errorf("candidate Strip = %v, want the model list on every hop", c.Strip)
+		}
+	}
+
+	// A model without a list inherits its provider's list per candidate.
+	m = load(base + "models:\n  a:\n    provider: pa\n    upstream-model: m\n")
+	if m.Strip != nil {
+		t.Errorf("inherited model Strip = %v, want nil (per-hop)", m.Strip)
+	}
+	if len(m.Chain[0].Strip) != 1 || m.Chain[0].Strip[0].Segments[0] != "provider" {
+		t.Errorf("chain[0].Strip = %v, want [provider] from pa", m.Chain[0].Strip)
+	}
+
+	// A chain through two providers carries each provider's list per hop.
+	m = load(base + "models:\n  a:\n    providers:\n      - { provider: pa, upstream-model: x }\n      - { provider: pb, upstream-model: y }\n")
+	if m.Strip != nil {
+		t.Errorf("chained model Strip = %v, want nil (per-hop)", m.Strip)
+	}
+	if len(m.Chain[0].Strip) != 1 || m.Chain[0].Strip[0].Segments[0] != "provider" {
+		t.Errorf("chain[0].Strip = %v, want [provider]", m.Chain[0].Strip)
+	}
+	if len(m.Chain[1].Strip) != 2 {
+		t.Errorf("chain[1].Strip = %v, want pb's 2 paths", m.Chain[1].Strip)
 	}
 }
