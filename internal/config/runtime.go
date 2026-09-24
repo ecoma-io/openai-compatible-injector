@@ -1376,10 +1376,10 @@ func ParseStripPath(s string) ([]string, error) {
 	var segments []string
 	i := 0
 	for i < len(s) {
-		switch {
-		case s[i] == '.':
+		switch s[i] {
+		case '.':
 			return nil, errors.New("strip-fields: path must not contain an empty segment")
-		case s[i] == '\'':
+		case '\'':
 			// A single-quoted segment: find the closing quote. A doubled
 			// quote is an escaped quote; a lone quote starts the next
 			// segment only after the closing one.
