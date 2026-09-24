@@ -683,6 +683,81 @@ concurrency state for one endpoint must exist exactly once, and the
 duplicate check runs on the resolved endpoint (host case and userinfo
 spelling collapse), never on the YAML name.
 
+## Provider upstream credentials
+
+A provider may carry an optional `auth:` block: upstream API-key
+authentication with **multi-key rotation** across accounts, and
+**429-aware cooldown** per account.
+
+```yaml
+providers:
+  opencode:
+    base-url: https://api.opencode.example/v1
+    transport: egress
+    auth:
+      type: api_key # the only accepted value today
+      header:
+        Authorization # required: the RFC 7230 field-name the
+        # credential is sent in (Authorization,
+        # X-API-Key, ...)
+      prefix: "Bearer " # optional, default "" — placed before the value
+      strategy:
+        round_robin # optional, default round_robin — the only
+        # accepted value today
+      rate-limit: # optional, defaults cooldown 2s / max 60s
+        cooldown:
+          2s #   default cooldown when the upstream sends no
+          #   usable Retry-After
+        max-cooldown:
+          60s #   ceiling on what an upstream Retry-After may
+          #   request from a key
+      keys:
+        - id: primary # operator-chosen name, [A-Za-z0-9._:-]; the
+          # only credential-adjacent identifier that
+          # ever reaches a log
+          value:
+            replace-me # the secret material itself; never logged,
+            # never echoed by an error, memory + wire only
+        - id: secondary
+          value: replace-me-too
+```
+
+The block lives on a provider (all its models share the pool); the inline
+`endpoint` form cannot declare one.
+
+How it composes with the architecture:
+
+- **Recovery stays the only authority.** The pool never retries, never
+  waits, never answers a request. It only decides WHICH account the next
+  attempt carries — and reports "none ready" to the recovery policy, which
+  decides what the request does about it (retry after the earliest cooldown,
+  fall back to another candidate, or terminate — per the operator's matrix).
+- **One account per attempt.** Each attempt acquires exactly one key. A
+  retry of the SAME candidate on a non-429 failure (5xx, protocol, ...)
+  keeps the same key — it is the same logical attempt on the same account.
+  An egress switch inside one attempt keeps it too: the credential is
+  composed above the transport, so path changes never change accounts.
+- **A 429 marks the account, and only the account.** On an upstream 429 the
+  request's key enters cooldown (the upstream said the account is
+  rate-limited) _whatever the recovery policy later does with the request_.
+  The cooldown is the `Retry-After` directive when usable, capped at
+  `max-cooldown`, otherwise `cooldown`. The next attempt on that candidate
+  acquires the next ready key, so a provider with three keys and a 429
+  walks them in rotation. The request's own retry remains a recovery
+  decision — a policy whose `429` row says `terminal` still marks the key,
+  but does not retry.
+- **Reload identity is content-keyed, like transports.** An auth block
+  whose bytes (header, prefix, strategy, ids and values) are unchanged
+  across a reload keeps its rotation state; any change is a fresh pool.
+  The identity digest hashes the values and never appears in a log.
+
+Secrecy is the same rule as everywhere else: values live in the config
+file, in memory, and on the outgoing wire — never in an error, a log line,
+a reload event, a metric label, or a response body. And the client token
+stays strictly separate: `Authorization` is not a forwarded header, so on a
+credential-bearing provider the ONLY Authorization on the wire is the one
+the pool composed.
+
 ## Provider recovery policy
 
 A model routes through an **ordered candidate chain** — a primary route plus
