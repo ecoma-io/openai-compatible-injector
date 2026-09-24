@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -130,6 +131,7 @@ func NewHandler(store *config.Store, doers transport.Resolver, authProvider auth
 	// plain-text default.
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 	mux.HandleFunc("/v1/responses", h.responses)
+	mux.HandleFunc("/v1/models", h.models)
 	// The catch-all keeps the same promise for unknown paths — trailing
 	// slashes, wrong case, anything unmatched: an OpenAI SDK client always
 	// gets a parseable JSON error body, never the mux's plain text.
@@ -2304,4 +2306,95 @@ func newRequestID() string {
 		return "0000000000000000"
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// models is GET /v1/models. It lists public models from the snapshot's
+// model mapping. Auth is required; non-GET → 405. Each model object has
+// only id and created (0).
+func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	if r.Method != http.MethodGet {
+		// Keep the 405-before-401 ordering and outside-lifecycle semantics of
+		// the model-serving POST routes.
+		h.log.Debug().Str("api", "models").Str("method", r.Method).
+			Str("path", r.URL.Path).Str("remote_addr", r.RemoteAddr).
+			Msg("request_method_not_allowed")
+		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
+		return
+	}
+
+	snap := h.store.Load()
+	defer func() { _ = r.Body.Close() }()
+	sw := &statusWriter{ResponseWriter: w}
+	log := h.log.With().Str("request_id", newRequestID()).Str("api", "models").Logger()
+	log.Debug().Str("method", r.Method).Str("path", r.URL.Path).
+		Str("remote_addr", r.RemoteAddr).Msg("request_received")
+
+	outcome := "listed"
+	complete := func() {
+		log.Info().Int("status", sw.status).Str("outcome", outcome).
+			Bool("stream", false).Int64("bytes_in", 0).Int64("bytes_out", sw.bytes).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Uint64("config_generation", snap.Gen()).Msg("request_completed")
+	}
+	reject := func(status int, body string) {
+		if err := writeEnvelope(sw, status, body); err != nil {
+			outcome = "client_disconnected"
+			log.Warn().Err(err).Int64("bytes_out", sw.bytes).Msg("client_write_failed")
+		}
+		complete()
+	}
+
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok {
+		outcome = "unauthorized"
+		reject(http.StatusUnauthorized, envelopeAuthMissing)
+		return
+	}
+	_, reason, aerr := h.auth.For(snap).Authenticate(r.Context(), token)
+	if aerr != nil {
+		log.Warn().Str("error_class", auth.StoreErrorClass(aerr)).Msg("auth_backend_failed")
+	}
+	if reason != auth.ReasonOK {
+		outcome = "unauthorized"
+		reject(http.StatusUnauthorized, envelopeAuthInvalid)
+		return
+	}
+
+	// Public model names, sorted for determinism. No upstream call: the
+	// mapping is the catalog, and proxying the upstream's list would
+	// advertise names the mapping does not cover.
+	models := snap.Models()
+	ids := make([]string, 0, len(models))
+	for k := range models {
+		ids = append(ids, k)
+	}
+	sort.Strings(ids)
+
+	// Wire shape: each entry carries only id and created (the injector has
+	// no creation metadata, so created is always 0). The struct keeps the
+	// field order stable on the wire.
+	type modelItem struct {
+		ID      string `json:"id"`
+		Created int64  `json:"created"`
+	}
+	data := make([]modelItem, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, modelItem{ID: id, Created: 0})
+	}
+	type modelsList struct {
+		Object string      `json:"object"`
+		Data   []modelItem `json:"data"`
+	}
+	// json.Marshal cannot fail for this fixed string-and-integer shape. The
+	// full JSON response is generated locally, so no error propagation is
+	// possible after a successful write — a failed write is client-owned.
+	body, _ := json.Marshal(modelsList{Object: "list", Data: data})
+	sw.Header().Set(contentTypeHeader, envelopeJSONType)
+	sw.WriteHeader(http.StatusOK)
+	if _, err := sw.Write(body); err != nil {
+		outcome = "client_disconnected"
+		log.Warn().Err(err).Int64("bytes_out", sw.bytes).Msg("client_write_failed")
+	}
+	complete()
 }

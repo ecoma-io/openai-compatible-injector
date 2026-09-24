@@ -2127,3 +2127,171 @@ func TestUpstreamHTTPErrorHostileHeaderValuesJSONSafe(t *testing.T) {
 		t.Errorf("retry_after = %q, want the hostile value with obs-text replaced by U+FFFD", got)
 	}
 }
+
+// TestModelsEndpoint pins GET /v1/models: it lists the configured public
+// model mapping (sorted), each entry carrying only id and created (0), with
+// the object:"list" wrapper. It is served from the snapshot only — no
+// upstream call — and carries no extra fields beyond id/created.
+func TestModelsEndpoint(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("models endpoint must not reach upstream, got %s %s", r.Method, r.URL.Path)
+	}))
+	defer up.Close()
+
+	yaml := fmt.Sprintf("api-key: %s\nmodels:\n  zebra:\n    endpoint: %s\n    upstream-model: z1\n    injection-prompt: \"\"\n  alpha:\n    endpoint: %s\n    upstream-model: a1\n    injection-prompt: \"\"\n  mid-model:\n    endpoint: %s\n    upstream-model: m1\n    injection-prompt: \"\"\n", testAPIKey, up.URL+"/v1", up.URL+"/v1", up.URL+"/v1")
+	snap, err := config.LoadRuntime([]byte(yaml))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	h := newTestHandler(t, config.NewStore(snap))
+
+	rec := doRequest(t, h, http.MethodGet, "/v1/models", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	// Decode loosely to check the exact key sets.
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("body not JSON: %v (%q)", err, rec.Body.String())
+	}
+	if m["object"] != "list" {
+		t.Errorf("object = %v, want list", m["object"])
+	}
+	dataAny, ok := m["data"].([]any)
+	if !ok {
+		t.Fatalf("data not array: %T", m["data"])
+	}
+	// Only expected top-level keys.
+	if len(m) != 2 {
+		t.Errorf("top-level keys = %d (%v), want exactly object+data", len(m), keysOf(m))
+	}
+
+	// Sort expected ids.
+	var wantIDs = []string{"alpha", "mid-model", "zebra"}
+	if len(dataAny) != len(wantIDs) {
+		t.Fatalf("len(data) = %d, want %d (%v)", len(dataAny), len(wantIDs), dataAny)
+	}
+	for i, itemAny := range dataAny {
+		item, ok := itemAny.(map[string]any)
+		if !ok {
+			t.Fatalf("item %d not object: %T", i, itemAny)
+		}
+		// exactly id + created, nothing else
+		if len(item) != 2 {
+			t.Errorf("item %d keys = %v, want exactly id+created", i, keysOf(item))
+		}
+		if item["id"] != wantIDs[i] {
+			t.Errorf("item %d id = %v, want %q", i, item["id"], wantIDs[i])
+		}
+		if item["created"] != float64(0) {
+			t.Errorf("item %d created = %v, want 0", i, item["created"])
+		}
+	}
+}
+
+// TestModelsEndpointAuth pins the auth gate on /v1/models: missing bearer →
+// missing-key 401, wrong key → invalid_api_key 401, valid → 200. Non-GET →
+// 405 before auth (ordering preserved).
+func TestModelsEndpointAuth(t *testing.T) {
+	h := newTestHandler(t, newTestStore(t, "http://127.0.0.1:9/v1"))
+	cases := []struct {
+		name   string
+		method string
+		auth   string
+		want   int
+		body   string
+	}{
+		{"no header", http.MethodGet, "", http.StatusUnauthorized, envelopeAuthMissing},
+		{"wrong key", http.MethodGet, "Bearer wrong-key", http.StatusUnauthorized, envelopeAuthInvalid},
+		{"valid", http.MethodGet, "Bearer " + testAPIKey, http.StatusOK, ""},
+		{"post 405 before auth", http.MethodPost, "", http.StatusMethodNotAllowed, envelopeBadMethod},
+		{"delete 405 before auth", http.MethodDelete, "", http.StatusMethodNotAllowed, envelopeBadMethod},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doRequest(t, h, tc.method, "/v1/models", "", map[string]string{"Authorization": tc.auth})
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, tc.want, rec.Body.String())
+			}
+			if tc.body != "" && rec.Body.String() != tc.body {
+				t.Errorf("body:\n got %s\nwant %s", rec.Body.String(), tc.body)
+			}
+		})
+	}
+}
+
+// TestModelsEndpointReload pins the quiet direction: the listing follows the
+// snapshot — after a reload that adds/removes models, a subsequent request
+// reflects the new mapping, so a stale listing can never advertise a model
+// that now 404s or hide one that now works.
+func TestModelsEndpointReload(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("models endpoint must not reach upstream")
+	}))
+	defer up.Close()
+
+	store := newTestStore(t, up.URL+"/v1")
+	h := newTestHandler(t, store)
+
+	before := doRequest(t, h, http.MethodGet, "/v1/models", "", nil)
+	if ids := modelsIDs(t, before); !equalStrings(ids, []string{"test-model"}) {
+		t.Fatalf("before reload ids = %v, want [test-model]", ids)
+	}
+
+	next, err := config.LoadRuntime([]byte(fmt.Sprintf(
+		"api-key: %s\nmodels:\n  beta:\n    endpoint: %s\n    upstream-model: b1\n    injection-prompt: \"\"\n  alpha:\n    endpoint: %s\n    upstream-model: a1\n    injection-prompt: \"\"\n",
+		testAPIKey, up.URL+"/v1", up.URL+"/v1")))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	if err := store.Publish(next); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	after := doRequest(t, h, http.MethodGet, "/v1/models", "", nil)
+	if ids := modelsIDs(t, after); !equalStrings(ids, []string{"alpha", "beta"}) {
+		t.Fatalf("after reload ids = %v, want [alpha beta]", ids)
+	}
+}
+
+// modelsIDs extracts the sorted ids from a /v1/models response body.
+func modelsIDs(t *testing.T, rec *httptest.ResponseRecorder) []string {
+	t.Helper()
+	var m struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("unmarshal models response: %v (%q)", err, rec.Body.String())
+	}
+	out := make([]string, 0, len(m.Data))
+	for _, d := range m.Data {
+		out = append(out, d.ID)
+	}
+	return out
+}
+
+func keysOf(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

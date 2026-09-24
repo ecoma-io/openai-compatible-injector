@@ -12,10 +12,12 @@ metering, one static binary.
          ◀──model rewritten to public name──●
 ```
 
-Supports the two model-serving protocols:
+Supports two model-serving protocols and one configured discovery endpoint:
 
 - **Chat Completions** — `POST /v1/chat/completions`, including SSE streams.
 - **Responses API** — `POST /v1/responses`, including SSE streams.
+- **Model discovery** — authenticated `GET /v1/models`, served from the current
+  runtime model mapping without an upstream request.
 
 Everything else is deliberately out of scope (see [Out of scope](#out-of-scope)).
 
@@ -200,11 +202,12 @@ log-level: info # optional; debug | info | warn | error (absent = info)
 ```
 
 - `api-key` — required shared [Bearer token](https://www.rfc-editor.org/rfc/rfc6750#section-2.1): non-empty ASCII letters, digits, `-`, `.`, `_`, `~`, `+`, `/`, and trailing `=` padding only. Clients present it as
-  `Authorization: Bearer <key>` on both model-serving routes; the scheme is
-  case-insensitive and outer spaces are ignored. It is bound
-  to the [per-request config snapshot](#hot-reload), so rotating the YAML
-  value affects subsequent requests without a restart. The key is credential
-  material: it never appears in logs, error text, or reload metadata.
+  `Authorization: Bearer <key>` on every supported `/v1` endpoint, including
+  `GET /v1/models`; the scheme is case-insensitive and outer spaces are
+  ignored. It is bound to the [per-request config snapshot](#hot-reload), so
+  rotating the YAML value affects subsequent requests without a restart. The
+  key is credential material: it never appears in logs, error text, or reload
+  metadata.
 - `endpoint` — base URL of the upstream provider, legacy inline form. Scheme
   `http` or `https` only; port and path allowed, trailing slashes ignored;
   URL userinfo is rejected. Requests are sent to
@@ -467,6 +470,28 @@ several shapes:
 | string `"text"`        | `"prompt\n\ntext"` — prompt first, blank line, existing text                                                                       |
 | array                  | a developer message item is prepended: `{"type":"message","role":"developer","content":[{"type":"input_text","text":"<prompt>"}]}` |
 | anything else          | untouched                                                                                                                          |
+
+## Model discovery
+
+`GET /v1/models` authenticates with the same bearer credential as the two
+model-serving routes and answers from the current request's runtime config
+snapshot. It **never calls an upstream provider**: the public mapping is the
+catalog, while an upstream list could advertise unusable names or disclose an
+alias target. Model IDs are sorted lexicographically for deterministic output;
+a successful config reload affects the next list request.
+
+The response is a JSON list envelope. Each entry deliberately contains only
+the configured public `id` and `created: 0` (the injector has no creation
+metadata):
+
+```json
+{ "object": "list", "data": [{ "id": "echo-model", "created": 0 }] }
+```
+
+`POST`, `PUT`, `DELETE`, and every other non-GET method return the normal JSON
+405 before authentication. Missing/malformed and invalid bearer credentials
+return the same exact 401 envelopes as the model-serving routes. A near-miss
+path such as `/v1/models/` remains the JSON 404 catch-all.
 
 ## Model mapping and rewriting
 
@@ -1466,8 +1491,9 @@ Upstream and client failures are classified, never fogged:
 
 | Condition                                                                                                                             | Status                 | `error.type` / `code`                                                                                                                                                                           |
 | ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Missing/malformed `Authorization: Bearer <key>`                                                                                       | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`  |
+| Missing/malformed `Authorization: Bearer <key>` on any `/v1` route (including `GET /v1/models`)                                       | 401                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide an API key in the Authorization header (Bearer <key>)","type":"invalid_request_error","param":null,"code":null}}`  |
 | Wrong bearer key (partner mode: unknown **or revoked** key, or an unavailable key store — fail closed)                                | 401                    | `invalid_request_error` / `invalid_api_key` — exact body: `{"error":{"message":"invalid API key","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`                        |
+| Non-GET `GET /v1/models` route request                                                                                                | 405                    | `invalid_request_error` — exact body: `{"error":{"message":"method not allowed","type":"invalid_request_error","param":null,"code":null}}`; this precedes its auth check                        |
 | Body is not JSON                                                                                                                      | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                            |
 | Missing `model`                                                                                                                       | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                      |
 | Request body over the 64 MiB cap                                                                                                      | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                  |
@@ -1988,8 +2014,9 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
 
 Decided, and not coming back without a design discussion:
 
-- **More OpenAI surfaces** — embeddings, batch, assistants, etc. This is an
-  injector for the two model-serving protocols.
+- **More OpenAI model-serving surfaces** — embeddings, batch, assistants,
+  etc. `GET /v1/models` is the deliberate exception: a local discovery
+  endpoint backed by the mapping, not an upstream protocol surface.
 - **Manual reload triggers** (SIGHUP, fsnotify) — the content poller is the
   design; see the atomic-replace caveat above for the blind spot no watcher
   fixes.
