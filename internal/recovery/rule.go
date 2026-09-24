@@ -36,6 +36,9 @@ type Match struct {
 	// validated as terminal-only: the caller's own cancellation is a
 	// hard-stop the matrix may describe but never weaken.
 	CallerCause string
+	// CredentialCause restricts a credential failure (cooldown): the
+	// candidate's pool could not hand out a key before the attempt dialed.
+	CredentialCause string
 	// ProviderErrorType and ProviderErrorCode match the upstream error
 	// object's own type/code members. They are the only provider-supplied
 	// predicate inputs, and both have already passed the evidence parser's
@@ -74,6 +77,9 @@ func (m Match) matches(o Observation) bool {
 		return false
 	}
 	if m.CallerCause != "" && m.CallerCause != o.CallerCause {
+		return false
+	}
+	if m.CredentialCause != "" && m.CredentialCause != o.CredentialCause {
 		return false
 	}
 	if m.ProviderErrorType != "" && m.ProviderErrorType != o.ProviderErrorType {
@@ -116,7 +122,7 @@ func (m Match) Specificity() int {
 	if m.StatusClass != StatusClassNone {
 		k |= 1 << 2
 	}
-	if m.TransportCause != "" || m.ProtocolCause != "" || m.CallerCause != "" {
+	if m.TransportCause != "" || m.ProtocolCause != "" || m.CallerCause != "" || m.CredentialCause != "" {
 		k |= 1 << 1
 	}
 	if m.Class != FailureAny || m.TransportClass != TransportClassNone {
@@ -145,6 +151,9 @@ func (m Match) classSet() uint8 {
 	}
 	if m.CallerCause != "" {
 		s |= 1 << uint(FailureCaller)
+	}
+	if m.CredentialCause != "" {
+		s |= 1 << uint(FailureCredential)
 	}
 	if s == 0 {
 		// No predicate at all: every layer is in scope.
@@ -202,12 +211,13 @@ func (m Match) overlaps(n Match) bool {
 	if m.RetryIndex != nil && n.RetryIndex != nil && *m.RetryIndex != *n.RetryIndex {
 		return false
 	}
-	// The three cause kinds are mutually exclusive on an observation: a
-	// transport failure carries no protocol cause, a protocol failure no
-	// caller cause. Two rules that each constrain a kind the other leaves
-	// free cannot both apply — the class set above already excludes the
-	// cross-layer cases, and this covers a rule that constrains two kinds
-	// against one that constrains a single, different one.
+	// The cause kinds are mutually exclusive on an observation: a transport
+	// failure carries no protocol cause, a protocol failure no caller cause,
+	// and a credential failure neither of the three — it never reached the
+	// wire. Two rules that each constrain a kind the other leaves free cannot
+	// both apply — the class set above already excludes the cross-layer
+	// cases, and this covers a rule that constrains two kinds against one
+	// that constrains a single, different one.
 	if m.TransportCause != "" && n.TransportCause != "" && m.TransportCause != n.TransportCause {
 		return false
 	}
@@ -215,6 +225,9 @@ func (m Match) overlaps(n Match) bool {
 		return false
 	}
 	if m.CallerCause != "" && n.CallerCause != "" && m.CallerCause != n.CallerCause {
+		return false
+	}
+	if m.CredentialCause != "" && n.CredentialCause != "" && m.CredentialCause != n.CredentialCause {
 		return false
 	}
 	return true
@@ -303,6 +316,11 @@ func CallerRuleID(cause string) string {
 	default:
 		return "caller-" + strings.ReplaceAll(cause, "_", "-")
 	}
+}
+
+// CredentialCauseRuleID is the canonical ID of a credential-cause rule.
+func CredentialCauseRuleID(cause string) string {
+	return "credential-" + cause
 }
 
 // sortRules orders a rule list deterministically: by precedence key

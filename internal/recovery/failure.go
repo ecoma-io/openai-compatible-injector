@@ -31,6 +31,14 @@ const (
 	// is decided from the request context, never from the wire, and it is
 	// terminal by construction.
 	FailureCaller
+	// FailureCredential is not a wire event at all: the candidate's
+	// credential pool could not hand out a key for the attempt because every
+	// key is cooling from an earlier upstream 429. It is decided BEFORE the
+	// attempt dials — no exchange was consumed and no provider was contacted
+	// — and it is the credential layer's entire vocabulary: the pool reports
+	// state, this class carries it to the matrix, and the matrix, as ever,
+	// decides what happens next. The wait rides Observation.RetryAfter.
+	FailureCredential
 )
 
 // String renders the class as the config-facing token.
@@ -44,6 +52,8 @@ func (c FailureClass) String() string {
 		return "protocol"
 	case FailureCaller:
 		return "caller"
+	case FailureCredential:
+		return "credential"
 	default:
 		return "any"
 	}
@@ -60,8 +70,10 @@ func ParseFailureClass(s string) (FailureClass, error) {
 		return FailureProtocol, nil
 	case "caller":
 		return FailureCaller, nil
+	case "credential":
+		return FailureCredential, nil
 	default:
-		return FailureAny, errors.New("failure must be one of http, transport, protocol, caller")
+		return FailureAny, errors.New("failure must be one of http, transport, protocol, caller, credential")
 	}
 }
 
@@ -271,6 +283,19 @@ const (
 	CallerDeadline = "caller_deadline_exceeded"
 )
 
+// Credential cause tokens: the credential pool could not hand out a key for
+// this attempt. Phase one carries exactly one cause — every key of the
+// candidate's pool is cooling from an earlier upstream 429. The observation
+// carrying this cause also carries the earliest ready-at time as a wait in
+// its RetryAfter field, so the engine's existing raise/cap machinery bounds
+// it exactly as it bounds an upstream's Retry-After directive.
+const CredentialCooldown = "cooldown"
+
+// KnownCredentialCause reports whether a token is part of the closed set.
+func KnownCredentialCause(s string) bool {
+	return s == CredentialCooldown
+}
+
 // CauseExchangeBudget names the exchange envelope itself as the reason a walk
 // stopped: the request had real exchanges left in principle, but not one more
 // the envelope would fund, so the next outbound HTTP request was refused
@@ -327,6 +352,11 @@ type Observation struct {
 	// itself rather than on any rule.
 	CallerCause string
 
+	// CredentialCause describes a FailureCredential. The observation is
+	// built before the attempt dials: no exchange is consumed, no provider
+	// was contacted, and no response exists to attribute anything to.
+	CredentialCause string
+
 	// ProviderErrorType and ProviderErrorCode are the upstream error
 	// object's own type/code members, when the bounded capture found an
 	// OpenAI-shaped error object and the values passed the printable-token
@@ -356,9 +386,12 @@ type Observation struct {
 	Elapsed int64
 
 	// RetryAfter is the failed response's parsed Retry-After directive, 0
-	// when absent, invalid, or already past. It is not a predicate — the
-	// Retry-After policy decides whether it may raise a wait at all, and the
-	// engine caps whatever it raises before anything sleeps.
+	// when absent, invalid, or already past. On a FailureCredential it
+	// carries the pool's earliest ready-at time instead — the same wait
+	// channel, produced by a cooldown mark rather than by a directive; the
+	// distinction lives in the class, the machinery is shared. It is not a
+	// predicate — the Retry-After policy decides whether it may raise a wait
+	// at all, and the engine caps whatever it raises before anything sleeps.
 	RetryAfter time.Duration
 }
 
@@ -395,6 +428,11 @@ func Reason(o Observation) string {
 			return o.CallerCause
 		}
 		return "caller_ended"
+	case FailureCredential:
+		if o.CredentialCause != "" {
+			return "credential_" + o.CredentialCause
+		}
+		return "credential_unavailable"
 	default:
 		return "unknown"
 	}
