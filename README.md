@@ -1302,6 +1302,67 @@ With no `thinking-usage` block on the model, the composed rewriter degenerates
 to the plain model rename and both response paths are byte-identical to an
 unconfigured deployment.
 
+## Response field stripping
+
+Some providers decorate every 2xx response with fields that are metadata, not
+answer — the Kilo providers' `provider` and `service_tier` members are the
+motivating case. `strip-fields` lets an operator configure the proxy to excise
+those members before the client sees them, on both the buffered and streamed
+relay paths, with no decode/encode round trip: an excised member's own bytes
+(key, colon, value, and the comma that separates it) are removed and every
+other byte — key order, whitespace, exotic non-JSON framing included —
+survives.
+
+**Where the list lives.** Both `providers.<name>.strip-fields` and
+`models.<name>.strip-fields` accept it. A model that states a list replaces
+its provider's list for every candidate in its chain; a model without one
+inherits each candidate's own provider list per hop, so a chain whose
+providers strip different fields answers under whichever provider served the
+request. Absent or null = no stripping; responses stay byte-identical to an
+unconfigured deployment. An empty list (`[]`) is a rejection — a block that
+states nothing reads like a typo. The hot-reload rules apply exactly as to
+the rest of the runtime file: a request binds its strip list to its [config
+snapshot](#hot-reload), so a reload mid-stream cannot change what an
+in-flight request strips.
+
+**The path syntax.** Each entry is a dotted JSON path over object keys:
+`parent.child` descends through objects. A segment containing a dot, space,
+or quote is wrapped in single quotes and decoded with JSON unquoting rules
+— `'parent name'.child`, `'a.b'.c`, `'a''b'.c` — so any key, whatever its
+bytes, is addressable. The traversal is **object-only**: a path never
+descends through an array, so `choices.provider` matches nothing (a classic
+provider field inside a choice object survives; that is the documented scope,
+mirroring the model and usage rewriters who never enter arrays). Duplicate
+keys in a payload are all excised — one left standing is one leak. A scan
+never re-serializes; malformed input is forwarded byte-for-byte.
+
+**Scope follows the API**, exactly like the model and usage rewriters, so the
+same list works across both surfaces:
+
+- Chat Completions: the top-level object. A nested `response` object in a
+  chat payload is client data and is reached only through the paths
+  themselves.
+- Responses: the top-level object AND the object directly inside a top-level
+  `response` envelope (where `response.completed` events carry their
+  provider-added fields), with the full path list reapplied inside the
+  descent — the single-descent rule.
+
+**The reserved keys.** `model` and `usage` are rejected in a strip list at
+any depth: the proxy itself writes those — the model rename in every path,
+the thinking-usage synthesis when its plan is active, the usage meter that
+reads pre-rewrite bytes — and a list that could strip them would carve a
+hole in data the service owns. The strip runs **last** in the composed
+rewriter (rename → synthesis → strip), precisely so those owned keys are
+untouchable by configuration.
+
+**Streaming parity.** The same composed rewriter serves both relay paths.
+The SSE data-line gate, which admits a line only when its payload carries
+the two keys the rewriter owns (`"model"`/`"usage"`), is widened with the
+strip list's first-segment byte patterns: a chunk carrying only a
+to-be-excised field still reaches the strip and comes out excised, while
+lines mentioning none of the gate keys pass through untouched — the
+unconfigured deployment runs the gate as before, byte for byte.
+
 ## Streaming
 
 SSE streams pass through **incrementally, line by line** — nothing is
