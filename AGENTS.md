@@ -424,8 +424,14 @@ provider_exhausted` over the final cause; a zero-dial pool reports
 - **Response field stripping is config-data, byte-preserving, and runs
   last.** The third response transform excises configured provider-added
   members (`strip-fields` — config-owned `StripPath` segment lists, dotted
-  with single-quoted segments, object-only traversal, reserved `model`/
-  `usage` keys rejected at load) from every relayed 2xx response before the
+  with single-quoted segments, object-only traversal, the proxy's own
+  members rejected at load as an enumerated set of EXACT paths —
+  `model`/`usage` and the two synthesized reasoning-count leaves, each in its
+  bare and its `response.`-prefixed spelling, because the envelope descent
+  and the key walk make both land on the same bytes, while `usage.is_byok` /
+  `usage.cost` and other provider-added children stay addressable; a segment
+  named `usage` is therefore legal anywhere except those paths) from every
+  relayed 2xx response before the
   client sees it. `StripChatFields`/`StripResponsesFields`
   (`internal/inject`), API-scoped like the rewrites (responses descends one
   level into the top-level `response` envelope), remove an excised member's

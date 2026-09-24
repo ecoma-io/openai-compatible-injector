@@ -517,19 +517,17 @@ func TestParseStripPath(t *testing.T) {
 		}
 	}
 	for _, path := range []string{
-		"",                              // empty
-		".a",                            // leading empty segment
-		"a.",                            // trailing empty segment
-		"a..b",                          // consecutive dots
-		"a.'b",                          // unterminated quote
-		"'a.b",                          // unterminated quote (at start)
-		"a.b'",                          // stray quote in unquoted segment
-		"a' b.c",                        // quote followed by space
-		"a.'b'.c'",                      // unterminated final quote
-		"'a''b",                         // escaped quote then unterminated
-		"usage.cache_read_input_tokens", // reserved usage segment
-		"a.model",                       // reserved model segment
-		"'b.c'.d.'e'.f.g.h.i.j.k",       // too deep
+		"",                        // empty
+		".a",                      // leading empty segment
+		"a.",                      // trailing empty segment
+		"a..b",                    // consecutive dots
+		"a.'b",                    // unterminated quote
+		"'a.b",                    // unterminated quote (at start)
+		"a.b'",                    // stray quote in unquoted segment
+		"a' b.c",                  // quote followed by space
+		"a.'b'.c'",                // unterminated final quote
+		"'a''b",                   // escaped quote then unterminated
+		"'b.c'.d.'e'.f.g.h.i.j.k", // too deep
 	} {
 		if _, err := ParseStripPath(path); err == nil {
 			t.Errorf("ParseStripPath(%q) accepted, want rejection", path)
@@ -537,9 +535,59 @@ func TestParseStripPath(t *testing.T) {
 	}
 }
 
+// TestStripReservedPaths pins the reserved set from both sides: every path
+// the proxy writes is rejected in every spelling it can be written under, and
+// the provider-added members strip-fields exists to reach are accepted. Both
+// lists are literal on purpose — they are the contract, so a writer that adds
+// a member has to come here and extend them, and a rule that quietly widens
+// (rejecting provider data) fails just as loudly as one that quietly narrows.
+func TestStripReservedPaths(t *testing.T) {
+	rejected := []string{
+		"model",
+		"usage",
+		"response.model",
+		"response.usage",
+		"usage.completion_tokens_details.reasoning_tokens",
+		"usage.output_tokens_details.reasoning_tokens",
+		"response.usage.completion_tokens_details.reasoning_tokens",
+		"response.usage.output_tokens_details.reasoning_tokens",
+	}
+	for _, path := range rejected {
+		if _, err := ParseStripPath(path); err == nil {
+			t.Errorf("ParseStripPath(%q) accepted, want rejection", path)
+		}
+	}
+	allowed := []string{
+		// The provider-added members inside the usage object — the motivating
+		// case: the object is reserved, its children are not.
+		"usage.is_byok",
+		"usage.cost",
+		"usage.cost_details.upstream_inference_cost",
+		"usage.prompt_tokens_details.cached_tokens",
+		"usage.cache_read_input_tokens",
+		// A synthesis leaf's PARENT: allowed, and documented as also excising
+		// the provider's own siblings under the same object.
+		"usage.completion_tokens_details",
+		"usage.output_tokens_details",
+		// A bare "model"/"usage" segment away from the proxy's own members.
+		"a.model",
+		"a.usage",
+		"'usage'.cost",
+		// The descent happens exactly once: a second "response" level reaches
+		// nothing the proxy writes.
+		"response.response.model",
+		"response.provider",
+	}
+	for _, path := range allowed {
+		if _, err := ParseStripPath(path); err != nil {
+			t.Errorf("ParseStripPath(%q) rejected: %v", path, err)
+		}
+	}
+}
+
 // TestLoadRuntimeStripFieldsValidation pins the rejections: an explicit empty
-// list, empty or unresolvable segments, duplicates, and the reserved keys
-// model and usage — all with fixed text that never echoes the offending path.
+// list, empty or unresolvable segments, duplicates, and the reserved paths
+// — all with fixed text that never echoes the offending path.
 func TestLoadRuntimeStripFieldsValidation(t *testing.T) {
 	entry := func(block string) string {
 		return "api-key: unit-test-key\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n    " + block
@@ -556,9 +604,14 @@ func TestLoadRuntimeStripFieldsValidation(t *testing.T) {
 		{"duplicate", entry("strip-fields: [a.b, a.b]\n"), "duplicate path"},
 		{"duplicate after trim", entry("strip-fields: [\" a \", a]\n"), "duplicate path"},
 		{"reserved model", entry("strip-fields: [model]\n"), `must not include "model"`},
-		{"reserved nested model", entry("strip-fields: [a.model]\n"), `must not include "model"`},
 		{"reserved usage", entry("strip-fields: [usage]\n"), `must not include "usage"`},
-		{"reserved nested usage", entry("strip-fields: [a.usage]\n"), `must not include "usage"`},
+		{"reserved envelope model", entry("strip-fields: [response.model]\n"), `must not include "response.model"`},
+		{"reserved envelope usage", entry("strip-fields: [response.usage]\n"), `must not include "response.usage"`},
+		{"reserved synthesis leaf", entry("strip-fields: [usage.output_tokens_details.reasoning_tokens]\n"),
+			`must not include "usage.output_tokens_details.reasoning_tokens"`},
+		{"reserved quoted synthesis leaf",
+			entry("strip-fields: [\"'usage'.completion_tokens_details.reasoning_tokens\"]\n"),
+			`must not include "usage.completion_tokens_details.reasoning_tokens"`},
 		{"double quote in segment", entry("strip-fields: [\"a\\\"b\"]\n"), "must not contain a double quote"},
 		{"too many paths", entry("strip-fields: " + manyPaths() + "\n"), "too many paths"},
 		{"too deep", entry("strip-fields: [a.b.c.d.e.f.g.h.i]\n"), "descends too deep"},

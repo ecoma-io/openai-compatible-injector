@@ -602,8 +602,8 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// rewriteOut is the single response rewriter both response paths share —
 	// parity by construction: the model rewrite, then, when the plan is
 	// active, the usage synthesis, and finally the strip. The order is
-	// deliberate: rewrite and synthesis OWN model and usage, whose keys are
-	// reserved in the strip list, so the strip runs on the bytes that will
+	// deliberate: rewrite and synthesis OWN the members the strip list
+	// reserves, so the strip runs on the bytes that will
 	// actually be relayed. Under an inactive plan and an empty strip list it
 	// is exactly today's model-rewrite closure, byte for byte.
 	rewriteOut := func(payload []byte) []byte {
