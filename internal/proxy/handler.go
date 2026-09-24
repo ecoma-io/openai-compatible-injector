@@ -1437,6 +1437,23 @@ walk:
 			status := resp.StatusCode
 
 			if isUpstreamHTTPError(status) {
+				// A 429 marks the KEY, not the request — an account fact
+				// taken off the raw status, before the body capture can
+				// fail, stall, or be abandoned by a departing caller (all
+				// three reclassify the observation, but none un-say the
+				// provider's 429). The mark is unconditional on the
+				// recovery matrix: a policy that ignores Retry-After for
+				// its request waits must not also leave the key in
+				// rotation. The key that cools is the one this attempt
+				// went out with; the cooldown folds the parsed directive
+				// under the provider's ceiling (credentialCooldown), and
+				// the engine's own decision below still governs whether
+				// THIS request retries — on it, the next Acquire finds the
+				// marked key cooling and rotates.
+				if status == http.StatusTooManyRequests && pool != nil && credKey != "" {
+					pool.MarkRateLimited(eng.Now(), credKey,
+						credentialCooldown(parseRetryAfter(resp.Header.Get("Retry-After"), eng.Now()), cand.Cred.RateLimit))
+				}
 				// The evidence capture is reused unchanged: one bounded read
 				// reduces the error body to shape + fingerprint before any
 				// decision, and the capture's own failure modes are

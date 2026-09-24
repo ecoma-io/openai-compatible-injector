@@ -134,6 +134,20 @@ func (p *Pool) NextReady(now time.Time) (time.Time, bool) {
 	return earliest, found
 }
 
+// CoolingUntil reports when a key leaves cooldown: the zero time when the
+// key is not currently cooling (never marked, or its deadline already
+// passed against the caller's clock). A read-only view for observability —
+// the proxy's tests pin the exact cooldown a mark earned through it.
+func (p *Pool) CoolingUntil(keyID string) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	until, cooling := p.cooling[keyID]
+	if !cooling {
+		return time.Time{}
+	}
+	return until
+}
+
 // readyLocked reports whether a key is out of cooldown at now. Expired
 // deadlines are left in place (the map is bounded by the key count; lazily
 // ignoring them is cheaper than pruning and cannot race a concurrent read).

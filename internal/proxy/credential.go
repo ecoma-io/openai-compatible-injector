@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"time"
+
 	"openai-compatible-injector/internal/credential"
 )
 
@@ -20,4 +22,23 @@ import (
 // transport layer — pools live beside the transports, never inside them.
 type CredentialResolver interface {
 	Pool(*credential.Provider) *credential.Pool
+}
+
+// credentialCooldown folds an upstream Retry-After directive into the
+// provider's cooldown policy for a 429 mark. The mark is an account fact
+// — the provider said this key is rate-limited — and is taken whatever
+// the recovery matrix later does with the request's wait: a policy that
+// ignores Retry-After for its own sleeps must not also unmark the key.
+// The key cools for the directive when one is usable, capped by the
+// provider's max-cooldown (an upstream cannot pin a key out of rotation
+// indefinitely by shouting in a header), and for the provider's configured
+// default cooldown when no usable directive arrived.
+func credentialCooldown(directive time.Duration, rl credential.RateLimit) time.Duration {
+	if directive <= 0 {
+		return rl.Cooldown
+	}
+	if directive > rl.MaxCooldown {
+		return rl.MaxCooldown
+	}
+	return directive
 }

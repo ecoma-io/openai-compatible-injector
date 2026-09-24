@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -283,5 +285,206 @@ func TestCredentialAllCoolingFallsThroughWithoutDialing(t *testing.T) {
 	}
 	if _, has := done[0]["upstream_credential_id"]; has {
 		t.Error("completion record named a credential the walk never used")
+	}
+}
+
+// TestCredential429RotatesToNextReadyKey pins the headline behavior:
+// a 429 marks the key that went out (for the parsed Retry-After, folded
+// under the provider's ceiling), the engine's retry re-acquires, and the
+// re-ask lands on the NEXT ready account — not the marked one.
+func TestCredential429RotatesToNextReadyKey(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, body: `{"error":{"message":"slow down"}}`,
+			header: http.Header{"Retry-After": []string{"30"}}},
+		okAnswer(),
+	}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, quietLogger())
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	got := pa.calls()
+	if len(got) != 2 || got[0] != "Bearer sk-test-one" || got[1] != "Bearer sk-test-two" {
+		t.Fatalf("429 rotation sequence = %v, want kilo-1 then kilo-2", got)
+	}
+	if until := pool.CoolingUntil("kilo-1"); !until.Equal(credFrozen.Add(30 * time.Second)) {
+		t.Errorf("kilo-1 cools until %v, want %v (the parsed directive)", until, credFrozen.Add(30*time.Second))
+	}
+	if until := pool.CoolingUntil("kilo-2"); !until.IsZero() {
+		t.Errorf("kilo-2 was marked: %v", until)
+	}
+}
+
+// TestCredential429DefaultCooldownWithoutDirective: a 429 with no usable
+// Retry-After still marks — the account fact stands — for the provider's
+// configured default cooldown.
+func TestCredential429DefaultCooldownWithoutDirective(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, body: `{}`},
+		okAnswer(),
+	}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, quietLogger())
+
+	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if until := pool.CoolingUntil("kilo-1"); !until.Equal(credFrozen.Add(2 * time.Second)) {
+		t.Errorf("kilo-1 cools until %v, want %v (the default cooldown)", until, credFrozen.Add(2*time.Second))
+	}
+}
+
+// TestCredential429DirectiveCappedAtMaxCooldown: an upstream cannot pin a
+// key out of rotation by shouting a huge Retry-After — the mark folds the
+// directive under the provider's max-cooldown.
+func TestCredential429DirectiveCappedAtMaxCooldown(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock+"      rate-limit:\n        cooldown: 3s\n        max-cooldown: 45s\n")
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, body: `{}`,
+			header: http.Header{"Retry-After": []string{"3600"}}},
+		okAnswer(),
+	}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, quietLogger())
+
+	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if until := pool.CoolingUntil("kilo-1"); !until.Equal(credFrozen.Add(45 * time.Second)) {
+		t.Errorf("kilo-1 cools until %v, want %v (capped at max-cooldown)", until, credFrozen.Add(45*time.Second))
+	}
+}
+
+// TestCredential429MarksWhenBodyCaptureFails: the mark is taken off the raw
+// status BEFORE the error body is read, so a 429 whose body stalls or dies
+// mid-capture still cools its key — the classification of the observation
+// (a protocol failure, not an HTTP 429) never un-says the provider's rate
+// limit. The walk still rotates: the re-ask goes to the next ready key.
+func TestCredential429MarksWhenBodyCaptureFails(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, bodyErr: errors.New("read: connection reset")},
+		okAnswer(),
+	}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, quietLogger())
+
+	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if until := pool.CoolingUntil("kilo-1"); until.IsZero() {
+		t.Fatal("kilo-1 was not marked despite the capture failure")
+	}
+	got := pa.calls()
+	if len(got) != 2 || got[1] != "Bearer sk-test-two" {
+		t.Fatalf("post-capture-failure rotation = %v, want kilo-1 then kilo-2", got)
+	}
+}
+
+// TestCredential429MarkSurvivesClientCancel: the mark is taken the moment
+// the 429's headers arrive, before any decision — so a caller already gone
+// (the engine hard-stops every observation of a dead context to
+// caller/terminal) still leaves the key cooling. No second attempt is made
+// for a caller that is gone, and the 429 that ended the walk is relayed
+// verbatim exactly as any terminal answer.
+func TestCredential429MarkSurvivesClientCancel(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, body: `{"error":{"message":"slow down"}}`},
+		okAnswer(),
+	}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	buf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	doRequestWithContext(t, h, ctx, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if got := pa.calls(); len(got) != 1 {
+		t.Fatalf("upstream received %d calls, want 1 (no retry for a gone caller)", len(got))
+	}
+	if until := pool.CoolingUntil("kilo-1"); until.IsZero() {
+		t.Fatal("the 429 mark did not survive the client's departure")
+	}
+	failed := buf.events(t, "upstream_http_error")
+	if len(failed) != 1 || failed[0]["policy_rule_id"] != "caller" {
+		t.Fatalf("upstream_http_error = %v, want one decided by the caller rule", failed)
+	}
+	done := buf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "upstream_http_error" {
+		t.Fatalf("completion = %v, want one upstream_http_error", done)
+	}
+}
+
+// TestCredentialCooldownFold pins the fold from an upstream directive to a
+// mark duration: usable directive wins up to the ceiling, the ceiling wins
+// above it, the configured default covers every unusable shape.
+func TestCredentialCooldownFold(t *testing.T) {
+	rl := credential.RateLimit{Cooldown: 2 * time.Second, MaxCooldown: time.Minute}
+	for _, tc := range []struct {
+		name string
+		d    time.Duration
+		want time.Duration
+	}{
+		{"no directive", 0, 2 * time.Second},
+		{"hostile negative", -time.Second, 2 * time.Second},
+		{"small directive", 5 * time.Second, 5 * time.Second},
+		{"exact ceiling", time.Minute, time.Minute},
+		{"above ceiling", 90 * time.Minute, time.Minute},
+	} {
+		if got := credentialCooldown(tc.d, rl); got != tc.want {
+			t.Errorf("%s: credentialCooldown = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestCredentialValuesNeverLogged sweeps the whole rotation scenario's log
+// at debug — the loudest level — for the key VALUES: ids may ride the
+// credential fields, values may ride nothing.
+func TestCredentialValuesNeverLogged(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStore(t, credAuthBlock)
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, body: `{"error":{"message":"slow down"}}`,
+			header: http.Header{"Retry-After": []string{"30"}}},
+		okAnswer(),
+	}}
+	creds := credential.NewRegistry()
+	buf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, log)
+
+	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	for _, secret := range []string{"sk-test-one", "sk-test-two"} {
+		if strings.Contains(buf.String(), secret) {
+			t.Errorf("key value %q reached the log: %s", secret, buf.String())
+		}
+	}
+	done := buf.events(t, "request_completed")
+	if len(done) != 1 {
+		t.Fatalf("request_completed events = %d, want 1", len(done))
+	}
+	if id, _ := done[0]["upstream_credential_id"].(string); id != "kilo-2" {
+		t.Errorf("completion upstream_credential_id = %v, want the answering key kilo-2", done[0]["upstream_credential_id"])
+	}
+	// The failed attempt's own event names ITS key — never the client's.
+	failed := buf.events(t, "upstream_http_error")
+	if len(failed) != 1 || failed[0]["upstream_credential_id"] != "kilo-1" {
+		t.Fatalf("upstream_http_error = %v, want exactly one naming kilo-1", failed)
 	}
 }
