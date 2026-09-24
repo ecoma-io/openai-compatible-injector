@@ -3,7 +3,6 @@ package e2e_test
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -131,7 +130,7 @@ func TestStripFieldsStreamedChat(t *testing.T) {
 			t.Fatalf("streamed chunk lost its choices payload: %s", payload)
 		}
 	}
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, _ = nextSSEEvent(t, br, 3*time.Second)
 	foundDone := false
 	for _, ln := range lines {
 		if ln == "data: [DONE]" {
@@ -217,18 +216,4 @@ func TestStripFieldsReloadBinding(t *testing.T) {
 	if got := stripFieldOf(t, body, "provider"); got != "" {
 		t.Fatalf("post-reload provider survived: %s", body)
 	}
-}
-
-// waitForConfigReload polls the WARN config_reloaded log line until it
-// appears or the deadline passes.
-func waitForConfigReload(t *testing.T, p *proc) error {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(p.stderr.String(), "config_reloaded") {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return fmt.Errorf("no config_reloaded within deadline; stderr:\n%s", p.stderr.String())
 }
