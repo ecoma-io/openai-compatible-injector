@@ -76,9 +76,13 @@ const (
 // buildAuth translates and validates one provider's `auth` block. A nil
 // block yields (nil, nil) — no credential, unchanged request bytes — and a
 // malformed block rejects the whole file with a position-prefixed,
-// fixed-text error. The key VALUES are validated by the credential domain
-// and never echoed anywhere, including here.
-func buildAuth(ra *runtimeAuth, ordinal int) (*credential.Provider, error) {
+// fixed-text error. name is the entry's trimmed providers-table name and
+// becomes the credential's Identity: rotation state belongs to the
+// provider that declared the block, so the name takes part in the pool key
+// and two providers with byte-identical auth stay independent. The key
+// VALUES are validated by the credential domain and never echoed anywhere,
+// including here.
+func buildAuth(ra *runtimeAuth, name string, ordinal int) (*credential.Provider, error) {
 	if ra == nil {
 		return nil, nil
 	}
@@ -132,5 +136,5 @@ func buildAuth(ra *runtimeAuth, ordinal int) (*credential.Provider, error) {
 			return nil, fmt.Errorf("%s rate-limit cooldown must not exceed the effective max-cooldown (configured %s, default %s)", prefix, rl.Cooldown, maxAuthCooldownCap)
 		}
 	}
-	return &credential.Provider{Spec: spec, RateLimit: rl}, nil
+	return &credential.Provider{Identity: name, Spec: spec, RateLimit: rl}, nil
 }

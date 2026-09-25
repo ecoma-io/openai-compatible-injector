@@ -1009,11 +1009,12 @@ walk:
 					req.Header.Set(cand.Cred.Spec.Header, cand.Cred.Spec.Prefix+k.Value)
 				} else {
 					// No ready key: every key of this provider is cooling
-					// under a 429 mark. The observation rides the earliest
-					// ready time as its Retry-After — the matrix re-caps it
-					// like any directive before the wait, so a long provider
-					// cooldown cannot stretch one retry's sleep — and the
-					// candidate's REAL retry budget bounds the whole cycle:
+					// under a 429 mark. The observation carries the earliest
+					// ready time as CredentialReadyIn — a LOCAL readiness
+					// floor on the re-ask, never an upstream directive, so
+					// the retry-after policy's mode and ceilings leave it
+					// alone while the candidate's REAL retry budget and the
+					// caller's deadline still bound the whole cycle:
 					// exhausted, the policy's on-exhausted action moves the
 					// walk on or ends it. No busy loop, no synthesized
 					// response, no invented counter.
@@ -1036,8 +1037,9 @@ walk:
 						RetryIndex:       retryIndex,
 						Elapsed:          eng.Now().Sub(candStart).Milliseconds(),
 					}
-					if next, ok := pool.NextReady(eng.Now()); ok {
-						obs.RetryAfter = next.Sub(eng.Now())
+					now := eng.Now()
+					if next, ok := pool.NextReady(now); ok {
+						obs.CredentialReadyIn = next.Sub(now)
 					}
 					dec := eng.Observe(obs)
 					lastRuleID = dec.RuleID

@@ -81,23 +81,30 @@ Per-request, per-candidate:
   recovery layer owns what happens next through a typed decision seam —
   **decided**: a new credential failure class (`FailureCredential` /
   `CredentialCooldown`) rides the engine's ordinary observation path, with
-  the pool's earliest-ready time folded in as the observation's
-  `RetryAfter` — so the existing directive/cap machinery bounds the wait
-  and the operator's matrix (default row: retry) owns the decision. Hard
-  requirements, all pinned by tests: no fake exchange consumption, no fake
-  attempt counters (a blocked attempt counts, dials nothing, emits no
-  started marker), no dial without a credential, no busy loop, no
-  unbounded sleep; candidate windows and caller deadlines bind exactly as
-  they do for backoff waits.
+  the pool's earliest-ready time carried on the observation's
+  `CredentialReadyIn` — a LOCAL readiness floor the engine applies to every
+  wait outside the `RetryAfter` channel, so the retry-after policy's mode
+  and ceilings (`ignore` included) never erase what the pool knows, while
+  the candidate's retry window, the caller's deadline, and the retry/exchange
+  envelopes bind it exactly as they bind every other wait. The operator's
+  matrix (default row: retry) owns the decision. Hard requirements, all
+  pinned by tests: no fake exchange consumption, no fake attempt counters (a
+  blocked attempt counts, dials nothing, emits no started marker), no dial
+  without a credential, no busy loop, no unbounded sleep.
 
 ## Snapshot / hot reload
 
 The pool is snapshot-bound like every other config plane. The registry is
-content-keyed in the style of the transport `Registry`: unchanged credential
-config across a reload keeps its rotation/cooldown state warm; changed
-config starts a fresh pool instance, and an in-flight request's pinned pool
-outlives any retirement. Reloads never reset or reshape another request's
-key state.
+keyed by the provider's pool identity in the style of the transport
+`Registry`: the identity is the providers-table name, the credential bytes,
+and the `rate-limit` policy TOGETHER — never the credential bytes alone, so
+two providers sharing identical credentials stay two rotation domains
+(separate cursors, separate cooldowns), and a reload that changes only a
+`rate-limit` value starts that provider's pool fresh rather than retuning
+state sized by the old policy. An unchanged identity keeps its
+rotation/cooldown state warm across a reload; a changed identity starts a
+fresh pool instance, and an in-flight request's pinned pool outlives any
+retirement. Reloads never reset or reshape another request's key state.
 
 ## Telemetry and secrets
 

@@ -350,22 +350,32 @@ func TestEngineRetryAfterIsOnlyAFloorAndNeverUnbounded(t *testing.T) {
 }
 
 func TestEngineRetryDelayNeverPassesTheCallerDeadline(t *testing.T) {
-	clk := newTestClock()
-	// The deadline lives on the same clock the engine reads: a request
-	// context and its engine must never be measured by two clocks.
-	ctx, cancel := context.WithDeadline(context.Background(), clk.now().Add(100*time.Millisecond))
+	// The deadline lives on the same clock the engine reads, and that clock
+	// starts at the real present: a deadline anchored on a fixed past date
+	// would expire the context before the first Observe and the cap below
+	// would assert nothing.
+	clk := &testClock{t: time.Now()}
+	// Wide margins: the context's real timer must outlive everything up to
+	// the first Observe, and the sleep below must outlive the timer, on a
+	// possibly loaded runner.
+	ctx, cancel := context.WithDeadline(context.Background(), clk.now().Add(500*time.Millisecond))
 	defer cancel()
 	pol := Default()
 	e := newTestEngineWithClock(ctx, pol, clk)
 	e.EnterCandidate(pol)
 	o := httpObs(429, 1)
 	o.RetryAfter = time.Hour
-	if d := e.Observe(o); d.Delay > 100*time.Millisecond {
+	d := e.Observe(o)
+	if d.Action != ActionRetry {
+		t.Fatalf("a live caller got %+v, want a capped retry", d)
+	}
+	if d.Delay > 500*time.Millisecond {
 		t.Fatalf("delay %v reaches past the caller's deadline", d.Delay)
 	}
 	// An expired deadline is the caller's condition, not a retry: it is
-	// terminal, decided from the context rather than from the status.
-	clk.advance(200 * time.Millisecond)
+	// terminal, decided from the context rather than from the status. The
+	// context's real timer is what expires it — wait it out.
+	time.Sleep(750 * time.Millisecond)
 	if d := e.Observe(httpObs(429, 2)); d.Action != ActionTerminal || d.RuleID != RuleIDCaller {
 		t.Fatalf("an expired deadline got %+v", d)
 	}

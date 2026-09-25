@@ -542,12 +542,14 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 		}
 	}
 
-	// The credential retain set: the distinct upstream credential providers
-	// the models reference, in first-use order over sorted model names,
-	// deduplicated by spec content key (not pointer). Two candidates whose
-	// providers configure byte-identical credentials share one pool — they
-	// are the same upstream accounts, so they share one rotation cursor and
-	// one cooldown state.
+	// The credential retain set: the distinct upstream credential pools the
+	// models reference, in first-use order over sorted model names,
+	// deduplicated by pool key (not pointer). The pool key covers the
+	// provider's identity, the credential content, and the resolved
+	// rate-limit policy: two models sharing one provider share one pool,
+	// while two providers configuring byte-identical credentials keep
+	// independent rotation and cooldown state — and a reload that changes
+	// any of the three starts that pool's state fresh.
 	credentialSeen := make(map[string]struct{}, 1)
 	credentialSet := make([]*credential.Provider, 0, 1)
 	for _, name := range names {
@@ -555,7 +557,7 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 			if cand.Cred == nil {
 				continue
 			}
-			k := cand.Cred.ContentKey()
+			k := cand.Cred.PoolKey()
 			if _, dup := credentialSeen[k]; dup {
 				continue
 			}
@@ -953,7 +955,7 @@ func buildProviders(rp map[string]runtimeProvider, transports map[string]transpo
 		if err != nil {
 			return nil, fmt.Errorf("provider entry %d: %w", ordinal, err)
 		}
-		cred, err := buildAuth(entry.Auth, ordinal)
+		cred, err := buildAuth(entry.Auth, name, ordinal)
 		if err != nil {
 			return nil, err
 		}

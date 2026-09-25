@@ -317,10 +317,10 @@ func TestCredential429RotatesToNextReadyKey(t *testing.T) {
 	if len(got) != 2 || got[0] != "Bearer sk-test-one" || got[1] != "Bearer sk-test-two" {
 		t.Fatalf("429 rotation sequence = %v, want kilo-1 then kilo-2", got)
 	}
-	if until := pool.CoolingUntil("kilo-1"); !until.Equal(credFrozen.Add(30 * time.Second)) {
+	if until := pool.CoolingUntil(credFrozen, "kilo-1"); !until.Equal(credFrozen.Add(30 * time.Second)) {
 		t.Errorf("kilo-1 cools until %v, want %v (the parsed directive)", until, credFrozen.Add(30*time.Second))
 	}
-	if until := pool.CoolingUntil("kilo-2"); !until.IsZero() {
+	if until := pool.CoolingUntil(credFrozen, "kilo-2"); !until.IsZero() {
 		t.Errorf("kilo-2 was marked: %v", until)
 	}
 }
@@ -342,7 +342,7 @@ func TestCredential429DefaultCooldownWithoutDirective(t *testing.T) {
 	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if until := pool.CoolingUntil("kilo-1"); !until.Equal(credFrozen.Add(2 * time.Second)) {
+	if until := pool.CoolingUntil(credFrozen, "kilo-1"); !until.Equal(credFrozen.Add(2 * time.Second)) {
 		t.Errorf("kilo-1 cools until %v, want %v (the default cooldown)", until, credFrozen.Add(2*time.Second))
 	}
 }
@@ -365,7 +365,7 @@ func TestCredential429DirectiveCappedAtMaxCooldown(t *testing.T) {
 	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if until := pool.CoolingUntil("kilo-1"); !until.Equal(credFrozen.Add(45 * time.Second)) {
+	if until := pool.CoolingUntil(credFrozen, "kilo-1"); !until.Equal(credFrozen.Add(45 * time.Second)) {
 		t.Errorf("kilo-1 cools until %v, want %v (capped at max-cooldown)", until, credFrozen.Add(45*time.Second))
 	}
 }
@@ -389,7 +389,7 @@ func TestCredential429MarksWhenBodyCaptureFails(t *testing.T) {
 	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if until := pool.CoolingUntil("kilo-1"); until.IsZero() {
+	if until := pool.CoolingUntil(credFrozen, "kilo-1"); until.IsZero() {
 		t.Fatal("kilo-1 was not marked despite the capture failure")
 	}
 	got := pa.calls()
@@ -422,7 +422,7 @@ func TestCredential429MarkSurvivesClientCancel(t *testing.T) {
 	if got := pa.calls(); len(got) != 1 {
 		t.Fatalf("upstream received %d calls, want 1 (no retry for a gone caller)", len(got))
 	}
-	if until := pool.CoolingUntil("kilo-1"); until.IsZero() {
+	if until := pool.CoolingUntil(credFrozen, "kilo-1"); until.IsZero() {
 		t.Fatal("the 429 mark did not survive the client's departure")
 	}
 	failed := buf.events(t, "upstream_http_error")
@@ -669,11 +669,11 @@ func TestCredentialRotationAcrossBudget(t *testing.T) {
 		t.Fatalf("rotation sequence = %v, want kilo-1, kilo-2, kilo-3", got)
 	}
 	for _, id := range []string{"kilo-1", "kilo-2"} {
-		if pool.CoolingUntil(id).IsZero() {
+		if pool.CoolingUntil(credFrozen, id).IsZero() {
 			t.Errorf("%s was not marked by its 429", id)
 		}
 	}
-	if until := pool.CoolingUntil("kilo-3"); !until.IsZero() {
+	if until := pool.CoolingUntil(credFrozen, "kilo-3"); !until.IsZero() {
 		t.Errorf("kilo-3 was marked: %v", until)
 	}
 }
@@ -771,7 +771,7 @@ func TestCredentialAuthFailureDoesNotMarkOrRotate(t *testing.T) {
 			t.Fatalf("status %d: pa calls = %v, want exactly one kilo-1 dial", status, got)
 		}
 		for _, id := range []string{"kilo-1", "kilo-2"} {
-			if until := pool.CoolingUntil(id); !until.IsZero() {
+			if until := pool.CoolingUntil(credFrozen, id); !until.IsZero() {
 				t.Errorf("status %d: %s was marked, cools until %v", status, id, until)
 			}
 		}
@@ -922,5 +922,140 @@ func TestCredentialBlockedTerminalOnDeadCaller(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Fatalf("a dead caller received a body: %q", rec.Body.String())
+	}
+}
+
+// newIdenticalAuthStore is newCredChainStore with the SAME auth block on
+// BOTH providers (pa direct, pb proxied): the shape the pool-isolation
+// contract exists for — two providers, byte-identical credentials.
+func newIdenticalAuthStore(t *testing.T) *config.Store {
+	t.Helper()
+	snap, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + "\n" + `
+transports:
+  t1:
+    type: direct
+  t2:
+    type: proxy
+    proxy: http://127.0.0.1:9090
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t1
+` + credAuthBlock + `  pb:
+    base-url: https://b.example/v1
+    transport: t2
+` + credAuthBlock + `models:
+  m-a:
+    provider: pa
+    upstream-model: up-a
+  m-b:
+    provider: pb
+    upstream-model: up-b
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	return config.NewStore(snap)
+}
+
+// TestCredentialPoolsAreProviderScoped pins the isolation half of the pool
+// identity: two providers whose auth blocks are byte-identical are TWO
+// rotation domains. A 429 earned on pa's account cools pa's copy only, and
+// pa's rotation never moves pb's cursor — pb's first request still carries
+// its own first key.
+func TestCredentialPoolsAreProviderScoped(t *testing.T) {
+	stubRetryTiming(t)
+	store := newIdenticalAuthStore(t)
+	ca, ok := store.Load().Model("m-a")
+	if !ok {
+		t.Fatal("model m-a not found")
+	}
+	cb, _ := store.Load().Model("m-b")
+	if ca.Chain[0].Cred == nil || cb.Chain[0].Cred == nil {
+		t.Fatal("an auth block failed to reach a candidate")
+	}
+	if ca.Chain[0].Cred.PoolKey() == cb.Chain[0].Cred.PoolKey() {
+		t.Fatal("byte-identical auth blocks under two providers share a pool key")
+	}
+	pa := &authScript{steps: []credStep{
+		{status: http.StatusTooManyRequests, body: `{}`},
+		okAnswer(),
+	}}
+	pb := &authScript{steps: []credStep{okAnswer()}}
+	creds := credential.NewRegistry()
+	poolA := creds.Pool(ca.Chain[0].Cred)
+	poolB := creds.Pool(cb.Chain[0].Cred)
+	if poolA == poolB {
+		t.Fatal("the registry handed both providers the same pool instance")
+	}
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, creds, nil, nil, quietLogger())
+
+	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"m-a","messages":[{"role":"user","content":"hi"}]}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("m-a status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	// pa's walk: kilo-1 429s and cools, the re-ask lands on kilo-2.
+	if got := pa.calls(); len(got) != 2 || got[1] != "Bearer sk-test-two" {
+		t.Fatalf("pa calls = %v, want kilo-1 then kilo-2", got)
+	}
+	if until := poolA.CoolingUntil(credFrozen, "kilo-1"); until.IsZero() {
+		t.Fatal("pa's 429 did not mark pa's key")
+	}
+	// pb's identical accounts are untouched — no leaked cooldown, and the
+	// request below still carries pb's OWN kilo-1.
+	if until := poolB.CoolingUntil(credFrozen, "kilo-1"); !until.IsZero() {
+		t.Errorf("pa's 429 cooled pb's copy of the same account: %v", until)
+	}
+	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
+		`{"model":"m-b","messages":[{"role":"user","content":"hi"}]}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("m-b status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := pb.calls(); len(got) != 1 || got[0] != "Bearer sk-test-one" {
+		t.Errorf("pb calls = %v, want one dial on pb's own kilo-1", got)
+	}
+}
+
+// TestCredentialReadinessIndependentOfRetryAfterMode pins the separation
+// end to end: a model whose recovery policy IGNORES upstream Retry-After
+// directives still waits out its credential pool's readiness. The captured
+// wait is the pool's cooldown remainder — not the bare backoff an
+// ignore-mode directive collapses to — and the blocked attempt still burns
+// the real retry budget before the fallback answers.
+func TestCredentialReadinessIndependentOfRetryAfterMode(t *testing.T) {
+	stubRetryTiming(t)
+	store := newCredChainStoreBlocks(t, credAuthBlock,
+		"    recovery:\n      retry-after:\n        mode: ignore\n")
+	pa := &authScript{steps: []credStep{okAnswer()}}
+	pb := &authScript{steps: []credStep{okAnswer()}}
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+	// Both accounts cooling on the default cooldown: the pool's earliest
+	// readiness sits 2s past the frozen clock.
+	pool.MarkRateLimited(credFrozen, "kilo-1", 2*time.Second)
+	pool.MarkRateLimited(credFrozen, "kilo-2", 2*time.Second)
+	var waits []time.Duration
+	origWait := retryWait
+	retryWait = func(ctx context.Context, d time.Duration) bool {
+		waits = append(waits, d)
+		return origWait(ctx, d)
+	}
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, creds, nil, nil, quietLogger())
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := pa.calls(); len(got) != 0 {
+		t.Errorf("the cooling provider was dialed %d times, want 0", len(got))
+	}
+	// One blocked attempt (max-retries 1), one wait — and that wait is the
+	// pool's 2s readiness. Under the defect this fix removed, `mode:
+	// ignore` erased the readiness and the wait collapsed to the 250ms
+	// backoff.
+	if len(waits) != 1 {
+		t.Fatalf("waits = %v, want exactly the blocked attempt's one wait", waits)
+	}
+	if waits[0] != 2*time.Second {
+		t.Errorf("wait = %v, want the 2s readiness an ignore-mode policy must not erase", waits[0])
 	}
 }

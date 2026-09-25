@@ -132,12 +132,12 @@ func Default() Policy {
 
 	// Every key of the candidate's credential pool is cooling from earlier
 	// upstream 429s, so the attempt was never dialed and no exchange was
-	// consumed. The default is a retry whose wait is the cooldown's
-	// remainder — it rides Observation.RetryAfter through the same
-	// raise/cap machinery as an upstream Retry-After — and the candidate's
-	// retry budget bounds how long the walk keeps re-asking before
-	// on-exhausted takes over. This row does NOT decide rotation: which key
-	// the next attempt carries is acquisition's job alone.
+	// consumed. The default is a retry whose wait is at least the cooldown's
+	// remainder — carried on Observation.CredentialReadyIn, a local floor
+	// outside the retry-after policy's vote — and the candidate's retry
+	// budget bounds how long the walk keeps re-asking before on-exhausted
+	// takes over. This row does NOT decide rotation: which key the next
+	// attempt carries is acquisition's job alone.
 	add(CredentialCauseRuleID(CredentialCooldown), Match{Class: FailureCredential, CredentialCause: CredentialCooldown}, ActionRetry)
 
 	m, err := NewMatrix(rules, ActionTerminal)

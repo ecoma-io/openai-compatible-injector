@@ -170,6 +170,41 @@ func TestNextReadyEarliestOfSeveral(t *testing.T) {
 	}
 }
 
+// TestCoolingUntilContract pins the read-only view's full shape: the zero
+// time is "not currently cooling" — never marked, unknown id, deadline
+// already passed at the CALLER's now, or exactly at it (the key is ready
+// again) — and a cooling key reports its own deadline, never a wall clock.
+// A read also never rewrites state.
+func TestCoolingUntilContract(t *testing.T) {
+	p := NewPool(threeKeys())
+	if until := p.CoolingUntil(base, "k1"); !until.IsZero() {
+		t.Fatalf("unmarked key CoolingUntil = %v, want zero", until)
+	}
+	if until := p.CoolingUntil(base, "ghost"); !until.IsZero() {
+		t.Fatalf("unknown id CoolingUntil = %v, want zero", until)
+	}
+	p.MarkRateLimited(base, "k1", 30*time.Second)
+	if until := p.CoolingUntil(base, "k1"); !until.Equal(base.Add(30 * time.Second)) {
+		t.Fatalf("cooling key CoolingUntil = %v, want %v", until, base.Add(30*time.Second))
+	}
+	// Exactly at the deadline the key is ready again: zero.
+	if until := p.CoolingUntil(base.Add(30*time.Second), "k1"); !until.IsZero() {
+		t.Fatalf("boundary CoolingUntil = %v, want zero", until)
+	}
+	// Past it: zero — a past deadline is not a wait a caller may sleep.
+	if until := p.CoolingUntil(base.Add(31*time.Second), "k1"); !until.IsZero() {
+		t.Fatalf("expired CoolingUntil = %v, want zero", until)
+	}
+	// The reads left the mark itself intact for a caller on the old clock.
+	if until := p.CoolingUntil(base, "k1"); !until.Equal(base.Add(30 * time.Second)) {
+		t.Fatalf("reads rewrote the mark: CoolingUntil = %v", until)
+	}
+	// Other keys were never touched by any of it.
+	if until := p.CoolingUntil(base, "k2"); !until.IsZero() {
+		t.Fatalf("unrelated key CoolingUntil = %v, want zero", until)
+	}
+}
+
 func TestMarkRateLimitedEdgeInputs(t *testing.T) {
 	p := NewPool(threeKeys())
 	// Non-positive cooldowns are no-ops.
