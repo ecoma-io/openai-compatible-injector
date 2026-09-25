@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.12.0...v0.13.0) (2026-09-25)
+
+
+### Features
+
+* **proxy:** per-provider upstream API-key auth with multi-key rotation and 429-aware cooldown ([#71](https://github.com/ecoma-io/openai-compatible-injector/issues/71)) ([cb9b16d](https://github.com/ecoma-io/openai-compatible-injector/commit/cb9b16dc81a13885cc44206484cb6c8a43c03ef4))
+
 ## [0.12.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.11.0...v0.12.0) (2026-09-24)
 
 
