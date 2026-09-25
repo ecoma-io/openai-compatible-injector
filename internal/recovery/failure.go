@@ -37,7 +37,9 @@ const (
 	// attempt dials — no exchange was consumed and no provider was contacted
 	// — and it is the credential layer's entire vocabulary: the pool reports
 	// state, this class carries it to the matrix, and the matrix, as ever,
-	// decides what happens next. The wait rides Observation.RetryAfter.
+	// decides what happens next. The wait travels on
+	// Observation.CredentialReadyIn — a LOCAL lower bound, never the
+	// RetryAfter channel an upstream directive rides.
 	FailureCredential
 )
 
@@ -286,9 +288,10 @@ const (
 // Credential cause tokens: the credential pool could not hand out a key for
 // this attempt. Phase one carries exactly one cause — every key of the
 // candidate's pool is cooling from an earlier upstream 429. The observation
-// carrying this cause also carries the earliest ready-at time as a wait in
-// its RetryAfter field, so the engine's existing raise/cap machinery bounds
-// it exactly as it bounds an upstream's Retry-After directive.
+// carrying this cause also carries the earliest ready-at time in its
+// CredentialReadyIn field — a local readiness floor the engine raises the
+// retry delay to, deliberately separate from the RetryAfter channel the
+// retry-after policy governs.
 const CredentialCooldown = "cooldown"
 
 // KnownCredentialCause reports whether a token is part of the closed set.
@@ -386,13 +389,24 @@ type Observation struct {
 	Elapsed int64
 
 	// RetryAfter is the failed response's parsed Retry-After directive, 0
-	// when absent, invalid, or already past. On a FailureCredential it
-	// carries the pool's earliest ready-at time instead — the same wait
-	// channel, produced by a cooldown mark rather than by a directive; the
-	// distinction lives in the class, the machinery is shared. It is not a
-	// predicate — the Retry-After policy decides whether it may raise a wait
-	// at all, and the engine caps whatever it raises before anything sleeps.
+	// when absent, invalid, or already past. It carries an UPSTREAM's ask
+	// and nothing else — the pool's cooldown readiness travels on
+	// CredentialReadyIn below, never here. It is not a predicate — the
+	// Retry-After policy decides whether it may raise a wait at all, and
+	// the engine caps whatever it raises before anything sleeps.
 	RetryAfter time.Duration
+
+	// CredentialReadyIn is how far away the candidate's credential pool
+	// said its earliest key's cooldown ends, when the attempt was refused
+	// for having no ready key. It is LOCAL state — a cooldown this proxy
+	// marked from an earlier upstream 429 — and deliberately not an
+	// upstream directive: the retry-after policy has no vote on it
+	// (`retry-after: ignore` discards what the UPSTREAM asked for, never
+	// what the pool knows), and only a FailureCredential observation may
+	// carry it. The engine raises the retry delay to it as a floor, and the
+	// existing windows — the candidate's retry window and the caller's
+	// deadline — bound it exactly as they bound every other wait.
+	CredentialReadyIn time.Duration
 }
 
 // Reason returns the closed-set reason token the evidence events carry for an

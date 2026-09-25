@@ -37,7 +37,7 @@ const (
 
 // TestProviderAuthBuildsCredential pins the happy path: the block builds a
 // validated candidate credential, the chain carries it, and the snapshot's
-// retain set dedups by content so two models sharing a provider share one
+// retain set dedups by pool key so two models sharing a provider share one
 // pool identity.
 func TestProviderAuthBuildsCredential(t *testing.T) {
 	s := mustSnapshot(t, authRuntime(validAuthBlock, ""))
@@ -62,13 +62,64 @@ func TestProviderAuthBuildsCredential(t *testing.T) {
 	if cred.RateLimit.Cooldown != 2*time.Second || cred.RateLimit.MaxCooldown != time.Minute {
 		t.Errorf("default rate limit = %+v", cred.RateLimit)
 	}
-	if len(s.Credentials()) != 1 || s.Credentials()[0].ContentKey() != cred.ContentKey() {
+	if len(s.Credentials()) != 1 || s.Credentials()[0].PoolKey() != cred.PoolKey() {
 		t.Errorf("retain set = %d entries, want 1 identical", len(s.Credentials()))
 	}
 	// The second model's chain candidate carries the same configuration.
 	m2, _ := s.Model("m2")
-	if m2.Chain[0].Cred == nil || m2.Chain[0].Cred.ContentKey() != cred.ContentKey() {
+	if m2.Chain[0].Cred == nil || m2.Chain[0].Cred.PoolKey() != cred.PoolKey() {
 		t.Error("m2 candidate lost the shared credential")
+	}
+	if cred.Identity != "pa" {
+		t.Errorf("credential Identity = %q, want the providers-table name", cred.Identity)
+	}
+}
+
+// TestProviderCredentialPoolKeyIsProviderScoped pins the identity axes at
+// the config plane: two providers whose auth blocks are byte-identical
+// carry DIFFERENT pool keys and both land in the retain set — they are two
+// rotation domains, never one shared cursor — and a rate-limit-ONLY change
+// between loads moves the pool key even though every credential byte is
+// unchanged, so a reload starts that provider's state fresh.
+func TestProviderCredentialPoolKeyIsProviderScoped(t *testing.T) {
+	twoProviders := "api-key: unit-test-key\n" +
+		"transports:\n  t1:\n    type: direct\n" +
+		"providers:\n" +
+		"  pa:\n    base-url: https://a.example/v1\n    transport: t1\n" + validAuthBlock +
+		"  pb:\n    base-url: https://b.example/v1\n    transport: t1\n" + validAuthBlock +
+		"models:\n" +
+		"  m1:\n    provider: pa\n    upstream-model: up-a\n" +
+		"  m2:\n    provider: pb\n    upstream-model: up-b\n"
+	s := mustSnapshot(t, twoProviders)
+	pa, ok := s.Model("m1")
+	if !ok {
+		t.Fatal("model m1 not found")
+	}
+	pb, _ := s.Model("m2")
+	if pa.Chain[0].Cred.Identity != "pa" || pb.Chain[0].Cred.Identity != "pb" {
+		t.Errorf("identities = %q / %q, want the providers-table names", pa.Chain[0].Cred.Identity, pb.Chain[0].Cred.Identity)
+	}
+	if pa.Chain[0].Cred.PoolKey() == pb.Chain[0].Cred.PoolKey() {
+		t.Fatal("byte-identical auth blocks under two providers share a pool key")
+	}
+	if len(s.Credentials()) != 2 {
+		t.Errorf("retain set = %d entries, want 2 (one per provider)", len(s.Credentials()))
+	}
+
+	// The rate-limit axis: same provider name, same credential bytes, a
+	// different stated cooldown — a different pool key.
+	load := func(extra string) string {
+		snap := mustSnapshot(t, authRuntime(validAuthBlock+extra, ""))
+		m, _ := snap.Model("m1")
+		return m.Chain[0].Cred.PoolKey()
+	}
+	baseKey := load("")
+	retunedKey := load("      rate-limit:\n        cooldown: 5s\n")
+	if baseKey == retunedKey {
+		t.Fatal("a rate-limit-only change kept the pool key sized by the old policy")
+	}
+	if baseKey != load("") {
+		t.Fatal("an unchanged block changed its pool key between loads")
 	}
 }
 

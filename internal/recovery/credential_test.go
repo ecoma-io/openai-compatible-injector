@@ -8,16 +8,17 @@ import (
 
 // credObs builds the observation the proxy hands the engine when a
 // candidate's credential pool has nothing ready: the class carries the
-// pool's state, the cause names why, and the wait rides RetryAfter exactly
-// as an upstream directive does.
+// pool's state, the cause names why, and the wait rides CredentialReadyIn
+// — a LOCAL readiness floor, deliberately not the RetryAfter channel an
+// upstream directive travels on.
 func credObs(attempt int, wait time.Duration) Observation {
 	return Observation{
-		Class:            FailureCredential,
-		CredentialCause:  CredentialCooldown,
-		RetryAfter:       wait,
-		CandidateIndex:   1,
-		CandidateAttempt: attempt,
-		RetryIndex:       attempt - 1,
+		Class:             FailureCredential,
+		CredentialCause:   CredentialCooldown,
+		CredentialReadyIn: wait,
+		CandidateIndex:    1,
+		CandidateAttempt:  attempt,
+		RetryIndex:        attempt - 1,
 	}
 }
 
@@ -49,33 +50,100 @@ func TestDefaultMatrixCredentialCooldownRetries(t *testing.T) {
 	}
 }
 
-// TestEngineCredentialCooldownWaitRidesRetryAfter is the seam the feature
-// rests on: the pool's earliest ready-at time flows into the engine through
-// the SAME RetryAfter channel as a directive, so the raise/cap machinery and
-// every existing ceiling bind it without one line of engine change.
-func TestEngineCredentialCooldownWaitRidesRetryAfter(t *testing.T) {
-	cases := []struct {
-		name string
-		wait time.Duration
-		want time.Duration
-	}{
-		{"a cooldown above the backoff ceiling is ceilinged", 30 * time.Second, DefaultBackoffMax},
-		{"a cooldown between the backoff and its ceiling wins", time.Second, time.Second},
-		{"a cooldown below the backoff is only a floor", 50 * time.Millisecond, DefaultBackoffInitial},
-		{"no reported ready-at falls to plain backoff", 0, DefaultBackoffInitial},
-	}
-	for _, c := range cases {
+// TestEngineCredentialCooldownWaitIsItsOwnFloor is the seam the feature
+// rests on: the pool's earliest ready-at time is a LOCAL lower bound on the
+// re-ask. It never travels the RetryAfter channel, so the retry-after
+// policy's mode and ceilings leave it untouched — `ignore` discards what
+// the UPSTREAM asked for, never what the pool knows — while the two
+// shortening windows (the candidate's retry window, the caller's deadline)
+// still bind it like every other wait.
+func TestEngineCredentialCooldownWaitIsItsOwnFloor(t *testing.T) {
+	t.Run("floor over the schedule", func(t *testing.T) {
+		cases := []struct {
+			name string
+			wait time.Duration
+			want time.Duration
+		}{
+			{"a cooldown above the backoff ceiling is waited out in full", 30 * time.Second, 30 * time.Second},
+			{"a cooldown between the backoff and its ceiling wins", time.Second, time.Second},
+			{"a cooldown below the backoff is only a floor", 50 * time.Millisecond, DefaultBackoffInitial},
+			{"no reported ready-at falls to plain backoff", 0, DefaultBackoffInitial},
+		}
+		for _, c := range cases {
+			pol := Default()
+			// A window wide enough that only the readiness and the backoff
+			// schedule compete; the window's own cap has its case below.
+			pol.Retry.MaxElapsed = time.Minute
+			e, _ := newTestEngine(t, context.Background(), pol)
+			e.EnterCandidate(pol)
+			d := e.Observe(credObs(1, c.wait))
+			if d.Action != ActionRetry {
+				t.Fatalf("%s: %+v", c.name, d)
+			}
+			if d.Delay != c.want {
+				t.Errorf("%s: delay = %v, want %v", c.name, d.Delay, c.want)
+			}
+		}
+	})
+
+	// The regression the separation exists for: a policy that ignores
+	// upstream directives still waits out the pool's cooldown.
+	t.Run("ignore mode still waits readiness", func(t *testing.T) {
 		pol := Default()
+		pol.RetryAfter = RetryAfterPolicy{Enabled: true, Mode: RetryAfterIgnore, MaxDelay: DefaultRetryAfterMaxDelay}
 		e, _ := newTestEngine(t, context.Background(), pol)
 		e.EnterCandidate(pol)
-		d := e.Observe(credObs(1, c.wait))
-		if d.Action != ActionRetry {
-			t.Fatalf("%s: %+v", c.name, d)
+		d := e.Observe(credObs(1, 5*time.Second))
+		if d.Action != ActionRetry || d.Delay != 5*time.Second {
+			t.Fatalf("ignore-mode cooldown = %+v, want a 5s wait", d)
 		}
-		if d.Delay != c.want {
-			t.Errorf("%s: delay = %v, want %v", c.name, d.Delay, c.want)
+	})
+
+	t.Run("disabled retry-after still waits readiness", func(t *testing.T) {
+		pol := Default()
+		pol.RetryAfter = RetryAfterPolicy{}
+		e, _ := newTestEngine(t, context.Background(), pol)
+		e.EnterCandidate(pol)
+		d := e.Observe(credObs(1, 3*time.Second))
+		if d.Action != ActionRetry || d.Delay != 3*time.Second {
+			t.Fatalf("disabled retry-after cooldown = %+v, want a 3s wait", d)
 		}
-	}
+	})
+
+	// The floor is not an exemption from the windows: a readiness beyond
+	// the candidate's retry window shortens to the window, and the walk
+	// then exhausts through the ordinary on-exhausted path — a sleep never
+	// runs past a bound the request itself granted.
+	t.Run("the retry window still caps the floor", func(t *testing.T) {
+		pol := Default() // Retry.MaxElapsed 10s, MaxRetries 1
+		e, clk := newTestEngine(t, context.Background(), pol)
+		e.EnterCandidate(pol)
+		d := e.Observe(credObs(1, 30*time.Second))
+		if d.Action != ActionRetry || d.Delay != 10*time.Second {
+			t.Fatalf("beyond-window readiness = %+v, want a window-capped retry", d)
+		}
+		clk.advance(10 * time.Second)
+		if d := e.Observe(credObs(2, 20*time.Second)); d.Action != ActionFallback {
+			t.Fatalf("post-window cooldown should exhaust: %+v", d)
+		}
+	})
+
+	t.Run("the caller deadline still caps the floor", func(t *testing.T) {
+		pol := Default()
+		// The deadline lives on the same clock the engine reads — and that
+		// clock starts at the real present, so the deadline is genuinely in
+		// the future and the context is alive when Observe reads it.
+		clk := &testClock{t: time.Now()}
+		ctx, cancel := context.WithDeadline(context.Background(), clk.now().Add(2*time.Second))
+		defer cancel()
+		e := newTestEngineWithClock(ctx, pol, clk)
+		e.EnterCandidate(pol)
+		clk.advance(time.Second) // one second of deadline left
+		d := e.Observe(credObs(1, 30*time.Second))
+		if d.Action != ActionRetry || d.Delay != time.Second {
+			t.Fatalf("deadline-capped readiness = %+v, want a 1s wait", d)
+		}
+	})
 }
 
 // TestEngineCredentialCooldownExhaustsLikeAnyRetry: the wait consumes the

@@ -215,7 +215,7 @@ func (e *Engine) retry(o Observation, ruleID, reason string) Decision {
 	if windowLeft <= 0 {
 		return e.exhaustedRetry(ruleID, reason)
 	}
-	delay := e.retryDelay(o.RetryAfter, attempts, windowLeft)
+	delay := e.retryDelay(o, attempts, windowLeft)
 	return Decision{Action: ActionRetry, RuleID: ruleID, Delay: delay, Reason: reason}
 }
 
@@ -265,23 +265,27 @@ func (e *Engine) move(ruleID, reason string) Decision {
 //	backoff schedule (jittered), ceilinged at the backoff maximum
 //	  → raised to the upstream's Retry-After, when the policy honors it,
 //	    ceilinged at the retry-after maximum and again at the backoff maximum
+//	  → raised to the credential pool's readiness, when the observation
+//	    carries one — a LOCAL cooldown fact, never shaped by the retry-after
+//	    policy's mode or ceilings
 //	  → shortened to the remaining retry window
 //	  → shortened to the caller's remaining deadline
 //
 // The schedule's own ceiling and the two shortening steps only ever make the
-// wait shorter; the directive only ever raises it. So no upstream and no
-// configuration can make this proxy sleep past a bound the request itself did
-// not grant — and a retry-after ceiling below the schedule shortens the
-// DIRECTIVE's reach, never the wait the file asks for: a policy that ignores
-// the directive has nothing to say about a schedule the operator wrote.
-func (e *Engine) retryDelay(retryAfter time.Duration, attempts int, windowLeft time.Duration) time.Duration {
+// wait shorter; the directive and the readiness floor only ever raise it. So
+// no upstream and no configuration can make this proxy sleep past a bound
+// the request itself did not grant — and a retry-after ceiling below the
+// schedule shortens the DIRECTIVE's reach, never the wait the file asks for:
+// a policy that ignores the directive has nothing to say about a schedule
+// the operator wrote, and nothing to say about the pool's cooldown either.
+func (e *Engine) retryDelay(o Observation, attempts int, windowLeft time.Duration) time.Duration {
 	p := e.policy
 	delay := jitteredBackoff(p.Retry.Backoff, attempts, e.draw)
 	if delay > p.Retry.Backoff.Max {
 		delay = p.Retry.Backoff.Max
 	}
 	if p.RetryAfter.Enabled && p.RetryAfter.Mode == RetryAfterMax {
-		raised := retryAfter
+		raised := o.RetryAfter
 		if p.RetryAfter.MaxDelay > 0 && raised > p.RetryAfter.MaxDelay {
 			raised = p.RetryAfter.MaxDelay
 		}
@@ -291,6 +295,14 @@ func (e *Engine) retryDelay(retryAfter time.Duration, attempts int, windowLeft t
 		if raised > delay {
 			delay = raised
 		}
+	}
+	// Credential readiness is its own floor, deliberately outside the block
+	// above: it is this proxy's own cooldown state, not a directive, so
+	// neither the retry-after policy's mode nor its ceilings shape it. The
+	// two shortening steps below still bound it, and only a credential
+	// observation carries the field (see Observation.CredentialReadyIn).
+	if o.CredentialReadyIn > 0 && o.CredentialReadyIn > delay {
+		delay = o.CredentialReadyIn
 	}
 	if delay > windowLeft {
 		delay = windowLeft

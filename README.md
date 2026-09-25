@@ -746,15 +746,23 @@ How it composes with the architecture:
   walks them in rotation. The request's own retry remains a recovery
   decision — a policy whose `429` row says `terminal` still marks the key,
   but does not retry. When an attempt finds no ready key, the wait before
-  the re-ask rides the same `retry-after` policy as upstream directives:
-  the pool's earliest-ready time is folded in as the observation's
-  directive and re-capped by `max-delay` — `mode: ignore` (or a tight
-  ceiling) makes the walk re-ask after bare backoff instead of waiting out
-  the cooldown, spending one retry unit per cycle until `on-exhausted`.
-- **Reload identity is content-keyed, like transports.** An auth block
-  whose bytes (header, prefix, strategy, ids and values) are unchanged
-  across a reload keeps its rotation state; any change is a fresh pool.
-  The identity digest hashes the values and never appears in a log.
+  the re-ask is the pool's own LOCAL readiness floor (`CredentialReadyIn` on
+  the observation): the engine raises every wait to at least that remainder,
+  and the `retry-after` policy has no vote over it — `mode: ignore` discards
+  what the UPSTREAM asked for, never what the pool knows. The floor is still
+  bounded like every other wait: the candidate's retry window and the
+  caller's deadline shorten it, and a wait that exhausts the retry budget
+  ends the candidate through the ordinary `on-exhausted` path.
+- **Pool identity is per provider, never content alone.** The rotation and
+  cooldown state is keyed by the provider's pool identity — the
+  providers-table name, the credential bytes, and the `rate-limit` policy
+  together. Two providers whose auth blocks are byte-identical are two
+  rotation domains: one account's 429 never cools the other's cursor. A
+  reload that changes ONLY `rate-limit` values starts that provider's pool
+  fresh (sizing changed with the policy), while an unchanged block — name,
+  bytes, and rate-limit alike — keeps its rotation state warm; in-flight
+  requests keep the pool they pinned. The identity digest hashes the values
+  and never appears in a log.
 
 Secrecy is the same rule as everywhere else: values live in the config
 file, in memory, and on the outgoing wire — never in an error, a log line,
@@ -1160,6 +1168,11 @@ first.** The remaining retry window is a fourth veto. Every cap is applied in
 order, and each one bounds either the directive or the whole wait, never the
 configured schedule on the directive's behalf, so a hostile or broken upstream
 cannot buy itself an arbitrarily long gateway sleep.
+
+This block governs only UPSTREAM directives. The local credential-cooldown
+readiness (the pool's earliest ready key) is a separate floor the engine
+applies to every wait regardless of `enabled`/`mode`/`max-delay` — see the
+provider upstream credentials section.
 
 ### Answers, commitment, and reload
 

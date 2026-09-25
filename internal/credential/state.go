@@ -7,9 +7,10 @@ import (
 
 // Pool is one provider's credential rotation state: a round-robin cursor over
 // the spec's keys plus per-key cooldown deadlines. It is runtime state keyed
-// by the spec's content (see Registry) and shared by every request whose
-// snapshot carries the same credential configuration — rotation is a
-// process-wide property, exactly like transport pool scheduler position.
+// by the provider's pool identity (Provider.PoolKey; see Registry) and shared
+// by every request whose snapshot carries the same provider's credential
+// configuration — rotation is a process-wide property, exactly like
+// transport pool scheduler position.
 //
 // The pool is deliberately inert: Acquire reads state and moves a cursor,
 // MarkRateLimited writes a deadline, NextReady reads the earliest deadline.
@@ -140,15 +141,18 @@ func (p *Pool) NextReady(now time.Time) (time.Time, bool) {
 	return earliest, found
 }
 
-// CoolingUntil reports when a key leaves cooldown: the zero time when the
-// key is not currently cooling (never marked, or its deadline already
-// passed against the caller's clock). A read-only view for observability —
-// the proxy's tests pin the exact cooldown a mark earned through it.
-func (p *Pool) CoolingUntil(keyID string) time.Time {
+// CoolingUntil reports when a key leaves cooldown, judged against the
+// CALLER's clock: the key's deadline while that deadline is still in the
+// future at now, and the zero time when the key is not currently cooling —
+// never marked, or its deadline already passed at now. A read-only view for
+// observability — the proxy's tests pin the exact cooldown a mark earned
+// through it — and a read never rewrites state: Acquire's lazy expiry is
+// the only writer.
+func (p *Pool) CoolingUntil(now time.Time, keyID string) time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	until, cooling := p.cooling[keyID]
-	if !cooling {
+	if !cooling || !now.Before(until) {
 		return time.Time{}
 	}
 	return until

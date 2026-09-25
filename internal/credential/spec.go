@@ -94,12 +94,12 @@ type Spec struct {
 	Keys []Key
 }
 
-// ContentKey returns a memory-only identity for the spec's exact content
-// (header, prefix, strategy, and every key id and value, in order). The
-// registry uses it to key pool instances the way the transport registry keys
-// clients: unchanged content across a reload keeps its runtime state, changed
-// content starts fresh. The digest never reaches a log — the key VALUES are
-// hashed into it.
+// ContentKey returns a memory-only digest of the spec's exact content
+// (header, prefix, strategy, and every key id and value, in order). It is
+// the credential CONTENT identity, not the pool identity: the runtime pool
+// is keyed by Provider.PoolKey, which folds this digest together with the
+// declaring provider's identity and the resolved rate-limit policy. The
+// digest never reaches a log — the key VALUES are hashed into it.
 func (s Spec) ContentKey() string {
 	h := sha256.New()
 	writeField := func(v string) {
