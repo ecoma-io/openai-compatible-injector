@@ -255,7 +255,7 @@ func TestStripChainedCandidatesDifferentStrips(t *testing.T) {
 	pa := &fakeUpstream{status: http.StatusOK, body: `{"id":"a","model":"up-a","provider":"pa","service_tier":"x","choices":[]}`}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"id":"b","model":"up-b","provider":"pb","service_tier":"y","choices":[]}`}
 	store := chainStripStore(t, "https://a.example/v1", "https://b.example/v1")
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, quietLogger())
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, nil, quietLogger())
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", `{"model":"chain-model"}`, nil)
 	if rec.Code != http.StatusOK {

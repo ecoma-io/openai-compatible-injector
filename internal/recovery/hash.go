@@ -10,7 +10,11 @@ import (
 // hashTag versions the canonical encoding below. A future change to what the
 // encoding writes must bump this tag, so two policies hashed by different
 // builds of this package can never be mistaken for the same policy.
-const hashTag = "recovery-policy-v1"
+//
+// v2 added the credential-cause predicate to the per-rule encoding; a policy
+// hashed by a v1 build is never equal to one hashed by a v2 build, whatever
+// its content.
+const hashTag = "recovery-policy-v2"
 
 // Hash returns a short, stable identity for the policy's DATA.
 //
@@ -51,6 +55,7 @@ func (p Policy) Hash() string {
 		w.str(r.Match.TransportCause)
 		w.str(r.Match.ProtocolCause)
 		w.str(r.Match.CallerCause)
+		w.str(r.Match.CredentialCause)
 		w.str(r.Match.ProviderErrorType)
 		w.str(r.Match.ProviderErrorCode)
 		w.optBool(r.Match.Streaming)

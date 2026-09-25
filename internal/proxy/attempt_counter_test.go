@@ -72,7 +72,7 @@ func TestProviderAttemptCounterDirectAttempt(t *testing.T) {
 	store := newPoolStore(t)
 	d := &stubDoer{code: http.StatusOK, body: `{"id":"x","choices":[]}`}
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(store, &singleDoerResolver{d: d}, nil, nil, log)
+	h := NewHandler(store, &singleDoerResolver{d: d}, nil, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"direct-model","messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -95,7 +95,7 @@ func TestProviderAttemptCounterSameCandidateRetry(t *testing.T) {
 	)
 	pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","choices":[]}`})
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, log)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -115,7 +115,7 @@ func TestProviderAttemptCounterPooledAttempt(t *testing.T) {
 	store := newPoolStore(t)
 	ex := &stubExecutor{info: transport.AttemptInfo{Attempts: 1, Kind: "direct", Target: "direct"}}
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, log)
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusOK {
@@ -135,7 +135,7 @@ func TestProviderAttemptCounterPooledZeroDial(t *testing.T) {
 	// reporting the exhaustion sentinel exactly as the real pool does.
 	ex := &allIneligibleExecutor{}
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, log)
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusBadGateway {
@@ -216,7 +216,7 @@ func TestProviderAttemptCounterEnvelopeRefusalAtDial(t *testing.T) {
 	store := newPoolStore(t)
 	ex := &refusingExecutor{}
 	buf, log := captureLog(zerolog.DebugLevel)
-	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, log)
+	h := NewHandler(store, &singleDoerResolver{d: ex}, nil, nil, nil, log)
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", poolChatBody, nil)
 	if rec.Code != http.StatusBadGateway {

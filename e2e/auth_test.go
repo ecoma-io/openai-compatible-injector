@@ -247,3 +247,120 @@ func TestAPIKeyRotationHotReload(t *testing.T) {
 		t.Fatal("rotated key material reached stderr — logging leak")
 	}
 }
+
+// credRuntimeYAML renders the provider-form runtime file the credential
+// scenarios run on: one named provider carrying an auth block (the keys
+// below are obviously fake fixtures), one model routed through it. extra
+// lines are appended verbatim inside the provider entry.
+func credRuntimeYAML(endpoint string, extra string) string {
+	return "api-key: " + e2eAPIKey + `
+transports:
+  direct-egress:
+    type: direct
+providers:
+  keyed:
+    base-url: ` + endpoint + `
+    transport: direct-egress
+` + extra + `models:
+  chat-keyed:
+    provider: keyed
+    upstream-model: ` + chatUpstream + `
+`
+}
+
+// chatKeyedBody is chatBody aimed at the credential scenarios' model name.
+const chatKeyedBody = `{"model":"chat-keyed","messages":[{"role":"user","content":"hello"}],"temperature":0.5,"extra":"x"}`
+
+const credAuthTwoKeys = `    auth:
+      type: api_key
+      header: Authorization
+      prefix: "Bearer "
+      strategy: round_robin
+      keys:
+        - id: up-key-one
+          value: e2e-upstream-key-one
+        - id: up-key-two
+          value: e2e-upstream-key-two
+`
+
+// TestUpstreamReceivesPoolCredentialNotClientKey: with a provider auth
+// block, the upstream receives EXACTLY the pool's first credential under
+// the configured header and prefix — the client's own bearer token
+// (presented to this proxy in the same header name) never rides along.
+func TestUpstreamReceivesPoolCredentialNotClientKey(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(jsonChatHandler(chatUpstream))
+	p := startSubprocess(t, startOpts{
+		yaml:     credRuntimeYAML(up.url()+"/v1", credAuthTwoKeys),
+		logLevel: "error",
+	})
+
+	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions", chatKeyedBody,
+		map[string]string{"Authorization": "Bearer " + e2eAPIKey}); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	req, ok := up.last()
+	if !ok {
+		t.Fatal("upstream recorded no request")
+	}
+	if got := req.Headers.Get("Authorization"); got != "Bearer e2e-upstream-key-one" {
+		t.Fatalf("upstream Authorization = %q, want exactly the pool's first key", got)
+	}
+	if strings.Contains(req.Headers.Get("Authorization"), e2eAPIKey) {
+		t.Fatal("the client credential reached the upstream alongside the pool key")
+	}
+}
+
+// TestUpstreamKeyRotationOn429 is the wire-level rotation scenario: the
+// upstream 429s the first credential and answers the next one. The
+// rotation is observable at exactly two surfaces — the Authorization
+// header the upstream actually received, and the completion log's
+// upstream_credential_id (a configured key id, never a value). The client
+// sees one plain 200 either way.
+func TestUpstreamKeyRotationOn429(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		if up.count() == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+			return
+		}
+		jsonChatHandler(chatUpstream)(w, r)
+	})
+	p := startSubprocess(t, startOpts{
+		yaml:     credRuntimeYAML(up.url()+"/v1", credAuthTwoKeys),
+		logLevel: "info",
+	})
+
+	if status, _, body := postJSON(t, p.addr, "/v1/chat/completions", chatKeyedBody, nil); status != http.StatusOK {
+		t.Fatalf("status = %d body %s, want the rotation to land on a plain 200", status, body)
+	}
+
+	reqs := up.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("upstream hits = %d, want one 429 attempt and one rotated attempt", len(reqs))
+	}
+	if got := reqs[0].Headers.Get("Authorization"); got != "Bearer e2e-upstream-key-one" {
+		t.Errorf("first attempt Authorization = %q, want the pool's first key", got)
+	}
+	if got := reqs[1].Headers.Get("Authorization"); got != "Bearer e2e-upstream-key-two" {
+		t.Errorf("second attempt Authorization = %q, want the pool's second key after the 429", got)
+	}
+
+	done := eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_completed")
+	if len(done) != 1 {
+		t.Fatalf("request_completed events = %d, want 1", len(done))
+	}
+	if got, _ := done[0]["upstream_credential_id"].(string); got != "up-key-two" {
+		t.Fatalf("completion upstream_credential_id = %q, want the key that answered", got)
+	}
+
+	// No credential value reaches the process output at any level; only
+	// the configured key ids travel through the logs.
+	for _, secret := range []string{"e2e-upstream-key-one", "e2e-upstream-key-two", e2eAPIKey} {
+		if strings.Contains(p.stderr.String(), secret) {
+			t.Errorf("credential value %q reached stderr — logging leak", secret)
+		}
+	}
+}

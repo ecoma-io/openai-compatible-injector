@@ -95,6 +95,9 @@ func (m Match) validate() error {
 	if m.CallerCause != "" {
 		kinds++
 	}
+	if m.CredentialCause != "" {
+		kinds++
+	}
 	if kinds > 1 {
 		return errActionNotAllowed("a rule constraining more than one cause kind", "a single cause kind")
 	}
@@ -116,8 +119,9 @@ func (m Match) validate() error {
 	transport := m.TransportClass != TransportClassNone || m.TransportCause != ""
 	protocol := m.ProtocolCause != ""
 	caller := m.CallerCause != ""
+	credential := m.CredentialCause != ""
 	layers := 0
-	for _, named := range [...]bool{http, transport, protocol, caller} {
+	for _, named := range [...]bool{http, transport, protocol, caller, credential} {
 		if named {
 			layers++
 		}
@@ -139,6 +143,9 @@ func (m Match) validate() error {
 	}
 	if m.Class != FailureCaller && caller {
 		return errActionNotAllowed("a rule's failure class and its caller predicate", "the same layer")
+	}
+	if m.Class != FailureCredential && credential {
+		return errActionNotAllowed("a rule's failure class and its credential predicate", "the same layer")
 	}
 	return nil
 }

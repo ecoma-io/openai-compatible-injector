@@ -119,6 +119,79 @@ func TestRecoveryShorthandBuildsCanonicalRules(t *testing.T) {
 	}
 }
 
+// TestRecoveryCredentialShorthandAndRejections covers the credential layer of
+// the matrix schema: the shorthand block expands to the canonical identity,
+// the free-form `when.credential-cause` predicate builds, and unknown tokens
+// or a mixed cause set are rejected by position, never echoed.
+func TestRecoveryCredentialShorthandAndRejections(t *testing.T) {
+	data := recoveryYAML(
+		"recovery:\n"+
+			"  matrix:\n"+
+			"    credential:\n"+
+			"      cooldown: retry\n",
+		"",
+		"  m:\n    provider: pa\n    upstream-model: up-a\n")
+	m := recoveryModel(t, data, "m")
+	r := recoveryRule(t, m.Recovery, "credential-cooldown")
+	if r.Action != recovery.ActionRetry {
+		t.Errorf("credential-cooldown action = %s, want retry", r.Action)
+	}
+	if r.Match.Class != recovery.FailureCredential || r.Match.CredentialCause != recovery.CredentialCooldown {
+		t.Errorf("credential-cooldown match = %+v", r.Match)
+	}
+
+	freeform := recoveryYAML(
+		"recovery:\n"+
+			"  matrix:\n"+
+			"    rules:\n"+
+			"      - id: pool-empty\n"+
+			// Without `failure:` the class is inferred, so this row sits BELOW
+			// the class-pinned default row in precedence instead of colliding
+			// with it at equal precedence.
+			"        when: {credential-cause: cooldown, retry-index: 1}\n"+
+			"        action: fallback\n",
+		"",
+		"  m:\n    provider: pa\n    upstream-model: up-a\n")
+	m2 := recoveryModel(t, freeform, "m")
+	if r := recoveryRule(t, m2.Recovery, "pool-empty"); r.Action != recovery.ActionFallback {
+		t.Errorf("pool-empty action = %s, want fallback", r.Action)
+	}
+
+	const marker = "SECRETMARKER"
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			"bad shorthand key",
+			"recovery:\n  matrix:\n    credential: {\"" + marker + "\": retry}\n",
+			"credential cause token",
+		},
+		{
+			"bad free-form cause",
+			"recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {credential-cause: " + marker + "}\n        action: retry\n",
+			"unknown credential cause token",
+		},
+		{
+			"two cause kinds",
+			"recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {transport-cause: tls, credential-cause: cooldown}\n        action: retry\n",
+			"a single cause kind",
+		},
+		{
+			"credential beside status",
+			"recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {status: 429, credential-cause: cooldown}\n        action: retry\n",
+			"predicates from a single layer",
+		},
+	} {
+		if _, err := LoadRuntime([]byte(recoveryYAML(tc.yaml, "", "  m:\n    provider: pa\n    upstream-model: up-a\n"))); err == nil {
+			t.Errorf("%s: accepted, want %q", tc.name, tc.want)
+		} else if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error = %v, want it to name %q", tc.name, err, tc.want)
+		}
+	}
+}
+
 // TestRecoveryBlocksAcceptEveryDocumentedField pins the rest of the schema
 // the shorthand test does not touch: the free-form rule predicate set, the
 // resolved-retry and fallback terminal actions, a candidate-scoped envelope,

@@ -99,7 +99,7 @@ func TestPartnerModeIdentityReachesRequestCompleted(t *testing.T) {
 	store, snap := partnerStore(t, up.URL+"/v1")
 	provider := &stubAuthProvider{principal: auth.Principal{PartnerID: "partner-acme", KeyID: "pak_x1"}}
 	var logs bytes.Buffer
-	h := NewHandler(store, directResolver(), provider, nil, zerolog.New(&logs))
+	h := NewHandler(store, directResolver(), nil, provider, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -144,7 +144,7 @@ func TestPartnerModeDenialsShareTheStaticBody(t *testing.T) {
 			store, _ := partnerStore(t, up.URL+"/v1")
 			provider := &stubAuthProvider{reason: reason}
 			var logs bytes.Buffer
-			h := NewHandler(store, directResolver(), provider, nil, zerolog.New(&logs))
+			h := NewHandler(store, directResolver(), nil, provider, nil, zerolog.New(&logs))
 
 			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 				`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -179,7 +179,7 @@ func TestPartnerModeBackendFailureFailsClosed(t *testing.T) {
 	store, _ := partnerStore(t, up.URL+"/v1")
 	provider := &stubAuthProvider{reason: auth.ReasonBackend, err: context.DeadlineExceeded}
 	var logs bytes.Buffer
-	h := NewHandler(store, directResolver(), provider, nil, zerolog.New(&logs))
+	h := NewHandler(store, directResolver(), nil, provider, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)
@@ -222,7 +222,7 @@ func TestPartnerModeIgnoresTheConfiguredKey(t *testing.T) {
 	// knows no keys at all, so the denial comes from the partner path.
 	provider := &stubAuthProvider{reason: auth.ReasonUnknown}
 	var logs bytes.Buffer
-	h := NewHandler(store, directResolver(), provider, nil, zerolog.New(&logs))
+	h := NewHandler(store, directResolver(), nil, provider, nil, zerolog.New(&logs))
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions",
 		`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`, nil)

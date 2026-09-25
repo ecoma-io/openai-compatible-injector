@@ -51,7 +51,7 @@ func quietLogger() zerolog.Logger { return zerolog.Nop() }
 
 func usageHandler(t *testing.T, store *config.Store, meter *recordingMeter) http.Handler {
 	t.Helper()
-	return NewHandler(store, directResolver(), nil, meter, quietLogger())
+	return NewHandler(store, directResolver(), nil, nil, meter, quietLogger())
 }
 
 // The buffered chat path meters the upstream's own usage — even when the
@@ -224,7 +224,7 @@ func TestUsageFallbackChainFacts(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{status: http.StatusOK, body: `{"model":"up-b","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`}
 	meter := &recordingMeter{}
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, meter, quietLogger())
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, meter, quietLogger())
 
 	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -262,7 +262,7 @@ func TestUsageRetryChainFacts(t *testing.T) {
 	pa := newScript(scriptStep{status: http.StatusTooManyRequests, body: `{"error":{"message":"rate limited"}}`})
 	pb := newScript(scriptStep{status: http.StatusOK, body: `{"model":"up-b","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`})
 	meter := &recordingMeter{}
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, meter, quietLogger())
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, meter, quietLogger())
 
 	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -358,7 +358,7 @@ models:
 	}
 	pb := &fakeUpstream{err: dialError("b.example")}
 	meter := &recordingMeter{}
-	h := NewHandler(store, &kindDoerResolver{pool: px, direct: pb}, nil, meter, quietLogger())
+	h := NewHandler(store, &kindDoerResolver{pool: px, direct: pb}, nil, nil, meter, quietLogger())
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
 	if rec.Code != http.StatusTooManyRequests {
@@ -397,7 +397,7 @@ func TestUsageExhaustionFacts(t *testing.T) {
 	pa := &fakeUpstream{err: dialError("a.example")}
 	pb := &fakeUpstream{err: dialError("b.example")}
 	meter := &recordingMeter{}
-	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, meter, quietLogger())
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, meter, quietLogger())
 
 	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil); rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
@@ -502,7 +502,7 @@ func TestUsageCarriesPartnerIdentity(t *testing.T) {
 
 	provider := &stubAuthProvider{principal: auth.Principal{PartnerID: "acme", KeyID: "pak_123"}, reason: auth.ReasonOK}
 	meter := &recordingMeter{}
-	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), provider, meter, quietLogger())
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, provider, meter, quietLogger())
 
 	body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`
 	if rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", body, nil); rec.Code != http.StatusOK {
@@ -524,7 +524,7 @@ func TestUsageReloadCannotRebindGeneration(t *testing.T) {
 	resolver := &blockingResolver{entered: entered, release: release}
 
 	meter := &recordingMeter{}
-	h := NewHandler(store, resolver, nil, meter, quietLogger())
+	h := NewHandler(store, resolver, nil, nil, meter, quietLogger())
 
 	body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`
 	done := make(chan int, 1)
@@ -585,7 +585,7 @@ func TestUsageNilMeterRecordsNothing(t *testing.T) {
 	}))
 	defer up.Close()
 
-	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, quietLogger())
+	h := NewHandler(newTestStore(t, up.URL+"/v1"), directResolver(), nil, nil, nil, quietLogger())
 	body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", body, nil)
 	if rec.Code != http.StatusOK {

@@ -43,12 +43,13 @@ type runtimeRecovery struct {
 // expand into canonical rules, the free-form rule list, and the catch-all
 // action.
 type runtimeRecoveryMatrix struct {
-	HTTP      *runtimeRecoveryHTTP  `yaml:"http"`
-	Transport map[string]string     `yaml:"transport"`
-	Protocol  map[string]string     `yaml:"protocol"`
-	Caller    map[string]string     `yaml:"caller"`
-	Rules     []runtimeRecoveryRule `yaml:"rules"`
-	Default   string                `yaml:"default"`
+	HTTP       *runtimeRecoveryHTTP  `yaml:"http"`
+	Transport  map[string]string     `yaml:"transport"`
+	Protocol   map[string]string     `yaml:"protocol"`
+	Caller     map[string]string     `yaml:"caller"`
+	Credential map[string]string     `yaml:"credential"`
+	Rules      []runtimeRecoveryRule `yaml:"rules"`
+	Default    string                `yaml:"default"`
 }
 
 // runtimeRecoveryHTTP mirrors `matrix.http`: exact statuses and status
@@ -70,20 +71,21 @@ type runtimeRecoveryRule struct {
 
 // runtimeRecoveryWhen mirrors a rule's `when` predicate set. Every member is
 // optional; an omitted `when` block constrains nothing. At most one of the
-// transport/protocol/caller cause members may be stated — the domain rejects
-// the rest, because no observation carries two cause kinds.
+// transport/protocol/caller/credential cause members may be stated — the
+// domain rejects the rest, because no observation carries two cause kinds.
 type runtimeRecoveryWhen struct {
-	Status         *int                          `yaml:"status"`
-	StatusClass    string                        `yaml:"status-class"`
-	Failure        string                        `yaml:"failure"`
-	TransportClass string                        `yaml:"transport-class"`
-	TransportCause string                        `yaml:"transport-cause"`
-	ProtocolCause  string                        `yaml:"protocol-cause"`
-	CallerCause    string                        `yaml:"caller-cause"`
-	ProviderError  *runtimeRecoveryProviderError `yaml:"provider-error"`
-	Streaming      *bool                         `yaml:"streaming"`
-	CandidateIndex *int                          `yaml:"candidate-index"`
-	RetryIndex     *int                          `yaml:"retry-index"`
+	Status          *int                          `yaml:"status"`
+	StatusClass     string                        `yaml:"status-class"`
+	Failure         string                        `yaml:"failure"`
+	TransportClass  string                        `yaml:"transport-class"`
+	TransportCause  string                        `yaml:"transport-cause"`
+	ProtocolCause   string                        `yaml:"protocol-cause"`
+	CallerCause     string                        `yaml:"caller-cause"`
+	CredentialCause string                        `yaml:"credential-cause"`
+	ProviderError   *runtimeRecoveryProviderError `yaml:"provider-error"`
+	Streaming       *bool                         `yaml:"streaming"`
+	CandidateIndex  *int                          `yaml:"candidate-index"`
+	RetryIndex      *int                          `yaml:"retry-index"`
 }
 
 // runtimeRecoveryProviderError mirrors the rule predicate over the upstream
@@ -251,9 +253,9 @@ func buildRecoveryOverride(block *runtimeRecovery) (recovery.Partial, error) {
 // into the layer's rule overrides plus its default action.
 //
 // Rules are emitted in a fixed order — http.exact by numeric status, then
-// http.classes, transport, protocol, caller and rules each by sorted key (the
-// free-form list in written order) — so a rejection's rule ordinal is
-// deterministic and never depends on Go map iteration.
+// http.classes, transport, protocol, caller, credential and rules each by
+// sorted key (the free-form list in written order) — so a rejection's rule
+// ordinal is deterministic and never depends on Go map iteration.
 func buildRecoveryMatrix(rm *runtimeRecoveryMatrix) (*recovery.MatrixPartial, error) {
 	out := &recovery.MatrixPartial{}
 	if rm.HTTP != nil {
@@ -349,6 +351,20 @@ func buildRecoveryMatrix(rm *runtimeRecoveryMatrix) (*recovery.MatrixPartial, er
 			Action: action,
 		})
 	}
+	for _, key := range sortedRecoveryKeys(rm.Credential) {
+		if !recovery.KnownCredentialCause(key) {
+			return nil, errors.New("recovery.matrix.credential: key must be a credential cause token (cooldown)")
+		}
+		action, err := recovery.ParseAction(rm.Credential[key])
+		if err != nil {
+			return nil, fmt.Errorf("recovery.matrix.credential: %w", err)
+		}
+		out.Rules = append(out.Rules, recovery.Rule{
+			ID:     recovery.CredentialCauseRuleID(key),
+			Match:  recovery.Match{Class: recovery.FailureCredential, CredentialCause: key},
+			Action: action,
+		})
+	}
 	for i, rr := range rm.Rules {
 		rule, err := buildRecoveryRule(rr, i+1)
 		if err != nil {
@@ -440,6 +456,12 @@ func buildRecoveryMatch(w runtimeRecoveryWhen, field string) (recovery.Match, er
 			return recovery.Match{}, fmt.Errorf("%s.when.caller-cause: %w", field, err)
 		}
 		m.CallerCause = cause
+	}
+	if w.CredentialCause != "" {
+		if !recovery.KnownCredentialCause(w.CredentialCause) {
+			return recovery.Match{}, fmt.Errorf("%s.when.credential-cause: unknown credential cause token", field)
+		}
+		m.CredentialCause = w.CredentialCause
 	}
 	if w.ProviderError != nil {
 		m.ProviderErrorType = w.ProviderError.Type

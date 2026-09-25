@@ -111,6 +111,82 @@ models:
 		"\xff\xfe\x00\x01",       // binary garbage
 		"\xef\xbb\xbfmodels: {}", // BOM-prefixed YAML
 		"models:\n  a:\n    endpoint: \"ht tp://h\"\n    upstream-model: m\n", // unparseable URL
+		// Provider auth blocks: a valid pool, a broken one, an unknown
+		// strategy, and a rate-limit contradiction. Any error outcome is
+		// legal; a panic or an echoed key value is not.
+		`api-key: k
+providers:
+  pa:
+    base-url: https://h/v1
+    auth:
+      type: api_key
+      header: Authorization
+      prefix: "Bearer "
+      strategy: round_robin
+      keys:
+        - id: k1
+          value: sk-one
+        - id: k2
+          value: sk-two
+      rate-limit:
+        cooldown: 3s
+        max-cooldown: 45s
+models:
+  a:
+    provider: pa
+    upstream-model: m
+`,
+		`api-key: k
+providers:
+  pa:
+    base-url: https://h/v1
+    auth:
+      type: api_key
+      header: "bad header"
+      strategy: round_robin
+      keys:
+        - id: k1
+          value: sk-one
+models:
+  a:
+    provider: pa
+    upstream-model: m
+`,
+		`api-key: k
+providers:
+  pa:
+    base-url: https://h/v1
+    auth:
+      type: api_key
+      header: Authorization
+      strategy: least_connections
+      keys:
+        - id: k1
+          value: sk-one
+models:
+  a:
+    provider: pa
+    upstream-model: m
+`,
+		`api-key: k
+providers:
+  pa:
+    base-url: https://h/v1
+    auth:
+      type: api_key
+      header: Authorization
+      strategy: round_robin
+      keys:
+        - id: k1
+          value: sk-one
+      rate-limit:
+        cooldown: 30s
+        max-cooldown: 10s
+models:
+  a:
+    provider: pa
+    upstream-model: m
+`,
 	}
 	for _, s := range seeds {
 		f.Add([]byte(s))
