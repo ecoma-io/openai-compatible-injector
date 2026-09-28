@@ -1617,3 +1617,97 @@ func TestStreamRecoveryWindowOwnsAHopCutByIt(t *testing.T) {
 		t.Errorf("stream_recoveries = %v, want the cut hop counted as a request", trunc[0]["stream_recoveries"])
 	}
 }
+
+// partialLineBody delivers a PARTIAL `data:` line — no newline — and then
+// parks. It exists because the usual parked-body fixture ends its event with
+// a blank line, which leaves the relay parked on a ReadSlice for the NEXT
+// line; closing a body at that boundary makes `bufio` return io.EOF, which
+// CopySSE maps to a nil error. A relay parked mid-line does not get that
+// luck: the close surfaces as a real read error, so this is the only shape
+// that can tell a bound-owned truncation from an upstream-owned one.
+type partialLineBody struct {
+	data     []byte
+	closed   chan struct{}
+	once     sync.Once
+	released atomic.Bool
+}
+
+func (b *partialLineBody) Read(p []byte) (int, error) {
+	if b.data != nil {
+		d := b.data
+		b.data = nil
+		return copy(p, d), nil
+	}
+	select {
+	case <-b.closed:
+		b.released.Store(true)
+		return 0, errors.New("http: read on closed response body")
+	case <-time.After(parkedSafety):
+		b.released.Store(true)
+		return 0, errors.New("parked read was never released")
+	}
+}
+
+func (b *partialLineBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+// TestStreamRecoveryWindowOwnsACommittedRelayCutIt is the committed path's
+// half of the same ownership invariant the hop path pins.
+//
+// A watchdog that closes the body mid-line produces a genuine read error —
+// this proxy's own close, not the peer's. The record must still say the
+// bound: `recovery_reason=max_elapsed`, `phase=recovery`, and NO `error`
+// field, because there was no upstream failure to report and inventing one
+// would send an operator after a peer that behaved perfectly. It is also
+// exactly the case the line-boundary fixtures cannot reach, which is why the
+// transport-level misattribution it rules out is otherwise untested.
+func TestStreamRecoveryWindowOwnsACommittedRelayCutIt(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 150ms\n    max-recoveries: 2\n"))
+	body := &partialLineBody{
+		data:   []byte(`data: {"choices":[{"delta":{"content":"hel`),
+		closed: make(chan struct{}),
+	}
+	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+		}, nil
+	}}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !body.released.Load() {
+		t.Fatal("the relay's read never returned: the window closed no upstream body")
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want no hop past the window", pa.dials())
+	}
+	// The bound is the story, and it is told once.
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want exactly one max_elapsed", exh)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Errorf("truncation reason = %v, want max_elapsed", trunc[0]["recovery_reason"])
+	}
+	if trunc[0]["phase"] != "recovery" {
+		t.Errorf("truncation phase = %v, want recovery (the bound, not a read fault)", trunc[0]["phase"])
+	}
+	// This proxy's own closed body must never be relayed as a peer failure.
+	if got, has := trunc[0]["error"]; has {
+		t.Errorf("the bound reported an upstream error it invented: %v", got)
+	}
+	if ev := logBuf.events(t, "stream_recovery_failed"); len(ev) != 0 {
+		t.Errorf("a bound-owned cut was reported as a hop failure: %v", ev)
+	}
+}
