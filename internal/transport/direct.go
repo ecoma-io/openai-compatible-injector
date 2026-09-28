@@ -33,11 +33,27 @@ func relayRedirects(*http.Request, []*http.Request) error {
 
 // newBaseTransport clones http.DefaultTransport's settings and then applies
 // the service's tuning: a 30s dial timeout, a 10s TLS handshake timeout,
-// generous idle pooling, and — deliberately — no ResponseHeaderTimeout,
-// because SSE streams stay open far longer than any sane header deadline.
+// generous idle pooling, and — deliberately — no ResponseHeaderTimeout.
 // HTTP/2 is attempted eagerly. The clone keeps http.DefaultTransport's
 // Proxy (ProxyFromEnvironment); callers that own their proxy hop override
 // Proxy or DialContext.
+//
+// ResponseHeaderTimeout is left at zero because this transport is shared by
+// every path and a fixed constant here would be a policy no operator wrote:
+// a provider that queues a request behind its own load legitimately takes
+// minutes to send a status line, and nothing in the config plane states a
+// "time to first header" budget for the walk. The tuning that DOES bound a
+// blocked exchange lives where the operator's own numbers are:
+//
+//   - the request's context. A client that hangs up or a caller that set a
+//     deadline cancels the exchange, headers or body, through net/http's own
+//     handling of a canceled request context.
+//   - internal/proxy's recovery window, for the post-commitment continuation
+//     loop: it cancels each hop's request context at the frozen
+//     `stream.max-elapsed` instant, which is why a continuation hop cannot
+//     park in Do waiting for headers nobody will send. That bound is derived
+//     from configuration and scoped to the one path whose budget states it,
+//     rather than applied to every dial the process makes.
 func newBaseTransport() *http.Transport {
 	var tr *http.Transport
 	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {

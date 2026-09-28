@@ -16,7 +16,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -2037,37 +2036,41 @@ walk:
 			observe = partial.Observe
 		}
 
-		// The recovery window opens when the first hop COULD start — the
-		// instant before the committed stream begins relaying — so it bounds
-		// the whole recovery effort rather than one hop, and it is measured
-		// on the engine's clock like every other window this request obeys.
-		streamStart := eng.Now()
-		// ... and it is ALSO armed as a hard wall-clock deadline here, because
-		// the engine's clock can only be consulted between reads. A peer that
-		// sends a partial event and then holds the connection open parks the
-		// relay inside Body.Read, where no amount of checking the policy
-		// afterwards can reach it; the deadline's watchdog closes the body and
-		// the read returns. Every pass of this loop — the committed relay and
-		// each hop — is armed against the SAME instant, so `max-elapsed`
-		// remains one window since the commit rather than a per-hop budget.
+		// The recovery window is ONE absolute instant, opened here — the
+		// instant before the committed stream begins relaying — and every
+		// bound this session has is measured against it: the loop's own gate,
+		// the body watchdog each pass is armed with, and the context each hop
+		// dials under. It is read on the engine's clock like every other
+		// window this request obeys, and read ONCE: `max-elapsed` is a bound
+		// since the commit, never a per-hop budget that a long stream could
+		// extend by making a hop.
 		//
-		// windowClosed is written only by that watchdog, so it is the one
-		// authority on "this relay was cut by the operator's bound" as opposed
-		// to "the upstream cut it" or "the client left".
+		// It exists as a deadline rather than only as an elapsed check because
+		// a clock can only be consulted between operations. A peer that sends
+		// a partial event and then holds the connection open parks the relay
+		// inside Body.Read; a peer that accepts a connection and answers
+		// nothing at all parks the hop inside Do. Neither can be reached by
+		// re-checking the policy afterwards, so each is bound by a watchdog
+		// armed for the distance that REMAINS to this same instant
+		// (recoveryWindow): the body is closed, the dial's context canceled.
 		//
-		// The watchdog is armed ONLY when the block is enabled. The resolved
+		// Its `closed` flag is written only by those watchdogs, so it is the
+		// one authority on "this relay was cut by the operator's bound" as
+		// opposed to "the upstream cut it" or "the client left".
+		//
+		// The window is opened ONLY when the block is enabled. The resolved
 		// policy carries a nonzero `max-elapsed` even when it is disabled —
 		// that is what makes the default meaningful when a layer turns it on —
 		// so an unconditional arm would close the body of every healthy stream
 		// twenty seconds in, on deployments that never asked for any of this.
 		// The disabled path therefore keeps the plain relay it has always had:
 		// no timer, no deadline, no window state.
-		var windowClosed atomic.Bool
+		var window *recoveryWindow
 		relay := func(src io.ReadCloser) (StreamStats, error) {
 			return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
 		}
 		if contPolicy.Enabled {
-			windowEnd := time.Now().Add(contPolicy.MaxElapsed)
+			window = newRecoveryWindow(eng.Now(), contPolicy.MaxElapsed)
 			relay = func(src io.ReadCloser) (StreamStats, error) {
 				// THE UPSTREAM-RESPONSE BOUNDARY. relay is invoked once per
 				// upstream HTTP response relayed into this one client stream:
@@ -2089,7 +2092,7 @@ walk:
 				if usageCapture != nil {
 					usageCapture.Seal()
 				}
-				stopWindow := armRecoveryWindow(windowEnd, src, &windowClosed)
+				stopWindow := window.armBody(eng.Now(), src)
 				defer stopWindow()
 				return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
 			}
@@ -2136,7 +2139,7 @@ walk:
 				stopReason = recoveryMaxRecoveries
 				break
 			}
-			if windowClosed.Load() {
+			if window.shut() {
 				// The hard bound fired: the watchdog closed the body this
 				// relay was blocked on, which is what ended the pass. The
 				// window is shut for the rest of the request, so no hop can
@@ -2182,14 +2185,14 @@ walk:
 				unsafeReason, stopReason = verdict.Reason, recoveryUnsafeContent
 				break
 			}
-			if eng.Now().Sub(streamStart) > contPolicy.MaxElapsed {
-				// The same window the watchdog arms, read on the frozen clock
-				// the policy was resolved with. The watchdog is what bounds a
-				// blocked read; this check is what bounds the effort even if a
-				// pass ends cleanly just past the deadline, or a caller's
-				// clock disagrees with the wall's. The pass ended by itself
-				// here, so its error — if any — is the upstream's and is
-				// reported as such: `windowShut` stays false.
+			if window.expired(eng.Now()) {
+				// The same instant the watchdogs are armed against, read on
+				// the same clock the policy was resolved with. A watchdog is
+				// what bounds an operation the proxy is parked inside; this
+				// check is what bounds the effort when a pass ends cleanly
+				// just past the deadline. The pass ended by itself here, so
+				// its error — if any — is the upstream's and is reported as
+				// such: `windowShut` stays false.
 				stopReason = recoveryMaxElapsed
 				break
 			}
@@ -2249,6 +2252,7 @@ walk:
 			hopExchangeBefore := eng.Budget().RequestExchanges()
 			dial := h.dialContinuation(continuationHop{
 				ctx:       r.Context(),
+				window:    window,
 				client:    r,
 				cand:      answer.cand,
 				pool:      answer.pool,
@@ -2337,6 +2341,20 @@ walk:
 				withCredentialFields(event, dial.credKey).Msg("stream_recovery_failed")
 			}
 			if dial.phase != "" {
+				if dial.phase == recoveryMaxElapsed {
+					// The window, not a peer. This is the one hop phase that
+					// names an owner this proxy chose rather than an endpoint
+					// that misbehaved: nothing was dialed for the refusal, or
+					// the dial was canceled by this window's own watchdog, so
+					// the error — if there is one — belongs to nothing outside
+					// this process and is deliberately not attached. The
+					// phase token is the loop's own stop reason, because it is
+					// the same fact, and `windowShut` makes the recorder treat
+					// this as the bound it is rather than as an upstream read.
+					recoveryFailed(recoveryMaxElapsed, nil, 0)
+					windowShut, stopReason = true, recoveryMaxElapsed
+					break
+				}
 				recoveryFailed(dial.phase, dial.err, 0)
 				break
 			}
@@ -2389,7 +2407,7 @@ walk:
 			// Read the window's own flag BEFORE the terminal check: a hop cut
 			// short by the watchdog is a bound, never a success, however its
 			// partial bytes happen to land.
-			cutByWindow := windowClosed.Load()
+			cutByWindow := window.shut()
 			if hopStats.Terminal && !cutByWindow {
 				log.Info().Str("public_model", model).
 					Str("provider", answer.cand.Label()).
