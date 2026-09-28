@@ -1018,16 +1018,49 @@ func TestStreamRecoveryMaxElapsedCutsABlockedRead(t *testing.T) {
 }
 
 // TestStreamRecoveryWindowCoversEveryHop: one window since the commit, not a
-// fresh one per hop. The first relay ends cleanly just under the bound; the
-// hop's relay parks — and the SAME instant closes it, because the window was
-// armed once for the whole effort.
+// fresh one per hop.
+//
+// The first relay ends cleanly but only after most of the window has already
+// run, so the hop starts with almost nothing left. The SAME instant the relay
+// used must be the one that closes the hop's parked read.
+//
+// Measuring the WHOLE request is the only assertion that tells one shared
+// window from N per-hop ones: with a fresh window per hop the total would be
+// the committed relay's pause PLUS a full window for the hop, so the request
+// would run for roughly twice the configured bound. A test that only asserted
+// "the hop was cut as max_elapsed" cannot tell the two apart — a per-hop
+// window cuts it too, just later — and that is exactly how a per-hop budget
+// passes a test named for a shared one.
 func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
+	const window = 300 * time.Millisecond
+	// The committed relay spends ~200ms of the 300ms window before its stream
+	// ends cleanly, leaving the hop ~100ms of the SAME window.
+	const firstPause = 200 * time.Millisecond
 	h, logBuf, pa, _ := recoveryHandler(t,
-		recoveryBlock(t, "    enabled: true\n    max-elapsed: 250ms\n    max-recoveries: 2\n"))
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 300ms\n    max-recoveries: 2\n"))
 	body, dial := sseParked(context.Background(), sseChat(", world"))
-	pa.script = []dialFunc{sseStream(sseChat("Hello")), dial}
+	pa.script = []dialFunc{
+		func(*http.Request) (*http.Response, error) {
+			// A slow but perfectly healthy committed stream: it yields text,
+			// pauses, then ends at EOF. The pause is real time the window
+			// must account for.
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(&pausedReader{
+					first:  sseChat("Hello"),
+					pause:  firstPause,
+					closed: make(chan struct{}),
+				}),
+			}, nil
+		},
+		dial,
+	}
 
+	start := time.Now()
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	elapsed := time.Since(start)
+
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
 	}
@@ -1048,6 +1081,14 @@ func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
 	// bound cut is the read, and the count says so.
 	if exh[0]["recoveries"] != float64(1) {
 		t.Errorf("recoveries = %v, want the hop that was cut counted", exh[0]["recoveries"])
+	}
+	// THE ASSERTION THAT SEPARATES ONE WINDOW FROM N. Generous headroom on
+	// both sides, because CI scheduling is not a clock this test can trust to
+	// the millisecond: the bound must be beaten by a comfortable margin, and a
+	// per-hop window (pause + a fresh full window ≈ 2×) must miss it by one.
+	if elapsed > window+150*time.Millisecond {
+		t.Errorf("request took %v against a %v window: a fresh window per hop would let the "+
+			"hop outlive the instant the committed relay used", elapsed.Round(time.Millisecond), window)
 	}
 }
 
