@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"openai-compatible-injector/internal/inject"
 )
@@ -23,6 +24,24 @@ func sseRewriter(public string) func([]byte) []byte {
 // CRLF arriving in one transport read — TCP is a byte stream and makes no
 // such promise.
 type byteReader struct{ r io.Reader }
+
+// notifyingWriter captures what a live relay has made visible without waiting
+// for CopySSE to return.
+type notifyingWriter struct {
+	bytes.Buffer
+	writes chan struct{}
+}
+
+func (w *notifyingWriter) Write(p []byte) (int, error) {
+	n, err := w.Buffer.Write(p)
+	if n > 0 {
+		select {
+		case w.writes <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
 
 func (r byteReader) Read(p []byte) (int, error) {
 	if len(p) > 1 {
@@ -430,6 +449,40 @@ func copySSEStats(t *testing.T, input string) (StreamStats, string, error) {
 // particular, CRLF split as `...\r` / `\n...` must be emitted as ONE CRLF line:
 // treating its LF as a subsequent lone blank line invents an event boundary,
 // changes flush counts, and corrupts the byte-for-byte relay guarantee.
+// TestCopySSELoneCRReachesTheClientBeforeTheNextByte proves a valid lone-CR
+// line does not become a hidden read-ahead barrier. A live upstream may pause
+// after the CR forever; the completed line still must leave the proxy.
+func TestCopySSELoneCRReachesTheClientBeforeTheNextByte(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer func() { _ = pr.Close() }()
+	defer func() { _ = pw.Close() }()
+
+	dst := &notifyingWriter{writes: make(chan struct{}, 1)}
+	done := make(chan error, 1)
+	go func() {
+		_, err := CopySSE(dst, pr, sseRewriter("public-name"), nil, nil, nil)
+		done <- err
+	}()
+	if _, err := io.WriteString(pw, "data: x\r"); err != nil {
+		t.Fatalf("write CR-terminated line: %v", err)
+	}
+
+	select {
+	case <-dst.writes:
+		if got := dst.String(); got != "data: x\r" {
+			t.Fatalf("delivered = %q, want the complete CR line", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a complete lone-CR line waited for a following byte")
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close upstream: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("CopySSE: %v", err)
+	}
+}
+
 func TestCopySSELineEndingsSurviveReadFragmentation(t *testing.T) {
 	for _, tc := range []struct {
 		name       string

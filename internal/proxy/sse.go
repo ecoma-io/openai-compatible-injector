@@ -110,6 +110,12 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 	// still terminates. Lines are relayed one at a time, so this is the
 	// worst case one event can pin between reads and the flush.
 	var pending int64
+	// A CR is a complete EventSource line ending in its own right. If its
+	// following LF arrives in a later read, the LF is wire data but not a
+	// second (blank) line. Remembering that one-byte ambiguity lets a lone CR
+	// reach the observer and client immediately without inventing a boundary
+	// when it later proves to have been CRLF.
+	pendingCRLF := false
 	for {
 		line, rerr := readBoundedLine(br)
 		if errors.Is(rerr, ErrSSELineTooLong) {
@@ -119,50 +125,66 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 			return stats, rerr
 		}
 		if len(line) > 0 {
-			boundary := isEventBoundary(line)
-			if !boundary {
-				pending += int64(len(line))
-				if pending > MaxEventBytes {
-					return stats, fmt.Errorf("%w: event reached %d bytes, limit %d",
-						ErrSSEEventTooLarge, pending, MaxEventBytes)
+			// An immediately following LF belongs to the CR line already written.
+			// Relay the byte exactly, but do not run it through line accounting,
+			// observation, rewriting, terminal detection, or boundary flushing.
+			if pendingCRLF && bytes.Equal(line, []byte("\n")) {
+				n, werr := dst.Write(line)
+				stats.Bytes += int64(n)
+				if werr != nil {
+					return stats, &streamWriteError{err: werr}
 				}
-			}
-			if observe != nil {
-				if payload, ok := sseDataPayload(line); ok {
-					observe(payload)
+				if n < len(line) {
+					return stats, &streamWriteError{err: io.ErrShortWrite}
 				}
-			}
-			out := rewriteSSELine(line, rewrite, stripKeys)
-			n, werr := dst.Write(out)
-			// Account exactly what dst accepted — on a failed or torn write
-			// the stats say how much of the stream actually went out. A
-			// short write with a nil error is the io.Writer contract's other
-			// failure mode (io.ErrShortWrite); continuing past it would
-			// relay a torn line and overcount, so it truncates too — as a
-			// client-side failure, since dst is the client.
-			stats.Bytes += int64(n)
-			if werr != nil {
-				return stats, &streamWriteError{err: werr}
-			}
-			if n < len(out) {
-				return stats, &streamWriteError{err: io.ErrShortWrite}
-			}
-			// The terminal fact is recorded on the bytes that actually
-			// reached the client — the same buffer the write was handed —
-			// never on a line the relay read but could not deliver.
-			if isTerminalSSELine(out) {
-				stats.Terminal = true
-			}
-			if boundary {
-				// Accounting and budget reset belong to the boundary, not to
-				// the flush: stats.Events counts dispatched events and the
-				// in-flight budget restarts per event whether or not this
-				// caller asked for explicit flushes.
-				if flush != nil {
-					flush()
+				pendingCRLF = false
+			} else {
+				boundary := isEventBoundary(line)
+				if !boundary {
+					pending += int64(len(line))
+					if pending > MaxEventBytes {
+						return stats, fmt.Errorf("%w: event reached %d bytes, limit %d",
+							ErrSSEEventTooLarge, pending, MaxEventBytes)
+					}
 				}
-				stats.Events++
-				pending = 0
+				if observe != nil {
+					if payload, ok := sseDataPayload(line); ok {
+						observe(payload)
+					}
+				}
+				out := rewriteSSELine(line, rewrite, stripKeys)
+				n, werr := dst.Write(out)
+				// Account exactly what dst accepted — on a failed or torn write
+				// the stats say how much of the stream actually went out. A
+				// short write with a nil error is the io.Writer contract's other
+				// failure mode (io.ErrShortWrite); continuing past it would
+				// relay a torn line and overcount, so it truncates too — as a
+				// client-side failure, since dst is the client.
+				stats.Bytes += int64(n)
+				if werr != nil {
+					return stats, &streamWriteError{err: werr}
+				}
+				if n < len(out) {
+					return stats, &streamWriteError{err: io.ErrShortWrite}
+				}
+				// The terminal fact is recorded on the bytes that actually
+				// reached the client — the same buffer the write was handed —
+				// never on a line the relay read but could not deliver.
+				if isTerminalSSELine(out) {
+					stats.Terminal = true
+				}
+				if boundary {
+					// Accounting and budget reset belong to the boundary, not to
+					// the flush: stats.Events counts dispatched events and the
+					// in-flight budget restarts per event whether or not this
+					// caller asked for explicit flushes.
+					if flush != nil {
+						flush()
+					}
+					stats.Events++
+					pending = 0
+				}
+				pendingCRLF = len(line) > 0 && line[len(line)-1] == '\r'
 			}
 		}
 		if rerr != nil {
@@ -209,36 +231,15 @@ func readToLineEnd(br *bufio.Reader) ([]byte, error) {
 		// own and propagates.
 		return chunk, rerr
 	}
-	// No LF buffered. A CR ends the line, as a CRLF whose LF is the next
-	// byte or as a lone CR. The distinction must be made BEFORE the CR is
-	// emitted: writing CR now and swallowing a later LF would corrupt the
-	// wire; writing both as separate lines would invent a blank event.
-	//
-	// Discard the pre-CR prefix to make room, then peek CR plus one byte.
-	// That fills when CR was the final byte buffered, so CRLF split over two
-	// upstream reads remains one byte-identical line. EOF proves a trailing
-	// CR is lone. (UnreadByte is not an option: bufio forbids it after Peek.)
+	// No LF buffered. A CR is itself a complete line ending. Do not wait for
+	// the next byte to learn whether it grows into CRLF: a peer may legally
+	// pause forever after a lone CR, and holding that complete line would leave
+	// its client-visible event unflushed. CopySSE remembers the ambiguity and
+	// treats one later LF as part of this line rather than a new blank line.
 	if i := bytes.IndexByte(b, '\r'); i >= 0 {
-		chunk := append([]byte(nil), b[:i]...)
-		if _, err := br.Discard(i); err != nil {
+		chunk := append([]byte(nil), b[:i+1]...)
+		if _, err := br.Discard(i + 1); err != nil {
 			return chunk, err
-		}
-		tail, _ := br.Peek(2)
-		if len(tail) == 0 {
-			// The CR was in b, so the reader cannot have forgotten it; this
-			// guards an impossible bufio state rather than indexing empty data.
-			return chunk, io.ErrUnexpectedEOF
-		}
-		crlf := len(tail) == 2 && tail[1] == '\n'
-		chunk = append(chunk, tail[0])
-		if _, err := br.Discard(1); err != nil {
-			return chunk, err
-		}
-		if crlf {
-			if _, err := br.Discard(1); err != nil {
-				return chunk, err
-			}
-			return append(chunk, '\n'), nil
 		}
 		return chunk, nil
 	}
