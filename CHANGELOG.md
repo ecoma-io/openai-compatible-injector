@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.13.1...v0.14.0) (2026-09-28)
+
+
+### Features
+
+* **proxy:** transparent SSE stream recovery via semantic continuation ([#77](https://github.com/ecoma-io/openai-compatible-injector/issues/77)) ([140efe2](https://github.com/ecoma-io/openai-compatible-injector/commit/140efe2ac07681d0c8c3c41c9a78d22d0f27dd3a))
+
 ## [0.13.1](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.13.0...v0.13.1) (2026-09-25)
 
 
