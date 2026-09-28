@@ -218,9 +218,42 @@ func scanRecoveryTokens(t *testing.T) (reasons, phases map[string]bool) {
 		}
 		phases[lit] = true
 	}
-	// ... and once as a structured field, on the pre-hop build refusal.
-	for _, m := range regexp.MustCompile(`Str\("phase",\s*"([a-z_]+)"\)`).FindAllStringSubmatch(loop+"\n"+handler, -1) {
-		phases[m[1]] = true
+	// ... and once as a structured field, on the pre-hop build refusal. This
+	// pattern is scoped to the five recovery events, by the message a field
+	// chain ends in: `phase` is a name this package also uses for closed sets
+	// that have nothing to do with a continuation hop — the capacity refusal
+	// names the buffer it refused — and those tokens must not be dragged into
+	// a matrix that would then be describing something else.
+	src := loop + "\n" + handler
+	recoveryEvents := map[string]bool{
+		"stream_recovery_started":   true,
+		"stream_recovery_failed":    true,
+		"stream_recovery_succeeded": true,
+		"stream_recovery_exhausted": true,
+		"stream_truncated":          true,
+	}
+	type msgSite struct {
+		at   int
+		slug string
+	}
+	var msgs []msgSite
+	for _, m := range regexp.MustCompile(`Msg\("([a-z_.]+)"\)`).FindAllStringSubmatchIndex(src, -1) {
+		msgs = append(msgs, msgSite{at: m[0], slug: src[m[2]:m[3]]})
+	}
+	for _, m := range regexp.MustCompile(`Str\("phase",\s*"([a-z_]+)"\)`).FindAllStringSubmatchIndex(src, -1) {
+		// A field is set before the Msg that emits it, so the owning event is
+		// the first message site after the field.
+		owner := ""
+		for _, msg := range msgs {
+			if msg.at > m[0] {
+				owner = msg.slug
+				break
+			}
+		}
+		if !recoveryEvents[owner] {
+			continue
+		}
+		phases[src[m[2]:m[3]]] = true
 	}
 	return reasons, phases
 }
