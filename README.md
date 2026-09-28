@@ -169,8 +169,8 @@ recovery:
   # "Stream recovery".
   # stream:
   #   enabled: false # absent means streams are never continued
-  #   max-recoveries: 1 # continuation hops per stream, 0..2
-  #   max-elapsed: 20s # window from the commit, >= 1ms, <= 2m
+  #   max-recoveries: 1 # continuation REQUESTS per stream, 0..2
+  #   max-elapsed: 20s # hard window from the commit, >= 1ms, <= 2m
   #   max-partial-bytes: 262144 # committed text held to build the hop, 1KiB..1MiB
 
 # Optional. Named upstream bases, each routed through a transport.
@@ -1221,19 +1221,36 @@ continued only when all of the following hold; anything else ends the stream
 exactly as it would with the block absent, and `stream_recovery_exhausted`
 records which gate fired:
 
-| gate            | refuses when                                                   |
-| --------------- | -------------------------------------------------------------- |
-| terminal marker | a marker was already forwarded — the stream is over            |
-| tool calls      | any `delta.tool_calls`/`delta.function_call` was seen          |
-| finish reason   | any non-null `finish_reason` was seen on a primary choice      |
-| readable shape  | a `data:` line was neither `[DONE]` nor recognizable JSON      |
-| prefix bound    | the committed text reached `max-partial-bytes`                 |
-| usable prefix   | no text was committed at all, so a hop would be a blind replay |
-| request body    | the client's body cannot express a continuation (see below)    |
-| client          | the client connection is gone, or a relay cap stopped the pass |
-| reach           | `max-recoveries` hops were already used                        |
-| window          | `max-elapsed` passed since the stream committed                |
-| envelope        | the request's `budget.request` envelope is spent               |
+| gate            | refuses when                                                     | reported as                                      |
+| --------------- | ---------------------------------------------------------------- | ------------------------------------------------ |
+| terminal marker | a marker was already forwarded — the stream is over              | no reason (it ended on its own terms)            |
+| client          | the client connection is gone, or a relay cap stopped the pass   | no reason (`client_disconnected` on the request) |
+| generation over | the upstream declared the answer finished (`finish_reason`)      | `logical_terminal`                               |
+| tool calls      | any `delta.tool_calls`/`delta.function_call` was seen            | `unsafe_content` / `tool_calls`                  |
+| stream failed   | the upstream declared the stream failed (an error event)         | `unsafe_content` / `upstream_terminal`           |
+| output topology | Responses text not provably from ONE message output's ONE stream | `unsafe_content` / `multiple_outputs`            |
+| readable shape  | a `data:` line was neither `[DONE]` nor recognizable JSON        | `unsafe_content` / `not_object`/`unknown_shape`  |
+| prefix bound    | the committed text reached `max-partial-bytes`                   | `unsafe_content` / `oversize`                    |
+| usable prefix   | no text was committed at all, so a hop would be a blind replay   | `unsafe_content` / `no_prefix`                   |
+| request body    | the client's body cannot express a continuation (see below)      | `unsafe_content` / the builder's token           |
+| reach           | `max-recoveries` continuation requests were already made         | `max_recoveries`                                 |
+| window          | `max-elapsed` passed since the stream committed                  | `max_elapsed`                                    |
+| envelope        | the request's `budget.request` envelope is spent                 | `budget_spent`                                   |
+
+A non-null `finish_reason` is **not** an unsafe-content refusal and is never
+reported as one: the generation ended, it simply ended without the marker the
+client keys on. Nothing is left to continue, and no marker is invented to paper
+over the missing one. The distinction is what keeps `unsafe_content` readable —
+it means "this proxy could not safely continue this stream", not "the model
+stopped talking".
+
+**MVP scope: plain text only.** The feature continues plain assistant text with
+provably safe structure and nothing else. Tool calls are refused, and so is any
+Responses stream whose text cannot be attributed to exactly one message output
+and one content stream: a delta whose `item_id`, `output_index` or
+`content_index` disagrees with the prefix already accumulated — or a second
+message item, or a second text stream — refuses the whole stream rather than
+concatenating two answers into one assistant turn.
 
 The unbounded-accumulation case is the one that matters for memory: a stream
 whose text passes `max-partial-bytes` stops being a candidate for
@@ -1247,6 +1264,44 @@ never a different candidate. It pays for its dials out of the same
 outbound traffic. It counts as a provider-level attempt on
 `request_completed`: `provider_attempts` and `upstream_exchanges` both move,
 while `candidates_entered` does not.
+
+**`max-recoveries` counts continuation requests, not continuations that
+worked.** `max-recoveries: 1` means this logical stream may make one extra
+upstream request — whether that request is established, refused at the
+credential or the envelope, answered with a status, or truncated mid-stream.
+The slot is spent before the dial, so a stream that keeps dying cannot spend an
+unbounded number of upstream requests under a bound that reads as a limit; the
+cap is `2`. A hop that could not be established at all (a refused dial, a
+status, a non-stream 2xx) ends the effort on the spot rather than spending the
+rest of the reach: another immediate ask would not change what those answers
+said, and the client's stream is open and silent the whole time. The one
+failure that continues is a hop that streamed and truncated again — evidence of
+progress — and only while the reach, the window and the envelope still allow
+it.
+
+**`max-elapsed` is a hard runtime bound, not a check between reads.** It is one
+window measured from the moment the stream committed, shared by the committed
+relay and every hop. A peer that sends a partial event and then holds the TCP
+connection open cannot outlive it: at the deadline the proxy closes the body
+the relay is blocked on, the read returns, no further hop is dialed, and the
+stream is reported `stream_truncated` with `recovery_reason: max_elapsed`. The
+window is also read off the frozen clock between hops, so an effort that ends
+cleanly just past the deadline stops too. A client that disconnects is a
+different thing altogether and is reported as `client_disconnected`: the
+client's own context remains the higher hard stop, and it is never confused
+with the operator's window. A client disconnect also means **zero** further
+upstream requests — the proxy never spends an exchange on a stream nobody is
+reading.
+
+> **Size the window for your longest generation, not your shortest outage.**
+> The window is armed on the committed stream itself, so while the block is
+> enabled it also caps how long any single streamed answer may take. A
+> generation still running at `max-elapsed` is cut and reported
+> `stream_truncated` with `recovery_reason: max_elapsed` even if no upstream
+> ever failed — which is the point of a hard bound, but it means the default
+> `20s` is short for long reasoning models. The cap is `2m`; set the window
+> above the longest answer you expect to relay, or leave the block disabled and
+> keep the plain relay, which has no window at all.
 
 **What is never done.** No ordinary retry and no fallback, before or after
 commitment; the pre-commitment walk is untouched and no decision here goes
@@ -1265,7 +1320,11 @@ transform unchanged apart from the added turn:
   with string content (a prefill), the committed text extends that content;
   otherwise an assistant message carrying the committed text is appended.
   Either way the answer-so-far ends the body, which is what lets the model
-  continue it. `stream: true` is set; every other member travels as sent.
+  continue it. `stream: true` is set; every other member travels as sent. A
+  prefill message is **mutated, not rebuilt**: only its `content` is
+  regenerated, so a `name`, a provider extension, or a field this build has
+  never heard of survives into the continuation rather than being silently
+  dropped.
 - **Responses** — `input` is normalized into the array form: the client's own
   string input is preserved as its leading user item, and the continuation adds
   an assistant `message` item carrying the committed text followed by a user
@@ -2036,11 +2095,15 @@ What each level carries:
   `stream_recovery_failed` (one per hop that refused, answered with a status
   instead of a stream, or truncated again — `recovery_index`, `provider`,
   `upstream`, `phase` from the closed set `build`/`credential`/`budget`/
-  `dial`/`upstream_status`, and `upstream_status` when the hop answered with
-  one) and `stream_recovery_exhausted` (the effort stopped at a gate —
+  `dial`/`upstream_status`/`upstream_read`/`client_write`, and
+  `upstream_status` when the hop answered with one, plus
+  `upstream_credential_id` when the candidate has a pool) and
+  `stream_recovery_exhausted` (the effort stopped at a gate —
   `recoveries`, `reason` from `budget_spent`/`max_recoveries`/`max_elapsed`/
-  `unsafe_content`, and `unsafe_reason` naming the accumulator's own token
-  when the gate was `unsafe_content`) — one
+  `logical_terminal`/`unsafe_content`, and `unsafe_reason` naming the
+  accumulator's own token when the gate was `unsafe_content`; a
+  `logical_terminal` reason carries no `unsafe_reason`, because a generation
+  the upstream declared finished is not an unsafe stream) — one
   warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —

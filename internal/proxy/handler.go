@@ -16,6 +16,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -2041,10 +2042,56 @@ walk:
 		// the whole recovery effort rather than one hop, and it is measured
 		// on the engine's clock like every other window this request obeys.
 		streamStart := eng.Now()
-		stats, err := CopySSE(dst, answer.resp.Body, relayRewrite, progress, stripKeys, observe)
+		// ... and it is ALSO armed as a hard wall-clock deadline here, because
+		// the engine's clock can only be consulted between reads. A peer that
+		// sends a partial event and then holds the connection open parks the
+		// relay inside Body.Read, where no amount of checking the policy
+		// afterwards can reach it; the deadline's watchdog closes the body and
+		// the read returns. Every pass of this loop — the committed relay and
+		// each hop — is armed against the SAME instant, so `max-elapsed`
+		// remains one window since the commit rather than a per-hop budget.
+		//
+		// windowClosed is written only by that watchdog, so it is the one
+		// authority on "this relay was cut by the operator's bound" as opposed
+		// to "the upstream cut it" or "the client left".
+		//
+		// The watchdog is armed ONLY when the block is enabled. The resolved
+		// policy carries a nonzero `max-elapsed` even when it is disabled —
+		// that is what makes the default meaningful when a layer turns it on —
+		// so an unconditional arm would close the body of every healthy stream
+		// twenty seconds in, on deployments that never asked for any of this.
+		// The disabled path therefore keeps the plain relay it has always had:
+		// no timer, no deadline, no window state.
+		var windowClosed atomic.Bool
+		relay := func(src io.ReadCloser) (StreamStats, error) {
+			return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
+		}
+		if contPolicy.Enabled {
+			windowEnd := time.Now().Add(contPolicy.MaxElapsed)
+			relay = func(src io.ReadCloser) (StreamStats, error) {
+				stopWindow := armRecoveryWindow(windowEnd, src, &windowClosed)
+				defer stopWindow()
+				return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
+			}
+		}
+		stats, err := relay(answer.resp.Body)
 		bytesOut, eventsOut := stats.Bytes, stats.Events
+		// recoveries counts the continuation REQUESTS this logical stream has
+		// INITIATED — one per entry into the hop below, whether the hop was
+		// established, refused, or died on the wire. That, and nothing else,
+		// is what `max-recoveries` bounds: the number of extra upstream
+		// requests the proxy is allowed to make for one committed stream,
+		// never the number of continuations that succeeded. A hop that fails
+		// has still spent its slot, so the counter is incremented before the
+		// dial rather than after a stream is established.
 		recoveries := 0
 		credKey := answer.credKey
+		// windowShut records that the pass above, or a hop's pass, was ended
+		// by the recovery window rather than by anything at the wire. It is
+		// reported as `max_elapsed` and it suppresses the relay's own error,
+		// which in that case is this proxy's closed body and not a fault
+		// anybody upstream committed.
+		windowShut := false
 		// stopReason names why the loop gave up short of a terminal stream,
 		// using the closed set below; unsafeReason carries the safety gate's
 		// own token alongside it when the refusal was about content. Both
@@ -2056,6 +2103,12 @@ walk:
 		// because nothing about the recovery was wrong: the reader left.
 		clientGone := false
 		for contPolicy.Enabled {
+			// The gates run in a fixed order, and every one of them is a
+			// refusal rather than a clamp. `continuationEligible` comes first
+			// because the facts it reads are about the STREAM — a marker that
+			// reached the client, a client write that failed, a bounded-relay
+			// cap that stopped the pass — and a stream that ended on its own
+			// terms is never described as a bound the recovery hit.
 			if !continuationEligible(stats, err) {
 				break
 			}
@@ -2063,27 +2116,60 @@ walk:
 				stopReason = recoveryMaxRecoveries
 				break
 			}
+			if windowClosed.Load() {
+				// The hard bound fired: the watchdog closed the body this
+				// relay was blocked on, which is what ended the pass. The
+				// window is shut for the rest of the request, so no hop can
+				// start and the stream truncates exactly where the read
+				// stopped. Reported before the caller gate, matching the
+				// order every other bound in this loop already follows: a
+				// bound the operator set is the answer, and a reader that
+				// also happened to leave is a second event this loop is not
+				// the recorder of.
+				windowShut, stopReason = true, recoveryMaxElapsed
+				break
+			}
 			if r.Context().Err() != nil {
 				// The client is gone. Dialing anyway would spend an upstream
 				// exchange on a stream nobody is reading, and the read would
 				// fail on the write anyway — the same judgement the walk's
-				// own dials make.
+				// own dials make. The hop's own context is this one, so the
+				// window is closed here as a courtesy and at the wire as a
+				// fact: a cancel that lands between this check and the dial
+				// reaches the transport as a canceled request context, and
+				// net/http refuses to send one.
 				clientGone = true
 				break
 			}
-			prefix, reason := partial.Safe()
-			if reason != "" {
-				// FAIL CLOSED. The stream carried a tool call, declared
-				// itself finished, was declared failed by the upstream, is
-				// not a shape this proxy understands, or is too large to
-				// hold. Guessing here is what produces duplicated tool calls
-				// and repeated output; the client keeps exactly the bytes it
-				// already has, and the stream ends as truncated as it would
-				// have with the feature off.
-				unsafeReason, stopReason = reason, recoveryUnsafeContent
+			verdict := partial.Verdict()
+			if verdict.Kind == verdictTerminal {
+				// The upstream declared the answer finished but never sent
+				// the marker the client keys on. There is nothing left to
+				// continue, so no hop is made — and this is a bound of the
+				// stream's own making, not an unsafe-content refusal. The
+				// proxy synthesizes no marker to paper over the missing one.
+				stopReason = recoveryLogicalTerminal
+				break
+			}
+			if verdict.Kind == verdictUnsafe {
+				// FAIL CLOSED. The stream carried a tool call, was declared
+				// failed by the upstream, is not a shape this proxy
+				// understands, spans more than one recoverable output, or is
+				// too large to hold. Guessing here is what produces
+				// duplicated tool calls and repeated output; the client keeps
+				// exactly the bytes it already has, and the stream ends as
+				// truncated as it would have with the feature off.
+				unsafeReason, stopReason = verdict.Reason, recoveryUnsafeContent
 				break
 			}
 			if eng.Now().Sub(streamStart) > contPolicy.MaxElapsed {
+				// The same window the watchdog arms, read on the frozen clock
+				// the policy was resolved with. The watchdog is what bounds a
+				// blocked read; this check is what bounds the effort even if a
+				// pass ends cleanly just past the deadline, or a caller's
+				// clock disagrees with the wall's. The pass ended by itself
+				// here, so its error — if any — is the upstream's and is
+				// reported as such: `windowShut` stays false.
 				stopReason = recoveryMaxElapsed
 				break
 			}
@@ -2095,7 +2181,7 @@ walk:
 				stopReason = recoveryBudgetSpent
 				break
 			}
-			hopBody, berr := buildCont(body, prefix)
+			hopBody, berr := buildCont(body, verdict.Text)
 			if berr != nil {
 				// The body cannot express a continuation. The typed reason
 				// is a token; the refusal never quotes the body it refused.
@@ -2115,6 +2201,14 @@ walk:
 				break
 			}
 
+			// The slot is claimed HERE, before the hop exists: `max-recoveries`
+			// bounds the continuation REQUESTS this stream may make, so a hop
+			// that is built and dialed has spent one whatever it returns —
+			// established, refused at the credential or the envelope, answered
+			// with a status, or truncated mid-stream. Counting successful
+			// continuations instead would let a stream that keeps dying spend
+			// an unbounded number of upstream requests under a bound that
+			// reads as a limit.
 			recoveries++
 			index := recoveries
 			// The hop's own message name is never logged — it is
@@ -2172,12 +2266,30 @@ walk:
 					hopExchangeBefore+j+1, eng.Budget().RequestRemaining()),
 					dial.credKey).Msg("egress_attempt_failed")
 			}
+			// A hop that never produced a continuable STREAM — a refused
+			// dial, a status, a non-stream 2xx — ends the recovery effort on
+			// the spot, and that is a deliberate policy rather than a bound
+			// being exhausted: `max-recoveries` says how many continuation
+			// requests this stream MAY make, and a policy is not obliged to
+			// spend them all. A hop that could not be established says
+			// something about the provider that another ask would not change
+			// (the credential is cooling, the envelope is spent, the provider
+			// is answering with errors), and the client's stream is open and
+			// silent the whole time, so the safe direction is to stop and
+			// report the phase. The BOUND remains exactly what it says: no
+			// loop can ever make more than `max-recoveries` requests, however
+			// a hop fails. What DOES continue is the one failure that is
+			// evidence of progress — a hop that streamed and truncated again
+			// — and only while the reach, the window and the envelope allow.
+			//
 			// recoveryFailed reports one hop that did not produce a
 			// continuable stream. The phase is a closed token and the cause
 			// is the sanitized error — or absent, for the refusals this
 			// proxy made itself, where nothing was dialed and no endpoint is
 			// at fault. `upstream_status` is the hop's received status when
-			// there was one.
+			// there was one. No `recovery_reason` accompanies it: that field
+			// names a bound the loop stopped at, and a failed hop is a
+			// failure, not a bound.
 			recoveryFailed := func(phase string, hopErr error, status int) {
 				event := log.Warn().Str("public_model", model).
 					Str("provider", answer.cand.Label()).
@@ -2221,7 +2333,7 @@ walk:
 				_ = dial.resp.Body.Close()
 				break
 			}
-			hopStats, hopErr := CopySSE(dst, dial.resp.Body, relayRewrite, progress, stripKeys, observe)
+			hopStats, hopErr := relay(dial.resp.Body)
 			_ = dial.resp.Body.Close()
 			bytesOut += hopStats.Bytes
 			eventsOut += hopStats.Events
@@ -2250,6 +2362,17 @@ walk:
 				hopPhase = "client_write"
 			}
 			recoveryFailed(hopPhase, hopErr, 0)
+		}
+		if windowShut {
+			// The pass that ended this loop was ended by the window's own
+			// watchdog closing the body it was reading, so its error is THIS
+			// proxy's, not the upstream's: left in place it would be reported
+			// as an upstream read failure and send an operator after a peer
+			// that behaved perfectly. Dropping it is what makes `max_elapsed`
+			// legible next to the three causes it must never be confused
+			// with — `client_disconnected`, `upstream_read` and
+			// `upstream_limit` — since none of those can set this flag.
+			err = nil
 		}
 		if stopReason != "" {
 			event := log.Warn().Str("public_model", model).

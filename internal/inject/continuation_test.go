@@ -130,6 +130,81 @@ func TestBuildContinuationChatExtendsAPrefill(t *testing.T) {
 	}
 }
 
+// TestBuildContinuationChatPreservesThePrefillMessage is the other half of
+// extending a prefill: the message is MUTATED, not REBUILT. Only `content` is
+// the builder's to touch. Every other member of the client's assistant message
+// — a `name`, a provider extension, a field this build has never heard of —
+// must survive into the continuation byte for byte, because the alternative is
+// a continuation that silently rewrites the client's own conversation.
+//
+// A rebuild from the two fields this package knows about would pass a test
+// that only checked role and content. That is exactly the bug this pins.
+func TestBuildContinuationChatPreservesThePrefillMessage(t *testing.T) {
+	orig := []byte(`{"model":"public","stream":true,"messages":[` +
+		`{"role":"user","content":"count"},` +
+		`{"role":"assistant","content":"one, ","name":"narrator",` +
+		`"x_provider_extension":{"nested":[1,2],"flag":true},"prefix":true,` +
+		`"x_future_field":"keep me"}]}`)
+
+	built, err := BuildContinuationChat(orig, " two")
+	if err != nil {
+		t.Fatalf("BuildContinuationChat: %v", err)
+	}
+	msgs := chatMsg(t, built)
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want the client's two", len(msgs))
+	}
+	prefill := msgs[1]
+
+	// The member the builder owns, and only it, moved.
+	if got := textOf(t, prefill["content"]); got != "one,  two" {
+		t.Fatalf("content = %q, want the prefill extended", got)
+	}
+	// Every other member is the client's own bytes.
+	for member, want := range map[string]string{
+		"role":                 `"assistant"`,
+		"name":                 `"narrator"`,
+		"x_provider_extension": `{"nested":[1,2],"flag":true}`,
+		"prefix":               `true`,
+		"x_future_field":       `"keep me"`,
+	} {
+		raw, ok := prefill[member]
+		if !ok {
+			t.Errorf("the continuation dropped the prefill's %q member: %s", member, built)
+			continue
+		}
+		// Compared as decoded JSON so the assertion is about the VALUE the
+		// upstream sees, not about the member order json.Marshal happens to
+		// emit maps in.
+		if !sameJSON(t, raw, json.RawMessage(want)) {
+			t.Errorf("member %q = %s, want %s", member, raw, want)
+		}
+	}
+
+	// The client's other members and its first message are untouched.
+	m := decodeMap(t, built)
+	if string(m["model"]) != `"public"` {
+		t.Errorf("model = %s, want the client's", m["model"])
+	}
+	if got := textOf(t, msgs[0]["content"]); got != "count" {
+		t.Errorf("the user turn was rewritten: %q", got)
+	}
+}
+
+// sameJSON compares two raw JSON values by decoded value, so a member re-emitted
+// in a different key order still counts as preserved.
+func sameJSON(t *testing.T, a, b json.RawMessage) bool {
+	t.Helper()
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false
+	}
+	return jsonEqual(av, bv)
+}
+
 // TestBuildContinuationChatRefusals: every way the builder declines. Each one
 // means "do not recover this stream", and each is a shape where guessing
 // would splice repeated or misordered text into the client's answer.

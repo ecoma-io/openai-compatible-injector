@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,11 +87,29 @@ func sseChat(content string) string {
 	return `data: {"model":"up-a","choices":[{"delta":{"content":"` + content + `"}}]}` + "\n\n"
 }
 
-// sseResponses renders one Responses output-text delta.
+// sseResponses renders one Responses output-text delta, carrying the full
+// identity (`item_id`/`output_index`/`content_index`) a real upstream sends:
+// those three members are what the accumulator proves the prefix's provenance
+// from, so a fixture without them is not a stream this feature will continue.
 func sseResponses(delta string) string {
-	return `event: response.output_text.delta` + "\n" +
-		`data: {"type":"response.output_text.delta","delta":"` + delta + `"}` + "\n\n"
+	return sseResponsesIdent("response.output_text.delta", "m1", 0, 0, delta)
 }
+
+// sseResponsesIdent renders one Responses text-bearing delta with an explicit
+// identity, so a test can make two deltas disagree about which output they
+// belong to.
+func sseResponsesIdent(typ, itemID string, outputIndex, contentIndex int, delta string) string {
+	return `event: ` + typ + "\n" +
+		`data: {"type":"` + typ + `","item_id":"` + itemID + `","output_index":` + itoa(outputIndex) +
+		`,"content_index":` + itoa(contentIndex) + `,"delta":"` + delta + `"}` + "\n\n"
+}
+
+// sseResponsesUnknown renders an event whose type this build does not know.
+func sseResponsesUnknown(typ string) string {
+	return `event: ` + typ + "\n" + `data: {"type":"` + typ + `"}` + "\n\n"
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
 
 // sseStream answers with a body that ends at EOF — an upstream that closed the
 // connection. With no terminal marker in it, the stream was CUT, not finished.
@@ -172,6 +193,104 @@ func TestStreamRecoveryOffByDefault(t *testing.T) {
 	}
 	if _, ok := trunc[0]["recovery_reason"]; ok {
 		t.Errorf("recovery_reason set without a recovery attempt: %v", trunc[0])
+	}
+}
+
+// pausedReader yields its first chunk, holds the read for a pause, and then
+// yields the rest — a slow but perfectly healthy upstream, which is the shape
+// a bound must never mistake for a stalled one.
+type pausedReader struct {
+	first  string
+	rest   string
+	pause  time.Duration
+	closed chan struct{}
+	i      int
+}
+
+// Close is what makes this reader a faithful stand-in for a response body: a
+// body that ignored Close would let the very bug this test exists to catch
+// pass it, because closing the body is the only way a watchdog can unblock a
+// read.
+func (r *pausedReader) Close() error {
+	select {
+	case <-r.closed:
+	default:
+		close(r.closed)
+	}
+	return nil
+}
+
+func (r *pausedReader) Read(p []byte) (int, error) {
+	switch r.i {
+	case 0:
+		r.i++
+		return copy(p, r.first), nil
+	case 1:
+		r.i++
+		select {
+		case <-time.After(r.pause):
+			return copy(p, r.rest), nil
+		case <-r.closed:
+			return 0, errors.New("http: read on closed response body")
+		}
+	}
+	return 0, io.EOF
+}
+
+// TestStreamRecoveryWindowIsNotArmedWhenDisabled is the regression this
+// hardening pass introduced and then fixed, pinned in the quiet direction.
+//
+// The window's watchdog closes the upstream body at `max-elapsed`. The
+// RESOLVED policy carries a nonzero `max-elapsed` even when the block is
+// disabled — it is the default that makes a layer's `enabled: true` meaningful
+// — so arming it unconditionally would cut every healthy stream short on
+// deployments that never asked for recovery at all. Here the block is present
+// and disabled with a deliberately tiny window, and the upstream pauses
+// three times longer than it: the stream must still finish, because a
+// disabled policy has no window.
+func TestStreamRecoveryWindowIsNotArmedWhenDisabled(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: false\n    max-elapsed: 150ms\n"))
+	upstream := &pausedReader{
+		first:  sseChat("Hello"),
+		rest:   sseChat(", world") + "data: [DONE]\n\n",
+		pause:  450 * time.Millisecond,
+		closed: make(chan struct{}),
+	}
+	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       upstream,
+		}, nil
+	}}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Hello", ", world", "[DONE]"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("relayed stream is missing %q: %s", want, body)
+		}
+	}
+	if pa.dials() != 1 {
+		t.Errorf("dials = %d, want the primary once and no continuation", pa.dials())
+	}
+	for _, slug := range []string{"stream_recovery_started", "stream_recovery_failed", "stream_recovery_succeeded", "stream_recovery_exhausted"} {
+		if ev := logBuf.events(t, slug); len(ev) != 0 {
+			t.Errorf("%s fired with stream recovery disabled: %v", slug, ev)
+		}
+	}
+	completed := logBuf.events(t, "stream_completed")
+	if len(completed) != 1 {
+		t.Fatalf("stream_completed = %v, want one — a paused stream is not a stalled one", completed)
+	}
+	if got := completed[0]["stream_recoveries"]; got != float64(0) {
+		t.Errorf("stream_recoveries = %v, want 0", got)
+	}
+	if trunc := logBuf.events(t, "stream_truncated"); len(trunc) != 0 {
+		t.Errorf("a healthy paused stream was reported truncated: %v", trunc)
 	}
 }
 
@@ -753,3 +872,681 @@ func (b *selfCancelingBody) Read(p []byte) (int, error) {
 }
 
 func (b *selfCancelingBody) Close() error { return nil }
+
+// parkedBody is an upstream that sends its bytes and then HOLDS THE
+// CONNECTION OPEN: the next read parks until something closes the body.
+//
+// It is the shape `max-elapsed` exists for. A peer that streams a partial
+// event and then goes quiet leaves the relay parked inside Body.Read, where
+// no check the loop makes afterwards can reach it — the recovery window's
+// watchdog closing the body is the only lever that returns the read. Before
+// this body existed the suite had nothing that could block a read at all, so
+// the window was only ever observed as a clock reading, never as a bound.
+//
+// ctx, when non-nil, models what net/http does to a REAL response body when
+// the client goes away: the parked read is aborted with the context's error.
+// A nil ctx is an upstream whose socket nobody else will close.
+type parkedBody struct {
+	data []byte
+	ctx  context.Context
+	// closed is closed by Close. The watchdog calls it.
+	closed chan struct{}
+	once   sync.Once
+	used   bool
+	// released is set by the parked read itself, so a test can prove the read
+	// RETURNED rather than merely that a timer fired somewhere near it: a
+	// relay goroutine left parked on an upstream that never speaks again is
+	// exactly the leak this bound must not create.
+	released atomic.Bool
+}
+
+func newParkedBody(ctx context.Context, data string) *parkedBody {
+	return &parkedBody{data: []byte(data), ctx: ctx, closed: make(chan struct{})}
+}
+
+func (b *parkedBody) Read(p []byte) (int, error) {
+	if !b.used {
+		b.used = true
+		return copy(p, b.data), nil
+	}
+	var clientGone <-chan struct{}
+	if b.ctx != nil {
+		clientGone = b.ctx.Done()
+	}
+	select {
+	case <-b.closed:
+		b.released.Store(true)
+		return 0, errors.New("http: read on closed response body")
+	case <-clientGone:
+		b.released.Store(true)
+		return 0, b.ctx.Err()
+	case <-time.After(parkedSafety):
+		// NOT a behaviour of the service: a regression that leaves the read
+		// parked forever would otherwise hang the suite until the package
+		// timeout. The test fails on its assertions instead.
+		b.released.Store(true)
+		return 0, errors.New("parked read was never released")
+	}
+}
+
+func (b *parkedBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+// parkedSafety is the test-only escape hatch above. It must be far longer
+// than any window a test arms, and a test that reaches it fails.
+const parkedSafety = 20 * time.Second
+
+// sseParked answers with a body that streams `body` and then holds the
+// connection open, optionally aborting on the client's context.
+func sseParked(ctx context.Context, body string) (*parkedBody, dialFunc) {
+	b := newParkedBody(ctx, body)
+	return b, func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       b,
+		}, nil
+	}
+}
+
+// TestStreamRecoveryMaxElapsedCutsABlockedRead is the hard-bound half of
+// `max-elapsed`, and the case that used to be a hole: an upstream that sends
+// a partial event and then holds the TCP connection open.
+//
+// The sequence the test drives is the one the bound has to cover — the partial
+// event reaches the client, the relay parks in the next read, the window
+// expires, the watchdog closes the upstream body, the read returns, and the
+// loop stops. Without the watchdog the relay never returns at all: there is no
+// read deadline anywhere else on this path, and the check that reads
+// `max-elapsed` sits after the very call that is blocked.
+func TestStreamRecoveryMaxElapsedCutsABlockedRead(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 150ms\n"))
+	body, dial := sseParked(context.Background(), sseChat("Hello"))
+	pa.script = []dialFunc{dial}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	// The partial event was relayed before the read parked: the bound cuts the
+	// stream where it stopped, it does not withhold what already happened.
+	if !strings.Contains(rec.Body.String(), "Hello") {
+		t.Fatalf("the committed partial event never reached the client: %s", rec.Body.String())
+	}
+	if !body.released.Load() {
+		t.Fatal("the relay's read never returned: the window closed no upstream body")
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want no hop past the window", pa.dials())
+	}
+	if ev := logBuf.events(t, "stream_recovery_started"); len(ev) != 0 {
+		t.Errorf("a hop was dialed past the window: %v", ev)
+	}
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want one max_elapsed refusal", exh)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Errorf("truncation reason = %v, want max_elapsed", trunc[0]["recovery_reason"])
+	}
+	// The error the relay saw is THIS proxy's closed body. Left in place it
+	// would be reported as an upstream read failure, which is the one reading
+	// an operator must not get from their own configured bound.
+	if _, hasErr := trunc[0]["error"]; hasErr {
+		t.Errorf("the bound reported an upstream error it invented: %v", trunc[0])
+	}
+	if trunc[0]["phase"] != "recovery" {
+		t.Errorf("truncation phase = %v, want recovery", trunc[0]["phase"])
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "stream_truncated" {
+		t.Fatalf("request_completed = %v, want stream_truncated", done)
+	}
+	// max_elapsed must stay tellable apart from the three causes it is
+	// adjacent to. None of them can produce this pair.
+	if done[0]["outcome"] == "client_disconnected" {
+		t.Errorf("the operator's own bound was reported as a client disconnect: %v", done[0])
+	}
+}
+
+// TestStreamRecoveryWindowCoversEveryHop: one window since the commit, not a
+// fresh one per hop. The first relay ends cleanly just under the bound; the
+// hop's relay parks — and the SAME instant closes it, because the window was
+// armed once for the whole effort.
+func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 250ms\n    max-recoveries: 2\n"))
+	body, dial := sseParked(context.Background(), sseChat(", world"))
+	pa.script = []dialFunc{sseStream(sseChat("Hello")), dial}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Hello") {
+		t.Fatalf("the first hop's text never reached the client: %s", rec.Body.String())
+	}
+	if !body.released.Load() {
+		t.Fatal("the hop's parked read never returned: the window did not cover the hop")
+	}
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the one hop", pa.dials())
+	}
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want one max_elapsed refusal", exh)
+	}
+	// The hop DID happen — it was under the bound when it started. What the
+	// bound cut is the read, and the count says so.
+	if exh[0]["recoveries"] != float64(1) {
+		t.Errorf("recoveries = %v, want the hop that was cut counted", exh[0]["recoveries"])
+	}
+}
+
+// TestStreamRecoveryClientCancelBeatsTheWindow: the client's context is a
+// higher hard-stop than any recovery policy, and it stays distinguishable
+// from the window even when both are live. Here the window is wide open
+// (10s) and the client leaves while the read is parked: the read returns the
+// context's error, the caller gate refuses every further hop, and the record
+// names the disconnect rather than the bound.
+func TestStreamRecoveryClientCancelBeatsTheWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 10s\n"))
+	body, dial := sseParked(ctx, sseChat("Hello"))
+	pa.script = []dialFunc{dial}
+
+	// The client leaves 40ms in, while the relay is parked.
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel()
+	}()
+
+	rec := doRequestWithContext(t, h, ctx, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !body.released.Load() {
+		t.Fatal("the parked read never returned after the client left")
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want zero recovery requests after the client left", pa.dials())
+	}
+	for _, slug := range []string{"stream_recovery_started", "stream_recovery_failed", "stream_recovery_succeeded", "stream_recovery_exhausted"} {
+		if ev := logBuf.events(t, slug); len(ev) != 0 {
+			t.Errorf("%s fired for a departed client: %v", slug, ev)
+		}
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
+		t.Fatalf("request_completed = %v, want client_disconnected", done)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if _, has := trunc[0]["recovery_reason"]; has {
+		t.Errorf("a departed client reported a recovery bound: %v", trunc[0])
+	}
+}
+
+// TestStreamRecoveryWindowOutranksASimultaneousDisconnect pins the gate order
+// when the window and the reader both go away: the bound the operator
+// configured is the answer. The construction is exact rather than timed — the
+// client is already gone when the watchdog closes the body — so what it
+// proves is the ordering, not a race that happened to land one way.
+func TestStreamRecoveryWindowOutranksASimultaneousDisconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 120ms\n"))
+	// The body ignores the client's context and cancels it instead: the relay
+	// stays parked on an upstream that will not speak again, and by the time
+	// the window fires the caller is already gone.
+	body := newParkedBody(context.Background(), sseChat("Hello"))
+	canceled := make(chan struct{})
+	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+			close(canceled)
+		}()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+		}, nil
+	}}
+
+	doRequestWithContext(t, h, ctx, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	<-canceled
+	if !body.released.Load() {
+		t.Fatal("the parked read never returned")
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want zero recovery requests", pa.dials())
+	}
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want the window's own reason", exh)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 || trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Fatalf("stream_truncated = %v, want max_elapsed rather than a disconnect", trunc)
+	}
+}
+
+// failAfterWriter is a client connection that breaks after n successful
+// writes. httptest's recorder never fails, so without this the recovery
+// loop's client-write path could not be exercised at the handler at all.
+type failAfterWriter struct {
+	*httptest.ResponseRecorder
+	mu    sync.Mutex
+	after int
+	n     int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.n++
+	over := w.n > w.after
+	w.mu.Unlock()
+	if over {
+		return 0, errors.New("client connection broke")
+	}
+	return w.ResponseRecorder.Write(p)
+}
+
+func (w *failAfterWriter) Flush() { w.ResponseRecorder.Flush() }
+
+// TestStreamRecoveryStopsOnAClientWriteFailure: the client's socket breaks
+// while a hop is streaming. There is nobody left to continue for, so the loop
+// makes no further request — the same judgement the caller gate makes, taken
+// from the failure that actually happened rather than from the context.
+func TestStreamRecoveryStopsOnAClientWriteFailure(t *testing.T) {
+	store := newChainStore(t, recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	pa := &scriptedDoer{script: []dialFunc{
+		sseStream(sseChat("Hello")),
+		sseStream(sseChat("there")),
+		sseStream(sseChat("never asked")),
+	}}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: &scriptedDoer{}}, nil, nil, nil, log)
+
+	// The walk relays one event (two writes). The hop's data line is write 3;
+	// write 4 — the hop's event boundary — is where the client is gone.
+	w := &failAfterWriter{ResponseRecorder: httptest.NewRecorder(), after: 3}
+	h.ServeHTTP(w, buildRequest(t, http.MethodPost, "/v1/chat/completions", chatRequest, nil))
+
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want no continuation after the client write failed", pa.dials())
+	}
+	failed := logBuf.events(t, "stream_recovery_failed")
+	if len(failed) != 1 || failed[0]["phase"] != "client_write" {
+		t.Fatalf("stream_recovery_failed = %v, want one client_write phase", failed)
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
+		t.Fatalf("request_completed = %v, want client_disconnected", done)
+	}
+}
+
+// TestStreamRecoveryFinishReasonIsNotUnsafeContent is Task 2's contract at the
+// handler: a stream whose upstream declared the answer FINISHED — a non-null
+// Chat `finish_reason` — is never continued, and the record says the
+// generation ENDED rather than that this proxy refused to read it.
+//
+// The distinction is the whole point. "The upstream finished without sending
+// the marker" and "the proxy found something it must not continue" call for
+// completely different operator responses, and reporting the first as
+// `unsafe_content` sends them looking for a parsing problem that does not
+// exist.
+func TestStreamRecoveryFinishReasonIsNotUnsafeContent(t *testing.T) {
+	for _, finish := range []string{"stop", "length", "content_filter"} {
+		t.Run(finish, func(t *testing.T) {
+			h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
+			pa.script = []dialFunc{sseCut(sseChat("Hello") +
+				`data: {"choices":[{"delta":{},"finish_reason":"` + finish + `"}]}` + "\n\n")}
+
+			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want the committed 200", rec.Code)
+			}
+			if pa.dials() != 1 {
+				t.Fatalf("dials = %d, want zero recovery dials after a declared finish", pa.dials())
+			}
+			if ev := logBuf.events(t, "stream_recovery_started"); len(ev) != 0 {
+				t.Errorf("a finished stream was continued: %v", ev)
+			}
+			exh := logBuf.events(t, "stream_recovery_exhausted")
+			if len(exh) != 1 {
+				t.Fatalf("stream_recovery_exhausted = %v, want one", exh)
+			}
+			if exh[0]["reason"] != "logical_terminal" {
+				t.Errorf("reason = %v, want logical_terminal", exh[0]["reason"])
+			}
+			if _, has := exh[0]["unsafe_reason"]; has {
+				t.Errorf("a declared finish was reported as unsafe content: %v", exh[0])
+			}
+			trunc := logBuf.events(t, "stream_truncated")
+			if len(trunc) != 1 || trunc[0]["recovery_reason"] != "logical_terminal" {
+				t.Fatalf("stream_truncated = %v, want the logical_terminal reason", trunc)
+			}
+			// NO SYNTHESIZED MARKER. The client gets exactly the bytes the
+			// upstream sent: a stream that never said [DONE] still never says it.
+			if strings.Contains(rec.Body.String(), "[DONE]") {
+				t.Errorf("the proxy invented a terminal marker: %s", rec.Body.String())
+			}
+			done := logBuf.events(t, "request_completed")
+			if len(done) != 1 || done[0]["outcome"] != "stream_truncated" {
+				t.Fatalf("request_completed = %v, want stream_truncated", done)
+			}
+		})
+	}
+}
+
+// TestStreamRecoveryFinishReasonThenMarkerIsTheClientTerminal: the upstream
+// declared the finish AND sent the marker. The client keys on the marker, so
+// this stream is finished on its own terms — `stream_completed`, no refusal,
+// no hop. The two facts are tracked separately and neither imitates the other.
+func TestStreamRecoveryFinishReasonThenMarkerIsTheClientTerminal(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
+	pa.script = []dialFunc{sseStream(sseChat("Hello") +
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n")}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if n := strings.Count(rec.Body.String(), "data: [DONE]"); n != 1 {
+		t.Fatalf("terminal markers = %d, want exactly the upstream's one", n)
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want zero recovery dials", pa.dials())
+	}
+	if ev := logBuf.events(t, "stream_recovery_exhausted"); len(ev) != 0 {
+		t.Errorf("a marked stream reported a recovery refusal: %v", ev)
+	}
+	if ev := logBuf.events(t, "stream_completed"); len(ev) != 1 {
+		t.Errorf("stream_completed = %v, want one", ev)
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "completed" {
+		t.Fatalf("request_completed = %v, want completed", done)
+	}
+}
+
+// TestStreamRecoveryFinishReasonWithADelayedEOF: the finish is read in one
+// chunk and the EOF arrives in a later one — a provider that declares the
+// finish and then takes its time closing. The latch is what makes the answer
+// the same either way: nothing after a declared finish can un-finish it.
+func TestStreamRecoveryFinishReasonWithADelayedEOF(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
+	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(&stagedReader{chunks: []string{
+				sseChat("Hello"),
+				`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+			}}),
+		}, nil
+	}}
+
+	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want zero recovery dials", pa.dials())
+	}
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "logical_terminal" {
+		t.Fatalf("stream_recovery_exhausted = %v, want one logical_terminal refusal", exh)
+	}
+}
+
+// stagedReader hands each chunk back from its own Read, so a test can control
+// where the reads fall rather than pretending every read returns everything.
+type stagedReader struct {
+	chunks []string
+	i      int
+}
+
+func (r *stagedReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.i])
+	r.i++
+	return n, nil
+}
+
+// TestStreamRecoveryRefusesResponsesMultiOutput is Task 3 at the handler: the
+// MVP continues plain text from exactly one message output's exactly one
+// content stream, and a Responses stream that does not match that topology
+// fails closed rather than concatenating two answers into one assistant turn.
+func TestStreamRecoveryRefusesResponsesMultiOutput(t *testing.T) {
+	cases := []struct {
+		name     string
+		payloads string
+		want     string
+	}{
+		{
+			name:     "identity changes mid-stream",
+			payloads: sseResponses("Once") + sseResponsesIdent("response.output_text.delta", "m2", 1, 0, " upon a time"),
+			want:     "multiple_outputs",
+		},
+		{
+			name:     "the content index changes",
+			payloads: sseResponses("Once") + sseResponsesIdent("response.output_text.delta", "m1", 0, 1, " upon a time"),
+			want:     "multiple_outputs",
+		},
+		{
+			name:     "a second message item is announced",
+			payloads: sseResponses("Once") + `event: response.output_item.added` + "\n" + `data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m2"}}` + "\n\n",
+			want:     "multiple_outputs",
+		},
+		{
+			name:     "an event this build does not know",
+			payloads: sseResponses("Once") + sseResponsesUnknown("response.some_future_event"),
+			want:     "unknown_shape",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
+			pa.script = []dialFunc{sseCut(tc.payloads)}
+
+			doRequest(t, h, http.MethodPost, "/v1/responses", `{"model":"chain-model","stream":true,"input":"hi"}`, nil)
+			if pa.dials() != 1 {
+				t.Fatalf("dials = %d, want no hop on a multi-output stream", pa.dials())
+			}
+			exh := logBuf.events(t, "stream_recovery_exhausted")
+			if len(exh) != 1 {
+				t.Fatalf("stream_recovery_exhausted = %v, want one", exh)
+			}
+			if exh[0]["reason"] != "unsafe_content" || exh[0]["unsafe_reason"] != tc.want {
+				t.Fatalf("refusal = %v/%v, want unsafe_content/%v", exh[0]["reason"], exh[0]["unsafe_reason"], tc.want)
+			}
+		})
+	}
+}
+
+// TestStreamRecoveryHopMatrix pins the two semantics Task 5 is about, across
+// the whole space of first-hop outcomes:
+//
+//   - `max-recoveries` counts continuation REQUESTS INITIATED, never
+//     continuations that succeeded. A hop that was dialed and then failed has
+//     spent its slot even though it recovered nothing, and a stream that keeps
+//     dying can never make more requests than the bound says.
+//   - A hop that failed to produce a continuable stream ENDS the effort. That
+//     is a deliberate policy and not a bound: the bound says how many requests
+//     the stream MAY make, and nothing obliges it to make them all. A refused
+//     dial or an error answer says something another immediate ask would not
+//     change, and the client is holding an open, silent stream the whole time.
+//     What DOES continue is the one failure that is evidence of progress — a
+//     hop that streamed and truncated again — and only while the bounds allow.
+func TestStreamRecoveryHopMatrix(t *testing.T) {
+	okHop := sseStream(sseChat(", world") + "data: [DONE]\n\n")
+	cutHop := sseStream(sseChat(", world"))
+	nonSSE := func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[]}`)),
+		}, nil
+	}
+	status500 := func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"boom"}}`)),
+		}, nil
+	}
+	dialFail := func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+	}
+
+	cases := []struct {
+		name string
+		// reach is max-recoveries; hops[0] is the first continuation's answer
+		// and hops[1] the second's.
+		reach int
+		hops  []dialFunc
+		// wantDials counts the walk attempt plus every hop actually dialed.
+		wantDials int
+		// wantStarted counts hops INITIATED — the slot claims.
+		wantStarted int
+		// wantFailed counts `stream_recovery_failed` events: a hop that
+		// truncated and was retried produced one, and so did the one that
+		// ended the effort.
+		wantFailed   int
+		wantSucceed  int
+		wantPhase    string
+		wantExhaust  string
+		wantRecovery float64
+	}{
+		// `max-recoveries: 0` is not a row here because the config layer
+		// already refuses it: `enabled: true` with a zero reach states an
+		// intent it could never act on (TestStreamValidateRejectsOutOfRange).
+		// One is therefore the smallest reach a live policy can have, and it
+		// is the row below.
+		{
+			name: "one hop succeeds", reach: 1, hops: []dialFunc{okHop},
+			wantDials: 2, wantStarted: 1, wantSucceed: 1, wantRecovery: 1,
+		},
+		{
+			name: "first hop refused at the dial", reach: 2, hops: []dialFunc{dialFail, okHop},
+			wantDials: 2, wantStarted: 1, wantFailed: 1, wantPhase: "dial", wantRecovery: 1,
+		},
+		{
+			name: "first hop answers a status", reach: 2, hops: []dialFunc{status500, okHop},
+			wantDials: 2, wantStarted: 1, wantFailed: 1, wantPhase: "upstream_status", wantRecovery: 1,
+		},
+		{
+			name: "first hop answers a non-stream 2xx", reach: 2, hops: []dialFunc{nonSSE, okHop},
+			wantDials: 2, wantStarted: 1, wantFailed: 1, wantPhase: "upstream_status", wantRecovery: 1,
+		},
+		{
+			name: "first hop truncates and the reach is one", reach: 1, hops: []dialFunc{cutHop},
+			wantDials: 2, wantStarted: 1, wantFailed: 1, wantPhase: "upstream_read",
+			wantExhaust: "max_recoveries", wantRecovery: 1,
+		},
+		{
+			name: "two truncating hops spend the reach", reach: 2, hops: []dialFunc{cutHop, cutHop},
+			wantDials: 3, wantStarted: 2, wantFailed: 2, wantPhase: "upstream_read",
+			wantExhaust: "max_recoveries", wantRecovery: 2,
+		},
+		{
+			name: "the second hop recovers", reach: 2, hops: []dialFunc{cutHop, okHop},
+			wantDials: 3, wantStarted: 2, wantFailed: 1, wantSucceed: 1, wantPhase: "upstream_read", wantRecovery: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t,
+				"    enabled: true\n    max-recoveries: "+strconv.Itoa(tc.reach)+"\n"))
+			script := append([]dialFunc{sseStream(sseChat("Hello"))}, tc.hops...)
+			pa.script = script
+
+			doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+			if pa.dials() != tc.wantDials {
+				t.Fatalf("dials = %d, want %d", pa.dials(), tc.wantDials)
+			}
+			if n := len(logBuf.events(t, "stream_recovery_started")); n != tc.wantStarted {
+				t.Errorf("stream_recovery_started = %d, want %d", n, tc.wantStarted)
+			}
+			if n := len(logBuf.events(t, "stream_recovery_succeeded")); n != tc.wantSucceed {
+				t.Errorf("stream_recovery_succeeded = %d, want %d", n, tc.wantSucceed)
+			}
+			failed := logBuf.events(t, "stream_recovery_failed")
+			if len(failed) != tc.wantFailed {
+				t.Fatalf("stream_recovery_failed = %v, want %d", failed, tc.wantFailed)
+			}
+			if tc.wantPhase != "" && failed[len(failed)-1]["phase"] != tc.wantPhase {
+				t.Errorf("last failure = %v, want phase %q", failed[len(failed)-1], tc.wantPhase)
+			}
+			exh := logBuf.events(t, "stream_recovery_exhausted")
+			if tc.wantExhaust == "" {
+				if len(exh) != 0 {
+					t.Errorf("stream_recovery_exhausted = %v, want none", exh)
+				}
+			} else if len(exh) != 1 || exh[0]["reason"] != tc.wantExhaust {
+				t.Errorf("stream_recovery_exhausted = %v, want reason %q", exh, tc.wantExhaust)
+			}
+			trunc := logBuf.events(t, "stream_truncated")
+			if tc.wantSucceed == 1 {
+				if len(trunc) != 0 {
+					t.Errorf("stream_truncated = %v, want none after a successful recovery", trunc)
+				}
+				return
+			}
+			if len(trunc) != 1 {
+				t.Fatalf("stream_truncated = %v, want one", trunc)
+			}
+			// The slot count is the REQUEST count, and it is reported whether
+			// or not the hop that spent it produced anything.
+			if trunc[0]["stream_recoveries"] != tc.wantRecovery {
+				t.Errorf("stream_recoveries = %v, want %v", trunc[0]["stream_recoveries"], tc.wantRecovery)
+			}
+		})
+	}
+}
+
+// TestStreamRecoveryHopFailureCarriesNoBoundReason: a hop that failed is a
+// failure, not a bound the loop stopped at, so `recovery_reason` — the field
+// that names which bound stopped the effort — stays absent. The hop's own
+// `stream_recovery_failed` event is where the failure is reported, and the
+// two must not be read as the same thing.
+func TestStreamRecoveryHopFailureCarriesNoBoundReason(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	pa.script = []dialFunc{
+		sseStream(sseChat("Hello")),
+		func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connection reset by peer")
+		},
+	}
+
+	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the failed hop", pa.dials())
+	}
+	if ev := logBuf.events(t, "stream_recovery_exhausted"); len(ev) != 0 {
+		t.Errorf("a failed hop was reported as a bound: %v", ev)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if _, has := trunc[0]["recovery_reason"]; has {
+		t.Errorf("a failed hop reported a recovery_reason: %v", trunc[0])
+	}
+	if trunc[0]["stream_recoveries"] != float64(1) {
+		t.Errorf("stream_recoveries = %v, want the failed hop counted as a request", trunc[0]["stream_recoveries"])
+	}
+}

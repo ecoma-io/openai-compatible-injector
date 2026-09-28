@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"openai-compatible-injector/internal/config"
@@ -28,8 +30,19 @@ const (
 	// recoveryMaxRecoveries — the configured reach was used up.
 	recoveryMaxRecoveries = "max_recoveries"
 	// recoveryMaxElapsed — the configured window since the stream began is
-	// over. It bounds the whole recovery effort, not one hop.
+	// over. It bounds the whole recovery effort, not one hop, and it is a HARD
+	// bound: the window's watchdog closes the upstream body the relay is
+	// blocked on, so a stream that stops producing bytes without closing its
+	// connection cannot outlive it (armRecoveryWindow).
 	recoveryMaxElapsed = "max_elapsed"
+	// recoveryLogicalTerminal — the upstream declared the answer FINISHED
+	// (a non-null Chat `finish_reason`) without forwarding the terminal
+	// marker the client keys on. There is nothing left to continue, so no hop
+	// was made — and this is NOT `unsafe_content`: the stream was neither
+	// unreadable nor forbidden, its generation had simply ended. The wire
+	// fact the client experiences — a stream with no marker — is unchanged
+	// and unrepairable from here, because the proxy synthesizes no marker.
+	recoveryLogicalTerminal = "logical_terminal"
 	// recoveryUnsafeContent — the stream is not one this proxy may continue:
 	// it carried a tool call, it declared itself finished, the upstream
 	// declared it failed, the text accumulated past its bound, or the
@@ -185,6 +198,55 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 		dial.phase = "budget"
 	}
 	return dial
+}
+
+// armRecoveryWindow arms the recovery window's HARD bound against one relay
+// pass: at end — a wall-clock instant, computed once when the committed
+// stream began relaying — the returned watchdog closes the upstream body the
+// pass is reading from, which is what unblocks a relay sitting inside a read.
+//
+// Closing the body is the only lever a Go response body offers: Body.Read
+// takes no context, so a peer that sends a partial event and then holds the
+// TCP connection open blocks the relay indefinitely, and `max-elapsed` would
+// otherwise be checked only after the read it was supposed to bound. The same
+// lever, for the same reason, is what the upstream error capture uses
+// (upstream_error.go) — and the same cost is accepted: closing a body
+// mid-read discards that connection rather than returning it to the pool,
+// which is a deliberate casualty of cutting a stalled stream.
+//
+// Three properties make this safe to arm around every pass:
+//
+//   - It is a plain timer, NOT a derivation of the request context. A client
+//     disconnect is not the window closing, and the two must stay
+//     distinguishable in the record: the request context already aborts the
+//     read on its own, so a watchdog hung off it would be unable to tell
+//     "the operator's window elapsed" from "the reader left".
+//   - It creates no goroutine of its own. time.AfterFunc runs its function on
+//     the runtime's timer goroutine, and the caller's stop() — deferred by
+//     the relay closure — releases the timer on every path, including the one
+//     where the pass ended long before the deadline.
+//   - end is read once for the whole recovery effort, so every hop shares one
+//     window rather than each pass restarting its own clock. The bound is
+//     `max-elapsed` since the commit, exactly as the policy states it.
+//
+// closed is set only by the watchdog itself, so a caller can read it after a
+// pass to tell a relay this proxy cut from one the upstream cut.
+func armRecoveryWindow(end time.Time, body io.Closer, closed *atomic.Bool) (stop func()) {
+	remaining := time.Until(end)
+	if remaining <= 0 {
+		// The window is already shut — the only way a pass can start here is
+		// a commit that itself outlived the window. Close the body now: the
+		// pass returns immediately and the loop reports the bound instead of
+		// relaying bytes past a deadline the operator set.
+		closed.Store(true)
+		_ = body.Close()
+		return func() {}
+	}
+	timer := time.AfterFunc(remaining, func() {
+		closed.Store(true)
+		_ = body.Close()
+	})
+	return func() { timer.Stop() }
 }
 
 // continuationEligible reports whether a finished relay pass ended in the one

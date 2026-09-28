@@ -202,18 +202,31 @@ recovery:
   # This is SEMANTIC continuation, not token-level resumption: no
   # OpenAI-compatible provider exposes a resume token, so the upstream is
   # asked to keep writing from the point it stopped, and it may rephrase a
-  # little at the seam. It is also fail-closed by construction. A stream that
-  # carried tool calls or a finish reason, or whose shape the proxy does not
-  # recognize, is never continued — it is truncated exactly as it is today,
-  # and `stream_recovery_exhausted` records why. No ordinary retry, fallback,
-  # or status handling is involved: the pre-commitment walk is untouched.
+  # little at the seam. It is also fail-closed by construction, and the MVP
+  # continues PLAIN TEXT only: a stream that carried tool calls, that the
+  # upstream declared failed, or whose Responses text cannot be attributed to
+  # exactly one message output and one content stream is never continued — it
+  # is truncated exactly as it is today, and `stream_recovery_exhausted`
+  # records why. A non-null `finish_reason` ends the effort too, but it is
+  # reported as `logical_terminal` rather than `unsafe_content`: the
+  # generation finished, it simply finished without the marker. No ordinary
+  # retry, fallback, or status handling is involved: the pre-commitment walk
+  # is untouched.
   #
   #    stream:
   #      enabled: true # default false; absent means streams are never continued
-  #      max-recoveries: 1 # continuation hops per stream, 0..2; `enabled: true`
-  #      # alone means 1 — one extra upstream request, never a loop
-  #      max-elapsed: 20s # window measured from the commit, >= 1ms, <= 2m;
-  #      # checked BEFORE a hop is scheduled, so none ever starts past it
+  #      max-recoveries: 1 # continuation REQUESTS per stream, 0..2; a request
+  #      # that is refused, answered with a status or truncated still spends
+  #      # its slot; `enabled: true` alone means 1 — never a loop
+  #      max-elapsed: 20s # HARD window from the commit, >= 1ms, <= 2m; one
+  #      # bound for the whole effort, checked between hops AND enforced
+  #      # during every relay by closing the upstream body on the deadline, so
+  #      # a peer that stops sending without closing the connection cannot
+  #      # outlive it. While the block is enabled this also caps how long ONE
+  #      # answer may take — a generation still running at the deadline is cut
+  #      # and reported `max_elapsed` — so size it above the longest generation
+  #      # you relay, or leave the block off and keep the plain relay, which has
+  #      # no window at all.
   #      max-partial-bytes: 262144 # committed output held in memory to build
   #      # the continuation, 1KiB..1MiB; past it the stream is not recoverable
 
