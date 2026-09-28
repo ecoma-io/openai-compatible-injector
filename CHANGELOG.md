@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.1...v0.14.2) (2026-09-28)
+
+
+### Bug Fixes
+
+* scope stream-recovery hop state to one upstream response ([#87](https://github.com/ecoma-io/openai-compatible-injector/issues/87)) ([9b641ee](https://github.com/ecoma-io/openai-compatible-injector/commit/9b641ee195a5579504175ae36d1069f845c06f57))
+
 ## [0.14.1](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.0...v0.14.1) (2026-09-28)
 
 
