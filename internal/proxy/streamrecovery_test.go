@@ -17,6 +17,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/transport"
 )
 
@@ -1017,16 +1018,49 @@ func TestStreamRecoveryMaxElapsedCutsABlockedRead(t *testing.T) {
 }
 
 // TestStreamRecoveryWindowCoversEveryHop: one window since the commit, not a
-// fresh one per hop. The first relay ends cleanly just under the bound; the
-// hop's relay parks — and the SAME instant closes it, because the window was
-// armed once for the whole effort.
+// fresh one per hop.
+//
+// The first relay ends cleanly but only after most of the window has already
+// run, so the hop starts with almost nothing left. The SAME instant the relay
+// used must be the one that closes the hop's parked read.
+//
+// Measuring the WHOLE request is the only assertion that tells one shared
+// window from N per-hop ones: with a fresh window per hop the total would be
+// the committed relay's pause PLUS a full window for the hop, so the request
+// would run for roughly twice the configured bound. A test that only asserted
+// "the hop was cut as max_elapsed" cannot tell the two apart — a per-hop
+// window cuts it too, just later — and that is exactly how a per-hop budget
+// passes a test named for a shared one.
 func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
+	const window = 300 * time.Millisecond
+	// The committed relay spends ~200ms of the 300ms window before its stream
+	// ends cleanly, leaving the hop ~100ms of the SAME window.
+	const firstPause = 200 * time.Millisecond
 	h, logBuf, pa, _ := recoveryHandler(t,
-		recoveryBlock(t, "    enabled: true\n    max-elapsed: 250ms\n    max-recoveries: 2\n"))
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 300ms\n    max-recoveries: 2\n"))
 	body, dial := sseParked(context.Background(), sseChat(", world"))
-	pa.script = []dialFunc{sseStream(sseChat("Hello")), dial}
+	pa.script = []dialFunc{
+		func(*http.Request) (*http.Response, error) {
+			// A slow but perfectly healthy committed stream: it yields text,
+			// pauses, then ends at EOF. The pause is real time the window
+			// must account for.
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(&pausedReader{
+					first:  sseChat("Hello"),
+					pause:  firstPause,
+					closed: make(chan struct{}),
+				}),
+			}, nil
+		},
+		dial,
+	}
 
+	start := time.Now()
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	elapsed := time.Since(start)
+
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
 	}
@@ -1047,6 +1081,14 @@ func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
 	// bound cut is the read, and the count says so.
 	if exh[0]["recoveries"] != float64(1) {
 		t.Errorf("recoveries = %v, want the hop that was cut counted", exh[0]["recoveries"])
+	}
+	// THE ASSERTION THAT SEPARATES ONE WINDOW FROM N. Generous headroom on
+	// both sides, because CI scheduling is not a clock this test can trust to
+	// the millisecond: the bound must be beaten by a comfortable margin, and a
+	// per-hop window (pause + a fresh full window ≈ 2×) must miss it by one.
+	if elapsed > window+150*time.Millisecond {
+		t.Errorf("request took %v against a %v window: a fresh window per hop would let the "+
+			"hop outlive the instant the committed relay used", elapsed.Round(time.Millisecond), window)
 	}
 }
 
@@ -1548,5 +1590,279 @@ func TestStreamRecoveryHopFailureCarriesNoBoundReason(t *testing.T) {
 	}
 	if trunc[0]["stream_recoveries"] != float64(1) {
 		t.Errorf("stream_recoveries = %v, want the failed hop counted as a request", trunc[0]["stream_recoveries"])
+	}
+}
+
+// TestStreamRecoveryWindowOwnsAHopCutByIt is the misattribution regression.
+// A continuation hop that the window's own watchdog cuts produces a read
+// error — this proxy's closed body — and the naive classification calls that
+// `upstream_read`, then reports the SAME cause a second time as
+// `stream_recovery_exhausted reason=max_elapsed` when the loop re-checks its
+// gates. Two records, one cause, and the one an operator reads first blames a
+// peer that behaved perfectly.
+//
+// The invariant: exactly one owner. A read that the watchdog ended is owned by
+// `max_elapsed` and nothing else, and the bound is reported once.
+func TestStreamRecoveryWindowOwnsAHopCutByIt(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 250ms\n    max-recoveries: 2\n"))
+	// The committed stream relays one event and ends cleanly under the bound;
+	// the HOP parks, so the window that fires is cutting a hop's read, not the
+	// first relay's.
+	body, dial := sseParked(context.Background(), sseChat(", world"))
+	pa.script = []dialFunc{sseStream(sseChat("Hello")), dial}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !body.released.Load() {
+		t.Fatal("the hop's parked read never returned: the window did not cover the hop")
+	}
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the one hop", pa.dials())
+	}
+
+	// The hop DID happen and DID fail — it is a real request that produced no
+	// terminal marker, so it must still be recorded as a hop failure.
+	failed := logBuf.events(t, "stream_recovery_failed")
+	if len(failed) != 1 {
+		t.Fatalf("stream_recovery_failed = %v, want one for the cut hop", failed)
+	}
+	// ... and its owner is the bound, NOT the peer.
+	if failed[0]["phase"] != "max_elapsed" {
+		t.Errorf("hop failure phase = %v, want max_elapsed (a read the watchdog ended is this proxy's, not the upstream's)", failed[0]["phase"])
+	}
+	// The bound is reported exactly once, by the loop, and not duplicated by a
+	// second event claiming to be an upstream fault.
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want exactly one max_elapsed", exh)
+	}
+	// The cut is not a success, however its partial bytes landed.
+	if ev := logBuf.events(t, "stream_recovery_succeeded"); len(ev) != 0 {
+		t.Errorf("a hop the window cut was reported as a success: %v", ev)
+	}
+	// The truncation carries the bound, and no invented upstream error: the
+	// read failed because this proxy closed the body.
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Errorf("truncation reason = %v, want max_elapsed", trunc[0]["recovery_reason"])
+	}
+	if _, hasErr := trunc[0]["error"]; hasErr {
+		t.Errorf("the bound reported an upstream error it invented: %v", trunc[0])
+	}
+	if trunc[0]["stream_recoveries"] != float64(1) {
+		t.Errorf("stream_recoveries = %v, want the cut hop counted as a request", trunc[0]["stream_recoveries"])
+	}
+}
+
+// partialLineBody delivers a PARTIAL `data:` line — no newline — and then
+// parks. It exists because the usual parked-body fixture ends its event with
+// a blank line, which leaves the relay parked on a ReadSlice for the NEXT
+// line; closing a body at that boundary makes `bufio` return io.EOF, which
+// CopySSE maps to a nil error. A relay parked mid-line does not get that
+// luck: the close surfaces as a real read error, so this is the only shape
+// that can tell a bound-owned truncation from an upstream-owned one.
+type partialLineBody struct {
+	data     []byte
+	closed   chan struct{}
+	once     sync.Once
+	released atomic.Bool
+}
+
+func (b *partialLineBody) Read(p []byte) (int, error) {
+	if b.data != nil {
+		d := b.data
+		b.data = nil
+		return copy(p, d), nil
+	}
+	select {
+	case <-b.closed:
+		b.released.Store(true)
+		return 0, errors.New("http: read on closed response body")
+	case <-time.After(parkedSafety):
+		b.released.Store(true)
+		return 0, errors.New("parked read was never released")
+	}
+}
+
+func (b *partialLineBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+// TestStreamRecoveryWindowOwnsACommittedRelayCutIt is the committed path's
+// half of the same ownership invariant the hop path pins.
+//
+// A watchdog that closes the body mid-line produces a genuine read error —
+// this proxy's own close, not the peer's. The record must still say the
+// bound: `recovery_reason=max_elapsed`, `phase=recovery`, and NO `error`
+// field, because there was no upstream failure to report and inventing one
+// would send an operator after a peer that behaved perfectly. It is also
+// exactly the case the line-boundary fixtures cannot reach, which is why the
+// transport-level misattribution it rules out is otherwise untested.
+func TestStreamRecoveryWindowOwnsACommittedRelayCutIt(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 150ms\n    max-recoveries: 2\n"))
+	body := &partialLineBody{
+		data:   []byte(`data: {"choices":[{"delta":{"content":"hel`),
+		closed: make(chan struct{}),
+	}
+	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+		}, nil
+	}}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !body.released.Load() {
+		t.Fatal("the relay's read never returned: the window closed no upstream body")
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want no hop past the window", pa.dials())
+	}
+	// The bound is the story, and it is told once.
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want exactly one max_elapsed", exh)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Errorf("truncation reason = %v, want max_elapsed", trunc[0]["recovery_reason"])
+	}
+	if trunc[0]["phase"] != "recovery" {
+		t.Errorf("truncation phase = %v, want recovery (the bound, not a read fault)", trunc[0]["phase"])
+	}
+	// This proxy's own closed body must never be relayed as a peer failure.
+	if got, has := trunc[0]["error"]; has {
+		t.Errorf("the bound reported an upstream error it invented: %v", got)
+	}
+	if ev := logBuf.events(t, "stream_recovery_failed"); len(ev) != 0 {
+		t.Errorf("a bound-owned cut was reported as a hop failure: %v", ev)
+	}
+}
+
+// TestStreamRecoveryHop429MarksTheCredential closes the gap that made the
+// credential seam dead on the continuation path: every other recovery test
+// wires `NewHandler(..., nil, ...)`, so `hop.pool` is always nil and a
+// continuation has never once been observed against a real rotation pool.
+//
+// The defect it pins: a rate limit is an ACCOUNT fact, so the account a hop
+// went out with must leave rotation however the recovery ends. `MarkRateLimited`
+// used to be called on the walk's answer path only, which made the mark
+// walk-only — a provider answering the COMMITTING stream with 429 (rather
+// than cutting it) left its key in rotation, and the next request acquired the
+// same key in cursor order. The continuation would then be the thing that
+// silently defeats the rotation the pool exists to provide.
+func TestStreamRecoveryHop429MarksTheCredential(t *testing.T) {
+	store := newCredChainRecoveryStore(t)
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+
+	pa := &scriptedDoer{}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, log)
+
+	// The committed stream is cut, so a hop is made — and the hop is answered
+	// with 429, the shape that only reaches the status branch on a hop.
+	pa.script = []dialFunc{
+		sseCut(sseChat("Hello")),
+		func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(&errBody{data: []byte(`{"error":"rate limited"}`)}),
+			}, nil
+		},
+	}
+	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the hop", pa.dials())
+	}
+
+	// The hop went out under a key. That key must now be cooling, so the NEXT
+	// request cannot acquire it.
+	var used string
+	for _, ev := range logBuf.events(t, "stream_recovery_failed") {
+		if ev["phase"] == "upstream_status" {
+			used, _ = ev["upstream_credential_id"].(string)
+		}
+	}
+	if used == "" {
+		t.Fatal("the 429 hop named no credential id; cannot tell which key to check")
+	}
+	// The handler marks against the REAL clock (no frozen test clock is wired
+	// here), so the check reads the real one: asking at the frozen instant
+	// would predate the deadline and report the key as ready.
+	after := time.Now()
+	if until := pool.CoolingUntil(after, used); until.IsZero() {
+		t.Errorf("credential %q was NOT marked rate-limited by the hop's 429", used)
+	}
+	// And the state is real: an Acquire that PREFERS the key the hop used must
+	// skip it. The pool still has a healthy key, so this is a rotation, not a
+	// refusal — what matters is that the rate-limited one is not handed out.
+	next, ok := pool.Acquire(after, used)
+	if !ok {
+		t.Fatalf("no credential was acquirable at all: %q", used)
+	}
+	if next.ID == used {
+		t.Errorf("credential %q was still acquirable after a 429", used)
+	}
+}
+
+// TestStreamRecoveryACRFramedTerminalMarkerIsTheTerminal pins the failure
+// mode a lone CR produced: the SSE grammar admits CR, LF and CRLF, but only
+// two of the three were recognized. A provider whose final line was
+// `data: [DONE]\r` had its terminal marker read as payload — so the relay
+// reported the stream TRUNCATED, and stream recovery dialed a continuation
+// for an answer the model had already finished.
+//
+// That is a duplicate upstream request against a provider that behaved
+// correctly, on a stream whose contract says a terminal marker ends it.
+func TestStreamRecoveryACRFramedTerminalMarkerIsTheTerminal(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	// LF throughout, and the terminal marker framed with a lone CR — the
+	// dialect the relay must not mistake for a missing marker.
+	pa.script = []dialFunc{sseStream(sseChat("Hello") + "data: [DONE]\r\r")}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want exactly 1: a CR-framed terminal marker must not be continued", pa.dials())
+	}
+	for _, slug := range []string{"stream_recovery_started", "stream_recovery_failed", "stream_recovery_succeeded", "stream_recovery_exhausted"} {
+		if ev := logBuf.events(t, slug); len(ev) != 0 {
+			t.Errorf("%s fired for a stream that reached its terminal marker: %v", slug, ev)
+		}
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 0 {
+		t.Errorf("a terminated stream was reported truncated: %v", trunc)
+	}
+	// stream_completed is a DEBUG event with no outcome field; the request
+	// outcome is on request_completed. Existence + the truncation check above
+	// are the contract.
+	done := logBuf.events(t, "stream_completed")
+	if len(done) != 1 {
+		t.Errorf("stream_completed = %v, want one", done)
+	}
+	rc := logBuf.events(t, "request_completed")
+	if len(rc) != 1 || rc[0]["outcome"] != "completed" {
+		t.Errorf("request_completed = %v, want one completed", rc)
 	}
 }

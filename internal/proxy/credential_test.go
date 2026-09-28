@@ -1059,3 +1059,30 @@ func TestCredentialReadinessIndependentOfRetryAfterMode(t *testing.T) {
 		t.Errorf("wait = %v, want the 2s readiness an ignore-mode policy must not erase", waits[0])
 	}
 }
+
+// newCredChainRecoveryStore is newCredChainStore with the global
+// `recovery.stream` block enabled, so the credential seam is live on the
+// CONTINUATION path rather than only on the walk. Every other recovery test
+// wires a handler with a nil registry, which is why a hop has never been
+// observed against a real rotation pool.
+func newCredChainRecoveryStore(t *testing.T) *config.Store {
+	t.Helper()
+	snap, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + "\n" + "recovery:\n  stream:\n    enabled: true\n\n" + `
+transports:
+  t1:
+    type: direct
+providers:
+  pa:
+    base-url: https://a.example/v1
+    transport: t1
+` + credAuthBlock + `models:
+  chain-model:
+    providers:
+      - provider: pa
+        upstream-model: up-a
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	return config.NewStore(snap)
+}

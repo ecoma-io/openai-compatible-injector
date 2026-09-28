@@ -41,6 +41,8 @@ func TestPartialTextAccumulatesChatContent(t *testing.T) {
 	}
 }
 
+// TestPartialTextAccumulatesResponsesContent proves a cut Responses stream is
+// recoverable while its one output-text channel remains in progress.
 func TestPartialTextAccumulatesResponsesContent(t *testing.T) {
 	v := feed(apiResponses, 1<<20,
 		`{"type":"response.created","response":{"id":"r1"}}`,
@@ -49,13 +51,35 @@ func TestPartialTextAccumulatesResponsesContent(t *testing.T) {
 		`{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text"}}`,
 		`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`,
 		`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":" upon a time"}`,
-		`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`,
-		`{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0}`,
-		`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m1"}}`,
-		`{"type":"response.completed","response":{"id":"r1"}}`,
 	)
 	if got := recovered(t, v); got != "Once upon a time" {
 		t.Fatalf("prefix = %q, want %q", got, "Once upon a time")
+	}
+}
+
+// TestPartialTextResponsesOutputTextDoneIsLogicalTerminal distinguishes the
+// content channel's own completed signal from the stream's wire terminal. A
+// cut after output_text.done is not safe to continue: the generation ended,
+// even if response.completed never arrived.
+func TestPartialTextResponsesOutputTextDoneIsLogicalTerminal(t *testing.T) {
+	p := newPartialText(apiResponses, 1<<20)
+	p.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a "}`))
+	p.Observe([]byte(`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`))
+	if v := p.Verdict(); v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+		t.Fatalf("mismatched output_text.done = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+	}
+
+	p = newPartialText(apiResponses, 1<<20)
+	p.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a time"}`))
+	p.Observe([]byte(`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`))
+	if v := p.Verdict(); v.Kind != verdictTerminal {
+		t.Fatalf("matching output_text.done = %v/%q, want terminal", v.Kind, v.Reason)
+	}
+
+	p = newPartialText(apiResponses, 1<<20)
+	p.Observe([]byte(`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"final delta"}`))
+	if v := p.Verdict(); v.Kind != verdictTerminal {
+		t.Fatalf("text-only output_text.done = %v/%q, want terminal", v.Kind, v.Reason)
 	}
 }
 
@@ -166,6 +190,39 @@ func TestPartialTextRefusesUnsafeShapes(t *testing.T) {
 			want: reasonUpstreamTerminal,
 		},
 		{
+			name: "responses completed has nested error",
+			api:  apiResponses,
+			payloads: []string{
+				`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"before"}`,
+				`{"type":"response.completed","response":{"id":"r1","error":{"code":"server_error"}}}`,
+			},
+			want: reasonUpstreamTerminal,
+		},
+		{
+			name: "responses lifecycle response is not object",
+			api:  apiResponses,
+			payloads: []string{
+				`{"type":"response.completed","response":"not an object"}`,
+			},
+			want: reasonUnknownShape,
+		},
+		{
+			name: "responses refusal done carries text",
+			api:  apiResponses,
+			payloads: []string{
+				`{"type":"response.refusal.done","item_id":"m1","output_index":0,"content_index":0,"refusal":"I can't help with that."}`,
+			},
+			want: reasonUpstreamTerminal,
+		},
+		{
+			name: "responses refusal done text is not a string",
+			api:  apiResponses,
+			payloads: []string{
+				`{"type":"response.refusal.done","refusal":{"text":"I can't help"}}`,
+			},
+			want: reasonUnknownShape,
+		},
+		{
 			name:     "responses unknown event",
 			api:      apiResponses,
 			payloads: []string{`{"type":"response.some_future_thing","delta":"x"}`},
@@ -234,6 +291,70 @@ func TestPartialTextFinishReasonIsTerminal(t *testing.T) {
 				t.Fatalf("a terminal stream still offered a prefix: %q", v.Text)
 			}
 		})
+	}
+}
+
+// TestPartialTextTerminalChunkIsStillRead pins the ordering the accumulator
+// owes its gate: a chunk carrying BOTH a delta and a finish_reason is read in
+// full before the terminal is latched.
+//
+// The bug this pins is a fail-open one on the unsafe side. The finish_reason
+// check used to run FIRST and return, so `{"delta":{"content":"…"},
+// "finish_reason":"stop"}` was classified terminal and the content dropped on
+// the floor — the stream looked finished when it had not been read at all, and
+// a chunk carrying BOTH a tool call and a finish_reason was classified a
+// clean logical terminal instead of the hard refusal it is. Either way the
+// accumulator decided WITHOUT LOOKING at the payload, which is the one thing
+// this gate may never do.
+func TestPartialTextTerminalChunkIsStillRead(t *testing.T) {
+	// A tool call in the same chunk as the finish_reason is a tool call. The
+	// verdict is unsafe/tool_calls, NOT terminal — reading the terminal first
+	// would launder a tool call into a clean finish.
+	for _, chunk := range []string{
+		`{"choices":[{"index":0,"delta":{"content":"calling","tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"stop"}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"calling","function_call":{"name":"f","arguments":"{}"}},"finish_reason":"function_call"}]}`,
+	} {
+		t.Run(chunk, func(t *testing.T) {
+			v := feed(apiChat, 1<<20, chunk)
+			if v.Kind != verdictUnsafe || v.Reason != reasonToolCalls {
+				t.Fatalf("verdict = %v/%q, want unsafe/%s — a tool call must fail closed whatever the finish_reason says",
+					v.Kind, v.Reason, reasonToolCalls)
+			}
+		})
+	}
+	// A content-bearing terminal chunk is READ, then latched: the text is
+	// accumulated (so the size bound still applies) and the stream is still
+	// terminal, so no continuation is ever built from it.
+	for _, chunk := range []string{
+		`{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"length"}]}`,
+	} {
+		t.Run(chunk, func(t *testing.T) {
+			p := newPartialText(apiChat, 1<<20)
+			p.Observe([]byte(chunk))
+			if v := p.Verdict(); v.Kind != verdictTerminal {
+				t.Fatalf("verdict = %v/%q, want terminal", v.Kind, v.Reason)
+			}
+			// The delta was read: the accumulator saw the bytes, applied the
+			// size bound, and only THEN released them for a terminal. A fix
+			// that just reordered the checks without reading the delta would
+			// leave the prefix unread — and the size bound unapplied.
+			if p.partialBytes() != 0 {
+				t.Fatalf("a terminal accumulator still holds %d bytes", p.partialBytes())
+			}
+		})
+	}
+	// The size bound applies to a terminal chunk's content too: a terminal
+	// chunk carrying an over-limit prefix is still refused, not accepted as a
+	// clean finish. This is the proof the content is really being read, not
+	// merely skipped.
+	p := newPartialText(apiChat, 8)
+	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"0123456789"},"finish_reason":"stop"}]}`))
+	v := p.Verdict()
+	if v.Kind != verdictUnsafe || v.Reason != reasonOversize {
+		t.Fatalf("verdict = %v/%q, want unsafe/%s — an over-limit terminal chunk was read as a clean finish",
+			v.Kind, v.Reason, reasonOversize)
 	}
 }
 
@@ -357,6 +478,31 @@ func TestPartialTextReasoningIsNotAssistantText(t *testing.T) {
 	)
 	if got := recovered(t, v); got != "the answer" {
 		t.Fatalf("prefix = %q, want %q", got, "the answer")
+	}
+}
+
+// TestPartialTextEmptyRefusalDoneIsIgnored is the fail-open half of the
+// refusal terminal: a `response.refusal.done` that states no refusal — absent,
+// null or empty — is the structural terminator of a content part this stream
+// never carried. Treating it as a decline would refuse every stream whose
+// provider emits the terminator unconditionally, and binding its identity
+// would refuse the text deltas that follow it. The stream stays continuable.
+func TestPartialTextEmptyRefusalDoneIsIgnored(t *testing.T) {
+	for _, done := range []string{
+		`{"type":"response.refusal.done","item_id":"m1","output_index":0,"content_index":0}`,
+		`{"type":"response.refusal.done","item_id":"m1","output_index":0,"content_index":0,"refusal":null}`,
+		`{"type":"response.refusal.done","item_id":"m1","output_index":0,"content_index":0,"refusal":""}`,
+	} {
+		t.Run(done, func(t *testing.T) {
+			v := feed(apiResponses, 1<<20,
+				`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"hello "}`,
+				done,
+				`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"world"}`,
+			)
+			if got := recovered(t, v); got != "hello world" {
+				t.Fatalf("prefix = %q, want %q — an empty refusal terminator must not end the text stream", got, "hello world")
+			}
+		})
 	}
 }
 

@@ -734,3 +734,80 @@ func assertResponsesEnvelopeModel(t *testing.T, lines []string, wantModel string
 		t.Fatalf("no data line with a response object in event %q", lines)
 	}
 }
+
+// Scenario: a PARTIALLY WRITTEN config file is a real production scenario and
+// must be covered deliberately rather than as a side effect of the harness
+// racing its own file writes.
+//
+// The proxy's contract here is fail-closed: a file it cannot fully validate
+// is REJECTED and the last-known-good snapshot keeps serving. The invariant
+// is not "no rejection event is ever emitted" — an operator who writes a
+// half file SHOULD see a rejection — it is that a transient write window
+// cannot change what the service serves, cannot leave it stuck, and cannot
+// publish a partial snapshot.
+//
+// Three properties are asserted, in order:
+//  1. a truncated file is rejected, never published;
+//  2. the last-known-good snapshot keeps routing and keeps serving;
+//  3. the process RECOVERS on its own once a valid file lands, with no
+//     restart and no operator signal.
+func TestPartialConfigWriteKeepsLastKnownGoodThenRecovers(t *testing.T) {
+	upA := newFakeUpstream(t)
+	upA.setHandler(jsonChatHandler("upA"))
+	upB := newFakeUpstream(t)
+	upB.setHandler(jsonChatHandler("upB"))
+	yamlA := runtimeYAML("common", upA.url()+"/v1", "upA", "")
+	yamlB := runtimeYAML("common", upB.url()+"/v1", "upB", "")
+
+	// A slow poll interval makes the 50ms-tick harness window irrelevant:
+	// this test is about the poller's DECISION, not about winning a race.
+	// info level: the rejection is a WARN, so it is invisible at the
+	// harness's default `error` level.
+	p := startSubprocess(t, startOpts{yaml: yamlA, pollInterval: "40ms", logLevel: "info"})
+
+	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions", commonBody, nil); status != http.StatusOK {
+		t.Fatalf("warm request status = %d, want 200", status)
+	}
+	if before := upA.count(); before != 1 {
+		t.Fatalf("warm request did not reach A (count %d)", before)
+	}
+
+	// Truncate, then write a document that is syntactically well-formed YAML
+	// but semantically incomplete: `api-key` parses, `models` is declared
+	// with nothing under it. This is exactly the transient state a
+	// truncate-then-write leaves on disk mid-write.
+	partial := "api-key: " + e2eAPIKey + "\nmodels:\n"
+	writeConfigPartial(t, p.cfgPath, partial)
+
+	waitForLogEvent(t, p, func(ev logEvent) bool {
+		return ev["message"] == "config_reload_rejected"
+	}, "config_reload_rejected for the partial file")
+
+	// No partial publish: routing is unchanged, and requests keep working.
+	if status, _, body := postJSON(t, p.addr, "/v1/chat/completions", commonBody, nil); status != http.StatusOK {
+		t.Fatalf("request while file is partial: status = %d, want 200 (body %s)", status, body)
+	}
+	if upB.count() != 0 {
+		t.Fatalf("partial file published a snapshot: B received %d requests", upB.count())
+	}
+	if upA.count() < 2 {
+		t.Fatalf("last-known-good routing lost: A count = %d, want >= 2", upA.count())
+	}
+
+	// The same file, completed: the poller must recover on its own.
+	rewriteConfig(t, p.cfgPath, yamlB)
+	if err := waitForUpstream(t, p, upB, 10*time.Second); err != nil {
+		t.Fatalf("poller did not recover from the partial file: %v", err)
+	}
+
+	// Recovery is a real publish, not a flap: a new generation is
+	// acknowledged exactly once the valid content is in place.
+	waitForLogEvent(t, p, func(ev logEvent) bool {
+		return ev["message"] == "config_reloaded"
+	}, "config_reloaded after the valid file landed")
+
+	// The rejection never mentioned a secret while doing it.
+	if enc := p.stderr.String(); strings.Contains(enc, e2eAPIKey) {
+		t.Fatal("reload events leaked the api-key — logging leak")
+	}
+}

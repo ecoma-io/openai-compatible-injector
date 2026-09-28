@@ -134,7 +134,7 @@ func TestBuildContinuationChatExtendsAPrefill(t *testing.T) {
 // extending a prefill: the message is MUTATED, not REBUILT. Only `content` is
 // the builder's to touch. Every other member of the client's assistant message
 // — a `name`, a provider extension, a field this build has never heard of —
-// must survive into the continuation byte for byte, because the alternative is
+// must survive into the continuation by value, because the alternative is
 // a continuation that silently rewrites the client's own conversation.
 //
 // A rebuild from the two fields this package knows about would pass a test
@@ -225,6 +225,9 @@ func TestBuildContinuationChatRefusals(t *testing.T) {
 		{"last message has no role", `{"messages":[{"content":"hi"}]}`, "x", refusalUnsupportedShape},
 		{"last message role is not a string", `{"messages":[{"role":7,"content":"hi"}]}`, "x", refusalUnsupportedShape},
 		{"assistant content is structured", `{"messages":[{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}`, "x", refusalUnsupportedShape},
+		{"duplicate top-level messages", `{"messages":[{"role":"user"}],"messages":[{"role":"user"}]}`, "x", refusalUnsupportedShape},
+		{"prefill has duplicate content", `{"messages":[{"role":"assistant","content":"one, ","content":"two, "}]}`, "x", refusalUnsupportedShape},
+		{"prefill has duplicate role", `{"messages":[{"role":"assistant","role":"user","content":"one, "}]}`, "x", refusalUnsupportedShape},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -371,6 +374,12 @@ func TestBuildContinuationResponsesRefusals(t *testing.T) {
 		{"previous_response_id", `{"previous_response_id":"resp_1","input":"hi"}`, "x", refusalPreviousResponseID},
 		{"input is a number", `{"input":7}`, "x", refusalUnsupportedShape},
 		{"input is an object", `{"input":{"role":"user"}}`, "x", refusalUnsupportedShape},
+		{"duplicate top-level input", `{"input":"one","input":"two"}`, "x", refusalUnsupportedShape},
+		{"input array has string item", `{"input":["one"]}`, "x", refusalUnsupportedShape},
+		{"input array has null item", `{"input":[null]}`, "x", refusalUnsupportedShape},
+		{"input array has number item", `{"input":[1]}`, "x", refusalUnsupportedShape},
+		{"input array has nested array item", `{"input":[["one"]]}`, "x", refusalUnsupportedShape},
+		{"input array item has duplicate member", `{"input":[{"role":"user","role":"assistant"}]}`, "x", refusalUnsupportedShape},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

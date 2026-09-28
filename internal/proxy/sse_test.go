@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"openai-compatible-injector/internal/inject"
 )
@@ -16,6 +17,37 @@ import (
 // their own.
 func sseRewriter(public string) func([]byte) []byte {
 	return func(p []byte) []byte { return inject.RewriteChatModel(p, public) }
+}
+
+// byteReader intentionally fragments every wire byte into a distinct Read.
+// It proves the SSE parser's line grammar does not accidentally depend on
+// CRLF arriving in one transport read — TCP is a byte stream and makes no
+// such promise.
+type byteReader struct{ r io.Reader }
+
+// notifyingWriter captures what a live relay has made visible without waiting
+// for CopySSE to return.
+type notifyingWriter struct {
+	bytes.Buffer
+	writes chan struct{}
+}
+
+func (w *notifyingWriter) Write(p []byte) (int, error) {
+	n, err := w.Buffer.Write(p)
+	if n > 0 {
+		select {
+		case w.writes <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+func (r byteReader) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return r.r.Read(p)
 }
 
 // copySSEOnce runs CopySSE over input and returns the exact output bytes and
@@ -410,6 +442,81 @@ func copySSEStats(t *testing.T, input string) (StreamStats, string, error) {
 	var buf bytes.Buffer
 	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), func() {}, nil, nil)
 	return stats, buf.String(), err
+}
+
+// TestCopySSELineEndingsSurviveReadFragmentation proves parsing operates on
+// the SSE byte stream rather than on convenient transport reads. In
+// particular, CRLF split as `...\r` / `\n...` must be emitted as ONE CRLF line:
+// treating its LF as a subsequent lone blank line invents an event boundary,
+// changes flush counts, and corrupts the byte-for-byte relay guarantee.
+// TestCopySSELoneCRReachesTheClientBeforeTheNextByte proves a valid lone-CR
+// line does not become a hidden read-ahead barrier. A live upstream may pause
+// after the CR forever; the completed line still must leave the proxy.
+func TestCopySSELoneCRReachesTheClientBeforeTheNextByte(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer func() { _ = pr.Close() }()
+	defer func() { _ = pw.Close() }()
+
+	dst := &notifyingWriter{writes: make(chan struct{}, 1)}
+	done := make(chan error, 1)
+	go func() {
+		_, err := CopySSE(dst, pr, sseRewriter("public-name"), nil, nil, nil)
+		done <- err
+	}()
+	if _, err := io.WriteString(pw, "data: x\r"); err != nil {
+		t.Fatalf("write CR-terminated line: %v", err)
+	}
+
+	select {
+	case <-dst.writes:
+		if got := dst.String(); got != "data: x\r" {
+			t.Fatalf("delivered = %q, want the complete CR line", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a complete lone-CR line waited for a following byte")
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close upstream: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("CopySSE: %v", err)
+	}
+}
+
+func TestCopySSELineEndingsSurviveReadFragmentation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		input      string
+		wantEvents int
+		terminal   bool
+	}{
+		{"LF", "data: x\n\ndata: [DONE]\n\n", 2, true},
+		{"CR", "data: x\r\rdata: [DONE]\r\r", 2, true},
+		{"CRLF split bytewise", "data: x\r\n\r\ndata: [DONE]\r\n\r\n", 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var dst bytes.Buffer
+			flushes := 0
+			stats, err := CopySSE(&dst, byteReader{r: strings.NewReader(tc.input)}, sseRewriter("public-name"), func() {
+				flushes++
+			}, nil, nil)
+			if err != nil {
+				t.Fatalf("CopySSE: %v", err)
+			}
+			if got := dst.String(); got != tc.input {
+				t.Fatalf("relayed bytes = %q, want exactly %q", got, tc.input)
+			}
+			if stats.Events != tc.wantEvents || flushes != tc.wantEvents {
+				t.Errorf("events/flushes = %d/%d, want %d/%d", stats.Events, flushes, tc.wantEvents, tc.wantEvents)
+			}
+			if stats.Terminal != tc.terminal {
+				t.Errorf("terminal = %v, want %v", stats.Terminal, tc.terminal)
+			}
+			if stats.Bytes != int64(len(tc.input)) {
+				t.Errorf("bytes = %d, want %d", stats.Bytes, len(tc.input))
+			}
+		})
+	}
 }
 
 // TestCopySSERecordsTheTerminalMarker pins the one fact StreamStats.Terminal

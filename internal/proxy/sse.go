@@ -110,6 +110,12 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 	// still terminates. Lines are relayed one at a time, so this is the
 	// worst case one event can pin between reads and the flush.
 	var pending int64
+	// A CR is a complete EventSource line ending in its own right. If its
+	// following LF arrives in a later read, the LF is wire data but not a
+	// second (blank) line. Remembering that one-byte ambiguity lets a lone CR
+	// reach the observer and client immediately without inventing a boundary
+	// when it later proves to have been CRLF.
+	pendingCRLF := false
 	for {
 		line, rerr := readBoundedLine(br)
 		if errors.Is(rerr, ErrSSELineTooLong) {
@@ -119,50 +125,66 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 			return stats, rerr
 		}
 		if len(line) > 0 {
-			boundary := isEventBoundary(line)
-			if !boundary {
-				pending += int64(len(line))
-				if pending > MaxEventBytes {
-					return stats, fmt.Errorf("%w: event reached %d bytes, limit %d",
-						ErrSSEEventTooLarge, pending, MaxEventBytes)
+			// An immediately following LF belongs to the CR line already written.
+			// Relay the byte exactly, but do not run it through line accounting,
+			// observation, rewriting, terminal detection, or boundary flushing.
+			if pendingCRLF && bytes.Equal(line, []byte("\n")) {
+				n, werr := dst.Write(line)
+				stats.Bytes += int64(n)
+				if werr != nil {
+					return stats, &streamWriteError{err: werr}
 				}
-			}
-			if observe != nil {
-				if payload, ok := sseDataPayload(line); ok {
-					observe(payload)
+				if n < len(line) {
+					return stats, &streamWriteError{err: io.ErrShortWrite}
 				}
-			}
-			out := rewriteSSELine(line, rewrite, stripKeys)
-			n, werr := dst.Write(out)
-			// Account exactly what dst accepted — on a failed or torn write
-			// the stats say how much of the stream actually went out. A
-			// short write with a nil error is the io.Writer contract's other
-			// failure mode (io.ErrShortWrite); continuing past it would
-			// relay a torn line and overcount, so it truncates too — as a
-			// client-side failure, since dst is the client.
-			stats.Bytes += int64(n)
-			if werr != nil {
-				return stats, &streamWriteError{err: werr}
-			}
-			if n < len(out) {
-				return stats, &streamWriteError{err: io.ErrShortWrite}
-			}
-			// The terminal fact is recorded on the bytes that actually
-			// reached the client — the same buffer the write was handed —
-			// never on a line the relay read but could not deliver.
-			if isTerminalSSELine(out) {
-				stats.Terminal = true
-			}
-			if boundary {
-				// Accounting and budget reset belong to the boundary, not to
-				// the flush: stats.Events counts dispatched events and the
-				// in-flight budget restarts per event whether or not this
-				// caller asked for explicit flushes.
-				if flush != nil {
-					flush()
+				pendingCRLF = false
+			} else {
+				boundary := isEventBoundary(line)
+				if !boundary {
+					pending += int64(len(line))
+					if pending > MaxEventBytes {
+						return stats, fmt.Errorf("%w: event reached %d bytes, limit %d",
+							ErrSSEEventTooLarge, pending, MaxEventBytes)
+					}
 				}
-				stats.Events++
-				pending = 0
+				if observe != nil {
+					if payload, ok := sseDataPayload(line); ok {
+						observe(payload)
+					}
+				}
+				out := rewriteSSELine(line, rewrite, stripKeys)
+				n, werr := dst.Write(out)
+				// Account exactly what dst accepted — on a failed or torn write
+				// the stats say how much of the stream actually went out. A
+				// short write with a nil error is the io.Writer contract's other
+				// failure mode (io.ErrShortWrite); continuing past it would
+				// relay a torn line and overcount, so it truncates too — as a
+				// client-side failure, since dst is the client.
+				stats.Bytes += int64(n)
+				if werr != nil {
+					return stats, &streamWriteError{err: werr}
+				}
+				if n < len(out) {
+					return stats, &streamWriteError{err: io.ErrShortWrite}
+				}
+				// The terminal fact is recorded on the bytes that actually
+				// reached the client — the same buffer the write was handed —
+				// never on a line the relay read but could not deliver.
+				if isTerminalSSELine(out) {
+					stats.Terminal = true
+				}
+				if boundary {
+					// Accounting and budget reset belong to the boundary, not to
+					// the flush: stats.Events counts dispatched events and the
+					// in-flight budget restarts per event whether or not this
+					// caller asked for explicit flushes.
+					if flush != nil {
+						flush()
+					}
+					stats.Events++
+					pending = 0
+				}
+				pendingCRLF = len(line) > 0 && line[len(line)-1] == '\r'
 			}
 		}
 		if rerr != nil {
@@ -172,6 +194,64 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 			return stats, rerr
 		}
 	}
+}
+
+// readToLineEnd reads one SSE line from br, stopping at CR, LF, or CRLF. It
+// is a drop-in for ReadSlice('\n') that recognizes all three line endings the
+// SSE grammar admits. The returned slice includes the terminator (one or two
+// bytes) exactly as it appeared on the wire; a final partial line returns it
+// together with io.EOF, matching ReadSlice's contract for a line that ran out
+// mid-read.
+//
+// Peeking and copying keeps the scanner byte-exact. bufio exposes no CR
+// terminator, so the line has to be cut here, and a copy is required because
+// the peeked slice is invalidated by the next read. bufio.ErrBufferFull is
+// returned unchanged, so readBoundedLine remains the single place a line's
+// size against the cap is measured.
+func readToLineEnd(br *bufio.Reader) ([]byte, error) {
+	// Peek fills the buffer when it is short, so n>=1 guarantees progress
+	// and an empty result can only be EOF. n<0 asks for no fill and would
+	// spin, so the floor of 1 is load-bearing: the line data is whatever is
+	// buffered, plus at least one more byte if the buffer is empty.
+	n := br.Buffered()
+	if n < 1 {
+		n = 1
+	}
+	b, err := br.Peek(n)
+	if err != nil && len(b) == 0 {
+		return nil, err
+	}
+	// An LF anywhere in the buffered window ends the line: every byte
+	// before it is line data whatever terminators precede it, so the whole
+	// line is one ReadSlice and a CRLF needs no special case.
+	if bytes.IndexByte(b, '\n') >= 0 {
+		chunk, rerr := br.ReadSlice('\n')
+		// ErrBufferFull is impossible here — the window held an LF, and
+		// the window is the whole buffer — so any error is the reader's
+		// own and propagates.
+		return chunk, rerr
+	}
+	// No LF buffered. A CR is itself a complete line ending. Do not wait for
+	// the next byte to learn whether it grows into CRLF: a peer may legally
+	// pause forever after a lone CR, and holding that complete line would leave
+	// its client-visible event unflushed. CopySSE remembers the ambiguity and
+	// treats one later LF as part of this line rather than a new blank line.
+	if i := bytes.IndexByte(b, '\r'); i >= 0 {
+		chunk := append([]byte(nil), b[:i+1]...)
+		if _, err := br.Discard(i + 1); err != nil {
+			return chunk, err
+		}
+		return chunk, nil
+	}
+	// No terminator in the window: it is all line data. Read it out
+	// (bufio returns the error only once its buffer is drained) and let
+	// readBoundedLine accumulate; ErrBufferFull is the "still no
+	// terminator, keep going" signal, unchanged from ReadSlice.
+	chunk := make([]byte, len(b))
+	if _, rerr := br.Read(chunk); rerr != nil {
+		return nil, rerr
+	}
+	return chunk, bufio.ErrBufferFull
 }
 
 // readBoundedLine returns the next line from br, terminator included,
@@ -185,7 +265,7 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 func readBoundedLine(br *bufio.Reader) ([]byte, error) {
 	var buf []byte
 	for {
-		chunk, err := br.ReadSlice('\n')
+		chunk, err := readToLineEnd(br)
 		if err == nil {
 			if int64(len(buf)+len(chunk)) > MaxLineBytes {
 				return nil, fmt.Errorf("%w: line reached %d bytes, limit %d",
@@ -263,7 +343,7 @@ func isTerminalSSELine(b []byte) bool {
 // isEventBoundary reports whether the raw line (terminator included) is a
 // blank line — the terminator that completes an SSE event.
 func isEventBoundary(line []byte) bool {
-	return len(line) == 1 && line[0] == '\n' ||
+	return len(line) == 1 && (line[0] == '\n' || line[0] == '\r') ||
 		len(line) == 2 && line[0] == '\r' && line[1] == '\n'
 }
 
@@ -337,13 +417,13 @@ func mentionsAnyKey(payload []byte, keys [][]byte) bool {
 	return false
 }
 
-// splitSSELineTerminator splits a raw line into content and its "\n" or
-// "\r\n" terminator. A final partial line has an empty terminator.
+// splitSSELineTerminator splits a raw line into content and its "\n",
+// "\r", or "\r\n" terminator. A final partial line has an empty terminator.
 func splitSSELineTerminator(line []byte) (content, term []byte) {
 	if len(line) >= 2 && line[len(line)-2] == '\r' && line[len(line)-1] == '\n' {
 		return line[:len(line)-2], line[len(line)-2:]
 	}
-	if len(line) >= 1 && line[len(line)-1] == '\n' {
+	if len(line) >= 1 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
 		return line[:len(line)-1], line[len(line)-1:]
 	}
 	return line, nil
