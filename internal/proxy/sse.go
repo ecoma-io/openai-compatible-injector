@@ -174,6 +174,75 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 	}
 }
 
+// readToLineEnd reads one SSE line from br, stopping at CR, LF, or CRLF. It
+// is a drop-in for ReadSlice('\n') that recognizes all three line endings the
+// SSE grammar admits. The returned slice includes the terminator (one or two
+// bytes) exactly as it appeared on the wire; a final partial line returns it
+// together with io.EOF, matching ReadSlice's contract for a line that ran out
+// mid-read.
+//
+// Peeking and copying keeps the scanner byte-exact. bufio exposes no CR
+// terminator, so the line has to be cut here, and a copy is required because
+// the peeked slice is invalidated by the next read. bufio.ErrBufferFull is
+// returned unchanged, so readBoundedLine remains the single place a line's
+// size against the cap is measured.
+func readToLineEnd(br *bufio.Reader) ([]byte, error) {
+	for {
+		// Peek fills the buffer when it is short, so n>=1 guarantees progress
+		// and an empty result can only be EOF. n<0 asks for no fill and would
+		// spin, so the floor of 1 is load-bearing: the line data is whatever is
+		// buffered, plus at least one more byte if the buffer is empty.
+		n := br.Buffered()
+		if n < 1 {
+			n = 1
+		}
+		b, err := br.Peek(n)
+		if err != nil && len(b) == 0 {
+			return nil, err
+		}
+		// An LF anywhere in the buffered window ends the line: every byte
+		// before it is line data whatever terminators precede it, so the whole
+		// line is one ReadSlice and a CRLF needs no special case.
+		if bytes.IndexByte(b, '\n') >= 0 {
+			chunk, rerr := br.ReadSlice('\n')
+			// ErrBufferFull is impossible here — the window held an LF, and
+			// the window is the whole buffer — so any error is the reader's
+			// own and propagates.
+			return chunk, rerr
+		}
+		// No LF buffered. A CR ends the line, as a CRLF whose LF is the next
+		// byte or as a lone CR. The bytes up to and including it are already
+		// in the peek, so they are copied out and discarded rather than
+		// re-read — UnreadByte cannot be used here, because bufio forbids it
+		// immediately after a Peek.
+		if i := bytes.IndexByte(b, '\r'); i >= 0 {
+			chunk := make([]byte, i+1)
+			copy(chunk, b[:i+1])
+			br.Discard(i + 1)
+			// Only a byte ALREADY buffered can turn this CR into a CRLF;
+			// Peek(1) would block on a peer that never sends the LF. A CR at
+			// the very end of a stream is a COMPLETE line — reporting nothing
+			// for a peer that is simply done is not this reader's failure.
+			if br.Buffered() > 0 {
+				if lf, _ := br.Peek(1); lf[0] == '\n' {
+					br.Discard(1)
+					return append(chunk, '\n'), nil
+				}
+			}
+			return chunk, nil
+		}
+		// No terminator in the window: it is all line data. Read it out
+		// (bufio returns the error only once its buffer is drained) and let
+		// readBoundedLine accumulate; ErrBufferFull is the "still no
+		// terminator, keep going" signal, unchanged from ReadSlice.
+		chunk := make([]byte, len(b))
+		if _, rerr := br.Read(chunk); rerr != nil {
+			return nil, rerr
+		}
+		return chunk, bufio.ErrBufferFull
+	}
+}
+
 // readBoundedLine returns the next line from br, terminator included,
 // mirroring bufio.Reader.ReadBytes: a final line without a terminator is
 // returned together with io.EOF, and any other read error is returned as
@@ -185,7 +254,7 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 func readBoundedLine(br *bufio.Reader) ([]byte, error) {
 	var buf []byte
 	for {
-		chunk, err := br.ReadSlice('\n')
+		chunk, err := readToLineEnd(br)
 		if err == nil {
 			if int64(len(buf)+len(chunk)) > MaxLineBytes {
 				return nil, fmt.Errorf("%w: line reached %d bytes, limit %d",
@@ -263,7 +332,7 @@ func isTerminalSSELine(b []byte) bool {
 // isEventBoundary reports whether the raw line (terminator included) is a
 // blank line — the terminator that completes an SSE event.
 func isEventBoundary(line []byte) bool {
-	return len(line) == 1 && line[0] == '\n' ||
+	return len(line) == 1 && (line[0] == '\n' || line[0] == '\r') ||
 		len(line) == 2 && line[0] == '\r' && line[1] == '\n'
 }
 
@@ -337,13 +406,13 @@ func mentionsAnyKey(payload []byte, keys [][]byte) bool {
 	return false
 }
 
-// splitSSELineTerminator splits a raw line into content and its "\n" or
-// "\r\n" terminator. A final partial line has an empty terminator.
+// splitSSELineTerminator splits a raw line into content and its "\n",
+// "\r", or "\r\n" terminator. A final partial line has an empty terminator.
 func splitSSELineTerminator(line []byte) (content, term []byte) {
 	if len(line) >= 2 && line[len(line)-2] == '\r' && line[len(line)-1] == '\n' {
 		return line[:len(line)-2], line[len(line)-2:]
 	}
-	if len(line) >= 1 && line[len(line)-1] == '\n' {
+	if len(line) >= 1 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
 		return line[:len(line)-1], line[len(line)-1:]
 	}
 	return line, nil

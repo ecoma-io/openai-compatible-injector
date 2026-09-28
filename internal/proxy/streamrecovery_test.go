@@ -1780,3 +1780,48 @@ func TestStreamRecoveryHop429MarksTheCredential(t *testing.T) {
 		t.Errorf("credential %q was still acquirable after a 429", used)
 	}
 }
+
+// TestStreamRecoveryACRFramedTerminalMarkerIsTheTerminal pins the failure
+// mode a lone CR produced: the SSE grammar admits CR, LF and CRLF, but only
+// two of the three were recognized. A provider whose final line was
+// `data: [DONE]\r` had its terminal marker read as payload — so the relay
+// reported the stream TRUNCATED, and stream recovery dialed a continuation
+// for an answer the model had already finished.
+//
+// That is a duplicate upstream request against a provider that behaved
+// correctly, on a stream whose contract says a terminal marker ends it.
+func TestStreamRecoveryACRFramedTerminalMarkerIsTheTerminal(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	// LF throughout, and the terminal marker framed with a lone CR — the
+	// dialect the relay must not mistake for a missing marker.
+	pa.script = []dialFunc{sseStream(sseChat("Hello") + "data: [DONE]\r\r")}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	if pa.dials() != 1 {
+		t.Fatalf("dials = %d, want exactly 1: a CR-framed terminal marker must not be continued", pa.dials())
+	}
+	for _, slug := range []string{"stream_recovery_started", "stream_recovery_failed", "stream_recovery_succeeded", "stream_recovery_exhausted"} {
+		if ev := logBuf.events(t, slug); len(ev) != 0 {
+			t.Errorf("%s fired for a stream that reached its terminal marker: %v", slug, ev)
+		}
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 0 {
+		t.Errorf("a terminated stream was reported truncated: %v", trunc)
+	}
+	// stream_completed is a DEBUG event with no outcome field; the request
+	// outcome is on request_completed. Existence + the truncation check above
+	// are the contract.
+	done := logBuf.events(t, "stream_completed")
+	if len(done) != 1 {
+		t.Errorf("stream_completed = %v, want one", done)
+	}
+	rc := logBuf.events(t, "request_completed")
+	if len(rc) != 1 || rc[0]["outcome"] != "completed" {
+		t.Errorf("request_completed = %v, want one completed", rc)
+	}
+}

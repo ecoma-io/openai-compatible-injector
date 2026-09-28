@@ -348,7 +348,10 @@ func TestUpstreamKeyRotationOn429(t *testing.T) {
 		t.Errorf("second attempt Authorization = %q, want the pool's second key after the 429", got)
 	}
 
-	done := eventsWithMessage(parseLogEvents(t, p.stderr.String()), "request_completed")
+	// Awaited, never read synchronously: the subprocess's stderr travels
+	// through a pipe, so an event the handler already wrote can still be in
+	// flight when the response completes.
+	done := waitForEventCount(t, p, "request_completed", 1)
 	if len(done) != 1 {
 		t.Fatalf("request_completed events = %d, want 1", len(done))
 	}
