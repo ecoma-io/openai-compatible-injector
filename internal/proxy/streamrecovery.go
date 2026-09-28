@@ -82,6 +82,10 @@ type continuationHop struct {
 // underlying cause when there was one (a credential or budget refusal has no
 // error — nothing was dialed and no endpoint is at fault).
 type continuationDial struct {
+	// resp is non-nil EXACTLY when phase is empty and err is nil. Every
+	// refusal this function makes — a build failure, a cooled-off pool, a
+	// spent envelope — leaves it nil and names a phase instead, so a caller
+	// may read a status only after checking the phase.
 	resp  *http.Response
 	info  transport.AttemptInfo
 	err   error
@@ -170,6 +174,15 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 	}
 	if dial.err != nil {
 		dial.phase = "dial"
+	} else if dial.resp == nil {
+		// The pool's zero-dial budget refusal is the ONE Execute outcome that
+		// is neither an answer nor an error: a nil response with a nil error,
+		// raised when the envelope would not fund this attempt's first dial
+		// (internal/transport/pool.go). It is a refusal by this proxy, so it
+		// names the budget phase and blames no endpoint — the same reading the
+		// walk gives it. Naming the phase here is what keeps the caller off
+		// dial.resp: an answer that never arrived must never be dereferenced.
+		dial.phase = "budget"
 	}
 	return dial
 }

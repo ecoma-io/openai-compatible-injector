@@ -220,6 +220,31 @@ Stated rather than smoothed over:
 6. **The `max-recoveries: 0` with `enabled: true` rejection** is enforced in
    `Validate` rather than at parse time, so every layer benefits from it.
 
+## A defect this branch found and fixed in its own review
+
+The pooled branch of a hop can be refused before its first dial, and
+`internal/transport/pool.go` reports that refusal the only way it can: a **nil
+response with a nil error** and `BudgetExhausted` set. `dialContinuation`
+originally named a phase only when `err != nil`, so that one outcome left both
+`resp` and `phase` empty and the loop dereferenced the response that was never
+produced.
+
+It was reachable, not theoretical. The loop's envelope gate and the pool's
+claim are two reads of the same clock, so an envelope whose _elapsed_ half
+expires between them — the candidate envelope's default ceiling is two minutes
+(`MaxCandidateElapsedCap`), and a long stream reaches it — passes the gate and
+is then refused at the dial. `net/http` recovers the resulting panic per
+connection, so the process survived and the request died without its completion
+record: a silent failure, which is why it took a review to find rather than an
+incident.
+
+`continuationDial` now states the invariant its callers rely on — `resp` is
+non-nil exactly when `phase` is empty and `err` is nil — and
+`TestStreamRecoveryPooledBudgetRefusalIsAPhase` drives the real handler with a
+doer that returns the pool's sentinel, so the shape is pinned rather than
+assumed. The refusal reports `phase: budget`, blames no endpoint, and leaves the
+stream truncated exactly as it would have been with the feature off.
+
 ## Reviewed and deliberately not changed
 
 - **The walk still replays a `send_unknown` transport failure at the provider

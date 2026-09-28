@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"openai-compatible-injector/internal/transport"
 )
 
 // The post-commitment recovery loop's tests. Every one of them drives the
@@ -523,6 +526,108 @@ func TestStreamRecoveryStopsAtASpentBudget(t *testing.T) {
 	// an attempted continuation that failed.
 	if trunc[0]["stream_recoveries"] != float64(0) {
 		t.Errorf("stream_recoveries = %v, want 0 for a refused hop", trunc[0]["stream_recoveries"])
+	}
+}
+
+// zeroDialRefuser is a transport.Doer that is ALSO a transport.Executor and
+// answers its refuseOn-th Execute with the pool's ZERO-DIAL BUDGET REFUSAL.
+//
+// That shape is not invented here: internal/transport/pool.go returns exactly
+// it — a nil response, a nil error, BudgetExhausted set — when the request's
+// exchange envelope will not fund an attempt's first dial. It is the one
+// Execute outcome that carries NOTHING to read: no answer and no error. A
+// continuation hop that reached for a status would dereference the response
+// that was never produced, so the hop has to name a phase for it instead.
+//
+// Refusing on the n-th call is what keeps the test honest: call 1 is the
+// WALK's own attempt and must behave normally, so the refusal below lands on
+// the hop and nowhere else.
+type zeroDialRefuser struct {
+	refuseOn int
+	inner    *scriptedDoer
+	mu       sync.Mutex
+	calls    int
+}
+
+func (d *zeroDialRefuser) Do(req *http.Request) (*http.Response, error) {
+	return d.inner.Do(req)
+}
+
+func (d *zeroDialRefuser) Execute(ar *transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
+	d.mu.Lock()
+	d.calls++
+	n := d.calls
+	d.mu.Unlock()
+	if n == d.refuseOn {
+		return nil, transport.AttemptInfo{BudgetExhausted: true}, nil
+	}
+	req, err := http.NewRequest(ar.Method, ar.URL.String(), bytes.NewReader(ar.Body))
+	if err != nil {
+		return nil, transport.AttemptInfo{}, err
+	}
+	req.Header = ar.Header.Clone()
+	resp, err := d.inner.Do(req)
+	return resp, transport.AttemptInfo{Attempts: 1}, err
+}
+
+// TestStreamRecoveryPooledBudgetRefusalIsAPhase pins the hop's reading of the
+// one Execute outcome that is neither an answer nor an error. The refusal is
+// reported as the budget phase — nothing was dialed and no endpoint is at
+// fault — the client's stream truncates cleanly as it would have with the
+// feature off, and the loop never reads a status off a response that does not
+// exist.
+func TestStreamRecoveryPooledBudgetRefusalIsAPhase(t *testing.T) {
+	store := newChainStore(t, recoveryBlock(t, "    enabled: true\n"))
+	inner := &scriptedDoer{script: []dialFunc{sseCut(sseChat("Hello"))}}
+	// The walk's attempt is Execute call 1; the hop's is call 2.
+	pooled := &zeroDialRefuser{refuseOn: 2, inner: inner}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+
+	h := NewHandler(store, kindResolver{direct: pooled, proxied: inner}, nil, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Hello") {
+		t.Fatalf("relayed events wrong: %s", rec.Body.String())
+	}
+	if inner.dials() != 1 {
+		t.Fatalf("upstream dials = %d, want the walk's one and no hop", inner.dials())
+	}
+	failed := logBuf.events(t, "stream_recovery_failed")
+	if len(failed) != 1 {
+		t.Fatalf("stream_recovery_failed = %v, want one refusal", failed)
+	}
+	if failed[0]["phase"] != "budget" {
+		t.Errorf("phase = %v, want budget for a refusal that reached no wire", failed[0]["phase"])
+	}
+	if failed[0]["upstream_status"] != nil {
+		t.Errorf("upstream_status = %v, want none for a hop that never dialed", failed[0]["upstream_status"])
+	}
+	if _, hasErr := failed[0]["error"]; hasErr {
+		t.Errorf("a refusal this proxy made carries an invented error field: %v", failed[0])
+	}
+	if ev := logBuf.events(t, "stream_recovery_succeeded"); len(ev) != 0 {
+		t.Errorf("stream_recovery_succeeded fired for a refused hop: %v", ev)
+	}
+	// The stream was already cut before the hop, so the truncation's phase and
+	// error belong to that relay — the hop's refusal is on its own event
+	// above. What the truncation must NOT carry is a recovery_reason: that
+	// field names a bound the loop stopped at, and a refused hop is a failure,
+	// not a bound.
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one clean truncation", trunc)
+	}
+	if trunc[0]["stream_recoveries"] != float64(1) {
+		t.Errorf("stream_recoveries = %v, want the refused hop counted", trunc[0]["stream_recoveries"])
+	}
+	if _, has := trunc[0]["recovery_reason"]; has {
+		t.Errorf("a refused hop reported a recovery_reason: %v", trunc[0])
+	}
+	if ev := logBuf.events(t, "stream_completed"); len(ev) != 0 {
+		t.Errorf("stream_completed fired for an unterminated stream: %v", ev)
 	}
 }
 
