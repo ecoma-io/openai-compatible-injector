@@ -285,54 +285,58 @@ func (p *partialText) observeChatChunk(obj map[string]json.RawMessage) {
 		return
 	}
 	for _, choice := range choices {
+		raw, ok := choice["delta"]
+		if !ok || jsonNull(raw) {
+			// A choice with no delta is a structural chunk (role-only
+			// opening, or a bare finish_reason). The finish_reason check
+			// below handles the terminal case; there is no content to
+			// accumulate here.
+		} else {
+			var delta map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &delta); err != nil {
+				p.refuse(reasonUnknownShape)
+				return
+			}
+			// Tool calls are a hard refusal — the committed prefix must be
+			// plain text. The legacy function_call spelling is included
+			// deliberately: it is the same event class as tool_calls, and an
+			// upstream using it would otherwise slip past the gate.
+			if raw, ok := delta["tool_calls"]; ok && !jsonNull(raw) {
+				p.refuse(reasonToolCalls)
+				return
+			}
+			if raw, ok := delta["function_call"]; ok && !jsonNull(raw) {
+				p.refuse(reasonToolCalls)
+				return
+			}
+			content, ok := delta["content"]
+			if ok && !jsonNull(content) {
+				var s string
+				if err := json.Unmarshal(content, &s); err != nil {
+					// A structured (multi-part) content value is not text
+					// this accumulator can splice back into a request.
+					p.refuse(reasonUnknownShape)
+					return
+				}
+				p.append(s)
+				if p.unsafe != "" {
+					return
+				}
+			}
+			// If the delta carried nothing but the finish_reason, the
+			// accumulator is unchanged — the logical terminal below will
+			// latch without discarding anything.
+		}
+		// The finish_reason check runs AFTER reading the delta. A chunk
+		// carrying BOTH content and finish_reason accumulates the content,
+		// then latches the logical terminal — it does NOT discard the
+		// prefix. Only an explicit refusal (tool_calls, oversize,
+		// unknown_shape) clears the text.
 		if raw, ok := choice["finish_reason"]; ok && !jsonNull(raw) {
-			// The upstream declared the answer FINISHED. That is a logical
-			// terminal, not a refusal: the generation is complete and there
-			// is nothing left to continue — but nothing about the stream was
-			// unreadable, and calling it "unsafe content" would report a
-			// parsing failure that never happened. The wire marker may still
-			// be missing (a provider that omits `[DONE]`), which the relay's
-			// own `Terminal` fact reports separately; the proxy synthesizes
-			// no marker either way.
 			p.finish()
 			return
 		}
-		raw, ok := choice["delta"]
-		if !ok || jsonNull(raw) {
-			continue
-		}
-		var delta map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &delta); err != nil {
-			p.refuse(reasonUnknownShape)
-			return
-		}
-		// The legacy function_call spelling is included deliberately: it is
-		// the same event class as tool_calls, and an upstream using it would
-		// otherwise slip past the gate.
-		if raw, ok := delta["tool_calls"]; ok && !jsonNull(raw) {
-			p.refuse(reasonToolCalls)
-			return
-		}
-		if raw, ok := delta["function_call"]; ok && !jsonNull(raw) {
-			p.refuse(reasonToolCalls)
-			return
-		}
-		content, ok := delta["content"]
-		if !ok || jsonNull(content) {
-			// The role-only opening delta and the closing chunk both land
-			// here, as does a reasoning-bearing delta on providers that
-			// stream one beside content.
-			continue
-		}
-		var s string
-		if err := json.Unmarshal(content, &s); err != nil {
-			// A structured (multi-part) content value is not text this
-			// accumulator can splice back into a request.
-			p.refuse(reasonUnknownShape)
-			return
-		}
-		p.append(s)
-		if p.unsafe != "" || p.terminal {
+		if p.terminal {
 			return
 		}
 	}

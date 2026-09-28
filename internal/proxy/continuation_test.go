@@ -237,6 +237,70 @@ func TestPartialTextFinishReasonIsTerminal(t *testing.T) {
 	}
 }
 
+// TestPartialTextTerminalChunkIsStillRead pins the ordering the accumulator
+// owes its gate: a chunk carrying BOTH a delta and a finish_reason is read in
+// full before the terminal is latched.
+//
+// The bug this pins is a fail-open one on the unsafe side. The finish_reason
+// check used to run FIRST and return, so `{"delta":{"content":"…"},
+// "finish_reason":"stop"}` was classified terminal and the content dropped on
+// the floor — the stream looked finished when it had not been read at all, and
+// a chunk carrying BOTH a tool call and a finish_reason was classified a
+// clean logical terminal instead of the hard refusal it is. Either way the
+// accumulator decided WITHOUT LOOKING at the payload, which is the one thing
+// this gate may never do.
+func TestPartialTextTerminalChunkIsStillRead(t *testing.T) {
+	// A tool call in the same chunk as the finish_reason is a tool call. The
+	// verdict is unsafe/tool_calls, NOT terminal — reading the terminal first
+	// would launder a tool call into a clean finish.
+	for _, chunk := range []string{
+		`{"choices":[{"index":0,"delta":{"content":"calling","tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"stop"}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"calling","function_call":{"name":"f","arguments":"{}"}},"finish_reason":"function_call"}]}`,
+	} {
+		t.Run(chunk, func(t *testing.T) {
+			v := feed(apiChat, 1<<20, chunk)
+			if v.Kind != verdictUnsafe || v.Reason != reasonToolCalls {
+				t.Fatalf("verdict = %v/%q, want unsafe/%s — a tool call must fail closed whatever the finish_reason says",
+					v.Kind, v.Reason, reasonToolCalls)
+			}
+		})
+	}
+	// A content-bearing terminal chunk is READ, then latched: the text is
+	// accumulated (so the size bound still applies) and the stream is still
+	// terminal, so no continuation is ever built from it.
+	for _, chunk := range []string{
+		`{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"length"}]}`,
+	} {
+		t.Run(chunk, func(t *testing.T) {
+			p := newPartialText(apiChat, 1<<20)
+			p.Observe([]byte(chunk))
+			if v := p.Verdict(); v.Kind != verdictTerminal {
+				t.Fatalf("verdict = %v/%q, want terminal", v.Kind, v.Reason)
+			}
+			// The delta was read: the accumulator saw the bytes, applied the
+			// size bound, and only THEN released them for a terminal. A fix
+			// that just reordered the checks without reading the delta would
+			// leave the prefix unread — and the size bound unapplied.
+			if p.partialBytes() != 0 {
+				t.Fatalf("a terminal accumulator still holds %d bytes", p.partialBytes())
+			}
+		})
+	}
+	// The size bound applies to a terminal chunk's content too: a terminal
+	// chunk carrying an over-limit prefix is still refused, not accepted as a
+	// clean finish. This is the proof the content is really being read, not
+	// merely skipped.
+	p := newPartialText(apiChat, 8)
+	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"0123456789"},"finish_reason":"stop"}]}`))
+	v := p.Verdict()
+	if v.Kind != verdictUnsafe || v.Reason != reasonOversize {
+		t.Fatalf("verdict = %v/%q, want unsafe/%s — an over-limit terminal chunk was read as a clean finish",
+			v.Kind, v.Reason, reasonOversize)
+	}
+}
+
 // TestPartialTextFinishReasonIsLatched: the terminal sticks. Content arriving
 // after a declared finish — a provider that keeps a socket open, or one whose
 // final chunk is followed by another delta — cannot make the stream
