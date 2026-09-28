@@ -693,6 +693,47 @@ func TestStreamRecoveryStopsWhenTheClientLeaves(t *testing.T) {
 	}
 }
 
+// TestStreamRecoveryStopsWhenTheClientLeavesMidHop: the client can walk away
+// while a hop is in flight, and the loop must notice before it spends another
+// exchange on a stream nobody is reading.
+//
+// The cancel fires from inside the hop's own dial, so the window is exact
+// rather than timed — and the hop answers with a clean EOF, which is what
+// isolates the caller gate: every other gate would have let a second hop
+// through. The outcome then names the disconnect rather than blaming the
+// upstream for a truncation this proxy chose.
+func TestStreamRecoveryStopsWhenTheClientLeavesMidHop(t *testing.T) {
+	store := newChainStore(t, recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pa := &scriptedDoer{script: []dialFunc{
+		sseStream(sseChat("Hello")),
+		func(req *http.Request) (*http.Response, error) {
+			cancel() // the client leaves with the hop in flight
+			return sseStream(sseChat(", world"))(req)
+		},
+		sseStream(sseChat("never asked")),
+	}}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: &scriptedDoer{}}, nil, nil, nil, log)
+
+	doRequestWithContext(t, h, ctx, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the one hop that was in flight", pa.dials())
+	}
+	if n := len(logBuf.events(t, "stream_recovery_started")); n != 1 {
+		t.Errorf("stream_recovery_started = %d, want 1: the next hop was refused", n)
+	}
+	// No bound was reached, so there is nothing to report as exhausted.
+	if ev := logBuf.events(t, "stream_recovery_exhausted"); len(ev) != 0 {
+		t.Errorf("stream_recovery_exhausted fired for a departed client: %v", ev)
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
+		t.Fatalf("request_completed = %v, want client_disconnected", done)
+	}
+}
+
 // selfCancelingBody yields its bytes once, then cancels the request context
 // and reports it — the deterministic shape of a client that walks away while
 // the upstream is mid-generation. A timer would be a race; this is not.

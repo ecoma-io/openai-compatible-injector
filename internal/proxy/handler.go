@@ -2051,6 +2051,10 @@ walk:
 		// empty means the loop never had to stop — the stream ended on its
 		// own terms.
 		stopReason, unsafeReason := "", ""
+		// clientGone records that the loop stopped at the caller gate rather
+		// than at any bound. It is the one stop with no `recovery_reason`,
+		// because nothing about the recovery was wrong: the reader left.
+		clientGone := false
 		for contPolicy.Enabled {
 			if !continuationEligible(stats, err) {
 				break
@@ -2064,6 +2068,7 @@ walk:
 				// exchange on a stream nobody is reading, and the read would
 				// fail on the write anyway — the same judgement the walk's
 				// own dials make.
+				clientGone = true
 				break
 			}
 			prefix, reason := partial.Safe()
@@ -2314,6 +2319,16 @@ walk:
 					outcome = "stream_limit_exceeded"
 					eventErr = err
 				}
+			}
+			if err == nil && clientGone {
+				// A clean EOF that never reached its marker, on a request the
+				// client abandoned. The upstream did not cut this answer — the
+				// loop refused to dial for it — so reporting the truncation as
+				// the provider's would send an operator after the wrong thing.
+				// The outcome names the disconnect, which is the same
+				// classification a failed client write gets; the phase stays
+				// `recovery`, which is what actually stopped.
+				outcome = "client_disconnected"
 			}
 			event := log.Warn().Str("public_model", model).Str("phase", phase).
 				Int64("bytes_out", bytesOut).Int("events", eventsOut).

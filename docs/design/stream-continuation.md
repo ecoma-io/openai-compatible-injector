@@ -180,7 +180,7 @@ by accident if the other's behavior changes.
 | `stream_recovery_failed`    | WARN  | `recovery_index`, `phase` (`build`/`credential`/`budget`/`dial`/`upstream_status`/`upstream_read`/`client_write`), `upstream_status`, the sanitized `err`, `upstream_credential_id` when the candidate has a pool |
 | `stream_recovery_exhausted` | WARN  | `recoveries`, `reason`, `unsafe_reason`                                                                                                                                                                           |
 | `stream_completed`          | DEBUG | + `stream_recoveries`                                                                                                                                                                                             |
-| `stream_truncated`          | WARN  | + `stream_recoveries`, `recovery_reason`, phase `recovery` for a marker-less stream                                                                                                                               |
+| `stream_truncated`          | WARN  | + `stream_recoveries`, `recovery_reason`, phase `recovery` for a marker-less stream — or outcome `client_disconnected` when the caller left during a hop                                                          |
 | `egress_attempt_failed`     | WARN  | one per endpoint a hop's pool dialed and lost                                                                                                                                                                     |
 
 Every reason is a closed-set token from a typed value, never error text — the
@@ -244,6 +244,20 @@ non-nil exactly when `phase` is empty and `err` is nil — and
 doer that returns the pool's sentinel, so the shape is pinned rather than
 assumed. The refusal reports `phase: budget`, blames no endpoint, and leaves the
 stream truncated exactly as it would have been with the feature off.
+
+And one misclassification, found the same way. The loop's caller gate stops
+without a `recovery_reason`, because nothing about the recovery was wrong — the
+reader left. But the truncation that follows keyed only on the relay's error, so
+a client that hung up during a hop, on a stream that ended cleanly at EOF,
+produced an outcome of `stream_truncated`: the report an operator reads as "the
+provider cut this answer", for a hop the proxy had deliberately refused to dial.
+The loop now records that it stopped at the caller gate, and a clean EOF on an
+abandoned request reports `client_disconnected` — the same classification a
+failed client write already got — while the phase stays `recovery`, which is
+what actually stopped. `TestStreamRecoveryStopsWhenTheClientLeavesMidHop` pins
+it: the cancel fires from inside the hop's dial, the hop answers with a clean
+EOF so every other gate would have permitted a second hop, and the dial count
+stays at two.
 
 ## Reviewed and deliberately not changed
 
