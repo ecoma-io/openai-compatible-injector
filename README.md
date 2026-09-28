@@ -4,8 +4,9 @@ A minimal OpenAI-compatible **request/response injector proxy**. Clients talk
 to it as if it were an OpenAI endpoint — authenticating with the single
 `api-key` from the runtime config — and it forwards to configured upstream
 providers, renaming the model and injecting a per-model system prompt into
-every request. Hot-reloadable model mapping, optional durable factual usage
-metering, one static binary.
+every request. Hot-reloadable model mapping, provider retry/fallback and
+egress pools, optional post-commitment SSE stream continuation, optional
+durable factual usage metering, one static binary.
 
 ```
  client ──POST /v1/chat/completions (Bearer api-key)──▶ injector ──forward (model→upstream-model, prompt injected, credential consumed)──▶ upstream provider
@@ -133,9 +134,10 @@ transports:
 # fall back, or terminate, how the same candidate is re-asked, how far the
 # candidate walk reaches, and how many real upstream exchanges one request may
 # spend. Overrides of the same shape sit on a providers entry, a models entry,
-# and one chain candidate; each layer merges onto the one before it. Two
+# and one chain candidate; each layer merges onto the one before it. Three
 # members are position-scoped and rejected elsewhere — `budget.request` only
-# here, `fallback` only here or on a model entry.
+# here, `fallback` only here or on a model entry, `stream` only here or on a
+# model entry.
 recovery:
   matrix:
     http:
@@ -162,6 +164,14 @@ recovery:
       max-exchanges: 16 # per candidate, 1..32
   retry-after:
     mode: max # max (default) | ignore
+  # Optional, OFF BY DEFAULT. Continue a COMMITTED SSE stream that ended
+  # without its terminal marker, on the client's existing connection. See
+  # "Stream recovery".
+  # stream:
+  #   enabled: false # absent means streams are never continued
+  #   max-recoveries: 1 # continuation hops per stream, 0..2
+  #   max-elapsed: 20s # window from the commit, >= 1ms, <= 2m
+  #   max-partial-bytes: 262144 # committed text held to build the hop, 1KiB..1MiB
 
 # Optional. Named upstream bases, each routed through a transport.
 providers:
@@ -1174,6 +1184,121 @@ readiness (the pool's earliest ready key) is a separate floor the engine
 applies to every wait regardless of `enabled`/`mode`/`max-delay` — see the
 provider upstream credentials section.
 
+### Stream recovery
+
+```yaml
+recovery:
+  stream:
+    enabled: false # default false; absent means streams are never continued
+    max-recoveries: 1 # continuation hops per stream, 0..2
+    max-elapsed: 20s # window measured from the commit, >= 1ms, <= 2m
+    max-partial-bytes: 262144 # committed text held to build a hop, 1KiB..1MiB
+```
+
+Everything above this section is pre-commitment: it decides which candidate
+answers, and it stops forever at the first client-visible byte. This block is
+the one thing that runs after that boundary, and it exists because "commitment
+is final" and "a cut stream is the client's problem" are not the same
+statement.
+
+When a **committed** SSE stream ends without its terminal marker — `data:
+[DONE]` for Chat Completions, `event: response.completed` for Responses — the
+upstream generation was cut short. With this block enabled, the proxy keeps
+the client's one connection open, re-asks the **same candidate** for a
+continuation carrying the text the client has already received, and relays the
+new events into the same response. The client sees one SSE connection and one
+terminal marker.
+
+**This is semantic continuation, not token-level resumption.** No
+OpenAI-compatible provider exposes a resume token, so the seam cannot be
+exact: the upstream is handed the committed text as an assistant turn and
+asked to keep writing from the point it stopped. It may rephrase slightly at
+the seam. That is a real, visible cost and the reason the block is off by
+default.
+
+**It is fail-closed, and it refuses more often than it acts.** A stream is
+continued only when all of the following hold; anything else ends the stream
+exactly as it would with the block absent, and `stream_recovery_exhausted`
+records which gate fired:
+
+| gate            | refuses when                                                   |
+| --------------- | -------------------------------------------------------------- |
+| terminal marker | a marker was already forwarded — the stream is over            |
+| tool calls      | any `delta.tool_calls`/`delta.function_call` was seen          |
+| finish reason   | any non-null `finish_reason` was seen on a primary choice      |
+| readable shape  | a `data:` line was neither `[DONE]` nor recognizable JSON      |
+| prefix bound    | the committed text reached `max-partial-bytes`                 |
+| usable prefix   | no text was committed at all, so a hop would be a blind replay |
+| request body    | the client's body cannot express a continuation (see below)    |
+| client          | the client connection is gone, or a relay cap stopped the pass |
+| reach           | `max-recoveries` hops were already used                        |
+| window          | `max-elapsed` passed since the stream committed                |
+| envelope        | the request's `budget.request` envelope is spent               |
+
+The unbounded-accumulation case is the one that matters for memory: a stream
+whose text passes `max-partial-bytes` stops being a candidate for
+continuation, and the rest of it relays untouched.
+
+**What a continuation is allowed to be.** The hop is the committed candidate
+re-asked, on its own endpoint, its own transport, its own credential pool, with
+the walk's sticky key preferred — not a new attempt that looks similar, and
+never a different candidate. It pays for its dials out of the same
+`budget.request` envelope the walk spent, because a continuation is real
+outbound traffic. It counts as a provider-level attempt on
+`request_completed`: `provider_attempts` and `upstream_exchanges` both move,
+while `candidates_entered` does not.
+
+**What is never done.** No ordinary retry and no fallback, before or after
+commitment; the pre-commitment walk is untouched and no decision here goes
+through the policy matrix. No terminal marker is ever synthesized — a hop that
+truncates leaves the stream unterminated, because that is more honest than a
+`[DONE]` after a partial answer. No error body and no second header block ever
+reaches a client already receiving a stream. No duplicate detection or
+overlap trimming: a repeated paragraph at the seam is visible and honest, and
+a heuristic that deletes client-visible text is not.
+
+**The request body has to be able to say it.** The continuation is built from
+the client's own original body, which is replayed through the candidate's
+transform unchanged apart from the added turn:
+
+- **Chat Completions** — if the last message is already an `assistant` message
+  with string content (a prefill), the committed text extends that content;
+  otherwise an assistant message carrying the committed text is appended.
+  Either way the answer-so-far ends the body, which is what lets the model
+  continue it. `stream: true` is set; every other member travels as sent.
+- **Responses** — `input` is normalized into the array form: the client's own
+  string input is preserved as its leading user item, and the continuation adds
+  an assistant `message` item carrying the committed text followed by a user
+  item carrying a fixed instruction to resume without repeating. A body
+  carrying `previous_response_id` is refused outright: the upstream would
+  resolve that id against a stored response whose generation never finished.
+
+The instruction text is fixed and not configurable. It is the whole difference
+between "continue this answer" and "answer this again", and a deployment that
+could edit it could ask for the duplication this feature forbids.
+
+**Position rule.** Like `fallback`, `stream` is legal only at the **global**
+and **model** layers; stating it on a `providers` entry or on a single chain
+candidate rejects the file. A continuation is pinned to the candidate that
+produced the committed stream, so a provider-layer statement would be a promise
+about every model routed through it — including models whose clients parse the
+answer strictly — that the walk's own candidate swap can silently invalidate.
+
+**Interaction with the other blocks.** `sse-keep-alive` keeps running across a
+hop, so a slow continuation still pings and the idle cut it exists to prevent
+cannot fire mid-recovery. Usage metering is unaffected and stays factual: the
+logical request contributes one event, and the final hop's usage object is the
+one recorded — never a sum of the two. A reload mid-stream cannot turn
+recovery on for a stream that started without it, nor reshape the bounds a
+stream in flight is recovering under.
+
+**When the block is absent, nothing changes.** An SSE stream that dies without
+its terminal marker still logs `stream_completed` at DEBUG with outcome
+`completed`, exactly as it always has. With the block present, a stream that
+never reached its marker is reported as `stream_truncated` whether the proxy
+dialed for it or refused to — that is the one fact a client cannot recover on
+its own.
+
 ### Answers, commitment, and reload
 
 - **The last HTTP answer wins.** Whatever the walk's history, the relayed
@@ -1196,6 +1321,9 @@ provider upstream credentials section.
   client-visible byte has produced THE response: no retry and no candidate
   switch after that, ever. A `200` SSE stream whose upstream dies before the
   first event is truncated and logged, never retried or replaced mid-flight.
+  Post-commitment [stream recovery](#stream-recovery) does not weaken this:
+  it continues the same candidate on the same connection under a separate,
+  off-by-default policy, and the walk is over before it starts.
 - **Replay is fresh and identical.** Each attempt — a same-candidate retry
   included — rebuilds the request from the same immutable client body
   through that candidate's own transform: its own `upstream-model`, the same
@@ -1537,7 +1665,12 @@ live stream with correct per-chunk latency. Behavior:
   stops at upstream EOF/error, on client disconnect, and as soon as the
   Chat `[DONE]` or Responses `response.completed` terminal marker is
   forwarded — it never injects inside a partial `data:` line, never splits
-  an event, and never appends after the terminal event. It starts only once
+  an event, and never appends after the terminal event. One exception: with
+  post-commitment [stream recovery](#stream-recovery) enabled, a relay pass
+  that ends without its terminal marker may be followed by another hop on
+  the same connection, so the heartbeat is not stopped at that EOF — it
+  keeps the client connection alive across the gap and stops for good when
+  the effort ends. It starts only once
   the upstream response headers are committed to the client: silence while
   waiting for upstream headers is **not** covered (that window is bounded
   by the upstream's response-header timeout, not this relay heartbeat).
@@ -1546,6 +1679,11 @@ live stream with correct per-chunk latency. Behavior:
   `stream error … INTERNAL_ERROR` at 125.39s, origin-side close at
   125.06s), which long reasoning phases exceed; a `: ping` every 15s kept a
   240s silent stream alive through the same path.
+- A committed stream that ends **without** its terminal marker is a stream
+  the upstream cut short. By default that is the end of it — the client's
+  partial answer is all it gets. With [`recovery.stream`](#stream-recovery)
+  enabled the proxy continues it on the same connection, on the same
+  candidate, under its own bounds; see that section for what is refused.
 - The streaming _shape_ is decided by the **URL path**, not the body:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses
@@ -1830,7 +1968,9 @@ What each level carries:
   response instead emits `stream_started`, periodic
   `stream_event_progress` heartbeats (running event/byte counts, one every
   256 dispatched events — a stuck stream shows up as a heartbeat that
-  stops advancing), and `stream_completed`. Plus the poller's per-tick
+  stops advancing), and `stream_completed` (carrying `stream_recoveries`,
+  and emitted only for a stream that either reached its terminal marker or
+  ran with post-commitment recovery off). Plus the poller's per-tick
   debug heartbeat while a config failure persists (the healthy unchanged
   state logs nothing at all). Detailed but never payload-bearing: request
   bodies, SSE `data:` payloads, and injection prompts do not exist at this
@@ -1859,10 +1999,19 @@ What each level carries:
   `model_count`, `log_level`), `config_file_recovered` (a file returned
   byte-identical after a failure), `service_started` (boot config
   accepted; the listener itself is announced by the DEBUG
-  `listener_ready`), and `drain_started`.
+  `listener_ready`), and `drain_started`. Post-commitment recovery, when the
+  block is enabled, adds `stream_recovery_started` (one per continuation hop,
+  emitted before its dial: `recovery_index`, `partial_bytes`, `provider`,
+  `upstream`, `policy_hash`, `policy_generation`) and
+  `stream_recovery_succeeded` (the hop's events carried the stream to its
+  marker: `recovered_bytes`, `recovered_events`, `upstream_exchanges`,
+  `elapsed_ms`).
 - **WARN** — client disconnects and truncations (`stream_truncated` with a
-  `phase` field separating `client_write` from `upstream_read` and
-  `upstream_limit`, and `relay_copy_failed` with phase `client_write` on
+  `phase` field separating `client_write` from `upstream_read`,
+  `upstream_limit` and `recovery` — the last for a stream that ran with
+  recovery enabled and ended without its terminal marker — plus
+  `stream_recoveries` and, when a gate stopped the effort, `recovery_reason`;
+  and `relay_copy_failed` with phase `client_write` on
   the verbatim and buffered paths — the buffered case covers a client whose
   cancel or expired deadline surfaces through the upstream body read, which
   is read from the request context rather than the error chain, with no
@@ -1882,7 +2031,16 @@ What each level carries:
   described below — a candidate whose exchange envelope refused another dial
   (`candidate_exchange_budget_spent`, `error_class` `provider_exhausted` over
   `error_cause` `exchange_budget`: a refusal, not a failed endpoint, so no
-  endpoint is blamed and no `egress_attempt_failed` accompanies it) — one
+  endpoint is blamed and no `egress_attempt_failed` accompanies it), and the
+  two post-commitment recovery events that mean "the stream did not make it":
+  `stream_recovery_failed` (one per hop that refused, answered with a status
+  instead of a stream, or truncated again — `recovery_index`, `provider`,
+  `upstream`, `phase` from the closed set `build`/`credential`/`budget`/
+  `dial`/`upstream_status`, and `upstream_status` when the hop answered with
+  one) and `stream_recovery_exhausted` (the effort stopped at a gate —
+  `recoveries`, `reason` from `budget_spent`/`max_recoveries`/`max_elapsed`/
+  `unsafe_content`, and `unsafe_reason` naming the accumulator's own token
+  when the gate was `unsafe_content`) — one
   warning per transition into a failed config
   state (`config_file_unreadable`, `config_reload_rejected`) — including a
   failure that changes kind, which warns again — never one per poll tick —
@@ -2120,9 +2278,11 @@ Decided, and not coming back without a design discussion:
   scheduling, eligibility gates, bounded fallback and passive health exist
   (see [Provider transports](#provider-transports)); what stays out is
   automatic egress rotation over time, active health probes, per-request
-  egress selection, and retries after response commitment or caller-driven
-  retry knobs (the recovery policy is resolved from YAML, per request — an
-  operator cannot let a client ask for a retry).
+  egress selection, and caller-driven retry knobs (the recovery policy is
+  resolved from YAML, per request — an operator cannot let a client ask for
+  a retry). An egress pool still never retries a response after commitment;
+  post-commitment [stream recovery](#stream-recovery) is not an egress retry
+  and runs above the pool, replacing neither.
 - **TLS configuration** — upstream and proxy TLS verify chain and host with
   system roots; custom TLS setup (client certificates, custom CA pools,
   `insecure-skip-verify`) is not coming. (Ambient
