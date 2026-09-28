@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.1](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.0...v0.14.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **proxy:** harden stream recovery correctness edges ([#83](https://github.com/ecoma-io/openai-compatible-injector/issues/83)) ([be194ae](https://github.com/ecoma-io/openai-compatible-injector/commit/be194ae921f4356d8690ad53b76bd934f8b55d87))
+* **proxy:** make stream max-elapsed a hard bound, split terminal from unsafe ([#80](https://github.com/ecoma-io/openai-compatible-injector/issues/80)) ([e9b7336](https://github.com/ecoma-io/openai-compatible-injector/commit/e9b7336f48a90f94aede580f82d0237ab2563540))
+
 ## [0.14.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.13.1...v0.14.0) (2026-09-28)
 
 
