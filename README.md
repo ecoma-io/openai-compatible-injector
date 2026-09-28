@@ -2316,7 +2316,9 @@ tokens, and `upstream_invalid_response` /
 `upstream_body_timeout` / `upstream_body_read_failed` for unusable
 answers, which ride the unusable-answer events rather than
 `provider_attempt_failed`), `failure_origin` (`upstream_http` | `transport` |
-`protocol` | `caller` | `envelope` — the layer the failure belongs to) and
+`protocol` | `caller` | `credential` | `envelope` — the layer the failure
+belongs to; `credential` is a candidate whose rotation pool had no usable key,
+which is a local refusal rather than a wire failure) and
 `elapsed_ms`. Transport failures additionally carry `send_state`
 (`definitely_not_sent` | `send_unknown`): whether this dialed attempt
 provably never carried a request byte. It is evidence about a **dialed**
@@ -2327,7 +2329,17 @@ the received HTTP status as `upstream_status` — a transport failure has no
 status to carry — so failures correlate by
 `request_id + candidate_index + candidate_attempt + egress_attempt`.
 
-Two naming notes, so a dashboard is not built on the wrong reading.
+Three naming notes, so a dashboard is not built on the wrong reading.
+
+**The counters carry compatibility aliases, and the new names are
+authoritative.** `candidate_attempts` is also emitted as
+`provider_attempts`, `retry_attempts` as `retries_total`, and the per-dial
+`egress_attempt` as `attempt` — each pair is one quantity under two names,
+kept so a dashboard built against an earlier release keeps reading the
+number it was built on. Every pair is incremented at a single site, so the
+alias can never disagree with its authoritative name; where a table below
+names one of them, it names the pair once rather than restating it.
+
 `provider_attempt_started` replaced the former `upstream_request_started`
 (the slug now names what it announces), and it is emitted **before** the
 dial, so it announces an attempt whose outcome is not yet known — but the
