@@ -144,5 +144,9 @@ fixture-containers:
   # Quoted values are the same exposure.
   # ruleid: workflow-container-image-not-digest-pinned
   - image: "redis:7"
+  # A plausible-looking but truncated digest must still match: pinning is
+  # exactly sha256 plus 64 hexadecimal digits, not merely "has @sha256:".
+  # ruleid: workflow-container-image-not-digest-pinned
+  - image: semgrep/semgrep:1.172.0@sha256:65dcd440
   # ok: workflow-container-image-not-digest-pinned
   - image: semgrep/semgrep:1.172.0@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b
