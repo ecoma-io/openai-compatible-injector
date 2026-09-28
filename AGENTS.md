@@ -27,18 +27,28 @@ stripping.
 
 ## Layout and boundaries
 
-| Path                              | Owns                                                                                                                                                             |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`                 | Bootstrap env, strict runtime YAML, providers/transports/pools tables, the `recovery` config surface, candidate chains, snapshot `Store`, content-hash `Poller`. |
-| `internal/credential`             | Per-provider credential `Spec`, rotation `Pool`, `Registry`. Inert by construction: no I/O, no goroutines, no timers.                                            |
-| `internal/inject`                 | Pure transforms: `Probe`, `Chat`/`Responses`, model rewriters, thinking/usage synthesizers, field stripping, continuation builders.                              |
-| `internal/auth`                   | Client identity: `Principal`, the `Provider` seam, static and partner providers, token minting and at-rest hashing, the PostgreSQL key store.                    |
-| `internal/migrate`                | The shared SQL-first, module-scoped migration runner; advisory locks serialize concurrent bootstrap and migration races.                                         |
-| `internal/usage`                  | Pre-rewrite usage capture, the PostgreSQL event repository, the bounded asynchronous pipeline.                                                                   |
-| `internal/transport`              | Outbound paths: `Doer`/`Executor`/`Resolver` seams, direct/proxy/pool clients, failure classification, the exchange-budget seam.                                 |
-| `internal/recovery`               | The recovery policy domain: `Failure`/`Match`/`Action`, the matrix, layer merge and `Resolve`, the policy hash, the `Engine`.                                    |
-| `internal/proxy`                  | HTTP wiring, client auth, `/v1/models`, error envelopes, the candidate walk, `CopySSE`, `rewriteOut`, the stream-continuation loop.                              |
-| `internal/server`, `cmd/…`, `e2e` | Listener lifecycle and shutdown; entrypoint and subcommands; black-box tests over the built binary.                                                              |
+- **`internal/config`** — bootstrap env, strict runtime YAML,
+  providers/transports/pools tables, the `recovery` config surface, candidate
+  chains, snapshot `Store`, content-hash `Poller`.
+- **`internal/credential`** — per-provider credential `Spec`, rotation `Pool`,
+  `Registry`. Inert by construction: no I/O, no goroutines, no timers.
+- **`internal/inject`** — pure transforms: `Probe`, `Chat`/`Responses`, model
+  rewriters, thinking/usage synthesizers, field stripping, continuation builders.
+- **`internal/auth`** — client identity: `Principal`, the `Provider` seam, static
+  and partner providers, token minting and at-rest hashing, the PostgreSQL key
+  store.
+- **`internal/migrate`** — the shared SQL-first, module-scoped migration runner;
+  advisory locks serialize concurrent bootstrap and migration races.
+- **`internal/usage`** — pre-rewrite usage capture, the PostgreSQL event
+  repository, the bounded asynchronous pipeline.
+- **`internal/transport`** — outbound paths: `Doer`/`Executor`/`Resolver` seams,
+  direct/proxy/pool clients, failure classification, the exchange-budget seam.
+- **`internal/recovery`** — the recovery policy domain: `Failure`/`Match`/`Action`,
+  the matrix, layer merge and `Resolve`, the policy hash, the `Engine`.
+- **`internal/proxy`** — HTTP wiring, client auth, `/v1/models`, error envelopes,
+  the candidate walk, `CopySSE`, `rewriteOut`, the stream-continuation loop.
+- **`internal/server`, `cmd/…`, `e2e`** — listener lifecycle and shutdown;
+  entrypoint and subcommands; black-box tests over the built binary.
 
 Boundaries a helpful-looking refactor will cross:
 
@@ -133,13 +143,11 @@ Boundaries a helpful-looking refactor will cross:
   > overlapping rules are REJECTED at load, so no disposition is left to whichever
   > rule the runtime happens to reach first.
 - **Four things stay code-owned and non-configurable, and apply BEFORE the
-  matrix** — a configuration able to weaken them would turn a client disconnect
-  into upstream traffic, or a committed answer into a retried one: a committed
-  response is terminal; a caller cancellation or expired deadline is terminal,
-  judged from the request context and never from the error chain or its text; the
-  request-wide exchange envelope is absolute; a resolved policy is immutable. The
-  evidence names which fired (`committed`, `caller`, `budget-request`,
-  `budget-candidate`) beside the rule ID.
+  matrix:** a committed response is terminal; a caller cancellation or expired
+  deadline is terminal, judged from the request context and never from the error
+  chain or its text; the request-wide exchange envelope is absolute; a resolved
+  policy is immutable. The evidence names which fired (`committed`, `caller`,
+  `budget-request`, `budget-candidate`) beside the rule ID.
 - **The two envelope identities are not interchangeable.** A spent REQUEST
   envelope ends the walk — no candidate can start another exchange. A spent
   CANDIDATE envelope forbids only another exchange on THAT candidate, and the walk
@@ -191,9 +199,9 @@ Boundaries a helpful-looking refactor will cross:
 - **Every attempt replays the immutable client body through that candidate's own
   transform** — retries included, a fresh request each time, with nothing observed
   on an earlier attempt feeding the next. A local transform error still answers
-  400 immediately, because a body failing one candidate's transform fails all.
-  Chains, resolved policies and transports all bind to the request's snapshot, and
-  the egress closure covers every candidate's transport.
+  400 immediately: a body failing one candidate's transform fails all. Chains,
+  resolved policies and transports all bind to the request's snapshot, and the
+  egress closure covers every candidate's transport.
 
 ### Egress and credentials
 
@@ -239,9 +247,8 @@ Boundaries a helpful-looking refactor will cross:
   WIRE OPERATION.** Only a `definitely_not_sent` failure may move the request to
   another egress member, because a `send_unknown` request may already have reached
   the upstream and replaying it would duplicate it. The classifier's class is a
-  catch-all that reads an established-connection reset the same way it reads a
-  refused connect, so `ClassConnection` must never be read as "never connected":
-  a `dial`/`proxyconnect` op, a typed proxy-tunnel failure, a TLS
+  catch-all, so `ClassConnection` must never be read as "never connected": a
+  `dial`/`proxyconnect` op, a typed proxy-tunnel failure, a TLS
   CERTIFICATE-VERIFICATION failure and a bare refused syscall prove no request
   byte left; everything else — a read/write op, a bare EOF, a timeout on an
   established connection — is `send_unknown`. The TLS clause is one failure, not
