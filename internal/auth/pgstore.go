@@ -36,7 +36,26 @@ type PGStore struct {
 	db      *sql.DB
 	touches chan touch
 	done    chan struct{}
-	close   sync.Once
+	// touchesMu guards the send side of the touch queue against Close's
+	// close(s.touches), and the sealed flag that records the close. It is
+	// held ONLY around the queue's own hand-off — the non-blocking enqueue
+	// on the request path, and the close itself on the shutdown path — and
+	// never across the flusher's database I/O, so "the queue is shutting
+	// down" can never become "the request path waits on a query".
+	touchesMu sync.RWMutex
+	// sealed reports that close(s.touches) has already happened. A
+	// TouchLastUsed arriving after it is the documented drop — the same
+	// outcome as a full queue — never a send on a closed channel.
+	sealed bool
+	// closeOnce admits exactly one pool close and closeErr carries that
+	// close's result to EVERY caller, so Close is idempotent in outcome and
+	// not merely in effect: a caller arriving after the first is handed the
+	// same error, instead of a nil that would hide a failed db.Close().
+	// sync.Once's Do establishes the happens-before edge between the write
+	// inside the body and every reader's load, so reading closeErr after Do
+	// returns is ordered without a second lock.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // touch is one pending last_used_at update.
@@ -172,10 +191,25 @@ func (s *PGStore) RevokeKey(ctx context.Context, keyID string) (bool, error) {
 	return n > 0, nil
 }
 
-// TouchLastUsed implements KeyStore: fire-and-forget, drop on full. The
-// latest touch per key wins in the flusher's batch, so a hot key produces
-// one UPDATE per window, not one per request.
+// TouchLastUsed implements KeyStore: fire-and-forget, drop on full, and —
+// once Close has sealed the queue — a harmless no-op. The latest touch per
+// key wins in the flusher's batch, so a hot key produces one UPDATE per
+// window, not one per request.
+//
+// The read lock is the whole safety property, and it is the reason this
+// method cannot panic during shutdown: Close needs the write lock to run
+// close(s.touches), so a send that holds the read lock cannot be racing it,
+// and a send that observes the seal returns without touching the channel at
+// all. Both branches stay non-blocking — the select's default is the drop
+// path, the critical section is a channel hand-off and a bool, and the lock
+// is never held across a database call — so shutdown cannot turn an
+// advisory metering write into request latency.
 func (s *PGStore) TouchLastUsed(keyID string, at time.Time) {
+	s.touchesMu.RLock()
+	defer s.touchesMu.RUnlock()
+	if s.sealed {
+		return
+	}
 	select {
 	case s.touches <- touch{keyID: keyID, at: at}:
 	default:
@@ -227,16 +261,36 @@ func (s *PGStore) flushLoop() {
 }
 
 // Close implements KeyStore: stops the flusher, waits for the final batch,
-// then closes the pool.
+// then closes the pool. The order is load-bearing — the queue is sealed and
+// drained first, so the pool is never closed out from under the one flush
+// that is supposed to land the backlog.
+//
+// Idempotence is in the OUTCOME, not just the effect: the first caller to
+// reach the Once seals the queue and performs the pool close, every
+// concurrent or later caller blocks on that same Once, and they all read
+// the one stored result afterwards. A failed db.Close() is therefore
+// reported to every caller rather than to whoever happened to arrive first,
+// which matters because the shutdown path logs it and the CLI exits on it.
+// The wait stays bounded exactly as before: the caller running the body
+// waits for the flusher to finish or for its own ctx to expire, whichever
+// comes first, and the drain of anything still queued is the flusher's own
+// documented last act.
 func (s *PGStore) Close(ctx context.Context) error {
-	var err error
-	s.close.Do(func() {
+	s.closeOnce.Do(func() {
+		// Seal under the write lock so no in-flight touch can be inside its
+		// send when the channel closes; the lock is released before the wait
+		// below, so a touch arriving mid-shutdown is refused promptly rather
+		// than queued behind the drain.
+		s.touchesMu.Lock()
+		s.sealed = true
 		close(s.touches)
+		s.touchesMu.Unlock()
+
 		select {
 		case <-s.done:
 		case <-ctx.Done():
 		}
-		err = s.db.Close()
+		s.closeErr = s.db.Close()
 	})
-	return err
+	return s.closeErr
 }
