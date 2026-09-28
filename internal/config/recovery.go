@@ -12,7 +12,8 @@ import (
 
 // The runtime `recovery` block is the configuration surface of the recovery
 // policy domain: the failure → action matrix, the retry mechanics, the
-// candidate-walk bound, the exchange envelope, and the Retry-After policy.
+// candidate-walk bound, the exchange envelope, the Retry-After policy, and
+// the post-commitment stream recovery bounds.
 //
 // The block is accepted in four positions, and the same shape means something
 // different in each: the top-level block is the GLOBAL layer (the only one
@@ -37,6 +38,7 @@ type runtimeRecovery struct {
 	Fallback   *runtimeRecoveryFallback   `yaml:"fallback"`
 	Budget     *runtimeRecoveryBudget     `yaml:"budget"`
 	RetryAfter *runtimeRecoveryRetryAfter `yaml:"retry-after"`
+	Stream     *runtimeStream             `yaml:"stream"`
 }
 
 // runtimeRecoveryMatrix mirrors the `matrix` block: the shorthand forms that
@@ -142,6 +144,18 @@ type runtimeRecoveryRetryAfter struct {
 	MaxDelay string `yaml:"max-delay"`
 }
 
+// runtimeStream mirrors the `stream` block: the post-commitment stream
+// recovery bounds. Four scalars and no nesting — the durations stay strings
+// for the same reason every other duration in this file does: yaml.v3 decodes
+// an unquoted `20s` as a string, and a bare integer would be nanoseconds, not
+// the spelling an operator writes.
+type runtimeStream struct {
+	Enabled         *bool  `yaml:"enabled"`
+	MaxRecoveries   *int   `yaml:"max-recoveries"`
+	MaxElapsed      string `yaml:"max-elapsed"`
+	MaxPartialBytes *int   `yaml:"max-partial-bytes"`
+}
+
 // buildGlobalRecovery builds the global layer's partial from the top-level
 // `recovery` block and the legacy `provider-fallback` block.
 //
@@ -211,6 +225,13 @@ func buildRecoveryPartial(block *runtimeRecovery) (recovery.Partial, error) {
 		}
 		p.RetryAfter = ra
 	}
+	if block.Stream != nil {
+		s, err := buildRecoveryStream(block.Stream)
+		if err != nil {
+			return recovery.Partial{}, err
+		}
+		p.Stream = s
+	}
 	return p, nil
 }
 
@@ -239,12 +260,27 @@ func buildRecoveryPartial(block *runtimeRecovery) (recovery.Partial, error) {
 // the model position states it through buildModelRecovery — which applies the
 // model's override to that model's own primary candidate and therefore
 // genuinely steers that model's walk.
+//
+// `recovery.stream` is rejected here for a different and narrower reason.
+// Unlike `fallback`, a provider-level stream block WOULD be honored: every
+// candidate naming that provider resolves it into its own frozen policy, and
+// the continuation reads the committed candidate's policy. It is refused
+// anyway because it changes text the client has ALREADY received — the one
+// output this proxy can produce that a client cannot tell from a fresh
+// generation — and a provider entry is a shared building block. Enabling it
+// there would silently extend post-commitment continuation to every model
+// that happens to route through that provider, including models whose
+// answers a strict client parses. The opt-in belongs where an operator names
+// the deployment or the model, so that is where it is accepted.
 func buildRecoveryOverride(block *runtimeRecovery) (recovery.Partial, error) {
 	if block.Budget != nil && block.Budget.Request != nil {
 		return recovery.Partial{}, errors.New("recovery.budget.request is request-scoped and only valid in the top-level recovery block")
 	}
 	if block.Fallback != nil {
 		return recovery.Partial{}, errors.New("recovery.fallback is request-scoped (the candidate walk's reach) and only valid in the top-level recovery block or a model entry")
+	}
+	if block.Stream != nil {
+		return recovery.Partial{}, errors.New("recovery.stream changes client-visible output and is only valid in the top-level recovery block or a model entry")
 	}
 	return buildRecoveryPartial(block)
 }
@@ -616,6 +652,34 @@ func buildRecoveryRetryAfter(ra *runtimeRecoveryRetryAfter) (*recovery.RetryAfte
 			return nil, err
 		}
 		out.MaxDelay = &d
+	}
+	return out, nil
+}
+
+// buildRecoveryStream translates the `stream` block. Values are passed
+// through untouched — the domain owns every range, cap, and cross-field
+// contradiction, and validating them here as well would give two places to
+// disagree about what is legal.
+func buildRecoveryStream(rs *runtimeStream) (*recovery.StreamPartial, error) {
+	out := &recovery.StreamPartial{}
+	if rs.Enabled != nil {
+		enabled := *rs.Enabled
+		out.Enabled = &enabled
+	}
+	if rs.MaxRecoveries != nil {
+		n := *rs.MaxRecoveries
+		out.MaxRecoveries = &n
+	}
+	if rs.MaxElapsed != "" {
+		d, err := parseRecoveryDuration(rs.MaxElapsed, "recovery.stream.max-elapsed")
+		if err != nil {
+			return nil, err
+		}
+		out.MaxElapsed = &d
+	}
+	if rs.MaxPartialBytes != nil {
+		n := *rs.MaxPartialBytes
+		out.MaxPartialBytes = &n
 	}
 	return out, nil
 }

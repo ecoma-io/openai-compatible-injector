@@ -184,21 +184,28 @@ func Merge(base Policy, p Partial) (Policy, error) {
 	}
 	if p.Stream != nil {
 		if p.Stream.Enabled != nil {
+			wasEnabled := base.Stream.Enabled
 			out.Stream.Enabled = *p.Stream.Enabled
 			if p.Stream.MaxRecoveries == nil {
-				// Switching recovery on IS one recovery, and switching it off
-				// IS none. The base policy carries 0 because it is the
-				// disabled default, so a layer that states only
-				// `enabled: true` must be given the per-host reach rather
-				// than inheriting the disabled zero — otherwise the one-line
-				// opt-in every operator writes would be rejected as a
-				// contradiction, and a layer that states `enabled: false`
-				// beside a parent's larger reach would state a bound it
-				// cannot use. Same rule the walk bound follows.
-				if *p.Stream.Enabled {
-					out.Stream.MaxRecoveries = DefaultMaxStreamRecoveries
-				} else {
+				// Switching recovery off IS zero recoveries: a disabled
+				// policy that kept a parent's reach would state a bound it
+				// cannot use, which Validate rejects as a contradiction the
+				// operator never wrote. Same rule the walk bound follows.
+				//
+				// Switching it on is the only place the documented reach can
+				// come from, because the base policy carries 0 — it is the
+				// disabled default — so a one-line `enabled: true` would
+				// otherwise state a policy that can never act. A base that
+				// was ALREADY enabled keeps its own reach: re-stating the
+				// switch is not a request to narrow it, and a model that
+				// turns recovery on beneath a global block that already
+				// configured a reach must inherit that reach rather than
+				// silently reset it to one.
+				switch {
+				case !*p.Stream.Enabled:
 					out.Stream.MaxRecoveries = 0
+				case !wasEnabled:
+					out.Stream.MaxRecoveries = DefaultMaxStreamRecoveries
 				}
 			}
 		}

@@ -90,6 +90,34 @@ func TestStreamMergeDisabledForcesZeroReach(t *testing.T) {
 	}
 }
 
+// TestStreamMergeRestatingTheSwitchKeepsTheInheritedReach: the co-rule fills
+// in a reach only when there is none to inherit. A model that turns recovery
+// on beneath a global block that already configured a reach must inherit that
+// reach — re-stating the switch is not a request to narrow it.
+func TestStreamMergeRestatingTheSwitchKeepsTheInheritedReach(t *testing.T) {
+	base, err := Merge(Default(), Partial{Stream: &StreamPartial{
+		Enabled:       boolp(true),
+		MaxRecoveries: intp(MaxStreamRecoveriesCap),
+	}})
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	got, err := Merge(base, Partial{Stream: &StreamPartial{
+		Enabled:    boolp(true),
+		MaxElapsed: durp(30 * time.Second),
+	}})
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if got.Stream.MaxRecoveries != MaxStreamRecoveriesCap {
+		t.Fatalf("re-stating the switch reset the reach to %d, want the inherited %d",
+			got.Stream.MaxRecoveries, MaxStreamRecoveriesCap)
+	}
+	if got.Stream.MaxElapsed != 30*time.Second {
+		t.Fatalf("window = %v, want the stated 30s", got.Stream.MaxElapsed)
+	}
+}
+
 // TestStreamMergeStatedScalarsBeatTheCoRule: the co-rule only fills in what
 // the layer left unstated. A layer that names both means both.
 func TestStreamMergeStatedScalarsBeatTheCoRule(t *testing.T) {
