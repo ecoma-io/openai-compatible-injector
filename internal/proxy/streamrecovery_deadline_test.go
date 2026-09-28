@@ -140,7 +140,7 @@ func TestRecoveryWindowBindsEveryLeverToOneDeadline(t *testing.T) {
 
 	// boundBody is the second half: the release rides the hop's own Close, so
 	// the context cannot be released while a relay is still reading.
-	var null io.ReadCloser = io.NopCloser(strings.NewReader(""))
+	null := io.NopCloser(strings.NewReader(""))
 	bounds := newRecoveryWindow(time.Now(), 10*time.Second).bind(context.Background(), time.Now())
 	wrapped := &boundBody{ReadCloser: null, release: bounds.release}
 	if err := bounds.ctx.Err(); err != nil {
