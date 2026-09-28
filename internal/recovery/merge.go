@@ -19,6 +19,8 @@ type Partial struct {
 	Fallback   *FallbackPartial
 	Budget     *BudgetPartial
 	RetryAfter *RetryAfterPartial
+	// Stream carries the post-commitment stream recovery bounds.
+	Stream *StreamPartial
 }
 
 // MatrixPartial restates a matrix slice: rules by identity, and the action
@@ -75,6 +77,14 @@ type RetryAfterPartial struct {
 	Enabled  *bool
 	Mode     *RetryAfterMode
 	MaxDelay *time.Duration
+}
+
+// StreamPartial overrides the post-commitment stream recovery bounds.
+type StreamPartial struct {
+	Enabled         *bool
+	MaxRecoveries   *int
+	MaxElapsed      *time.Duration
+	MaxPartialBytes *int
 }
 
 // Merge applies one layer over a base policy and returns the result. It is a
@@ -170,6 +180,36 @@ func Merge(base Policy, p Partial) (Policy, error) {
 		}
 		if p.RetryAfter.MaxDelay != nil {
 			out.RetryAfter.MaxDelay = *p.RetryAfter.MaxDelay
+		}
+	}
+	if p.Stream != nil {
+		if p.Stream.Enabled != nil {
+			out.Stream.Enabled = *p.Stream.Enabled
+			if p.Stream.MaxRecoveries == nil {
+				// Switching recovery on IS one recovery, and switching it off
+				// IS none. The base policy carries 0 because it is the
+				// disabled default, so a layer that states only
+				// `enabled: true` must be given the per-host reach rather
+				// than inheriting the disabled zero — otherwise the one-line
+				// opt-in every operator writes would be rejected as a
+				// contradiction, and a layer that states `enabled: false`
+				// beside a parent's larger reach would state a bound it
+				// cannot use. Same rule the walk bound follows.
+				if *p.Stream.Enabled {
+					out.Stream.MaxRecoveries = DefaultMaxStreamRecoveries
+				} else {
+					out.Stream.MaxRecoveries = 0
+				}
+			}
+		}
+		if p.Stream.MaxRecoveries != nil {
+			out.Stream.MaxRecoveries = *p.Stream.MaxRecoveries
+		}
+		if p.Stream.MaxElapsed != nil {
+			out.Stream.MaxElapsed = *p.Stream.MaxElapsed
+		}
+		if p.Stream.MaxPartialBytes != nil {
+			out.Stream.MaxPartialBytes = *p.Stream.MaxPartialBytes
 		}
 	}
 	if err := out.Validate(); err != nil {
