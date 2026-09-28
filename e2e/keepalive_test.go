@@ -6,7 +6,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,11 +50,13 @@ func responsesSilenceHandler(silent time.Duration) http.HandlerFunc {
 // trimmed non-empty lines it carried).
 func readFullStream(t *testing.T, resp *http.Response) [][]string {
 	t.Helper()
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	// The drain reaches EOF by construction, so close at return rather than
+	// waiting for the test's own cleanup to release the pooled connection.
+	defer s.close()
 	var events [][]string
 	for {
-		lines, eof := nextSSEEvent(t, br, 30*time.Second)
+		lines, eof := s.event(30 * time.Second)
 		if len(lines) > 0 {
 			events = append(events, lines)
 		}

@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -189,18 +188,18 @@ func TestProxyTransportStreamsSSEEndToEnd(t *testing.T) {
 	resp := openJSON(t, p.addr, "/v1/chat/completions",
 		`{"model":"proxied-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Fatalf("content type = %q", ct)
 	}
 
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 	var first, last time.Time
 	events := 0
 	seenDone := false
 	deadline := time.Now().Add(20 * time.Second)
 	for !seenDone && time.Now().Before(deadline) {
-		lines, eof := nextSSEEvent(t, br, 10*time.Second)
+		lines, eof := s.event(10 * time.Second)
 		for _, l := range lines {
 			payload := strings.TrimSpace(strings.TrimPrefix(l, "data:"))
 			if strings.HasPrefix(l, "data:") && payload == "[DONE]" {

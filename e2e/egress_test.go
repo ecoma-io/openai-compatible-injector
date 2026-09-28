@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -674,11 +673,11 @@ func TestEgressPoolStreamingSkipsNonStreamingMember(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Fatalf("content type = %q", ct)
 	}
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
 	events, seenDone := 0, false
 	deadline := time.Now().Add(10 * time.Second)
 	for !seenDone && time.Now().Before(deadline) {
-		lines, eof := nextSSEEvent(t, br, 5*time.Second)
+		lines, eof := s.event(5 * time.Second)
 		for _, l := range lines {
 			if strings.HasPrefix(l, "data:") {
 				if strings.TrimSpace(strings.TrimPrefix(l, "data:")) == "[DONE]" {
@@ -692,7 +691,7 @@ func TestEgressPoolStreamingSkipsNonStreamingMember(t *testing.T) {
 			t.Fatal("stream ended before [DONE]")
 		}
 	}
-	_ = resp.Body.Close()
+	s.close()
 	if !seenDone {
 		t.Fatal("no [DONE] within the deadline")
 	}

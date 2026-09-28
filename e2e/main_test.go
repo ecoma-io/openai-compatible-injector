@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -487,6 +488,18 @@ func (u *fakeUpstream) last() (recordedRequest, bool) {
 
 // openJSON issues a request with a JSON content type and returns the raw
 // response without consuming the body (needed for streaming scenarios).
+//
+// The response body is ALWAYS closed, at the latest when the test ends: this
+// helper hands out a live body so streaming callers can read it, but a caller
+// that neither drains it to EOF nor closes it leaks the connection, its
+// transport read-loop goroutine and the file descriptor — the confirmed
+// defect in the streamed-response scenarios. Registering the close here makes
+// the release unconditional on every path, an early t.Fatalf included. It is
+// not a substitute for prompt ownership: a cleanup that runs only at test end
+// holds the connection for the whole test, so callers still close what they
+// own as soon as they are done (a deferred close right after the call, or
+// newSSEStream below). Body.Close is idempotent, so an explicit close beside
+// this one is safe.
 func openJSON(t *testing.T, addr, path string, body any, hdr map[string]string) *http.Response {
 	t.Helper()
 	var rdr io.Reader
@@ -515,6 +528,7 @@ func openJSON(t *testing.T, addr, path string, body any, hdr map[string]string) 
 	if err != nil {
 		t.Fatalf("POST %s: %v", path, err)
 	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
 	return resp
 }
 
@@ -551,33 +565,104 @@ func decodeMap(t *testing.T, b []byte) map[string]any {
 
 // ---- SSE helpers ----
 
-// readSSELine reads one line (including its newline) with a bounded timeout.
-func readSSELine(t *testing.T, br *bufio.Reader, timeout time.Duration) (string, error) {
+// sseT is the slice of *testing.T an sseStream uses: the failure sink, the
+// cleanup registrar and Helper for stack attribution. It is an interface
+// rather than a *testing.T field for one reason only: a timeout must fail the
+// test, and the regression that proves it needs to observe that failure
+// without failing itself. testing.TB is sealed by its unexported private
+// method, so a stand-in is possible only against a seam this package owns.
+type sseT interface {
+	Helper()
+	Cleanup(func())
+	Fatalf(format string, args ...any)
+}
+
+// errSSETimeout is what line returns on the timeout branch after it has
+// failed the test. A real *testing.T never sees it — Fatalf ends the test
+// goroutine first — but it exists so the branch says what happened instead of
+// returning the clean-looking io.EOF the old helper carried, which let a
+// caller read a timeout as an orderly end of stream.
+var errSSETimeout = errors.New("sse stream line read timed out")
+
+// sseStream owns one streamed response: the live body, the reader over it,
+// and the per-line timeout that bounds every read. It exists so the reader
+// and the body can never be separated — the old readSSELine took a bare
+// *bufio.Reader and, on timeout, left its reader goroutine blocked in
+// ReadString until something closed the connection, while the unreachable
+// `return "", io.EOF` after the fatal hid that the caller would have seen a
+// clean EOF rather than an error.
+type sseStream struct {
+	t    sseT
+	resp *http.Response
+	br   *bufio.Reader
+}
+
+// newSSEStream wraps a streamed response, registers the close that runs at
+// the latest when the test ends, and returns the owner of both halves. The
+// body is closed on every exit path — an early t.Fatalf return included —
+// because the cleanup, and not the caller's control flow, guarantees it.
+func newSSEStream(t sseT, resp *http.Response) *sseStream {
 	t.Helper()
+	s := &sseStream{t: t, resp: resp, br: bufio.NewReader(resp.Body)}
+	t.Cleanup(s.close)
+	return s
+}
+
+// close releases the connection. It is idempotent, so a site that closes
+// promptly (a mid-stream client disconnect, say) and the end-of-test cleanup
+// can both call it. Closing a response body that was not read to EOF aborts
+// its connection — net/http's early-close path closes the wire and does not
+// wait on the body's own read lock — so this is also what unparks a read
+// blocked on a silent upstream, and it cannot deadlock behind that read.
+func (s *sseStream) close() {
+	if s.resp != nil && s.resp.Body != nil {
+		_ = s.resp.Body.Close()
+	}
+}
+
+// line reads one line (including its newline) with a bounded timeout. On
+// timeout it CLOSES the source and then drains the reader: the close aborts
+// the connection, which unparks the goroutine sitting in ReadString, and
+// waiting on the channel proves that goroutine has finished before the test
+// fails. No reader outlives the failure, and the caller gets an error rather
+// than the clean-looking EOF the old helper returned. The fatal is raised
+// HERE, on the caller's own goroutine: FailNow from the reader goroutine
+// would end a goroutine that has no test to end.
+func (s *sseStream) line(timeout time.Duration) (string, error) {
+	s.t.Helper()
 	type res struct {
 		line string
 		err  error
 	}
 	ch := make(chan res, 1)
 	go func() {
-		l, e := br.ReadString('\n')
+		l, e := s.br.ReadString('\n')
 		ch <- res{l, e}
 	}()
 	select {
 	case r := <-ch:
 		return r.line, r.err
 	case <-time.After(timeout):
-		t.Fatalf("timed out after %v waiting for SSE line", timeout)
-		return "", io.EOF
+		s.close()
+		<-ch
+		s.t.Fatalf("timed out after %v waiting for SSE line", timeout)
+		return "", errSSETimeout
 	}
 }
 
-// nextSSEEvent reads one SSE event (lines until a blank line or EOF) and
-// returns the trimmed non-empty lines plus whether EOF was reached.
-func nextSSEEvent(t *testing.T, br *bufio.Reader, timeout time.Duration) (lines []string, eof bool) {
-	t.Helper()
+// readLine reads one line with no deadline. It exists for the
+// timing-sensitive perf helper, which must not pay the per-line goroutine and
+// timer that bounding a read costs — its numbers are compared against a
+// threshold — yet still must not hold the reader and the body apart.
+func (s *sseStream) readLine() (string, error) { return s.br.ReadString('\n') }
+
+// event reads one SSE event (lines until a blank line or EOF) and returns the
+// trimmed non-empty lines plus whether EOF was reached. It is the exact
+// behaviour of the helper it replaces; only the ownership moved.
+func (s *sseStream) event(timeout time.Duration) (lines []string, eof bool) {
+	s.t.Helper()
 	for {
-		line, err := readSSELine(t, br, timeout)
+		line, err := s.line(timeout)
 		if err == io.EOF {
 			if line != "" {
 				lines = append(lines, strings.TrimRight(line, "\r\n"))
@@ -585,13 +670,125 @@ func nextSSEEvent(t *testing.T, br *bufio.Reader, timeout time.Duration) (lines 
 			return lines, true
 		}
 		if err != nil {
-			t.Fatalf("read SSE line: %v", err)
+			s.t.Fatalf("read SSE line: %v", err)
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		if trimmed == "" {
 			return lines, false
 		}
 		lines = append(lines, trimmed)
+	}
+}
+
+// recordingT is the timeout regression's stand-in for *testing.T: it records
+// the fatal where the real one would end the test, so the regression can
+// assert that the timeout failed the test without failing itself. It is
+// reached through the sseT seam and satisfies every method that seam names.
+type recordingT struct {
+	mu     sync.Mutex
+	fatals int
+	text   string
+}
+
+func (r *recordingT) Helper()        {}
+func (r *recordingT) Cleanup(func()) {}
+func (r *recordingT) Fatalf(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fatals++
+	r.text = fmt.Sprintf(format, args...)
+}
+
+func (r *recordingT) failed() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.fatals
+}
+
+func (r *recordingT) message() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.text
+}
+
+// TestSSEStreamTimeoutUnblocksAndFails is the regression for the parked
+// reader: a stream that never produces a line must fail the test promptly,
+// must unblock the goroutine waiting on the connection, and must leave the
+// source closed so nothing is left reading it. The failure is observed
+// through the recording sink — asserting a real fatal would fail the very
+// test doing the asserting. Both cases are bounded by the same wall clock,
+// so a regression turns into a fast, named failure rather than a suite
+// timeout.
+func TestSSEStreamTimeoutUnblocksAndFails(t *testing.T) {
+	t.Run("pipe", func(t *testing.T) {
+		// An io.Pipe read blocks until the write end is closed, which is the
+		// "stream produced no line" shape the timeout exists for, with no
+		// network involved.
+		pr, pw := io.Pipe()
+		defer func() { _ = pw.Close() }()
+
+		sink := &recordingT{}
+		s := newSSEStream(sink, &http.Response{Body: pr})
+		waitForSSETimeout(t, sink, s)
+
+		// The source was closed, which is what unparks the reader: a closed
+		// pipe reports ErrClosedPipe on any further read.
+		if _, err := pr.Read(make([]byte, 1)); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("source not closed after timeout (read err = %v): the reader had nothing to unblock it", err)
+		}
+	})
+
+	t.Run("http response", func(t *testing.T) {
+		// The load-bearing case: a REAL net/http response whose read is
+		// parked on a silent upstream. Closing such a body is what aborts its
+		// connection — net/http's early-close path does not wait on the
+		// body's own read lock — and that is the property this helper's
+		// timeout depends on. If it did not hold, line would block here
+		// instead of failing, and the suite would hang until its -timeout.
+		stall := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-stall
+		}))
+		defer srv.Close()
+		defer close(stall) // unblock the handler before srv.Close waits on it
+
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		sink := &recordingT{}
+		s := newSSEStream(sink, resp)
+		// line returns only after the parked read goroutine has finished, so
+		// reaching this point proves the reader was unparked, not merely that
+		// the timer fired.
+		waitForSSETimeout(t, sink, s)
+	})
+}
+
+// waitForSSETimeout drives one timeout through s.line and asserts the three
+// things the timeout branch owes: it returns promptly (no parked reader), it
+// fails the test exactly once, and the failure names the timeout rather than
+// a clean EOF.
+func waitForSSETimeout(t *testing.T, sink *recordingT, s *sseStream) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = s.line(50 * time.Millisecond)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("line did not return after its own timeout: the reader is still parked")
+	}
+	if got := sink.failed(); got != 1 {
+		t.Fatalf("timeout raised %d failures, want exactly 1", got)
+	}
+	if msg := sink.message(); !strings.Contains(msg, "timed out") {
+		t.Fatalf("failure message = %q, want the timeout wording", msg)
 	}
 }
 
