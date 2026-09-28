@@ -168,11 +168,11 @@ func (h *injectorHandler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "chat", inject.Chat, inject.RewriteChatModel, inject.SynthesizeChatThinkingUsage, inject.StripChatFields, "/chat/completions")
+	h.serve(w, r, apiChat, inject.Chat, inject.RewriteChatModel, inject.SynthesizeChatThinkingUsage, inject.StripChatFields, "/chat/completions")
 }
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
-	h.serve(w, r, "responses", inject.Responses, inject.RewriteResponsesModel, inject.SynthesizeResponsesThinkingUsage, inject.StripResponsesFields, "/responses")
+	h.serve(w, r, apiResponses, inject.Responses, inject.RewriteResponsesModel, inject.SynthesizeResponsesThinkingUsage, inject.StripResponsesFields, "/responses")
 }
 
 // notFound is the catch-all for paths no route matched. The interpolated
