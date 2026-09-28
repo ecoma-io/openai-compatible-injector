@@ -211,23 +211,29 @@ func readToLineEnd(br *bufio.Reader) ([]byte, error) {
 			return chunk, rerr
 		}
 		// No LF buffered. A CR ends the line, as a CRLF whose LF is the next
-		// byte or as a lone CR. The bytes up to and including it are already
-		// in the peek, so they are copied out and discarded rather than
-		// re-read — UnreadByte cannot be used here, because bufio forbids it
-		// immediately after a Peek.
+		// byte or as a lone CR. The distinction must be made BEFORE the CR is
+		// emitted: writing CR now and swallowing a later LF would corrupt the
+		// wire; writing both as separate lines would invent a blank event.
+		//
+		// Discard the pre-CR prefix to make room, then peek CR plus one byte.
+		// That fills when CR was the final byte buffered, so CRLF split over two
+		// upstream reads remains one byte-identical line. EOF proves a trailing
+		// CR is lone. (UnreadByte is not an option: bufio forbids it after Peek.)
 		if i := bytes.IndexByte(b, '\r'); i >= 0 {
-			chunk := make([]byte, i+1)
-			copy(chunk, b[:i+1])
-			br.Discard(i + 1)
-			// Only a byte ALREADY buffered can turn this CR into a CRLF;
-			// Peek(1) would block on a peer that never sends the LF. A CR at
-			// the very end of a stream is a COMPLETE line — reporting nothing
-			// for a peer that is simply done is not this reader's failure.
-			if br.Buffered() > 0 {
-				if lf, _ := br.Peek(1); lf[0] == '\n' {
-					br.Discard(1)
-					return append(chunk, '\n'), nil
-				}
+			chunk := append([]byte(nil), b[:i]...)
+			br.Discard(i)
+			tail, _ := br.Peek(2)
+			if len(tail) == 0 {
+				// The CR was in b, so the reader cannot have forgotten it; this
+				// guards an impossible bufio state rather than indexing empty data.
+				return chunk, io.ErrUnexpectedEOF
+			}
+			crlf := len(tail) == 2 && tail[1] == '\n'
+			chunk = append(chunk, tail[0])
+			br.Discard(1)
+			if crlf {
+				br.Discard(1)
+				return append(chunk, '\n'), nil
 			}
 			return chunk, nil
 		}
