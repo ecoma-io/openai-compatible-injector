@@ -24,6 +24,11 @@
 #   2. wait for it to be healthy — `docker inspect -f '{{.State.Health.Status}}'`;
 #      this is readiness, so healthy means "ready to be sent traffic";
 #   3. point the proxy at the new instance (traefik label, DNS, upstream list);
+#      the 503 the OLD instance answers on /readyz only reaches a proxy that
+#      reads it, so a proxy routing unconditionally (a static upstream list, a
+#      label it was told to ignore) must be repointed here — either way, this
+#      is the step that must happen AFTER step 2 reports healthy and BEFORE
+#      the old instance is stopped;
 #   4. `docker compose -f compose.production.yaml -p injector-a stop`.
 #
 # Step 4 gives the old instance SIGTERM: it stops answering /readyz
