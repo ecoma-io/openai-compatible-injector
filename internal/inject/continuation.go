@@ -3,6 +3,8 @@ package inject
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 )
 
 // The closed set of reasons a continuation request could not be built. They
@@ -44,6 +46,52 @@ func (e *ContinuationRefusal) Error() string { return "continuation refused: " +
 func (e *ContinuationRefusal) Reason() string { return e.reason }
 
 func refuse(reason string) error { return &ContinuationRefusal{reason: reason} }
+
+var errDuplicateContinuationMember = errors.New("duplicate object member")
+
+// decodeContinuationObject decodes a body an object member that the builder is
+// about to use or re-emit. Unlike json.Unmarshal into a map, it refuses
+// duplicate object members: a continuation must never silently choose one of
+// two client values when that choice changes the conversation it authors.
+func decodeContinuationObject(raw []byte) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, errors.New("not an object")
+	}
+	obj := make(map[string]json.RawMessage)
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, errors.New("object key is not a string")
+		}
+		if _, exists := obj[key]; exists {
+			return nil, errDuplicateContinuationMember
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		obj[key] = value
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("trailing JSON value")
+		}
+		return nil, err
+	}
+	return obj, nil
+}
 
 // continuationInstruction is the one thing an interrupt tells the model. It
 // is fixed and not configurable: it carries no operator data, no injection
@@ -108,8 +156,11 @@ type continuationResponsesItem struct {
 // spliced client-visible output. Declining is the correct, expected outcome,
 // not an error.
 func BuildContinuationChat(orig []byte, prefix string) ([]byte, error) {
-	var req map[string]json.RawMessage
-	if err := json.Unmarshal(orig, &req); err != nil || req == nil {
+	req, err := decodeContinuationObject(orig)
+	if err != nil {
+		if errors.Is(err, errDuplicateContinuationMember) {
+			return nil, refuse(refusalUnsupportedShape)
+		}
 		return nil, refuse(refusalNotObject)
 	}
 	if prefix == "" {
@@ -133,8 +184,8 @@ func BuildContinuationChat(orig []byte, prefix string) ([]byte, error) {
 	}
 
 	last := len(msgs) - 1
-	var tail map[string]json.RawMessage
-	if err := json.Unmarshal(msgs[last], &tail); err != nil || tail == nil {
+	tail, err := decodeContinuationObject(msgs[last])
+	if err != nil {
 		return nil, refuse(refusalUnsupportedShape)
 	}
 	var role string
@@ -216,8 +267,11 @@ func BuildContinuationChat(orig []byte, prefix string) ([]byte, error) {
 // never completed, and unlike a full `input` there is nothing local to rebuild
 // the conversation from.
 func BuildContinuationResponses(orig []byte, prefix string) ([]byte, error) {
-	var req map[string]json.RawMessage
-	if err := json.Unmarshal(orig, &req); err != nil || req == nil {
+	req, err := decodeContinuationObject(orig)
+	if err != nil {
+		if errors.Is(err, errDuplicateContinuationMember) {
+			return nil, refuse(refusalUnsupportedShape)
+		}
 		return nil, refuse(refusalNotObject)
 	}
 	if prefix == "" {
@@ -271,6 +325,11 @@ func BuildContinuationResponses(orig []byte, prefix string) ([]byte, error) {
 	case firstByte(raw) == '[':
 		if err := json.Unmarshal(raw, &items); err != nil {
 			return nil, refuse(refusalUnsupportedShape)
+		}
+		for _, item := range items {
+			if _, err := decodeContinuationObject(item); err != nil {
+				return nil, refuse(refusalUnsupportedShape)
+			}
 		}
 	default:
 		// A number, object, boolean or null-ish input: not a conversation

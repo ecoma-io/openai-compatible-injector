@@ -206,6 +206,17 @@ func (p *partialText) Observe(payload []byte) {
 		p.observeChatChunk(obj)
 		return
 	}
+	if raw, ok := obj["response"]; ok && !jsonNull(raw) {
+		var response map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &response); err != nil || response == nil {
+			p.refuse(reasonUnknownShape)
+			return
+		}
+		if raw, ok := response["error"]; ok && !jsonNull(raw) {
+			p.refuse(reasonUpstreamTerminal)
+			return
+		}
+	}
 	p.observeResponsesEvent(obj)
 }
 
@@ -372,10 +383,13 @@ func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 		p.refuse(reasonToolCalls)
 	case "response.failed", "response.incomplete", "response.error":
 		p.refuse(reasonUpstreamTerminal)
+	case "response.output_text.done":
+		p.observeResponsesTextDone(obj)
+	case "response.refusal.done":
+		p.observeResponsesRefusalDone(obj)
 	case "response.created", "response.queued", "response.in_progress",
 		"response.output_item.done",
 		"response.content_part.added", "response.content_part.done",
-		"response.output_text.done", "response.refusal.done",
 		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
 		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
 		"response.reasoning_text.delta", "response.reasoning_text.done",
@@ -391,6 +405,67 @@ func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 		// carried text, or opened a tool call.
 		p.refuse(reasonUnknownShape)
 	}
+}
+
+// observeResponsesTextDone verifies the output-text stream's final payload.
+// A done event can carry text the client received but whose delta was cut off;
+// continuing from a shorter prefix would splice an answer around that loss.
+// The only safe cases are exact agreement with the accumulated text or a
+// text-only done event, whose text becomes the full prefix. Its own identity
+// must still agree with the one all accumulated deltas proved.
+func (p *partialText) observeResponsesTextDone(obj map[string]json.RawMessage) {
+	if !p.bindTextStream("response.output_text.delta", obj) {
+		return
+	}
+	raw, ok := obj["text"]
+	if !ok || jsonNull(raw) {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	if len(p.text) == 0 {
+		p.append(text)
+	} else if string(p.text) != text {
+		p.refuse(reasonUnknownShape)
+	}
+	if p.unsafe == "" {
+		// The text output is complete even when the response envelope's final
+		// event never makes it over the wire. Re-asking after this point is a
+		// duplicate continuation, not recovery from a cut generation.
+		p.finish()
+	}
+}
+
+// observeResponsesRefusalDone reads the terminal event of the refusal channel.
+// Its text member is `refusal` — the deltas carry `delta` — and a refusal can
+// arrive with no delta at all, so this event is the only place some declines
+// are ever stated.
+//
+// A non-empty refusal is the upstream's final word on the request: the client
+// watched the model decline, and nothing the proxy could ask afterwards is a
+// continuation of the assistant text the prefix holds. An absent, null or
+// empty member declines nothing — it is the structural terminator of a content
+// part this stream never carried — and is ignored, identity and all: binding
+// the text stream here would refuse a later delta on a stream that is still
+// perfectly continuable.
+func (p *partialText) observeResponsesRefusalDone(obj map[string]json.RawMessage) {
+	raw, ok := obj["refusal"]
+	if !ok || jsonNull(raw) {
+		return
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	if text == "" {
+		return
+	}
+	p.refuse(reasonUpstreamTerminal)
 }
 
 // observeResponseItem classifies a response.output_item.added event by the
