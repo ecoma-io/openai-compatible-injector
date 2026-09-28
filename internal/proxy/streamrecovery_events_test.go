@@ -90,10 +90,12 @@ import (
 //
 // The vocabulary below is enforced, not merely written down: the const block
 // in streamrecovery.go owns the reason tokens and the string literals in
-// streamrecovery.go/handler.go own the phases, and
+// streamrecovery.go/handler.go own the phases, so
 // TestRecoveryTokenSetsAreTheDocumentedMatrix fails when either grows a value
-// this file does not document. A token an operator can be sent without a
-// meaning on this page is a token they cannot act on.
+// this file does not document, and TestUnsafeReasonTokensAreTheDocumentedMatrix
+// does the same for `unsafe_reason` across the two packages that can produce
+// one. A token an operator can be sent without a meaning on this page is a
+// token they cannot act on.
 
 // recoveryReasonTokens is the closed set of `stream_recovery_exhausted.reason`
 // values: every bound the loop can stop at. A stream that ends on its own
@@ -125,12 +127,44 @@ var recoveryPhaseTokens = []string{
 
 // proxyOwnedPhases is the subset of phases this proxy produced rather than a
 // peer: nothing was dialed for them, so neither an error nor an
-// `upstream_status` may accompany them.
+// `upstream_status` may accompany them. `max_elapsed` also names no ENDPOINT,
+// because the window is checked before the hop builds its URL — so the
+// `upstream` field is absent on that record too, which is asserted where the
+// backstop is driven.
 var proxyOwnedPhases = map[string]bool{
 	"build":            true,
 	"budget":           true,
 	"credential":       true,
 	recoveryMaxElapsed: true,
+}
+
+// unsafeReasonTokens is the closed set of `unsafe_reason` values, and it is
+// the one closed set this service has that is produced by TWO packages: the
+// accumulator's shape refusals in continuation.go and the continuation
+// builders' body refusals in internal/inject. Both arrive on the same field,
+// because from an operator's side "the stream was not continued and here is
+// why" is one question — so the union is what has to stay documented, and the
+// two halves are the two ways it can grow.
+//
+// `not_object` is deliberately in both halves: a `data:` line the accumulator
+// cannot parse and a client body that is not a JSON object are the same
+// statement about readability arriving from opposite ends of the request, and
+// collapsing them into one token is intended rather than an oversight.
+var unsafeReasonTokens = []string{
+	// The accumulator, on the stream it is reading.
+	reasonToolCalls,
+	reasonRefusal,
+	reasonUpstreamTerminal,
+	reasonNotObject,
+	reasonUnknownShape,
+	reasonMultipleOutputs,
+	reasonOversize,
+	reasonNoPrefix,
+	// The builders, on the client's own body.
+	"no_messages",
+	"unsupported_shape",
+	"previous_response_id",
+	"no_op",
 }
 
 // TestRecoveryTokenSetsAreTheDocumentedMatrix reads the package's own source
@@ -148,6 +182,31 @@ func TestRecoveryTokenSetsAreTheDocumentedMatrix(t *testing.T) {
 	if got, want := sortedKeys(phases), sortedCopy(recoveryPhaseTokens); !equalStrings(got, want) {
 		t.Errorf("hop phases in the source = %v, want the documented %v\n"+
 			"a new phase needs a row in the matrix above, and an owner: does it carry an error, or is it this proxy's own?", got, want)
+	}
+}
+
+// TestUnsafeReasonTokensAreTheDocumentedMatrix does for `unsafe_reason` what
+// the test above does for the loop's own vocabulary, over the two const blocks
+// that can produce one. It is a separate scan because it reads a file outside
+// this package: the builders that refuse the client's body live in
+// internal/inject, and a refusal token that landed there without a row on the
+// page is exactly the drift this catches — the accumulator's own set is
+// pinned in the same test so the union cannot be half-checked.
+func TestUnsafeReasonTokensAreTheDocumentedMatrix(t *testing.T) {
+	got := map[string]bool{}
+	for _, f := range []struct{ file, prefix string }{
+		{"continuation.go", "reason"},            // the accumulator
+		{"../inject/continuation.go", "refusal"}, // the builders
+	} {
+		pat := regexp.MustCompile(f.prefix + `[A-Z]\w*\s*=\s*"([a-z_]+)"`)
+		for _, m := range pat.FindAllStringSubmatch(readPackageFile(t, f.file), -1) {
+			got[m[1]] = true
+		}
+	}
+	if g, want := sortedKeys(got), sortedCopy(unsafeReasonTokens); !equalStrings(g, want) {
+		t.Errorf("unsafe reasons in the source = %v, want the documented %v\n"+
+			"a new refusal token needs a row in the documented set (and, if it is a "+
+			"content shape, a test in TestRecoveryStopReasonOwnsItsEvents)", g, want)
 	}
 }
 
@@ -256,6 +315,81 @@ func scanRecoveryTokens(t *testing.T) (reasons, phases map[string]bool) {
 		phases[src[m[2]:m[3]]] = true
 	}
 	return reasons, phases
+}
+
+// noEchoPhases is the subset of phases whose errors may reach a record RAW.
+// The no-echo rule governs one class of error only — the ones that come off
+// the wire, where a truncated read surfaces the transport's own parse
+// failures and those interpolate the upstream's bytes. Every other phase
+// produced its error inside this process, from a typed value with static
+// text, so sanitizing it would be pure loss: `sanitizeUpstreamError`
+// replaces anything it does not recognize with "upstream transport error",
+// which on a `client_write` or `upstream_limit` record would blame a peer for
+// a stop the reader or this proxy caused, one field away from the phase token
+// that says otherwise. The committed pass already logs its equivalent
+// truncation raw for exactly this reason, and the two paths must not disagree.
+var noEchoPhases = map[string]bool{
+	"dial":            true,
+	"upstream_read":   true,
+	"upstream_status": true,
+}
+
+// TestHopFailureCauseIsOwnedByThePhase pins the same rule as a unit, over
+// every phase, so it does not need a stream to fail in each of them: an error
+// is attached, omitted, or passed through according to the phase alone.
+func TestHopFailureCauseIsOwnedByThePhase(t *testing.T) {
+	// A real wrapped shape, so the sanitizer has something to collapse: this
+	// is a value it does not recognize, and its text is not provably
+	// echo-free.
+	peerText := errors.New("malformed MIME header line from peer")
+	peer := &url.Error{Op: "Post", URL: "https://up.example/v1/chat/completions?k=v", Err: peerText}
+	upstream := &url.URL{Scheme: "https", Host: "up.example"}
+
+	// Local causes: typed errors whose text is this package's own and never
+	// carries a peer's bytes. A short write is the one a client-side relay
+	// produces with a nil error of its own, and the sanitizer does not
+	// recognize it.
+	local := &streamWriteError{err: io.ErrShortWrite}
+
+	cases := []struct {
+		phase   string
+		err     error
+		want    string // "" means no cause may be attached at all
+		present bool
+	}{
+		{"build", errors.New("continuation refused: no_messages"), "", false},
+		{"credential", errors.New("no usable credential"), "", false},
+		{"budget", errors.New("exchange envelope spent"), "", false},
+		{recoveryMaxElapsed, context.DeadlineExceeded, "", false},
+		{"upstream_limit", local, local.Error(), true},
+		{"client_write", local, local.Error(), true},
+		{"dial", peer, sanitizeUpstreamError(peer, upstream).Error(), true},
+		{"upstream_read", peer, sanitizeUpstreamError(peer, upstream).Error(), true},
+		{"upstream_status", peer, sanitizeUpstreamError(peer, upstream).Error(), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.phase, func(t *testing.T) {
+			got := hopFailureCause(tc.phase, tc.err, upstream)
+			if !tc.present {
+				if got != nil {
+					t.Errorf("hopFailureCause(%q) = %v, want no cause: nothing was dialed", tc.phase, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("hopFailureCause(%q) = nil, want a cause", tc.phase)
+			}
+			if !noEchoPhases[tc.phase] && got.Error() == "upstream transport error" {
+				t.Errorf("a local cause collapsed to the wire's static text: %v", got)
+			}
+			if got.Error() != tc.want {
+				t.Errorf("hopFailureCause(%q).Error() = %q, want %q", tc.phase, got.Error(), tc.want)
+			}
+			if strings.Contains(got.Error(), "up.example/v1/chat/completions?k=v") {
+				t.Errorf("a wire cause echoed the request URL: %q", got.Error())
+			}
+		})
+	}
 }
 
 func readPackageFile(t *testing.T, name string) string {
