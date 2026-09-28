@@ -52,9 +52,22 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s [version|healthcheck|keys create|keys list|keys revoke]\n", os.Args[0])
 }
 
-// healthcheck probes the running service's /healthz endpoint without reading
+// healthcheck probes the running service's READINESS endpoint without reading
 // any configuration: a bad reload must never turn a healthy process into a
 // failing probe.
+//
+// Readiness, not liveness. A process that is draining is alive and behaving
+// correctly, and the fact that matters is that it must not be sent more
+// traffic — which is exactly what /readyz answers 503 for. Probing /healthz
+// instead would keep reporting a draining instance as fine until its listener
+// finally closed, and an orchestrator restarting on that signal would be
+// restarting a process that was stopping properly.
+//
+// The endpoint, its body, and the state machine behind it are defined in
+// internal/server/lifecycle.go; the two literals here are the same
+// duplication GET /healthz's probe already carries, and for the same reason —
+// this subcommand must not read the runtime YAML, so it cannot be handed them
+// through the config plane.
 func healthcheck() int {
 	log := zerolog.New(os.Stderr).With().Timestamp().Logger()
 
@@ -71,12 +84,16 @@ func healthcheck() int {
 	if host == "" || host == "::" || host == "0.0.0.0" {
 		host = "127.0.0.1"
 	}
-	url := "http://" + net.JoinHostPort(host, port) + "/healthz"
+	url := "http://" + net.JoinHostPort(host, port) + "/readyz"
 
 	// An empty Transport ignores HTTP_PROXY and friends: the probe must
 	// reach this process directly, never detour through a proxy that may be
 	// configured in the environment.
-	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{}}
+	//
+	// The timeout sits below the container HEALTHCHECK's own (2s) so a probe
+	// against a wedged process reports its own classified failure rather than
+	// being killed mid-flight and counted as a failure with no diagnosis.
+	client := &http.Client{Timeout: 1500 * time.Millisecond, Transport: &http.Transport{}}
 	resp, err := client.Get(url)
 	if err != nil {
 		log.Error().Err(err).Msg("healthcheck_probe_failed")
@@ -92,6 +109,11 @@ func healthcheck() int {
 		return 1
 	}
 	if resp.StatusCode != http.StatusOK || string(body) != "ok\n" {
+		// The body is the readiness state token ("draining", "starting",
+		// "stopped") — a fixed vocabulary the service owns, never anything an
+		// upstream or a database said. Only its length is logged: a probe
+		// aimed at the wrong port can hit anything, and its answer is not
+		// ours to quote.
 		log.Error().Int("status", resp.StatusCode).Int("body_len", len(body)).Msg("healthcheck_unhealthy")
 		return 1
 	}
@@ -290,9 +312,23 @@ func run() int {
 		doers.Retain(next.Transports())
 		creds.Retain(next.Credentials())
 	}
-	go config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, onPublish).Run(ctx)
+	// pollerDone is the join for the last component sharing this lifecycle: a
+	// reload publishing a snapshot after the process has announced its exit
+	// would be a component still running behind a shutdown that claimed to be
+	// complete.
+	pollerDone := make(chan struct{})
+	go func() {
+		defer close(pollerDone)
+		config.NewPoller(store, b.ConfigFile, data, b.PollInterval, log, onPublish).Run(ctx)
+	}()
 
 	err = server.New(store, doers, creds, authProvider, meter, b.Listen, b.ShutdownGrace, log).Run(ctx)
+	// Stop the poller and wait for it before anything else. On the signal
+	// path ctx is already cancelled and this returns at once; on a server
+	// failure the cancel is what reaches the poller, which would otherwise
+	// outlive the listener it serves.
+	cancel()
+	<-pollerDone
 	// Ignore before announcing the drain done: from the instant Run returns
 	// the process is committed to its exit code, and a duplicate signal must
 	// fall on the ignored disposition, not the default handler's 143.
