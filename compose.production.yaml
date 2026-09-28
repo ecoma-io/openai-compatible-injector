@@ -1,0 +1,106 @@
+# Production / rollout deployment for openai-compatible-injector.
+#
+# This is a DIFFERENT MODE from compose.yaml, not an override of it. That file
+# is the single-host shape: `container_name: injector`, `8080:8080` published
+# on the host, a build from the local context. Both of those settings are
+# correct for a homelab box a human curls and impossible for a rollout, where
+# two instances must run side by side and the only way in is a reverse proxy.
+# Nothing here is inherited from compose.yaml (only compose.override.yaml is
+# merged automatically, and this file is not that), so what you read is what
+# runs.
+#
+# Start one instance:
+#
+#   VERSION=0.14.2 docker compose -f compose.production.yaml -p injector-a up -d
+#
+# The explicit project name (`-p`) is what makes a rollout possible: two
+# instances of the same service are two projects, not one replacing the other.
+# Without it, compose derives a name from the directory and the second `up`
+# would tear the first one down.
+#
+# Rolling restart, in the order the service is built for:
+#
+#   1. bring up the new instance as a second project (`-p injector-b`);
+#   2. wait for it to be healthy — `docker inspect -f '{{.State.Health.Status}}'`;
+#      this is readiness, so healthy means "ready to be sent traffic";
+#   3. point the proxy at the new instance (traefik label, DNS, upstream list);
+#   4. `docker compose -f compose.production.yaml -p injector-a stop`.
+#
+# Step 4 gives the old instance SIGTERM: it stops answering /readyz
+# immediately, keeps accepting and serving for its readiness head start
+# (min(5s, grace/2)) so a proxy view that is one poll interval old is never
+# answered by a closed port, then drains in-flight requests for the rest of
+# OAICR_SHUTDOWN_GRACE, then exits 0. Nothing in the rollout closes a connection
+# a client is reading.
+name: openai-compatible-injector
+
+services:
+  injector:
+    # Pinned, and deliberately not `latest`: a rollout you cannot name the
+    # version of is a rollout you cannot roll back.
+    image: ghcr.io/ecoma-io/openai-compatible-injector:${VERSION:?set VERSION to the released tag}
+    # NO container_name — two instances must coexist.
+    # NO published ports — the reverse proxy on the shared network is the only
+    # way in; a published port would also make two instances on one host
+    # impossible without hand-allocating ports.
+    restart: unless-stopped
+    environment:
+      OAICR_LISTEN: :8080
+      OAICR_CONFIG_FILE: /app/config.yaml
+      OAICR_CONFIG_POLL_INTERVAL: 1s
+      # The whole post-signal budget: readiness head start plus in-flight
+      # drain. 50s + the 10s usage flush window stays inside the 60s
+      # stop_grace_period below, so Docker's SIGKILL never cuts a drain short.
+      OAICR_SHUTDOWN_GRACE: 50s
+      # The database URLs are deployment secrets (they embed credentials).
+      # They are bootstrap-only environment — never in config.yaml, never in
+      # this file. Add them via an env_file or the orchestrator's secret
+      # mechanism:
+      #
+      #   env_file:
+      #     - injector.env      # OAICR_AUTH_DATABASE_URL / OAICR_USAGE_DATABASE_URL
+    # Docker waits this long after SIGTERM before SIGKILL.
+    stop_grace_period: 60s
+    # The image is one static binary on scratch. It reads its config, its CA
+    # bundle, and nothing else — so the root filesystem can be read-only, and
+    # every capability can be dropped (it binds 8080, above the privileged
+    # port range).
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # A ceiling the process's own admission limits must stay below. Half of
+    # this is the practical headroom for buffers, TLS state, and the response
+    # bytes of in-flight requests.
+    mem_limit: 1g
+    cpus: 2.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # Read-only, as in the homelab file, and with the same caveat: a host-side
+      # mv/safe-save splices in a new inode this mount never follows. Edit in
+      # place (hot reload picks it up) or restart after a replace.
+      - ./config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "/app/openai-compatible-injector", "healthcheck"]
+      interval: 2s
+      timeout: 2s
+      start_period: 90s
+      retries: 1
+      # This probe decides when the rollout may move traffic here, so it reads
+      # /readyz and never /healthz. See the Dockerfile.
+    networks:
+      - ingress
+
+networks:
+  # Shared with the reverse proxy, created once on the host:
+  #   docker network create injector-ingress
+  ingress:
+    external: true
+    name: injector-ingress
