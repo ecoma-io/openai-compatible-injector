@@ -126,7 +126,20 @@ The safety gate is the fail-closed half. `partialText`
 in hop order, through `CopySSE`'s `observe` seam — which sits BEFORE the
 client-facing rewrite gate, because the accumulator has to see the lines the
 gate would have skipped; the usage meter still reads inside the rewrite wrapper
-it has always used, since it wants only the lines the rewriter touched. One
+it has always used, since it wants only the lines the rewriter touched.
+
+That ordering has one consequence an operator can configure their way into, and
+it is the only interaction between the feature and `strip-fields` worth naming:
+the prefix is accumulated from what the upstream SENT, while the client is
+shown what survived the strip. A strip path that reaches into the text the
+client is reading — `choices[].delta.content`, `delta`, `response.output_text`
+and their like — therefore puts text in the continuation body the client never
+saw, and the seam the client notices is a divergence rather than a repetition.
+Nothing here is unsafe (the prefix is still exactly one answer's text, in
+order), and the strip list is an operator's deliberate choice about which
+provider-added members to drop, so the proxy does not refuse it; but a
+strip-fields entry aimed at streamed TEXT and a continuation sitting on the
+same model is a configuration to make on purpose. One
 accumulator spans the whole logical stream, so hop 2's deltas extend hop 1's
 prefix — and its latches span the logical stream too, so a refusal a hop
 latched is never released by the hop that follows it. What does NOT span the
@@ -134,22 +147,27 @@ logical stream is the Responses identity, which is scoped to one upstream
 response; see "the identity is per upstream response" below. It refuses,
 permanently, on:
 
-| token               | trigger                                                     |
-| ------------------- | ----------------------------------------------------------- |
-| `tool_calls`        | any `delta.tool_calls` / `delta.function_call` present      |
-| `upstream_terminal` | an upstream-declared end/failure event in the stream        |
-| `multiple_outputs`  | Responses text not provably one output's one content stream |
-| `not_object`        | a `data:` line that is neither `[DONE]` nor parseable JSON  |
-| `unknown_shape`     | a parseable line with an unrecognized `type`/shape          |
-| `oversize`          | accumulation reached `max-partial-bytes`                    |
-| `no_prefix`         | the stream ended with no text at all                        |
+| token               | trigger                                                            |
+| ------------------- | ------------------------------------------------------------------ |
+| `tool_calls`        | any `delta.tool_calls` / `delta.function_call` present             |
+| `upstream_terminal` | an upstream-declared end/failure event in the stream               |
+| `refusal`           | a `response.refusal.delta`, or a non-empty `response.refusal.done` |
+| `multiple_outputs`  | Responses text not provably one output's one content stream        |
+| `not_object`        | a `data:` line that is neither `[DONE]` nor parseable JSON         |
+| `unknown_shape`     | a parseable line with an unrecognized `type`/shape                 |
+| `oversize`          | accumulation reached `max-partial-bytes`                           |
+| `no_prefix`         | the stream ended with no text at all                               |
 
 `tool_calls` is the hard case the brief called out, and refusing is the whole
 answer to it: a continuation of a stream that emitted a tool call would
 re-enter the model mid-tool-call, and the duplicate-call risk is exactly what
 this feature must not create. `no_prefix` is the other one — a hop with no
 committed text is a blind replay wearing a continuation's shape, which is the
-behavior the brief forbade.
+behavior the brief forbade. `refusal` is the narrowest of the seven: the
+upstream used the refusal channel, which is not assistant text, so it is never
+accumulated and never continued — reported under its own token rather than
+folded into `upstream_terminal`, because "the model declined" and "the wire
+died" are different pages to receive.
 
 ### Terminal is not unsafe
 
@@ -499,14 +517,77 @@ was called with. That error is this proxy's own closed body — the lever the
 window's watchdog uses to unblock a parked relay — so attaching it would put a
 transport error on the phase that blames no endpoint and send an operator after
 a peer that behaved perfectly. Nothing about it is visible on the wire as an
-upstream failure, and no reading of "recovery failed" may conclude "upstream
-failed" from it.
+`upstream` either, for the same reason in the other direction: the window
+refusal is taken before the hop builds its URL, so there is no endpoint to name,
+and the record says so by omitting the field rather than by naming one.
+
+**Which errors are sanitized, and which are not.** The no-echo rule governs
+exactly one class: the errors that come off the wire, where a truncated read
+surfaces the transport's own parse failures and those interpolate the
+upstream's bytes. `dial`, `upstream_read` and `upstream_status` are the phases
+that go through the sanitizer. `client_write` and `upstream_limit` do not: both
+errors are this package's own typed values whose text is sizes and counts, and
+`client_write` also covers the reader's cancellation surfacing through the hop
+dial. Running them through the sanitizer would replace them with the static
+string "upstream transport error" — blaming a peer for a stop the reader or
+this proxy caused, one field away from the phase token that says otherwise. The
+committed pass's own truncation record already logs those errors raw, and the
+two paths must not disagree about whose fault a cut stream was.
+
+**A client that leaves DURING a hop.** The loop's caller gate runs once per
+iteration, so a hop is only ever dialed for a client that was there a moment
+ago; a reader that cancels while the hop's dial is in flight is the one
+interleaving the gate cannot see. A hop runs under a context derived from the
+request's, so a cancellation arriving through it is indistinguishable by shape
+from a canceled dial. The hop therefore reads the REQUEST's own context — never
+the error chain, whose cancellation this proxy itself raises to stop a stalled
+hop — and reports `client_write`; the loop's final record then names the same
+cause, so a request whose reader vanished is classified `client_disconnected`
+rather than a truncated stream the provider caused. The hop that failed is
+still recorded — one cause keeps one owner, it is just not the provider's.
+
+`max_elapsed` is the same rule seen from the other end: a stop this proxy
+caused must never read as an upstream failure, and no reading of "recovery
+failed" may conclude "upstream failed" from it.
 
 The hop's `stream_recovery_failed` is deliberately NOT the walk's
 `upstream_http_error`: that record carries fields (fingerprint, error shape,
 capture outcome) a hop's answer never had, and emitting a thin one under the
 same slug would read as a walk event that lost its fields. The hop's status
 rides `upstream_status` on its own event instead.
+
+## Two gaps this pass found in its own safety gate
+
+Neither is fixed here, and neither is a claim that a real upstream does the
+thing: both are readings of the code, filed so the next change to this area
+starts from them rather than from a comment that says the gate is sound.
+
+1. **The event class comes from the data payload, and the SSE `event:` line is
+   never compared with it** (issue #100). `observe` is handed the payload; the
+   event name is not in scope, and `observeResponsesEvent` dispatches on the
+   payload's `type`. A frame whose two halves disagree therefore has no proven
+   content shape, and the gate reads only the half that says it does. The
+   relay's terminal predicate makes the opposite choice on purpose — trusting
+   the `event:` line and refusing a data payload naming `response.completed` —
+   so the two surfaces of one frame are already treated as evidence in one
+   place and as irrelevant in the other. Whether to refuse on a disagreement is
+   a behavior change, which is why it is the issue's decision and not this
+   note's.
+2. **`response.content_part.done` never reads its own `text`** (issue #101).
+   `content_part.added` and `.done` share one handler, and the part's `text`
+   member is not read for either, so a done event carrying text that disagrees
+   with the accumulated prefix is ignored rather than refused. The ignore is
+   sound for `.added` — a part being opened has no content yet — and is not
+   established for `.done`, which is why one function enforcing the weaker
+   invariant covers both. `response.output_text.done` is the event that states
+   the output text in full, and it IS read; the gap is specific to the
+   part-level event.
+
+The class comment in `continuation.go` said of the two events that "the
+identity proves they cannot have introduced text", which is not what the
+identity proves. It has been corrected to say what is actually relied on, with
+both issue numbers, so the next reader does not inherit a stronger claim than
+the code makes.
 
 ## Deviations from the plan this was written from
 
@@ -663,9 +744,17 @@ where the shipped code was reasonable-looking and wrong.
   an oversize prefix, a truncated line, a hop failure, a stream that already
   terminated, the window cutting a blocked read, the window covering a hop, a
   client cancel beating the window, a simultaneous window/disconnect, a client
-  write failure, and the finish-reason rows — plus the no-window-when-disabled
-  regression, whose fixture is a reader that HONORS its Close, because a reader
-  that ignored it would pass even against the bug it exists to catch.
+  write failure, a client that leaves DURING a hop's dial, the window's own
+  `dialable` backstop reached in the gap between the loop's gate and the hop, and
+  the finish-reason rows — plus the no-window-when-disabled regression, whose
+  fixture is a reader that HONORS its Close, because a reader that ignored it
+  would pass even against the bug it exists to catch.
+- `internal/proxy/streamrecovery_events_test.go` — the telemetry contract: one
+  row per stop reason and the whole event set each produces, the closed sets of
+  `reason`/`phase`/`unsafe_reason` scanned out of the source (the last across
+  both packages that can produce one), the rule that a proxy-owned phase names
+  no error and no status, and `hopFailureCause` per phase — which errors are
+  sanitized and which are this process's own.
 - `e2e/recovery_test.go` — the real binary: one connection, two hops, one
   marker, the log evidence, the refusal matrix, the stalled-upstream window,
   the enabled window bounding a healthy generation, a departed client, the

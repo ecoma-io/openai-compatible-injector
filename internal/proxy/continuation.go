@@ -504,12 +504,16 @@ func (p *partialText) bindChoiceIndex(choice map[string]json.RawMessage) bool {
 //	D. FAILURE — response.failed / .incomplete / .error: the upstream
 //	   declared the generation over without finishing it.
 //	E. BOUND — events that name the text content part the prefix was read
-//	   from but carry no assistant text of their own:
-//	   response.content_part.added / .done and
+//	   from: response.content_part.added / .done and
 //	   response.output_text.annotation.added. They are held to the delta
-//	   identity contract and then ignored, which is what makes them safe to
-//	   ignore: the identity proves they cannot have introduced text, and a
-//	   refusal part is detected rather than ignored.
+//	   identity contract and then ignored, and a refusal part is detected
+//	   rather than ignored. What makes the IGNORE sound is the shape of the
+//	   part, not the identity: the part's `type` is the same claim the deltas
+//	   make, and for an `output_text` part a payload whose `text` disagrees
+//	   with what this pass accumulated is a shape this build does not read —
+//	   see observeContentPart and issue #101. (response.output_text.done, by
+//	   contrast, is class A: its text IS read, because that event does state
+//	   the output text in full.)
 //	F. METADATA — response.created / .queued / .in_progress / .completed and
 //	   the reasoning channel (reasoning_text.*, reasoning_summary_*). The
 //	   reasoning channel is a SEPARATE output the client renders beside the
@@ -521,6 +525,17 @@ func (p *partialText) bindChoiceIndex(choice map[string]json.RawMessage) bool {
 // recognize" pass-through, because the events it would ignore are exactly the
 // ones a future upstream could use to stream text this proxy would then omit
 // from a continuation body.
+//
+// The event class comes from the DATA PAYLOAD alone, and that is the whole of
+// the evidence: the SSE `event:` line that precedes it is not passed to
+// `observe` at all, so the class is read from the payload's own `type` member
+// and the two are never compared. The relay's terminal predicate makes the
+// opposite choice deliberately — it trusts `event: response.completed` and
+// explicitly refuses a data payload naming it — because for a terminal marker
+// the safe error is to send one more event, while for the safety gate it is
+// not. That asymmetry is tracked as issue #100 rather than resolved here:
+// refusing on a mismatch is a behaviour change, not a fix, and it belongs to
+// the issue.
 func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 	raw, ok := obj["type"]
 	if !ok {
@@ -799,8 +814,7 @@ func responsesItem(obj map[string]json.RawMessage) (map[string]json.RawMessage, 
 
 // observeContentPart reads a content-part lifecycle event —
 // response.content_part.added or .done. The event announces or closes one
-// content part of one output item; the part's text arrives on the deltas, so
-// the event carries no assistant text of its own.
+// content part of one output item; the part's text arrives on the deltas.
 //
 // It is not ignored as a lifecycle detail, because it names the exact content
 // part a delta names and it names the part's CHANNEL: an event whose identity
@@ -810,6 +824,15 @@ func responsesItem(obj map[string]json.RawMessage) (map[string]json.RawMessage, 
 // event states one — is read: refusal latches reasonRefusal, an output_text
 // part is the channel the prefix is made of, and any other part type is a
 // shape this accumulator does not know how to continue from.
+//
+// KNOWN GAP (issue #101): the part's own `text` member is not read for either
+// event name, so a `content_part.done` carrying a text that disagrees with what
+// this pass accumulated is ignored rather than refused. The ignore is sound for
+// `.added` — a part being opened has no content yet — and not established for
+// `.done`, which is why the two share one function and the stronger invariant
+// is left unenforced. `response.output_text.done` is the event that states the
+// output text in full, and it IS read (observeResponsesTextDone); the gap is
+// specific to this part-level event and is tracked rather than guessed at.
 //
 // A part object that is absent is not refused. The provider then states the
 // identity without stating the channel, and the identity is what the contract
