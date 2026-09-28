@@ -160,6 +160,25 @@ type partialText struct {
 	streamBound  bool
 	contentIndex int
 	streamKind   string
+	// passStart is where the CURRENT upstream response's own accumulation
+	// begins in text. Everything before it was relayed from an earlier
+	// response of the same logical stream, and the identity above describes
+	// only the region from passStart on.
+	//
+	// The two scopes are deliberately different, and that is the whole point
+	// of the field. A continuation hop is a new upstream response: it
+	// announces its own output item, emits its own deltas and its own
+	// response.output_text.done, so its honest identity disagrees with the
+	// committed reply's by construction. Judging it against the earlier
+	// response's identity refuses every real second hop as multiple_outputs —
+	// after that hop has already been dialed and paid for.
+	//
+	// The prefix and the latches (unsafe, terminal) stay logical-stream-scoped:
+	// a later response must never release a refusal an earlier one latched, and
+	// the continuation body is built from the whole prefix. Only the identity,
+	// and the region a .done event is compared against, are per response.
+	// beginUpstreamStream is the only writer.
+	passStart int
 }
 
 // newPartialText builds the accumulator for one streamed response. limit is
@@ -168,6 +187,39 @@ type partialText struct {
 func newPartialText(api string, limit int) *partialText {
 	return &partialText{api: api, limit: limit}
 }
+
+// beginUpstreamStream marks the start of a new upstream response being relayed
+// into this logical stream: the committed pass, and then every continuation
+// hop. The caller invokes it exactly once per upstream body, before that body's
+// first line is observed — one relay invocation is one upstream HTTP response.
+//
+// It resets the Responses identity and only the identity. The identity is a
+// property of ONE response: the item a response announces is its own, and every
+// real upstream emits a fresh item id for a fresh response, so carrying the
+// earlier response's item across the boundary would refuse an honest
+// continuation as multiple_outputs. What must NOT be scoped to the response is
+// everything the client already has: the accumulated prefix, a latched refusal
+// and a latched terminal all live for the logical stream, because a later
+// response cannot un-say text the client already read or un-refuse a stream
+// that stopped being plain text.
+//
+// The first pass of an uncontinued stream calls this with an empty text and no
+// identity bound, which leaves the accumulator exactly as newPartialText built
+// it — the feature-off and single-pass paths are unaffected.
+func (p *partialText) beginUpstreamStream() {
+	p.passStart = len(p.text)
+	p.itemSeen, p.itemBound, p.itemID, p.outputIndex = false, false, "", 0
+	p.streamBound, p.contentIndex, p.streamKind = false, 0, ""
+}
+
+// passText returns the region of text this upstream response contributed. It is
+// what a per-response check — a .done event's own text — must be compared
+// against; the full text belongs to the continuation body, which is a
+// logical-stream artifact.
+//
+// The slice is a window on p.text, not a copy: every caller reads it before the
+// next Observe, and Observe is what can grow or release the backing array.
+func (p *partialText) passText() []byte { return p.text[p.passStart:] }
 
 // Observe records one committed data-line payload. It is called once per
 // admitted data line — every `data:` line the relay forwarded, before the
@@ -251,6 +303,11 @@ func (p *partialText) refuse(reason string) {
 		p.unsafe = reason
 	}
 	p.text = nil
+	// text is the only thing passStart indexes, and releasing it is the only
+	// way the offset could ever point past the end. Reset it here so the
+	// invariant holds by construction rather than by the argument that the
+	// latched verdict stops Observe before any reader runs.
+	p.passStart = 0
 }
 
 // finish latches the logical terminal and releases the accumulated text for
@@ -258,6 +315,7 @@ func (p *partialText) refuse(reason string) {
 func (p *partialText) finish() {
 	p.terminal = true
 	p.text = nil
+	p.passStart = 0
 }
 
 // append extends the committed prefix and applies the size bound.
@@ -413,6 +471,12 @@ func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 // The only safe cases are exact agreement with the accumulated text or a
 // text-only done event, whose text becomes the full prefix. Its own identity
 // must still agree with the one all accumulated deltas proved.
+//
+// Both the identity check and the text comparison are scoped to THIS upstream
+// response — the region from passStart on. A .done states the text of the
+// response that emitted it, so comparing it with the whole cross-hop prefix
+// would refuse a hop that is being exactly correct; the deltas it must agree
+// with are the hop's own.
 func (p *partialText) observeResponsesTextDone(obj map[string]json.RawMessage) {
 	if !p.bindTextStream("response.output_text.delta", obj) {
 		return
@@ -427,9 +491,14 @@ func (p *partialText) observeResponsesTextDone(obj map[string]json.RawMessage) {
 		p.refuse(reasonUnknownShape)
 		return
 	}
-	if len(p.text) == 0 {
+	// Read the PASS region, not the cross-hop prefix, in both branches. The
+	// empty case is load-bearing: a hop that emits only a .done and no deltas
+	// has a non-empty cross-hop prefix, so testing p.text here would send a
+	// correct event into the compare branch and refuse it for being right.
+	pass := p.passText()
+	if len(pass) == 0 {
 		p.append(text)
-	} else if string(p.text) != text {
+	} else if string(pass) != text {
 		p.refuse(reasonUnknownShape)
 	}
 	if p.unsafe == "" {
