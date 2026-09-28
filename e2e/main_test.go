@@ -295,12 +295,73 @@ func portOf(listen string) string {
 	return port
 }
 
-// rewriteConfig overwrites the runtime config file in place (same path); the
+// rewriteConfig replaces the runtime config file ATOMICALLY (same path); the
 // running poller picks up the new content by hash.
+//
+// It writes a sibling temp file in the same directory, fsyncs it, then
+// renames it over the target, so a reader never observes a partial document.
+// The old os.WriteFile call truncated first, which exposed an empty or
+// half-written file to the poller for the duration of the write: with a 50ms
+// poll interval the proxy would legitimately reject the transient state and
+// log `config_reload_rejected` for a document no operator ever wrote. That
+// was a harness defect, not a proxy defect — the poller's rejection was
+// correct. Tests that mean "this file is invalid" must write invalid
+// content, not depend on catching a rewrite in flight; see
+// writeConfigPartial for the deliberate partial-write scenario.
 func rewriteConfig(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	dir, base := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, "."+base+".e2e-*")
+	if err != nil {
 		t.Fatalf("rewrite config %s: %v", path, err)
+	}
+	tmpName := tmp.Name()
+	// Any failure past this point must not leave the temp file behind, and
+	// must not have touched the live config.
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.WriteString(content); err != nil {
+		t.Fatalf("rewrite config %s: %v", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		t.Fatalf("rewrite config %s: sync: %v", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("rewrite config %s: close: %v", path, err)
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		t.Fatalf("rewrite config %s: chmod: %v", path, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		t.Fatalf("rewrite config %s: rename: %v", path, err)
+	}
+	committed = true
+}
+
+// writeConfigTruncated is the NON-atomic write the harness used to perform
+// everywhere. It is retained deliberately as `writeConfigPartial`'s
+// primitive, and as the ability to reproduce the truncate/write window that
+// made a valid reload look like a rejection.
+func writeConfigPartial(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("write config %s: %v", path, err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		t.Fatalf("write config %s: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("write config %s: %v", path, err)
 	}
 }
 

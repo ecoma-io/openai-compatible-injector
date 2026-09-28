@@ -2338,7 +2338,11 @@ walk:
 			bytesOut += hopStats.Bytes
 			eventsOut += hopStats.Events
 			stats, err = hopStats, hopErr
-			if hopStats.Terminal {
+			// Read the window's own flag BEFORE the terminal check: a hop cut
+			// short by the watchdog is a bound, never a success, however its
+			// partial bytes happen to land.
+			cutByWindow := windowClosed.Load()
+			if hopStats.Terminal && !cutByWindow {
 				log.Info().Str("public_model", model).
 					Str("provider", answer.cand.Label()).
 					Int("recovery_index", index).
@@ -2356,12 +2360,36 @@ walk:
 			// relay died on the client write is not reported as an upstream
 			// fault — the phase carries the same distinction the relay's own
 			// log makes.
+			//
+			// Exactly one owner per stop. A read error is this proxy's OWN
+			// closed body whenever the watchdog fired, because Body.Close is
+			// the lever the window uses to unblock a parked relay; reporting
+			// that as `upstream_read` would send an operator after a peer that
+			// behaved perfectly, and it would double-report one cause as both a
+			// hop failure and a bound below. So the window is checked first and
+			// wins: the loop's next iteration, which never runs, is the only
+			// other place `max_elapsed` could be recorded.
 			hopPhase := "upstream_read"
 			var swe *streamWriteError
-			if errors.As(hopErr, &swe) || clientSide(hopErr) {
+			switch {
+			case cutByWindow:
+				hopPhase = recoveryMaxElapsed
+			case errors.As(hopErr, &swe), clientSide(hopErr):
 				hopPhase = "client_write"
+			case errors.Is(hopErr, ErrSSELineTooLong), errors.Is(hopErr, ErrSSEEventTooLarge):
+				// A bounded-relay cap stopped this pass at the wall. That is
+				// this proxy's own limit, not a peer that misbehaved past it.
+				hopPhase = "upstream_limit"
 			}
 			recoveryFailed(hopPhase, hopErr, 0)
+			if cutByWindow {
+				// Close the loop here rather than letting the gates above
+				// re-derive the same reason: the window is shut for the rest of
+				// the request, and `err` is this proxy's closed body, so the
+				// window is the only thing that ended the stream.
+				windowShut, stopReason = true, recoveryMaxElapsed
+				break
+			}
 		}
 		if windowShut {
 			// The pass that ended this loop was ended by the window's own

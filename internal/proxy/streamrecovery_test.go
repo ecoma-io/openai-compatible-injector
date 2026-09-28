@@ -1550,3 +1550,70 @@ func TestStreamRecoveryHopFailureCarriesNoBoundReason(t *testing.T) {
 		t.Errorf("stream_recoveries = %v, want the failed hop counted as a request", trunc[0]["stream_recoveries"])
 	}
 }
+
+// TestStreamRecoveryWindowOwnsAHopCutByIt is the misattribution regression.
+// A continuation hop that the window's own watchdog cuts produces a read
+// error — this proxy's closed body — and the naive classification calls that
+// `upstream_read`, then reports the SAME cause a second time as
+// `stream_recovery_exhausted reason=max_elapsed` when the loop re-checks its
+// gates. Two records, one cause, and the one an operator reads first blames a
+// peer that behaved perfectly.
+//
+// The invariant: exactly one owner. A read that the watchdog ended is owned by
+// `max_elapsed` and nothing else, and the bound is reported once.
+func TestStreamRecoveryWindowOwnsAHopCutByIt(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 250ms\n    max-recoveries: 2\n"))
+	// The committed stream relays one event and ends cleanly under the bound;
+	// the HOP parks, so the window that fires is cutting a hop's read, not the
+	// first relay's.
+	body, dial := sseParked(context.Background(), sseChat(", world"))
+	pa.script = []dialFunc{sseStream(sseChat("Hello")), dial}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !body.released.Load() {
+		t.Fatal("the hop's parked read never returned: the window did not cover the hop")
+	}
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the one hop", pa.dials())
+	}
+
+	// The hop DID happen and DID fail — it is a real request that produced no
+	// terminal marker, so it must still be recorded as a hop failure.
+	failed := logBuf.events(t, "stream_recovery_failed")
+	if len(failed) != 1 {
+		t.Fatalf("stream_recovery_failed = %v, want one for the cut hop", failed)
+	}
+	// ... and its owner is the bound, NOT the peer.
+	if failed[0]["phase"] != "max_elapsed" {
+		t.Errorf("hop failure phase = %v, want max_elapsed (a read the watchdog ended is this proxy's, not the upstream's)", failed[0]["phase"])
+	}
+	// The bound is reported exactly once, by the loop, and not duplicated by a
+	// second event claiming to be an upstream fault.
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want exactly one max_elapsed", exh)
+	}
+	// The cut is not a success, however its partial bytes landed.
+	if ev := logBuf.events(t, "stream_recovery_succeeded"); len(ev) != 0 {
+		t.Errorf("a hop the window cut was reported as a success: %v", ev)
+	}
+	// The truncation carries the bound, and no invented upstream error: the
+	// read failed because this proxy closed the body.
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Errorf("truncation reason = %v, want max_elapsed", trunc[0]["recovery_reason"])
+	}
+	if _, hasErr := trunc[0]["error"]; hasErr {
+		t.Errorf("the bound reported an upstream error it invented: %v", trunc[0])
+	}
+	if trunc[0]["stream_recoveries"] != float64(1) {
+		t.Errorf("stream_recoveries = %v, want the cut hop counted as a request", trunc[0]["stream_recoveries"])
+	}
+}
