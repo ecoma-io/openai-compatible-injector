@@ -2,7 +2,24 @@
 
 What this branch added, why it is a second orchestrator rather than a branch of
 the walk, what it refuses to do, and where the code deliberately disagrees with
-the plan it was written from.
+the plan it was written from. The final section records the hardening pass that
+followed the merge review and the defects it fixed; the behavior described
+above it is the behavior after that pass.
+
+## Scope, stated exactly
+
+**This is semantic continuation, not model-state resume.** No OpenAI-compatible
+provider exposes a resume token over the Chat Completions or Responses surface,
+so there is no way to hand the upstream the generation it was running. The hop
+instead hands the model the text the client already has as an assistant turn
+and asks it to keep writing. The two are not the same thing: the seam is a new
+generation, and it may rephrase slightly there. Everything below follows from
+that limit, including the fact that the feature is off by default.
+
+**The MVP only recovers plain text streams with provably safe structure. Tool
+calls and ambiguous Responses output topology are fail-closed.** A stream this
+proxy cannot describe as "one plain text answer" is truncated exactly as it is
+with the block absent; it is never continued on a guess.
 
 ## The problem it solves
 
@@ -92,11 +109,17 @@ permit.
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
 | `continuationEligible` | a terminal marker was forwarded; the client write failed; the client is gone; a bounded-relay cap stopped the pass | none (not a recovery failure — the stream ended on its own terms) |
 | reach                  | `recoveries >= max-recoveries`                                                                                     | `max_recoveries`                                                  |
+| window (watchdog)      | the relay was cut by the window's own body close (armed only while the block is enabled)                           | `max_elapsed`                                                     |
 | caller                 | `r.Context().Err() != nil`                                                                                         | none (the client is gone; `client_disconnected` reports it)       |
-| safety                 | `partial.Safe()` returns a reason                                                                                  | `unsafe_content` + `unsafe_reason`                                |
-| window                 | `now − streamStart > max-elapsed`                                                                                  | `max_elapsed`                                                     |
+| logical terminal       | `verdict.Kind == verdictTerminal` — the upstream declared the answer finished, without forwarding the marker       | `logical_terminal`                                                |
+| safety                 | `verdict.Kind == verdictUnsafe`                                                                                    | `unsafe_content` + `unsafe_reason`                                |
+| window (clock)         | `now − streamStart > max-elapsed`                                                                                  | `max_elapsed`                                                     |
 | envelope               | `budget.Exhausted() != ExhaustionNone`                                                                             | `budget_spent`                                                    |
 | body                   | the builder refuses                                                                                                | `unsafe_content` + the refusal token                              |
+
+The watchdog gate comes before the caller gate deliberately: it is the more
+specific fact — the operator's window ended the pass — and a reader that also
+happened to leave is a second event this loop is not the recorder of.
 
 The safety gate is the fail-closed half. `partialText`
 (`internal/proxy/continuation.go`) is fed every `data:` line the relay admits,
@@ -107,15 +130,15 @@ it has always used, since it wants only the lines the rewriter touched. One
 accumulator spans the whole logical stream, so hop 2's deltas extend hop 1's
 prefix. It refuses, permanently, on:
 
-| token               | trigger                                                    |
-| ------------------- | ---------------------------------------------------------- |
-| `tool_calls`        | any `delta.tool_calls` / `delta.function_call` present     |
-| `finish_reason`     | any non-null `finish_reason` on a primary choice           |
-| `upstream_terminal` | an upstream-declared end/failure event in the stream       |
-| `not_object`        | a `data:` line that is neither `[DONE]` nor parseable JSON |
-| `unknown_shape`     | a parseable line with an unrecognized `type`/shape         |
-| `oversize`          | accumulation reached `max-partial-bytes`                   |
-| `no_prefix`         | the stream ended with no text at all                       |
+| token               | trigger                                                     |
+| ------------------- | ----------------------------------------------------------- |
+| `tool_calls`        | any `delta.tool_calls` / `delta.function_call` present      |
+| `upstream_terminal` | an upstream-declared end/failure event in the stream        |
+| `multiple_outputs`  | Responses text not provably one output's one content stream |
+| `not_object`        | a `data:` line that is neither `[DONE]` nor parseable JSON  |
+| `unknown_shape`     | a parseable line with an unrecognized `type`/shape          |
+| `oversize`          | accumulation reached `max-partial-bytes`                    |
+| `no_prefix`         | the stream ended with no text at all                        |
 
 `tool_calls` is the hard case the brief called out, and refusing is the whole
 answer to it: a continuation of a stream that emitted a tool call would
@@ -123,6 +146,188 @@ re-enter the model mid-tool-call, and the duplicate-call risk is exactly what
 this feature must not create. `no_prefix` is the other one — a hop with no
 committed text is a blind replay wearing a continuation's shape, which is the
 behavior the brief forbade.
+
+### Terminal is not unsafe
+
+A non-null Chat `finish_reason` means the generation ENDED. The stream is not
+recoverable — there is nothing left to continue — but it is not unsafe, and
+the two must not be conflated:
+
+- a `finish_reason` latches `verdictTerminal`, never a refusal;
+- the loop stops with `logical_terminal`, and emits no `unsafe_reason` at all,
+  because no gate refused the content;
+- the client's stream is left exactly as it is — no `[DONE]` is synthesized to
+  paper over the missing marker, and no `upstream_terminal`/`unsafe_content`
+  token appears in the record.
+
+`upstream_terminal` remains its own refusal for a DIFFERENT fact: an upstream
+that declared the stream FAILED (a chat `error` event, a Responses
+`response.failed`/`response.incomplete`/`response.error`). That one is unsafe in
+the sense that matters here — its remaining text is not the answer the client
+asked for. `finish_reason` is a plain end; a failure event is not, and an
+operator reading `unsafe_content` should never have to guess which one they got.
+
+The distinction is pinned on both the unit and the wire:
+`TestPartialTextFinishReasonIsTerminal` and
+`TestStreamRecoveryFinishReasonIsNotUnsafeContent` (which also asserts the
+client's body carries no `[DONE]`), plus the `logical_terminal` row of
+`TestE2EStreamRecoveryRefusalMatrix`.
+
+### Responses identity is one stream or nothing
+
+Chat's text path needs no identity: a delta carries `content` and that is the
+whole story. Responses does, because the wire states identity in two places that
+must agree, and the MVP supports continuing exactly one of them:
+
+- `response.output_item.added` announces a message output with its own `id` and
+  the event's `output_index`;
+- every `response.output_text.delta` / `response.refusal.delta` carries
+  `item_id`, `output_index` and `content_index`.
+
+The accumulator binds an item identity the first time it sees one — from either
+place — and refuses `multiple_outputs` when:
+
+- a message announcement arrives while an item identity is already bound
+  (a second message item), or its `id`/`output_index` disagrees with the bound
+  one;
+- a delta's `item_id`, `output_index` or `content_index` disagrees with the
+  bound values;
+- a second content stream or channel switch appears at the same indices;
+- the item is not a message at all (a tool-call or unknown item type).
+
+Two things are worth being precise about. First, a message announcement WITHOUT
+an `id`, or without a numeric `output_index`, is `unknown_shape` rather than
+silently accepted: a stream whose identity cannot be read is a stream whose
+text cannot be attributed. Second, the announcement is cross-checked against
+the deltas — an announcement that disagrees with the identity the text was
+already accumulated under refuses the stream, rather than being treated as a
+harmless header. The alternative is splicing two answers into one assistant
+turn, which hands the model a conversation that never happened and is strictly
+worse than the truncation it replaces.
+
+## The two bounds, stated exactly
+
+### `max-elapsed` is a hard runtime bound
+
+`max-elapsed` is not a check the loop makes between reads — it is a bound on
+the request's wall clock that a stalled peer cannot outlive. One instant is
+computed when the committed stream begins relaying (`windowEnd`), and every
+pass — the committed relay and each hop's relay — is armed against that SAME
+instant through `armRecoveryWindow`. Two mechanisms read it:
+
+- a `time.AfterFunc` watchdog closes the upstream response body at the
+  deadline. `Body.Read` takes no context, so a peer that sends a partial event
+  and then holds the TCP connection open parks the relay inside a read; closing
+  the body is the only lever that unblocks it. When the watchdog fires it sets
+  `windowClosed`, and the loop refuses every later gate with
+  `max_elapsed` — no hop is dialed, and the pass's own error is suppressed,
+  because that error is this proxy's own close and not something the upstream
+  committed.
+- the frozen clock (`now − streamStart > max-elapsed`) is checked between
+  passes, so an effort that ends cleanly just past the deadline stops too, and
+  `windowClosed` stays false there: the pass ended by itself, so its error — if
+  any — is the upstream's and is reported as such.
+
+Four properties make the watchdog safe, and each is deliberate:
+
+1. It is a plain timer, NOT a `context.AfterFunc` on the request context. A
+   client disconnect must stay distinguishable from the operator's window, and
+   a watchdog hung off the context could not tell them apart — the outcome
+   would be `max_elapsed` for a reader that simply left.
+2. It creates no goroutine: `time.AfterFunc` runs on the runtime's timer
+   goroutine, and the relay's deferred `stop()` releases the timer on every
+   path, including the one where the pass ended long before the deadline.
+3. It closes the UPSTREAM body, never the client's connection. The client's
+   connection belongs to the request lifecycle and is closed by the server, not
+   by a recovery bound.
+4. The window is one window, not a per-hop budget: the reach cannot extend the
+   wall-clock bound by taking another hop.
+
+The distinction the record has to keep is the whole reason for the flag, and it
+is asserted at the wire level: `max_elapsed` must never be reported as
+`client_disconnected`, `upstream_read`, or `upstream_limit`. The client's own
+context remains the higher hard stop — cancellation really unblocks the read,
+and it happens without the watchdog's help — and the gates are ordered so the
+window answers first when both are true at once.
+
+Two consequences follow from the window being armed on the committed relay and
+not only on hops, and both are deliberate:
+
+- While the block is enabled, `max-elapsed` also caps how long any single
+  streamed answer may take. A generation still running at the deadline is cut
+  and reported `max_elapsed` even though no upstream ever failed. The
+  alternative — a window that only the recovery effort observes — is a bound a
+  stalled peer outlives by never dying, which is the case the bound exists for.
+- With the block DISABLED there is no window at all, which is the state the
+  compatibility hinge requires. The resolved policy carries a nonzero
+  `max-elapsed` even when `enabled: false` (it is the value an enabling layer
+  inherits — see `defaults.go`), so the proxy may not decide to arm the
+  watchdog from the window's value alone: the gate is `contPolicy.Enabled`, and
+  the disabled path keeps the plain relay with no timer, no deadline and no
+  window state. `TestStreamRecoveryWindowIsNotArmedWhenDisabled` pins that, and
+  `TestRecoveryStreamBlockParsesEveryFieldAndDefaultsOff` pins the data-side
+  fact that makes it necessary.
+
+`TestStreamRecoveryMaxElapsedCutsABlockedRead` and
+`TestE2EStreamRecoveryMaxElapsedCutsAStalledUpstream` prove the hard half on a
+reader that ignores its context and on a real socket respectively;
+`TestE2EStreamRecoveryEnabledWindowBoundsTheCommittedRelay` proves the window
+bounds a healthy generation too; `TestStreamRecoveryClientCancelBeatsTheWindow`
+and `TestE2EStreamRecoverySpendsNothingForADepartedClient` prove the other
+direction.
+
+### `max-recoveries` counts continuation requests
+
+`max-recoveries: N` means: this logical stream may INITIATE N continuation
+requests. It never means "N continuations that succeeded". The slot is claimed
+immediately before the dial (`recoveries++`), so a hop that is refused at the
+credential, refused by the envelope, answered with a status, or truncated
+mid-stream has spent one — counting successes would let a stream that keeps
+dying spend an unbounded number of upstream requests under a bound that reads
+as a limit. The cap is `2`, and `enabled: true` with no explicit reach means
+`1`.
+
+What a failed hop does next is a POLICY, not a bound, and it is stated here
+rather than left to be inferred from the code:
+
+- a hop that never produced a continuable stream — a refused dial, a status, a
+  non-stream 2xx — ends the effort on the spot. Another immediate ask would not
+  change what that answer said, and the client's stream is open and silent the
+  whole time.
+- a hop that streamed and truncated AGAIN is evidence of progress, and the loop
+  re-evaluates: the reach, the window and the envelope decide whether the
+  stream is worth continuing once more. If the reach was the next thing to
+  fire, the report carries `recovery_reason: max_recoveries` alongside the
+  hop's own `stream_recovery_failed`.
+
+Neither branch can exceed `max-recoveries` requests, and neither is a retry
+policy: there is no backoff, no `Retry-After`, and no second ask of a hop that
+failed to establish itself.
+
+## What the continuation body may touch
+
+The hop's body is built from the client's own original body by
+`BuildContinuationChat` / `BuildContinuationResponses`
+(`internal/inject/continuation.go`), which is the fail-closed half of the
+feature: a body the builder cannot read is a body it must not guess at. Its
+contract for the Chat prefill case is worth stating exactly, because the
+tempting implementation is the wrong one:
+
+- the last message, when it is an assistant message with string content, is
+  **mutated, not rebuilt**: only its `content` member is regenerated, as the
+  original prefill plus the committed prefix.
+- every other member of that message — a `name`, a provider extension, a field
+  this build has never heard of — is carried through untouched, so a
+  continuation cannot silently drop provider state or rewrite the client's own
+  conversation.
+- nothing else in the body moves except `stream: true`; the input byte slice is
+  never mutated in place, because the same original bytes are replayed through
+  the candidate's transform on every attempt.
+
+The appended-turn case (no prefill) and the Responses case (the client's input
+normalized into the array form, plus an assistant `message` item and a fixed
+instruction item) follow the same rule: the client's own bytes are preserved and
+only the continuation's own members are added.
 
 ## The compatibility hinge
 
@@ -169,6 +374,15 @@ by accident if the other's behavior changes.
 - **No overlap detection.** A duplicate paragraph at the seam is visible and
   honest; a heuristic that deletes client-visible text is not, and "data loss
   is worse than duplication" is the rule the brief set.
+- **No editing of a stream in flight.** The relay is byte-faithful over every
+  hop: the proxy adds no marker and removes none, so a provider that sends its
+  terminal marker twice has both relayed exactly as they would be with the
+  block off. What the feature guarantees is its own contribution — nothing.
+- **No upstream request for a departed client.** Once the client is gone, the
+  loop stops at the caller gate and zero further exchanges are spent; a client
+  write that fails ends the effort the same way. This is asserted at both
+  levels (`TestStreamRecoveryStopsOnAClientWriteFailure`,
+  `TestE2EStreamRecoverySpendsNothingForADepartedClient`).
 - **No metrics.** The repo has no metrics subsystem; none was added.
 
 ## Observability
@@ -178,7 +392,7 @@ by accident if the other's behavior changes.
 | `stream_recovery_started`   | INFO  | `recovery_index`, `partial_bytes`, `provider`, `upstream`, `policy_hash`, `policy_generation`                                                                                                                     |
 | `stream_recovery_succeeded` | INFO  | `recovery_index`, `recovered_bytes`, `recovered_events`, `upstream_exchanges`, `elapsed_ms`                                                                                                                       |
 | `stream_recovery_failed`    | WARN  | `recovery_index`, `phase` (`build`/`credential`/`budget`/`dial`/`upstream_status`/`upstream_read`/`client_write`), `upstream_status`, the sanitized `err`, `upstream_credential_id` when the candidate has a pool |
-| `stream_recovery_exhausted` | WARN  | `recoveries`, `reason`, `unsafe_reason`                                                                                                                                                                           |
+| `stream_recovery_exhausted` | WARN  | `recoveries`, `reason` (`budget_spent`/`max_recoveries`/`max_elapsed`/`logical_terminal`/`unsafe_content`), `unsafe_reason` only when the reason is `unsafe_content`                                              |
 | `stream_completed`          | DEBUG | + `stream_recoveries`                                                                                                                                                                                             |
 | `stream_truncated`          | WARN  | + `stream_recoveries`, `recovery_reason`, phase `recovery` for a marker-less stream — or outcome `client_disconnected` when the caller left during a hop                                                          |
 | `egress_attempt_failed`     | WARN  | one per endpoint a hop's pool dialed and lost                                                                                                                                                                     |
@@ -259,6 +473,52 @@ it: the cancel fires from inside the hop's dial, the hop answers with a clean
 EOF so every other gate would have permitted a second hop, and the dial count
 stays at two.
 
+## The hardening pass (post-merge adversarial review)
+
+The pass did not redesign the feature and changed no default. It fixed seven
+defects, each of which is now pinned by a test, and each of which is a case
+where the shipped code was reasonable-looking and wrong.
+
+1. **`max-elapsed` was not a bound on a blocked read.** It was checked only
+   after `CopySSE` returned, so an upstream that sent one event and held the
+   connection open parked the relay in `ReadSlice` indefinitely: the window
+   existed on paper and could not fire. The window is now armed around every
+   relay pass as a body-closing watchdog — see "The two bounds" above for why
+   the lever is the body and why the timer is not derived from the request
+   context. The state it added is one `atomic.Bool` and one deadline.
+2. **Arming that watchdog broke every deployment that did not want it.** The
+   first version of the fix armed the window unconditionally, and because the
+   resolved policy carries a nonzero `max-elapsed` (20s by default) even when
+   the block is `enabled: false`, every healthy committed stream would have
+   been cut twenty seconds in — on deployments that never configured any of
+   this. The gate is `contPolicy.Enabled` and the disabled path keeps the plain
+   relay. The regression test was written, verified to fail against the
+   unconditional arm, and is in the suite; the first version of it did not, and
+   that is why it is worth stating here.
+3. **`finish_reason` was conflated with unsafe content.** A generation the
+   upstream declared finished was reported as `unsafe_content`, which reads to
+   an operator as "the proxy could not safely continue this" rather than "the
+   model stopped talking". Terminal and unsafe are now separate verdicts and
+   separate stop reasons.
+4. **Responses identity was checked in one place and not the other.** A
+   `response.output_item.added` announcing a second message item was accepted
+   when no item had been seen yet, and was never cross-checked against the
+   identity the deltas had bound — so the proxy would concatenate two message
+   outputs into one continuation. Identity is now bound once, from either
+   place, and any disagreement refuses the stream. This one was found by
+   writing the multi-output test and watching it dial twice.
+5. **A Chat prefill was rebuilt rather than mutated.** The builder reconstructed
+   the assistant message from the fields it knew about, silently dropping a
+   `name`, a provider extension, or any field this build has never heard of.
+   It now regenerates `content` and nothing else.
+6. **`max-recoveries` was ambiguous.** It now means continuation REQUESTS
+   initiated, with the slot claimed before the dial, and the stop-on-hop-failure
+   policy is stated in the code and pinned by tests rather than left to be
+   inferred.
+7. **The cancellation races had no tests.** Client-disconnect-vs-window,
+   disconnect-mid-hop, write-failure, and disconnect-during-dial are now each
+   pinned at the unit level, and two of them at the wire level.
+
 ## Reviewed and deliberately not changed
 
 - **The walk still replays a `send_unknown` transport failure at the provider
@@ -281,25 +541,38 @@ stays at two.
   and the `enabled: false` co-rule, hash sensitivity per field.
 - `internal/config` — every field parses at the global and model layers; the
   block is rejected on a provider entry and on a candidate; absent ⇒ disabled;
-  a frozen pre-change `config.example.yaml` still loads and resolves to the
-  zero policy.
+  a disabled block still carries the stated bounds (the coupling that makes the
+  proxy's `Enabled` gate load-bearing); and a frozen pre-change
+  `config.example.yaml` still loads and resolves to the zero policy.
 - `internal/proxy/sse_test.go` — `StreamStats.Terminal` true for `data: [DONE]`
   and `event: response.completed`, false for a plain data line; the existing
   tests and the benchmark compile unchanged.
 - `internal/proxy/continuation_test.go` — the safety gate per closed token;
-  prefix accumulation across chunks, and that the first refusal is the one that
-  sticks; the oversize bound. The accumulation ACROSS hops is exercised by the
-  loop tests in `streamrecovery_test.go`.
-- `internal/inject/continuation_test.go` — both builders, the prefill extension
-  and the appended-turn shape, every refusal token, and that neither mutates
-  its input.
+  prefix accumulation across chunks; `finish_reason` latching TERMINAL (never a
+  refusal) for `stop`/`length`/`content_filter`/`tool_calls`; the first refusal
+  sticking; the oversize bound; the twelve-row Responses identity matrix
+  (item-id, output-index and content-index changes, channel switch, a second
+  message item, a tool-call item, missing/non-numeric identity) plus the
+  identity spanning hops. The accumulation ACROSS hops is exercised by the loop
+  tests in `streamrecovery_test.go`.
+- `internal/inject/continuation_test.go` — both builders, the prefill
+  extension, the appended-turn shape, every refusal token, that neither mutates
+  its input, and that a prefill's unknown members survive the extension.
 - `internal/proxy/streamrecovery_test.go` — the loop end to end over both API
   surfaces: off-by-default byte-identity, a continued stream, a refusal at each
   gate, a spent budget, a spent reach, a client that leaves, an unsafe stream,
-  an oversize prefix, a truncated line, a hop failure, and a stream that
-  already terminated.
-- `e2e/recovery_test.go` — the real binary, one connection, two hops, one
-  marker, and the log evidence.
+  an oversize prefix, a truncated line, a hop failure, a stream that already
+  terminated, the window cutting a blocked read, the window covering a hop, a
+  client cancel beating the window, a simultaneous window/disconnect, a client
+  write failure, and the finish-reason rows — plus the no-window-when-disabled
+  regression, whose fixture is a reader that HONORS its Close, because a reader
+  that ignored it would pass even against the bug it exists to catch.
+- `e2e/recovery_test.go` — the real binary: one connection, two hops, one
+  marker, the log evidence, the refusal matrix, the stalled-upstream window,
+  the enabled window bounding a healthy generation, a departed client, the
+  hop-failure matrix, a clean EOF, an empty prefix, the Responses multi-output
+  refusal, and that neither the client's turn nor the committed prefix reaches
+  the process's output.
 
 ## Rollout
 
@@ -310,3 +583,8 @@ to `stream_recovery_exhausted`, and among the exhausted ones, `unsafe_content`.
 On agent traffic `unsafe_content` should be the most common skip, and that is
 the feature working, not failing: a tool-call stream is one this proxy must not
 continuously re-enter.
+
+Before enabling it on a model, size `max-elapsed` above the longest generation
+that model produces. While the block is on, the window is armed on the committed
+stream itself, so a `20s` window on a long-reasoning model will cut healthy
+answers — reported, correctly, as `max_elapsed`.
