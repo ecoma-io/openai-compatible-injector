@@ -1221,21 +1221,22 @@ continued only when all of the following hold; anything else ends the stream
 exactly as it would with the block absent, and `stream_recovery_exhausted`
 records which gate fired:
 
-| gate            | refuses when                                                     | reported as                                      |
-| --------------- | ---------------------------------------------------------------- | ------------------------------------------------ |
-| terminal marker | a marker was already forwarded — the stream is over              | no reason (it ended on its own terms)            |
-| client          | the client connection is gone, or a relay cap stopped the pass   | no reason (`client_disconnected` on the request) |
-| generation over | the upstream declared the answer finished (`finish_reason`)      | `logical_terminal`                               |
-| tool calls      | any `delta.tool_calls`/`delta.function_call` was seen            | `unsafe_content` / `tool_calls`                  |
-| stream failed   | the upstream declared the stream failed (an error event)         | `unsafe_content` / `upstream_terminal`           |
-| output topology | Responses text not provably from ONE message output's ONE stream | `unsafe_content` / `multiple_outputs`            |
-| readable shape  | a `data:` line was neither `[DONE]` nor recognizable JSON        | `unsafe_content` / `not_object`/`unknown_shape`  |
-| prefix bound    | the committed text reached `max-partial-bytes`                   | `unsafe_content` / `oversize`                    |
-| usable prefix   | no text was committed at all, so a hop would be a blind replay   | `unsafe_content` / `no_prefix`                   |
-| request body    | the client's body cannot express a continuation (see below)      | `unsafe_content` / the builder's token           |
-| reach           | `max-recoveries` continuation requests were already made         | `max_recoveries`                                 |
-| window          | `max-elapsed` passed since the stream committed                  | `max_elapsed`                                    |
-| envelope        | the request's `budget.request` envelope is spent                 | `budget_spent`                                   |
+| gate            | refuses when                                                                         | reported as                                      |
+| --------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------ |
+| terminal marker | a marker was already forwarded — the stream is over                                  | no reason (it ended on its own terms)            |
+| client          | the client connection is gone, or a relay cap stopped the pass                       | no reason (`client_disconnected` on the request) |
+| generation over | the upstream declared the answer finished (`finish_reason`)                          | `logical_terminal`                               |
+| tool calls      | any `delta.tool_calls`/`delta.function_call` was seen                                | `unsafe_content` / `tool_calls`                  |
+| stream failed   | the upstream declared the stream failed (an error event)                             | `unsafe_content` / `upstream_terminal`           |
+| refusal         | the upstream used the refusal channel (`response.refusal.delta` / non-empty `.done`) | `unsafe_content` / `refusal`                     |
+| output topology | Responses text not provably from ONE message output's ONE stream                     | `unsafe_content` / `multiple_outputs`            |
+| readable shape  | a `data:` line was neither `[DONE]` nor recognizable JSON                            | `unsafe_content` / `not_object`/`unknown_shape`  |
+| prefix bound    | the committed text reached `max-partial-bytes`                                       | `unsafe_content` / `oversize`                    |
+| usable prefix   | no text was committed at all, so a hop would be a blind replay                       | `unsafe_content` / `no_prefix`                   |
+| request body    | the client's body cannot express a continuation (see below)                          | `unsafe_content` / the builder's token           |
+| reach           | `max-recoveries` continuation requests were already made                             | `max_recoveries`                                 |
+| window          | `max-elapsed` passed since the stream committed                                      | `max_elapsed`                                    |
+| envelope        | the request's `budget.request` envelope is spent                                     | `budget_spent`                                   |
 
 A non-null `finish_reason` is **not** an unsafe-content refusal and is never
 reported as one: the generation ended, it simply ended without the marker the
@@ -1243,6 +1244,15 @@ client keys on. Nothing is left to continue, and no marker is invented to paper
 over the missing one. The distinction is what keeps `unsafe_content` readable —
 it means "this proxy could not safely continue this stream", not "the model
 stopped talking".
+
+A **refusal** is the same distinction one layer down, and it is not assistant
+text: `response.refusal.delta` (or a `response.refusal.done` carrying a
+non-empty refusal) means the model declined to answer, so the bytes on that
+channel are not part of what the client is reading as an answer and must never
+enter the continuation prefix. It is reported as its own token rather than as
+a generic `upstream_terminal` because the reason a hop is refused is
+diagnostic — an operator paging on `unsafe_content` needs to tell "our
+continuation correctness gate" from "the model said no".
 
 **MVP scope: plain text only.** The feature continues plain assistant text with
 provably safe structure and nothing else. Tool calls are refused, and so is any
@@ -1722,6 +1732,18 @@ The usage **meter** is deliberately not part of this argument: it reads
 pre-rewrite bytes, so excising anything under `usage` cannot change what is
 attributed.
 
+**One path class to avoid, and only with stream recovery on.** The stream
+recovery accumulator also reads pre-rewrite bytes: it accumulates the text the
+upstream sent, while the client is shown what survived the strip. A strip path
+aimed at the streamed text itself (`delta.content`, `response.output_text`,
+their like) therefore makes the continuation body disagree with what the client
+read — the seam shows a divergence instead of a repetition. Nothing about it is
+unsafe and the proxy does not refuse it, because excising a member is a
+deliberate operator choice; if a continuation block and a strip list are
+configured on the same model, keep the strip list off the text members. The
+meter is unaffected either way, and with stream recovery off the two never
+interact at all.
+
 **Streaming parity.** The same composed rewriter serves both relay paths.
 The SSE data-line gate, which admits a line only when its payload carries
 the two keys the rewriter owns (`"model"`/`"usage"`), is widened with the
@@ -1762,8 +1784,15 @@ live stream with correct per-chunk latency. Behavior:
   keeps the client connection alive across the gap and stops for good when
   the effort ends. It starts only once
   the upstream response headers are committed to the client: silence while
-  waiting for upstream headers is **not** covered (that window is bounded
-  by the upstream's response-header timeout, not this relay heartbeat).
+  waiting for upstream headers is **not** covered, and the wait is not bounded
+  by this proxy at all. There is no response-header timeout on the direct
+  transport, and no overall request timeout, by design — a provider that queues
+  a request behind its own load legitimately takes minutes to send a status
+  line, and no configuration states a time-to-first-header budget. A peer that
+  accepts the connection and then answers nothing therefore holds the request
+  until the caller's own context ends (its deadline, its disconnect, or
+  process shutdown). A continuation hop IS bounded: it runs under the
+  recovery window's deadline, so the same peer cannot park a hop either.
   Why: Cloudflare silently cuts a client HTTP/2 stream after ~125s with
   zero bytes from origin (measured on 2026-09-22 — client
   `stream error … INTERNAL_ERROR` at 125.39s, origin-side close at
@@ -1818,7 +1847,7 @@ bounds one request; three things bound the process:
 | ---------------------- | ----------- | ---------------------------------- | -------------------------------------------------------------------- |
 | request body size      | one request | 64 MiB                             | one client sending an oversized body                                 |
 | request body read time | one request | 5 minutes                          | one client sending a body slowly enough to pin the goroutine forever |
-| buffering budget       | the process | 512 MiB outstanding, reserved live | N concurrent requests each holding a cap's worth at once             |
+| buffering budget       | the process | 256 MiB outstanding, reserved live | N concurrent requests each holding a cap's worth at once             |
 
 The third one is the gap a per-request cap cannot close. `N` concurrent
 requests may each be under the cap and together exceed what the container
@@ -1850,11 +1879,20 @@ The accounting is a bound on the bytes this process buffers, not a byte-exact
 map of the heap: Go's slice growth may round a block's allocation up, and the
 last block is reserved whole however little of it the input uses.
 
-The budget is a package constant (512 MiB), not runtime configuration — it is
-sized against the container the deployment ships, and
-`compose.production.yaml` pins `mem_limit: 1g` so the ceiling stays half the
-container's. Raising one without the other is the way to turn a clean refusal
-into an OOM kill.
+**An admitted buffer is not the only copy of itself, and the budget is sized
+for that.** The transform that injects the prompt decodes the request body and
+marshals it into a second buffer of the same size, live for the attempt beside
+the body the replay needs; the composed response rewriter builds a same-size
+copy of the answer before it is written. Neither copy is admitted separately —
+each is bounded by its admitted source — so the process peak is roughly
+**twice the budget** plus a few MiB per in-flight stream, and `mem_limit` has
+to be sized against that number rather than against the budget.
+
+The budget is a package constant (256 MiB), not runtime configuration, and
+`compose.production.yaml` pairs it with `mem_limit: 1g`: twice the budget for
+the derived copies, with the rest as headroom for TLS state and the response
+bytes of in-flight requests. Raising the limit alone buys nothing; lowering it
+towards the budget is the way to turn a clean refusal into an OOM kill.
 
 ## Errors
 
@@ -2231,13 +2269,13 @@ What each level carries:
 recovery loop, and an operator reads exactly one of them as the answer to
 "who ended this effort":
 
-| event                       | owner      | it means                                                                         |
-| --------------------------- | ---------- | -------------------------------------------------------------------------------- |
-| `stream_recovery_started`   | this proxy | a hop was built and dialed — an intent, emitted before its first dial            |
-| `stream_recovery_succeeded` | upstream   | the hop's events carried the stream to its terminal marker                       |
-| `stream_recovery_failed`    | the hop    | one hop that did not produce a continuable stream; `phase` names what went wrong |
-| `stream_recovery_exhausted` | this proxy | the effort stopped at a bound; `reason` names the bound it stopped at            |
-| `stream_truncated`          | upstream   | the committed stream reached the client without its terminal marker              |
+| event                       | owner              | it means                                                                                                                                                                     |
+| --------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stream_recovery_started`   | this proxy         | a hop was built and dialed — an intent, emitted before its first dial                                                                                                        |
+| `stream_recovery_succeeded` | upstream           | the hop's events carried the stream to its terminal marker                                                                                                                   |
+| `stream_recovery_failed`    | the hop            | one hop that did not produce a continuable stream; `phase` names what went wrong                                                                                             |
+| `stream_recovery_exhausted` | this proxy         | the effort stopped at a bound; `reason` names the bound it stopped at                                                                                                        |
+| `stream_truncated`          | whoever stopped it | the committed stream reached the client without its terminal marker; `phase` names the side that stopped it, and `client_disconnected` outcomes are not the provider's fault |
 
 Three readings are wrong and the field names exist to prevent them:
 
@@ -2245,10 +2283,23 @@ Three readings are wrong and the field names exist to prevent them:
   closing, whether it cut a header wait or closed a parked body. The error the
   cancel produced belongs to nothing outside this process and is deliberately
   not attached, so a hop cut by our own deadline carries no `error` and no
-  `upstream_status` — an operator must never read it as "upstream failed".
-  `client_write` and `upstream_limit` are this proxy's own work too (a client
-  that left, a relay cap reached); only `dial`, `upstream_status`,
-  `upstream_read` and `upstream_credential_id`-bearing refusals point at a peer.
+  `upstream_status` — an operator must never read it as "upstream failed". It
+  names no `upstream` either, because the window is checked before the hop
+  builds its URL: a refusal that never dialed has no endpoint to name, and the
+  field is omitted rather than invented.
+- **`client_write` and `upstream_limit` are this proxy's own work too** (a
+  client that left, a relay cap reached), and their errors are this package's
+  own typed values — so they are logged as they are, not through the no-echo
+  sanitizer, which would replace them with the static "upstream transport
+  error" and blame a peer for a stop we caused. Only `dial`,
+  `upstream_status` and `upstream_read` point at a peer, and only those go
+  through the sanitizer. A client that leaves DURING a hop is one of them:
+  the hop reads the request's own context (the hop runs under a context
+  derived from it, so a cancellation arriving through the transport cannot be
+  told apart by shape) and reports `client_write`, and the request's outcome
+  becomes `client_disconnected` rather than a truncated stream the provider
+  caused. The failed hop is still recorded — the cause just has one owner,
+  and it is not the provider's.
 - **`unsafe_content` on `stream_recovery_exhausted` with no `unsafe_reason`
   never happens**, and `unsafe_reason` never appears on `logical_terminal`. The
   two are different facts: one is a stream this proxy must not continue, the
@@ -2426,13 +2477,22 @@ accepting and drains:
    streams get the remainder of `OAICR_SHUTDOWN_GRACE` (default 55s) to
    complete.
 3. If the drain budget runs out, `Close()` force-terminates the remainder.
-4. If usage metering is enabled, its accepted event backlog is then flushed through its bounded close window; events that cannot be persisted are explicitly counted and reported.
-5. Idle keep-alive connections are closed; the process exits `0`.
+4. Idle egress connections are closed — the listener is already gone, and the
+   upstream pools are what is left to release.
+5. Then the defers run, and they are **outside** the drain budget: if usage
+   metering is enabled, its accepted event backlog is flushed through a 10s
+   close window with a 5s join grace behind it (events that cannot be
+   persisted are explicitly counted and reported, and `usage_meter_final`
+   logs the totals); in partner mode the key store closes within its own 5s.
+   The process then exits `0`.
 
-A second signal while draining forces an immediate `exit 1`. Compose's
-`stop_grace_period: 60s` is deliberately larger than the default drain
-budget so Docker's SIGKILL never cuts a drain short, and the head start is
-inside that budget rather than in front of it.
+A second signal while draining forces an immediate `exit 1` — defers do not
+run, so the metering accounting above is that path's deliberate casualty.
+Compose's `stop_grace_period` is deliberately larger than the drain budget,
+by the defers in step 5: 55s of default grace plus 15s of metering drain plus
+5s of key-store close is 75s worst case, which is why the shipped files use
+`75s` and not `60s`. Docker's SIGKILL must not land on that accounting. The
+head start is inside the drain budget rather than in front of it.
 
 The lifecycle transitions are logged: DEBUG `readiness_ready`, INFO
 `readiness_unready` (with `grace` and `propagation`), INFO `drain_started`
@@ -2467,12 +2527,13 @@ docker run --rm -p 8080:8080 \
 **coupled to the binary's own limits** — changing one without the other is the
 mistake to avoid:
 
-- `mem_limit: 1g` is deliberately twice the process's 512 MiB buffering
-  budget (see [Buffering](#buffering)); the other half is headroom for TLS
-  state and the response bytes of in-flight requests. The budget is a
-  constant in the binary, so raising `mem_limit` alone buys nothing and
-  lowering it below the budget converts a clean `503 capacity_exceeded`
-  refusal into an OOM kill.
+- `mem_limit: 1g` is sized against the process's 256 MiB buffering budget
+  (see [Buffering](#buffering)): twice the budget, because an admitted buffer
+  has a same-size derived copy beside it, plus headroom for TLS state and the
+  response bytes of in-flight requests. The budget is a constant in the
+  binary, so raising `mem_limit` alone buys nothing, and lowering it towards
+  the budget converts a clean `503 capacity_exceeded` refusal into an OOM
+  kill.
 - The `healthcheck` reads `/readyz` and never `/healthz` — see
   [Healthcheck](#healthcheck).
 - `read_only: true`, `cap_drop: ALL`, `no-new-privileges` and a `tmpfs` for

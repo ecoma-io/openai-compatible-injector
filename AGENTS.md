@@ -112,7 +112,7 @@ Boundaries a helpful-looking refactor will cross:
   request.** `maxRequestBodyBytes` (64 MiB) caps how much a client may send; a
   per-read deadline (`requestBodyReadTimeout`, via
   `http.NewResponseController(w).SetReadDeadline`) caps how long it may take; one
-  process-wide `memlimit.Budget` (512 MiB) caps what every in-flight request is
+  process-wide `memlimit.Budget` (256 MiB) caps what every in-flight request is
   buffering at once. Only the first is per-request. Clear the read deadline the
   moment the read returns — the connection then carries a response, an SSE
   stream included, and goes back into the keep-alive pool — and never reach for
@@ -121,9 +121,11 @@ Boundaries a helpful-looking refactor will cross:
   cap up front, and refuse an unmet reservation IMMEDIATELY rather than queueing
   it. The refusal is the 503 `capacity_exceeded` envelope and is NEVER fed to the
   recovery matrix: a process-wide condition is one every candidate shares, so no
-  retry or fallback can clear it. The ceiling is coupled to
-  `compose.production.yaml`'s `mem_limit: 1g`; README "Buffering" has the
-  rationale.
+  retry or fallback can clear it. Size it against the DERIVED copies, not the
+  budget: a transform re-marshals the request body and the rewriter rebuilds the
+  answer, each a same-size copy beside its admitted source, so the process peak is
+  about twice the budget — which is what `compose.production.yaml`'s
+  `mem_limit: 1g` is sized against. README "Buffering" has the rationale.
 - **Every transform is byte-preserving and API-scoped; nothing is ever
   re-serialized.** `RewriteChatModel` replaces only the top-level `"model"` string
   value; `RewriteResponsesModel` additionally replaces the `"model"` directly

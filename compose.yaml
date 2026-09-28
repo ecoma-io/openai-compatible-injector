@@ -30,12 +30,14 @@ services:
       # stop_grace_period, with room left for the usage flush.
       # OAICR_SHUTDOWN_GRACE: 45s
       # OAICR_CONFIG_POLL_INTERVAL: 1s
-    # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
-    # above the service's OAICR_SHUTDOWN_GRACE (default 55s) plus the usage
-    # flush's window, so an active SSE stream gets its full drain before the
-    # kill. The readiness transition is NOT an addition to this number: the
+    # docker stop sends SIGTERM and waits this long before SIGKILL. The whole
+    # post-signal budget is the drain grace (default 55s) PLUS the defers that
+    # follow it: the usage drain's 10s window and its 5s join grace, and the
+    # key store's own 5s close in partner mode — 75s worst case, which is why
+    # 60s is too short. A healthy drain finishes far sooner; this is only the
+    # backstop. The readiness transition is NOT an addition to the number: the
     # head start is drawn from the same grace as the drain.
-    stop_grace_period: 60s
+    stop_grace_period: 75s
     logging:
       driver: json-file
       options:

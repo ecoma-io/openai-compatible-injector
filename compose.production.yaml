@@ -53,9 +53,13 @@ services:
       OAICR_LISTEN: :8080
       OAICR_CONFIG_FILE: /app/config.yaml
       OAICR_CONFIG_POLL_INTERVAL: 1s
-      # The whole post-signal budget: readiness head start plus in-flight
-      # drain. 50s + the 10s usage flush window stays inside the 60s
-      # stop_grace_period below, so Docker's SIGKILL never cuts a drain short.
+      # The whole post-signal budget for serving: readiness head start plus
+      # in-flight drain. It is not the whole shutdown, though — after it, the
+      # defers run: the metering drain (a 10s window plus a 5s join grace
+      # when usage metering is configured) and the key store's own 5s close
+      # (partner mode). 50 + 15 + 5 = 70s worst case, which is why the
+      # stop_grace_period below is 75s rather than 60s: SIGKILL must not land
+      # on the accounting this drain exists to land.
       OAICR_SHUTDOWN_GRACE: 50s
       # The database URLs are deployment secrets (they embed credentials).
       # They are bootstrap-only environment — never in config.yaml, never in
@@ -64,8 +68,11 @@ services:
       #
       #   env_file:
       #     - injector.env      # OAICR_AUTH_DATABASE_URL / OAICR_USAGE_DATABASE_URL
-    # Docker waits this long after SIGTERM before SIGKILL.
-    stop_grace_period: 60s
+    # Docker waits this long after SIGTERM before SIGKILL: the drain budget
+    # above, plus the metering drain and the key store close that follow it.
+    # A healthy drain finishes far sooner — this is only the backstop for the
+    # worst case, and a wedged database can outlast any value here.
+    stop_grace_period: 75s
     # The image is one static binary on scratch. It reads its config, its CA
     # bundle, and nothing else — so the root filesystem can be read-only, and
     # every capability can be dropped (it binds 8080, above the privileged
@@ -79,11 +86,14 @@ services:
       - ALL
     # A ceiling the process's own admission limits must stay below. The
     # process-wide buffering budget the proxy admits request bodies and
-    # upstream answers against is 512 MiB, hard-coded, and it is a budget for
-    # what requests are BUFFERING rather than a promise of the resident set:
-    # slice growth rounds a reservation up, plus TLS state, connection
-    # buffers and the response bytes of in-flight requests on top. Half of
-    # this limit is the practical headroom for exactly that.
+    # upstream answers against is 256 MiB and hard-coded, but 256 MiB is not
+    # the process's peak: an admitted buffer has a same-size DERIVED copy
+    # beside it (the transform re-marshals the request body, the response
+    # rewriter rebuilds the answer), and those copies are bounded by their
+    # sources rather than admitted themselves. So the number to size this
+    # against is about twice the budget — 512 MiB — with the rest left for
+    # TLS state, connection buffers, slice-growth rounding, and the response
+    # bytes of in-flight requests.
     mem_limit: 1g
     cpus: 2.0
     logging:
