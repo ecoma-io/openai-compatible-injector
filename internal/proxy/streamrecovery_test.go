@@ -85,7 +85,7 @@ func (d *scriptedDoer) body(i int) string {
 
 // sseChat renders one chat content delta as a complete SSE event.
 func sseChat(content string) string {
-	return `data: {"model":"up-a","choices":[{"delta":{"content":"` + content + `"}}]}` + "\n\n"
+	return `data: {"model":"up-a","choices":[{"index":0,"delta":{"content":"` + content + `"}}]}` + "\n\n"
 }
 
 // sseResponses renders one Responses output-text delta, carrying the full
@@ -544,7 +544,7 @@ func TestStreamRecoverySkipsATerminatedStream(t *testing.T) {
 func TestStreamRecoveryRefusesToolCalls(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
 	pa.script = []dialFunc{sseCut(sseChat("Let me check") +
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}` + "\n\n")}
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}` + "\n\n")}
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 	if rec.Code != http.StatusOK {
@@ -577,7 +577,7 @@ func TestStreamRecoveryRefusesToolCalls(t *testing.T) {
 // the original question — a blind retry wearing a continuation's shape.
 func TestStreamRecoveryRefusesAStreamWithNoText(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
-	pa.script = []dialFunc{sseCut(`data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n")}
+	pa.script = []dialFunc{sseCut(`data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n")}
 
 	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 	if pa.dials() != 1 {
@@ -651,7 +651,7 @@ func TestStreamRecoveryStopsAtItsWindow(t *testing.T) {
 // can read, so it is refused rather than guessed at.
 func TestStreamRecoveryRefusesATruncatedLine(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
-	pa.script = []dialFunc{sseStream(`data: {"choices":[{"delta":{"content":"Hi","fi`)}
+	pa.script = []dialFunc{sseStream(`data: {"choices":[{"index":0,"delta":{"content":"Hi","fi`)}
 
 	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 	if pa.dials() != 1 {
@@ -1352,7 +1352,7 @@ func TestStreamRecoveryFinishReasonIsNotUnsafeContent(t *testing.T) {
 		t.Run(finish, func(t *testing.T) {
 			h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
 			pa.script = []dialFunc{sseCut(sseChat("Hello") +
-				`data: {"choices":[{"delta":{},"finish_reason":"` + finish + `"}]}` + "\n\n")}
+				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"` + finish + `"}]}` + "\n\n")}
 
 			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 			if rec.Code != http.StatusOK {
@@ -1398,7 +1398,7 @@ func TestStreamRecoveryFinishReasonIsNotUnsafeContent(t *testing.T) {
 func TestStreamRecoveryFinishReasonThenMarkerIsTheClientTerminal(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
 	pa.script = []dialFunc{sseStream(sseChat("Hello") +
-		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
 		"data: [DONE]\n\n")}
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
@@ -1432,7 +1432,7 @@ func TestStreamRecoveryFinishReasonWithADelayedEOF(t *testing.T) {
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 			Body: io.NopCloser(&stagedReader{chunks: []string{
 				sseChat("Hello"),
-				`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
 			}}),
 		}, nil
 	}}
@@ -1805,7 +1805,7 @@ func TestStreamRecoveryWindowOwnsACommittedRelayCutIt(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t,
 		recoveryBlock(t, "    enabled: true\n    max-elapsed: 150ms\n    max-recoveries: 2\n"))
 	body := &partialLineBody{
-		data:   []byte(`data: {"choices":[{"delta":{"content":"hel`),
+		data:   []byte(`data: {"choices":[{"index":0,"delta":{"content":"hel`),
 		closed: make(chan struct{}),
 	}
 	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {

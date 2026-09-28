@@ -114,8 +114,8 @@ func TestPartialTextRefusesUnsafeShapes(t *testing.T) {
 			name: "chat tool_calls",
 			api:  apiChat,
 			payloads: []string{
-				`{"choices":[{"delta":{"content":"Let me check"}}]}`,
-				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"ls"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"content":"Let me check"}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"ls"}}]}}]}`,
 			},
 			want: reasonToolCalls,
 		},
@@ -123,7 +123,7 @@ func TestPartialTextRefusesUnsafeShapes(t *testing.T) {
 			name: "chat legacy function_call",
 			api:  apiChat,
 			payloads: []string{
-				`{"choices":[{"delta":{"function_call":{"name":"ls"}}}]}`,
+				`{"choices":[{"index":0,"delta":{"function_call":{"name":"ls"}}}]}`,
 			},
 			want: reasonToolCalls,
 		},
@@ -156,14 +156,14 @@ func TestPartialTextRefusesUnsafeShapes(t *testing.T) {
 		{
 			name:     "chat content is not a string",
 			api:      apiChat,
-			payloads: []string{`{"choices":[{"delta":{"content":[{"type":"text","text":"x"}]}}]}`},
+			payloads: []string{`{"choices":[{"index":0,"delta":{"content":[{"type":"text","text":"x"}]}}]}`},
 			want:     reasonUnknownShape,
 		},
 		{
 			name:     "chat several choices",
 			api:      apiChat,
-			payloads: []string{`{"choices":[{"delta":{"content":"a"}},{"delta":{"content":"b"}}]}`},
-			want:     reasonUnknownShape,
+			payloads: []string{`{"choices":[{"index":0,"delta":{"content":"a"}},{"index":1,"delta":{"content":"b"}}]}`},
+			want:     reasonMultipleOutputs,
 		},
 		{
 			name: "responses function call item",
@@ -228,7 +228,7 @@ func TestPartialTextRefusesUnsafeShapes(t *testing.T) {
 			payloads: []string{
 				`{"type":"response.refusal.done","item_id":"m1","output_index":0,"content_index":0,"refusal":"I can't help with that."}`,
 			},
-			want: reasonUpstreamTerminal,
+			want: reasonRefusal,
 		},
 		{
 			name: "responses refusal done text is not a string",
@@ -259,7 +259,7 @@ func TestPartialTextRefusesUnsafeShapes(t *testing.T) {
 		{
 			name:     "oversize",
 			api:      apiChat,
-			payloads: []string{`{"choices":[{"delta":{"content":"0123456789"}}]}`},
+			payloads: []string{`{"choices":[{"index":0,"delta":{"content":"0123456789"}}]}`},
 			want:     reasonOversize,
 			// limit 8: the accumulator refuses as soon as it holds >= 8 bytes.
 		},
@@ -403,9 +403,9 @@ func TestPartialTextFinishReasonIsLatched(t *testing.T) {
 // is what makes the gate a gate rather than a running opinion.
 func TestPartialTextFirstRefusalWins(t *testing.T) {
 	p := newPartialText(apiChat, 1<<20)
-	p.Observe([]byte(`{"choices":[{"delta":{"content":"before"}}]}`))
-	p.Observe([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}`))
-	p.Observe([]byte(`{"choices":[{"delta":{"content":" after"}}]}`))
+	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"before"}}]}`))
+	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0}]}}]}`))
+	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":" after"}}]}`))
 
 	v := p.Verdict()
 	if v.Kind != verdictUnsafe || v.Reason != reasonToolCalls {
@@ -416,7 +416,7 @@ func TestPartialTextFirstRefusalWins(t *testing.T) {
 	}
 	// The latched reason survives further calls and further observations, and
 	// an unsafe latch outranks a later terminal: first verdict wins.
-	p.Observe([]byte(`{"choices":[{"delta":{"content":"more"},"finish_reason":"stop"}]}`))
+	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"more"},"finish_reason":"stop"}]}`))
 	if again := p.Verdict(); again.Kind != verdictUnsafe || again.Reason != reasonToolCalls {
 		t.Fatalf("second verdict = %v/%q, want the latched unsafe/%q", again.Kind, again.Reason, reasonToolCalls)
 	}
@@ -430,7 +430,7 @@ func TestPartialTextFirstRefusalWins(t *testing.T) {
 // chat stream at the last event — and it must not be accumulated either.
 func TestPartialTextDoneIsNotText(t *testing.T) {
 	v := feed(apiChat, 1<<20,
-		`{"choices":[{"delta":{"content":"hi"}}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"hi"}}]}`,
 		`[DONE]`,
 	)
 	if got := recovered(t, v); got != "hi" {
@@ -443,9 +443,9 @@ func TestPartialTextDoneIsNotText(t *testing.T) {
 // finish_reason explicitly as null is an ordinary in-flight stream.
 func TestPartialTextNullMembersAreZeroValues(t *testing.T) {
 	v := feed(apiChat, 1<<20,
-		`{"choices":[{"delta":{"content":"a"},"finish_reason":null}]}`,
-		`{"choices":[{"delta":{"content":"b","tool_calls":null,"function_call":null},"finish_reason":null}]}`,
-		`{"error":null,"choices":[{"delta":{"content":"c"}}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"b","tool_calls":null,"function_call":null},"finish_reason":null}]}`,
+		`{"error":null,"choices":[{"index":0,"delta":{"content":"c"}}]}`,
 	)
 	if got := recovered(t, v); got != "abc" {
 		t.Fatalf("prefix = %q, want %q", got, "abc")
@@ -462,8 +462,8 @@ func TestPartialTextNoPrefix(t *testing.T) {
 		payloads []string
 	}{
 		{"chat with nothing", apiChat, nil},
-		{"chat with an empty delta", apiChat, []string{`{"choices":[{"delta":{"role":"assistant"}}]}`}},
-		{"chat with null content", apiChat, []string{`{"choices":[{"delta":{"content":null}}]}`}},
+		{"chat with an empty delta", apiChat, []string{`{"choices":[{"index":0,"delta":{"role":"assistant"}}]}`}},
+		{"chat with null content", apiChat, []string{`{"choices":[{"index":0,"delta":{"content":null}}]}`}},
 		{"responses with only lifecycle", apiResponses, []string{`{"type":"response.created"}`, `{"type":"response.in_progress"}`}},
 		{"responses with empty deltas", apiResponses, []string{`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":""}`}},
 	} {
@@ -503,6 +503,13 @@ func TestPartialTextReasoningIsNotAssistantText(t *testing.T) {
 // never carried. Treating it as a decline would refuse every stream whose
 // provider emits the terminator unconditionally, and binding its identity
 // would refuse the text deltas that follow it. The stream stays continuable.
+//
+// The asymmetry with TestPartialTextRefusalDeltaIsNeverContinuationText — an
+// EMPTY refusal DELTA latches the refusal, an empty refusal terminator does
+// not — is deliberate. A .done is the structural terminator the API emits for
+// every content part a response declares, textless parts included, so a
+// textless one is an ordinary shape. A .delta exists only to carry text, so
+// its event type alone is the declaration that the model declined.
 func TestPartialTextEmptyRefusalDoneIsIgnored(t *testing.T) {
 	for _, done := range []string{
 		`{"type":"response.refusal.done","item_id":"m1","output_index":0,"content_index":0}`,
@@ -527,7 +534,7 @@ func TestPartialTextEmptyRefusalDoneIsIgnored(t *testing.T) {
 // refuse the stream and release what was accumulated.
 func TestPartialTextOversizeFreesTheBuffer(t *testing.T) {
 	p := newPartialText(apiChat, 1<<10)
-	chunk := `{"choices":[{"delta":{"content":"` + strings.Repeat("x", 256) + `"}}]}`
+	chunk := `{"choices":[{"index":0,"delta":{"content":"` + strings.Repeat("x", 256) + `"}}]}`
 	for i := 0; i < 8; i++ {
 		p.Observe([]byte(chunk))
 	}
@@ -606,7 +613,7 @@ func TestPartialTextResponsesIdentityIsOneStream(t *testing.T) {
 			payloads: []string{m1,
 				`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"I cannot"}`,
 			},
-			want: reasonMultipleOutputs,
+			want: reasonRefusal,
 		},
 		{
 			name: "second message item announced",
@@ -866,25 +873,549 @@ func TestPartialTextLatchSpansUpstreamResponses(t *testing.T) {
 	})
 }
 
-// TestPartialTextChatIdentityIsNotPerResponse: Chat latches no identity at all
-// (its own issue covers choices[i].index), so the boundary changes nothing for
-// it. This pins the quiet direction — the reset must not start refusing or
-// re-latching Chat streams.
-func TestPartialTextChatIdentityIsNotPerResponse(t *testing.T) {
+// TestPartialTextChatChoiceIdentityIsPerUpstreamResponse fixes the SCOPE of
+// Chat's choice provenance, which is the same scope as the Responses item
+// identity: a continuation hop is a NEW upstream response that numbers its own
+// choices from scratch, so the binding resets at the relay boundary rather
+// than carrying the committed pass's index into the hop.
+//
+// The reset is behaviorally inert — 0 is the only index that ever binds — and
+// this pins that: the hop's own chunk carries index 0 and joins the prefix. It
+// also pins the direction that is NOT inert, so the reset cannot be mistaken
+// for a licence: a hop stating ANY other index is refused.
+func TestPartialTextChatChoiceIdentityIsPerUpstreamResponse(t *testing.T) {
 	v := feedPasses(apiChat, 1<<20,
-		[]string{`{"choices":[{"delta":{"content":"Once"},"finish_reason":null}]}`},
-		[]string{`{"choices":[{"delta":{"content":" upon a time"},"finish_reason":null}]}`},
+		[]string{`{"choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":null}]}`},
+		[]string{`{"choices":[{"index":0,"delta":{"content":" upon a time"},"finish_reason":null}]}`},
 	)
 	if got := recovered(t, v); got != "Once upon a time" {
 		t.Fatalf("prefix = %q, want %q", got, "Once upon a time")
 	}
 
-	// A Chat finish_reason in pass 1 still latches the logical terminal.
+	// A hop that renumbers its choice is a multi-output stream, however
+	// cleanly it reset: the reset restarts the binding, it does not widen it.
 	w := feedPasses(apiChat, 1<<20,
-		[]string{`{"choices":[{"delta":{"content":"Once"},"finish_reason":"stop"}]}`},
-		[]string{`{"choices":[{"delta":{"content":"More"},"finish_reason":null}]}`},
+		[]string{`{"choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":null}]}`},
+		[]string{`{"choices":[{"index":1,"delta":{"content":" upon a time"},"finish_reason":null}]}`},
 	)
-	if w.Kind != verdictTerminal {
-		t.Fatalf("verdict = %v/%q, want terminal", w.Kind, w.Reason)
+	if w.Kind != verdictUnsafe || w.Reason != reasonMultipleOutputs {
+		t.Fatalf("verdict = %v/%q, want unsafe/%q", w.Kind, w.Reason, reasonMultipleOutputs)
 	}
+	if w.Text != "" {
+		t.Fatalf("a refused stream still offered the prefix %q", w.Text)
+	}
+
+	// A Chat finish_reason in pass 1 still latches the logical terminal.
+	z := feedPasses(apiChat, 1<<20,
+		[]string{`{"choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":"stop"}]}`},
+		[]string{`{"choices":[{"index":0,"delta":{"content":"More"},"finish_reason":null}]}`},
+	)
+	if z.Kind != verdictTerminal {
+		t.Fatalf("verdict = %v/%q, want terminal", z.Kind, z.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The refusal channel
+// ---------------------------------------------------------------------------
+
+// TestPartialTextRefusalDeltaIsNeverContinuationText is the defect this family
+// of tests exists for. The refusal channel used to be accumulated through the
+// same path as output_text, so a refusal the upstream cut before its own
+// refusal.done left the model's decline standing as the "committed prefix" —
+// and the proxy would then have re-asked the model to continue a sentence it
+// had just refused to write.
+//
+// The two facts pinned here are the whole contract: the stream is refused
+// under its own token, and NOT ONE BYTE of it survives as a prefix — neither
+// the refusal text nor the assistant text that preceded it, because a stream
+// that will not be continued must not be handed to a continuation body.
+func TestPartialTextRefusalDeltaIsNeverContinuationText(t *testing.T) {
+	const text = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Let me think."}`
+
+	t.Run("as the stream's first event", func(t *testing.T) {
+		p := newPartialText(apiResponses, 1<<20)
+		p.Observe([]byte(`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"I can't help with that."}`))
+		v := p.Verdict()
+		if v.Kind != verdictUnsafe || v.Reason != reasonRefusal {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonRefusal)
+		}
+		if v.Text != "" || p.partialBytes() != 0 {
+			t.Fatalf("the accumulator kept the refusal as a prefix: %q (%d bytes)", v.Text, p.partialBytes())
+		}
+	})
+
+	t.Run("after committed text", func(t *testing.T) {
+		p := newPartialText(apiResponses, 1<<20)
+		p.Observe([]byte(text))
+		p.Observe([]byte(`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"No, I won't."}`))
+		v := p.Verdict()
+		if v.Kind != verdictUnsafe || v.Reason != reasonRefusal {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonRefusal)
+		}
+		if v.Text != "" || p.partialBytes() != 0 {
+			t.Fatalf("a refused stream still offered a prefix: %q (%d bytes)", v.Text, p.partialBytes())
+		}
+	})
+
+	// The handler is given no payload at all, so a refusal delta latches
+	// whatever it carries: nothing, an unreadable shape, an identity that
+	// names a different output, or the same identity the text channel used.
+	// There is no value-dependent branch for refusal text to slip through,
+	// and "the channel was announced" is the whole statement the accumulator
+	// needs — a shape no conforming upstream emits is not worth the hole a
+	// payload branch would open.
+	for _, delta := range []string{
+		`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":""}`,
+		`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":null}`,
+		`{"type":"response.refusal.delta"}`,
+		`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":{"nested":"shape"}}`,
+		`{"type":"response.refusal.delta","item_id":"m9","output_index":3,"content_index":7,"delta":"elsewhere"}`,
+	} {
+		t.Run("latches on "+delta, func(t *testing.T) {
+			v := feed(apiResponses, 1<<20, text, delta)
+			if v.Kind != verdictUnsafe || v.Reason != reasonRefusal {
+				t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonRefusal)
+			}
+			if v.Text != "" {
+				t.Fatalf("a refused stream still offered a prefix: %q", v.Text)
+			}
+		})
+	}
+}
+
+// TestPartialTextRefusalLatchSpansUpstreamResponses: the refusal is latched
+// for the LOGICAL stream. The relay boundary resets identities — a hop's item
+// id is its own — but it must never release a refusal an earlier response
+// latched, or a hop's clean text deltas would make the client's answer whole
+// again by splicing a continuation onto a decline.
+func TestPartialTextRefusalLatchSpansUpstreamResponses(t *testing.T) {
+	v := feedPasses(apiResponses, 1<<20,
+		[]string{
+			`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Let me think."}`,
+			`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":" On reflection, no."}`,
+		},
+		[]string{
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m2"}}`,
+			`{"type":"response.output_text.delta","item_id":"m2","output_index":0,"content_index":0,"delta":" perfectly plain text again"}`,
+		},
+	)
+	if v.Kind != verdictUnsafe || v.Reason != reasonRefusal {
+		t.Fatalf("verdict = %v/%q, want the latched unsafe/%q", v.Kind, v.Reason, reasonRefusal)
+	}
+	if v.Text != "" {
+		t.Fatalf("a refused stream still offered the prefix %q", v.Text)
+	}
+}
+
+// TestPartialTextRefusalDoneIsItsOwnReason: a refusal.done that STATES a
+// refusal is the refusal channel's terminal. It is refused as reasonRefusal
+// rather than upstream_terminal, because the two facts an operator reads are
+// different: the upstream did not fail and the generation was not cut short —
+// the model declined, and there is no continuation of an answer it declined to
+// write. TestPartialTextEmptyRefusalDoneIsIgnored holds the other half.
+func TestPartialTextRefusalDoneIsItsOwnReason(t *testing.T) {
+	v := feed(apiResponses, 1<<20,
+		`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Let me think."}`,
+		`{"type":"response.refusal.done","item_id":"m1","output_index":0,"content_index":0,"refusal":"I can't help with that."}`,
+	)
+	if v.Kind != verdictUnsafe || v.Reason != reasonRefusal {
+		t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonRefusal)
+	}
+	if v.Text != "" {
+		t.Fatalf("the refusal text reached a prefix: %q", v.Text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Chat choice provenance
+// ---------------------------------------------------------------------------
+
+// TestPartialTextChatChoiceIndexIsProvenance is the accumulator's half of the
+// Chat identity contract: exactly one choice per chunk, and its `index` must be
+// present and must be the one the committed prefix has been read from. The
+// accumulator never assumes index 0 — an absent, null, non-integer or negative
+// index is unprovable provenance, and any nonzero index (or one that changes
+// mid-stream) is a multi-output stream, refused under that token because the
+// fix an operator reads off it is a different one.
+func TestPartialTextChatChoiceIndexIsProvenance(t *testing.T) {
+	// index is a raw JSON fragment so a row can state "absent" as well.
+	chunk := func(index, content string) string {
+		if index == "" {
+			return fmt.Sprintf(`{"choices":[{"delta":{"content":%q},"finish_reason":null}]}`, content)
+		}
+		return fmt.Sprintf(`{"choices":[{"index":%s,"delta":{"content":%q},"finish_reason":null}]}`, index, content)
+	}
+
+	cases := []struct {
+		name     string
+		payloads []string
+		want     string
+		prefix   string
+		recover  bool
+	}{
+		{
+			name:     "index present and zero",
+			payloads: []string{chunk("0", "hello"), chunk("0", " world")},
+			prefix:   "hello world",
+			recover:  true,
+		},
+		{
+			// No index to read is no provenance to prove: the accumulator
+			// must not fall back to 0, because a provider that omits the
+			// member could be streaming a choice this proxy would then
+			// mislabel.
+			name:     "index absent",
+			payloads: []string{chunk("", "hello")},
+			want:     reasonUnknownShape,
+		},
+		{name: "index null", payloads: []string{chunk("null", "hello")}, want: reasonUnknownShape},
+		{name: "index is a string", payloads: []string{chunk(`"0"`, "hello")}, want: reasonUnknownShape},
+		{name: "index is a fraction", payloads: []string{chunk("0.5", "hello")}, want: reasonUnknownShape},
+		{name: "index negative", payloads: []string{chunk("-1", "hello")}, want: reasonUnknownShape},
+		{
+			// A single choice that says it is not the first is still a
+			// choice this prefix was not read from.
+			name:     "index nonzero on the first chunk",
+			payloads: []string{chunk("1", "hello")},
+			want:     reasonMultipleOutputs,
+		},
+		{
+			name:     "index changes mid-stream",
+			payloads: []string{chunk("0", "hello"), chunk("1", " and more")},
+			want:     reasonMultipleOutputs,
+		},
+		{
+			name:     "index disappears after binding",
+			payloads: []string{chunk("0", "hello"), chunk("", " and more")},
+			want:     reasonUnknownShape,
+		},
+		{
+			// The provenance requirement is not skipped on a chunk that
+			// carries no delta: a structural chunk states a choice too.
+			name:     "no index on a finish_reason chunk",
+			payloads: []string{chunk("0", "hello"), `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+			want:     reasonUnknownShape,
+		},
+		{
+			// A chunk with no choices carries no assistant output and so
+			// states no choice: the usage-only final chunk is still admitted.
+			name:     "a chunk with no choices needs no index",
+			payloads: []string{chunk("0", "hello"), `{"choices":[],"usage":{"completion_tokens":3}}`},
+			prefix:   "hello",
+			recover:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := feed(apiChat, 1<<20, tc.payloads...)
+			if tc.recover {
+				if got := recovered(t, v); got != tc.prefix {
+					t.Fatalf("prefix = %q, want %q", got, tc.prefix)
+				}
+				return
+			}
+			if v.Kind != verdictUnsafe || v.Reason != tc.want {
+				t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, tc.want)
+			}
+			// A refused choice never contributes its bytes: the text of the
+			// chunk whose provenance failed must not have been accumulated
+			// even momentarily.
+			if v.Text != "" {
+				t.Fatalf("a refused stream still offered a prefix: %q", v.Text)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The Responses event topology, audited event by event
+// ---------------------------------------------------------------------------
+
+// TestPartialTextResponsesBoundEvents audits the events that NAME the text
+// content part the prefix was read from while carrying no assistant text of
+// their own: content_part.added, content_part.done and
+// output_text.annotation.added.
+//
+// They are admitted — refused would be wrong, because a Responses stream is
+// full of them and none of them can carry text — but only under the deltas'
+// own identity contract, which is what proves they cannot have come from
+// another stream. The refusal rows are the load-bearing half: the moment the
+// identity leaves the one stream, or the announced part turns out to be the
+// refusal channel, the event is refused.
+func TestPartialTextResponsesBoundEvents(t *testing.T) {
+	const prefix = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`
+
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+		recover bool
+	}{
+		{
+			name:    "annotation on the prefix's own stream",
+			payload: `{"type":"response.output_text.annotation.added","item_id":"m1","output_index":0,"content_index":0,"annotation_index":0,"annotation":{"type":"url_citation","url":"https://example.test"}}`,
+			recover: true,
+		},
+		{
+			name:    "annotation on another item",
+			payload: `{"type":"response.output_text.annotation.added","item_id":"m2","output_index":0,"content_index":0,"annotation":{"type":"url_citation"}}`,
+			want:    reasonMultipleOutputs,
+		},
+		{
+			name:    "annotation with no identity",
+			payload: `{"type":"response.output_text.annotation.added","annotation":{"type":"url_citation"}}`,
+			want:    reasonUnknownShape,
+		},
+		{
+			name:    "content part added for the prefix's own stream",
+			payload: `{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[]}}`,
+			recover: true,
+		},
+		{
+			name:    "content part done for the prefix's own stream",
+			payload: `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Once"}}`,
+			recover: true,
+		},
+		{
+			// The refusal channel announced structurally, with no refusal
+			// delta to latch on: refused rather than ignored, so a decline
+			// that only ever appears as a part type is still a decline.
+			name:    "content part is a refusal",
+			payload: `{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":""}}`,
+			want:    reasonRefusal,
+		},
+		{
+			name:    "content part is a channel this build cannot continue",
+			payload: `{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"image"}}`,
+			want:    reasonUnknownShape,
+		},
+		{
+			name:    "content part is not an object",
+			payload: `{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":0,"part":"output_text"}`,
+			want:    reasonUnknownShape,
+		},
+		{
+			// A part object that is absent states the identity without
+			// stating the channel. There is nothing in that which could have
+			// carried text, so the identity is the whole contract.
+			name:    "content part with no part member",
+			payload: `{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":0}`,
+			recover: true,
+		},
+		{
+			name:    "content part for a second content index",
+			payload: `{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":1,"part":{"type":"output_text"}}`,
+			want:    reasonMultipleOutputs,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := feed(apiResponses, 1<<20, prefix, tc.payload)
+			if tc.recover {
+				if got := recovered(t, v); got != "Once" {
+					t.Fatalf("prefix = %q, want %q", got, "Once")
+				}
+				return
+			}
+			if v.Kind != verdictUnsafe || v.Reason != tc.want {
+				t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, tc.want)
+			}
+		})
+	}
+}
+
+// TestPartialTextResponsesItemCompletion: the closing event of an output item
+// is classified exactly as the announcing one, minus the "second item" latch —
+// it is the SAME item's end, so latching there would refuse every ordinary
+// stream at its own item's completion.
+func TestPartialTextResponsesItemCompletion(t *testing.T) {
+	const prefix = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`
+
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+		recover bool
+	}{
+		{
+			name:    "the item the deltas belong to",
+			payload: `{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m1","content":[{"type":"output_text","text":"Once"}]}}`,
+			recover: true,
+		},
+		{
+			name:    "a reasoning item's completion",
+			payload: `{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r1"}}`,
+			recover: true,
+		},
+		{
+			name:    "another item's completion",
+			payload: `{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m2"}}`,
+			want:    reasonMultipleOutputs,
+		},
+		{
+			name:    "a message item with no id",
+			payload: `{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}`,
+			want:    reasonUnknownShape,
+		},
+		{
+			name:    "a call item's completion",
+			payload: `{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc1"}}`,
+			want:    reasonToolCalls,
+		},
+		{
+			name:    "an executable call item's completion",
+			payload: `{"type":"response.output_item.done","output_index":1,"item":{"type":"code_interpreter_call","id":"ci1"}}`,
+			want:    reasonToolCalls,
+		},
+		{
+			name:    "no item at all",
+			payload: `{"type":"response.output_item.done","output_index":0}`,
+			want:    reasonUnknownShape,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := feed(apiResponses, 1<<20, prefix, tc.payload)
+			if tc.recover {
+				if got := recovered(t, v); got != "Once" {
+					t.Fatalf("prefix = %q, want %q", got, "Once")
+				}
+				return
+			}
+			if v.Kind != verdictUnsafe || v.Reason != tc.want {
+				t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, tc.want)
+			}
+		})
+	}
+}
+
+// TestPartialTextResponsesUnknownCallSurfacesFailClosed is the audit's
+// negative half, and the one that must never soften. Every call surface other
+// than the two argument families named in the switch — a search, an
+// interpreter, an image generator, a surface that does not exist yet — reaches
+// the accumulator's default arm and is REFUSED. The parser is not an "ignore
+// what you do not recognize" pass-through: an event this build cannot classify
+// is assumed to be carrying text or opening a call until proven otherwise,
+// because a continuation built around an omitted call is a broken call.
+func TestPartialTextResponsesUnknownCallSurfacesFailClosed(t *testing.T) {
+	const prefix = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`
+
+	for _, typ := range []string{
+		"response.web_search_call.searching",
+		"response.file_search_call.completed",
+		"response.code_interpreter_call.in_progress",
+		"response.code_interpreter_call_code.delta",
+		"response.image_generation_call.generating",
+		"response.mcp_call.arguments.delta",
+		"response.mcp_list_tools.completed",
+		"response.local_shell_call.in_progress",
+		"response.audio.delta",
+		"response.some_future_thing",
+	} {
+		t.Run(typ, func(t *testing.T) {
+			v := feed(apiResponses, 1<<20, prefix, `{"type":"`+typ+`","item_id":"x","output_index":1,"delta":"y"}`)
+			if v.Kind != verdictUnsafe {
+				t.Fatalf("verdict = %v/%q, want an unsafe refusal — an unclassified event must fail closed", v.Kind, v.Reason)
+			}
+			if v.Text != "" {
+				t.Fatalf("a refused stream still offered a prefix: %q", v.Text)
+			}
+		})
+	}
+
+	// The two argument families whose deltas are enumerated are refused under
+	// the call token itself, in both their delta and their done spelling.
+	for _, typ := range []string{
+		"response.function_call_arguments.delta",
+		"response.function_call_arguments.done",
+		"response.custom_tool_call_input.delta",
+		"response.custom_tool_call_input.done",
+	} {
+		t.Run(typ, func(t *testing.T) {
+			v := feed(apiResponses, 1<<20, prefix, `{"type":"`+typ+`","item_id":"fc1","output_index":1,"delta":"{\"pa"}`)
+			if v.Kind != verdictUnsafe || v.Reason != reasonToolCalls {
+				t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonToolCalls)
+			}
+		})
+	}
+}
+
+// TestPartialTextHopItemIdentityRegression is the m1/m2 regression suite for
+// the hop-scoped identity PR #87 established: a continuation hop is a new
+// upstream response with its own output item, and its honest identity differs
+// from the committed reply's by construction. Judging the hop against the
+// committed item would refuse every real second hop as multiple_outputs, after
+// that hop had already been dialed and paid for.
+//
+// It is written as explicit item ids rather than through the shared helpers so
+// the regression is readable at a glance: m1 in the committed pass, m2 in the
+// hop, and the SAME pass still refusing two items.
+func TestPartialTextHopItemIdentityRegression(t *testing.T) {
+	delta := func(item string, index int, text string) string {
+		return fmt.Sprintf(`{"type":"response.output_text.delta","item_id":%q,"output_index":%d,"content_index":0,"delta":%q}`, item, index, text)
+	}
+
+	t.Run("m1 committed, m2 in the hop", func(t *testing.T) {
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{
+				`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1"}}`,
+				delta("m1", 0, "Once upon a "),
+			},
+			[]string{
+				`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m2"}}`,
+				delta("m2", 0, "time"),
+			},
+		)
+		if got := recovered(t, v); got != "Once upon a time" {
+			t.Fatalf("prefix = %q, want %q", got, "Once upon a time")
+		}
+	})
+
+	t.Run("m2 and m1 inside one pass still refuse", func(t *testing.T) {
+		v := feed(apiResponses, 1<<20,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1"}}`,
+			delta("m1", 0, "Once upon a "),
+			delta("m2", 0, "time"),
+		)
+		if v.Kind != verdictUnsafe || v.Reason != reasonMultipleOutputs {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonMultipleOutputs)
+		}
+	})
+
+	t.Run("each hop's .done is compared with its own deltas", func(t *testing.T) {
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{
+				`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1"}}`,
+				delta("m1", 0, "Once upon a "),
+			},
+			[]string{
+				`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m2"}}`,
+				delta("m2", 0, "time"),
+				`{"type":"response.output_text.done","item_id":"m2","output_index":0,"content_index":0,"text":"time"}`,
+			},
+		)
+		// The hop's own .done agrees with the hop's own deltas, so it is the
+		// logical terminal — NOT a refusal for disagreeing with the
+		// cross-hop prefix it never stated.
+		if v.Kind != verdictTerminal {
+			t.Fatalf("verdict = %v/%q, want terminal", v.Kind, v.Reason)
+		}
+	})
+
+	t.Run("a hop's .done disagreeing with its own deltas refuses", func(t *testing.T) {
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{
+				`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1"}}`,
+				delta("m1", 0, "Once upon a "),
+			},
+			[]string{
+				delta("m2", 0, "time"),
+				`{"type":"response.output_text.done","item_id":"m2","output_index":0,"content_index":0,"text":"Once upon a time"}`,
+			},
+		)
+		if v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
 }
