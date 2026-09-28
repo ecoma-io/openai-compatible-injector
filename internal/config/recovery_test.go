@@ -946,6 +946,33 @@ func TestRecoveryStreamBlockParsesEveryFieldAndDefaultsOff(t *testing.T) {
 	if all.RecoveryHash == absent.RecoveryHash {
 		t.Fatal("a stream block left the policy hash unchanged")
 	}
+
+	// A DISABLED block is not a zero policy: the bounds survive it. The
+	// window in particular is load-bearing — it is the value a layer turning
+	// the block on inherits, so a file that states `enabled: false` alone (or
+	// states a window next to it) still resolves to a nonzero `max-elapsed`.
+	// That fact is exactly why the proxy may not arm its watchdog on the
+	// strength of `max-elapsed` alone: every policy, enabled or not, carries
+	// one. It is a property of the resolved data, pinned here so the coupling
+	// to the proxy's own gate is stated rather than discovered.
+	disabled := recoveryModel(t, recoveryYAML("recovery:\n  stream:\n    enabled: false\n", "", simple), "m")
+	if disabled.Recovery.Stream.MaxElapsed != recovery.DefaultStreamMaxElapsed {
+		t.Fatalf("a disabled stream block resolved to a zero window: %+v", disabled.Recovery.Stream)
+	}
+	disabledStated := recoveryModel(t, recoveryYAML(
+		"recovery:\n  stream:\n    enabled: false\n    max-elapsed: 150ms\n", "", simple), "m")
+	if disabledStated.Recovery.Stream.MaxElapsed != 150*time.Millisecond {
+		t.Fatalf("a disabled stream block dropped the stated window: %+v", disabledStated.Recovery.Stream)
+	}
+	// ... and the opt-in that inherits it is a plain opt-in: no window stated
+	// at the enabling layer means the disabled layer's value.
+	inherit := recoveryModel(t, recoveryYAML(
+		"recovery:\n  stream:\n    enabled: false\n    max-elapsed: 45s\n", "",
+		"  m:\n    provider: pa\n    upstream-model: up-a\n"+
+			"    recovery:\n      stream:\n        enabled: true\n"), "m")
+	if inherit.Recovery.Stream.MaxElapsed != 45*time.Second {
+		t.Fatalf("the enabling layer lost the lower layer's window: %+v", inherit.Recovery.Stream)
+	}
 }
 
 // TestRecoveryStreamScopeIsTheDeployment pins the position rule. Stream

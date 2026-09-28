@@ -87,7 +87,9 @@ type continuationResponsesItem struct {
 //
 //   - the last message is already an `assistant` message with string content
 //     (a prefill-style request): the streamed text EXTENDS it, so the prefix
-//     is appended to that content and the message is otherwise left alone;
+//     is appended to that content and NOTHING else about the message changes
+//     — its other members, known and unknown alike, are re-emitted from the
+//     client's own bytes rather than rebuilt;
 //   - any other last message: the assistant turn does not exist yet in the
 //     body, so one is appended carrying the prefix.
 //
@@ -155,11 +157,26 @@ func BuildContinuationChat(orig []byte, prefix string) ([]byte, error) {
 				return nil, refuse(refusalUnsupportedShape)
 			}
 		}
-		extended, err := json.Marshal(continuationChatMessage{Role: "assistant", Content: existing + prefix})
+		// THE MESSAGE IS MUTATED, NOT REBUILT. Only the member this builder
+		// owns — `content` — is replaced, and every other member of the
+		// prefill message travels exactly as the client sent it: `name`,
+		// provider extensions, an opinionated `role`-adjacent field, a field
+		// this build has never heard of. Rebuilding the message from the two
+		// fields this package knows about would silently drop all of them,
+		// and a continuation that quietly rewrites a client's conversation is
+		// a corruption the client cannot see — worse than the truncated
+		// stream it was meant to repair. Members are re-emitted from the
+		// client's own bytes (json.RawMessage), so nothing is normalized.
+		extended, err := json.Marshal(existing + prefix)
 		if err != nil {
 			return nil, err
 		}
-		msgs[last] = extended
+		tail["content"] = extended
+		encodedTail, err := json.Marshal(tail)
+		if err != nil {
+			return nil, err
+		}
+		msgs[last] = encodedTail
 	}
 
 	encoded, err := json.Marshal(msgs)

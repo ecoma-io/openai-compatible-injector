@@ -1081,3 +1081,737 @@ func TestE2ERecoverySpentCandidateEnvelopeStillFallsBack(t *testing.T) {
 		t.Errorf("dial failures = %d, want 2 (the candidate envelope refuses the third dial)", got)
 	}
 }
+
+// ---- The adversarial stream-recovery matrix -------------------------------
+
+// drainSSE reads every remaining SSE line until EOF and reports the whole
+// text plus whether a terminal marker was among it. A cut stream ends here
+// exactly as a client experiences it: bytes, then the connection.
+func drainSSE(t *testing.T, br *bufio.Reader, timeout time.Duration) (text string, terminal bool) {
+	t.Helper()
+	var sb strings.Builder
+	for {
+		line, err := readSSELine(t, br, timeout)
+		if err == io.EOF {
+			sb.WriteString(line)
+			break
+		}
+		if err != nil {
+			t.Fatalf("read SSE line: %v", err)
+		}
+		sb.WriteString(line)
+		sb.WriteString("\n")
+	}
+	s := sb.String()
+	return s, strings.Contains(s, "[DONE]") || strings.Contains(s, "event: response.completed")
+}
+
+// streamRecoveryYAML renders the standard recovery-on file for one upstream.
+func streamRecoveryYAML(up *fakeUpstream, stream string) string {
+	return recoveryFile(fmt.Sprintf(`recovery:
+  stream:
+%s`, stream), fmt.Sprintf(`providers:
+  srm-p1:
+    base-url: %s/v1
+`, up.url()), `models:
+  srm-model:
+    providers:
+      - provider: srm-p1
+        upstream-model: srm-up
+`)
+}
+
+// TestE2EStreamRecoveryRefusalMatrix is the fail-closed half of the feature on
+// the real wire: every shape below is one this proxy must NOT continue. What
+// each row proves is the SAME two facts a client can observe — the upstream
+// was dialed exactly once (no continuation request was ever made) and the
+// client's stream ended with the bytes it already had, with no marker this
+// proxy invented. The per-row reason distinguishes WHY the pool of refusals
+// fired, and `logical_terminal` is deliberately not `unsafe_content`: a
+// generation the upstream declared finished is not a stream this proxy failed
+// to read.
+func TestE2EStreamRecoveryRefusalMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		// extra is appended after the committed fragment.
+		extra string
+		// wantExhaust is the closed-set reason on stream_recovery_exhausted;
+		// empty means the stream was refused with no recovery event at all.
+		wantExhaust string
+		// wantUnsafe is the gate's own token, when there is one.
+		wantUnsafe string
+	}{
+		// The cut stream itself — a clean fragment and then an abort — is the
+		// one shape that IS recoverable, so it is asserted where it belongs:
+		// TestE2EStreamRecoveryContinuesACutStream.
+		{
+			name:        "the upstream declared the finish",
+			extra:       `data: {"id":"sr2","model":"srm-up","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+			wantExhaust: "logical_terminal",
+		},
+		{
+			name:        "the stream carries a tool call",
+			extra:       `data: {"id":"sr2","model":"srm-up","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"ls"}}]},"finish_reason":null}]}` + "\n\n",
+			wantExhaust: "unsafe_content",
+			wantUnsafe:  "tool_calls",
+		},
+		{
+			name:        "an unrecognised data line",
+			extra:       `data: {"choices":{"delta":{"content":"x"}}}` + "\n\n",
+			wantExhaust: "unsafe_content",
+			wantUnsafe:  "unknown_shape",
+		},
+		{
+			name:        "a data line that is not JSON",
+			extra:       "data: }{ \n\n",
+			wantExhaust: "unsafe_content",
+			wantUnsafe:  "not_object",
+		},
+		{
+			name: "a prefix past the configured bound",
+			// max-partial-bytes is 4096 in the file below.
+			extra:       "data: {\"id\":\"sr2\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + strings.Repeat("x", 8192) + "\"},\"finish_reason\":null}]}\n\n",
+			wantExhaust: "unsafe_content",
+			wantUnsafe:  "oversize",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFakeUpstream(t)
+			up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fl := w.(http.Flusher)
+				_, _ = fmt.Fprintf(w, "data: {\"id\":\"sr1\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half \"},\"finish_reason\":null}]}\n\n")
+				fl.Flush()
+				_, _ = fmt.Fprint(w, tc.extra)
+				fl.Flush()
+				panic(http.ErrAbortHandler)
+			})
+
+			p := startSubprocess(t, startOpts{
+				yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 2\n    max-elapsed: 30s\n    max-partial-bytes: 4096\n"),
+				logLevel: "info",
+			})
+			resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
+				map[string]string{"Accept": "text/event-stream"})
+			defer func() { _ = resp.Body.Close() }()
+			br := bufio.NewReader(resp.Body)
+
+			lines, eof := nextSSEEvent(t, br, 5*time.Second)
+			if eof {
+				t.Fatal("the committed fragment never arrived")
+			}
+			assertChatSSE(t, lines, "srm-model", "half ")
+
+			text, terminal := drainSSE(t, br, 10*time.Second)
+			if terminal {
+				t.Errorf("a refused stream carried a terminal marker: %q", text)
+			}
+
+			// ONE dial: no continuation request was made for this stream.
+			if got := up.count(); got != 1 {
+				t.Fatalf("upstream dials = %d, want 1 — a refused stream must not be re-asked", got)
+			}
+			// The client's EOF and the process's report of it are two
+			// different clocks — the relay ends the moment the upstream
+			// aborts, and the refusal is written after. Wait for the
+			// truncation report before reading the refusal that precedes it.
+			waitForEventCount(t, p, "stream_truncated", 1)
+			logs := parseLogEvents(t, p.stderr.String())
+			if got := len(eventsWithMessage(logs, "stream_recovery_started")); got != 0 {
+				t.Errorf("stream_recovery_started events = %d, want 0", got)
+			}
+			exh := eventsWithMessage(logs, "stream_recovery_exhausted")
+			if len(exh) != 1 {
+				t.Fatalf("stream_recovery_exhausted events = %v, want 1", exh)
+			}
+			if exh[0]["reason"] != tc.wantExhaust {
+				t.Errorf("reason = %v, want %v", exh[0]["reason"], tc.wantExhaust)
+			}
+			if tc.wantUnsafe != "" && exh[0]["unsafe_reason"] != tc.wantUnsafe {
+				t.Errorf("unsafe_reason = %v, want %v", exh[0]["unsafe_reason"], tc.wantUnsafe)
+			}
+			// A declared finish is NOT unsafe content: the field that carries
+			// the gate's refusal must be absent, because there was no gate
+			// refusal — the generation simply ended.
+			if tc.wantUnsafe == "" {
+				if _, has := exh[0]["unsafe_reason"]; has {
+					t.Errorf("a logical terminal was reported as unsafe content: %v", exh[0])
+				}
+			}
+			trunc := eventsWithMessage(parseLogEvents(t, p.stderr.String()), "stream_truncated")
+			if len(trunc) != 1 {
+				t.Fatalf("stream_truncated events = %d, want 1", len(trunc))
+			}
+			if trunc[0]["recovery_reason"] != tc.wantExhaust {
+				t.Errorf("stream_truncated recovery_reason = %v, want %v", trunc[0]["recovery_reason"], tc.wantExhaust)
+			}
+		})
+	}
+}
+
+// TestE2EStreamRecoveryMaxElapsedCutsAStalledUpstream is the hard bound on
+// real sockets, and the reason the bound is not merely a check the loop makes
+// between reads: the upstream sends a partial event and then HOLDS THE TCP
+// CONNECTION OPEN, so the relay is parked inside a read of a real
+// net/http response body. Nothing the loop can inspect afterwards can reach
+// it — the recovery window's watchdog closing that body is what ends the
+// stream, and the client sees exactly the truncation a deployment without the
+// feature always had.
+func TestE2EStreamRecoveryMaxElapsedCutsAStalledUpstream(t *testing.T) {
+	up := newFakeUpstream(t)
+	hold := make(chan struct{})
+	// A failed assertion must not leave the handler blocked forever:
+	// httptest.Server.Close waits for it, and with it the whole test binary.
+	t.Cleanup(func() { close(hold) })
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"st1\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half \"},\"finish_reason\":null}]}\n\n")
+		fl.Flush()
+		// ... and then not another byte, with the connection still open.
+		<-hold
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 2\n    max-elapsed: 2s\n    max-partial-bytes: 4096\n"),
+		logLevel: "info",
+	})
+	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	if eof {
+		t.Fatal("the committed fragment never arrived")
+	}
+	assertChatSSE(t, lines, "srm-model", "half ")
+
+	// The bound fires and the stream ends. Generous read window: the assertion
+	// is that it ends at all, not how fast the timer is.
+	text, terminal := drainSSE(t, br, 20*time.Second)
+	if terminal {
+		t.Errorf("an abandoned stream carried a terminal marker: %q", text)
+	}
+	if got := up.count(); got != 1 {
+		t.Fatalf("upstream dials = %d, want 1 — no continuation past the window", got)
+	}
+	waitForEventCount(t, p, "stream_truncated", 1)
+
+	logs := parseLogEvents(t, p.stderr.String())
+	exh := eventsWithMessage(logs, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want one max_elapsed refusal", exh)
+	}
+	trunc := eventsWithMessage(logs, "stream_truncated")
+	if len(trunc) != 1 {
+		t.Fatalf("stream_truncated = %v, want one", trunc)
+	}
+	if trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Errorf("recovery_reason = %v, want max_elapsed", trunc[0]["recovery_reason"])
+	}
+	// The order the events are read in is the ordering that keeps the bound
+	// legible: this is the operator's own window, NOT a peer that broke and
+	// NOT a client that left. Both of those would have produced a different
+	// outcome, and neither can produce this pair.
+	if _, has := trunc[0]["error"]; has {
+		t.Errorf("the window reported an upstream error it invented: %v", trunc[0])
+	}
+	if trunc[0]["outcome"] == "client_disconnected" {
+		t.Errorf("the window was reported as a client disconnect: %v", trunc[0])
+	}
+	evs := completionsFor(t, p, "srm-model")
+	if len(evs) != 1 || evs[0]["outcome"] != "stream_truncated" {
+		t.Fatalf("completions = %v, want one stream_truncated", evs)
+	}
+}
+
+// TestE2EStreamRecoverySpendsNothingForADepartedClient pins the cancellation
+// invariant on real sockets: once the client is gone, the proxy makes no
+// further upstream request. The upstream here is stalled — the proxy's read is
+// parked on a real response body — and the client closing its own connection
+// is what has to end it: the request context cancels, the transport aborts the
+// parked read, and the loop refuses to dial for a stream nobody is reading.
+func TestE2EStreamRecoverySpendsNothingForADepartedClient(t *testing.T) {
+	up := newFakeUpstream(t)
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"dc1\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half \"},\"finish_reason\":null}]}\n\n")
+		fl.Flush()
+		<-hold
+	})
+
+	// A wide window: the disconnect has to be what ends this, not the bound.
+	p := startSubprocess(t, startOpts{
+		yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 2\n    max-elapsed: 60s\n    max-partial-bytes: 4096\n"),
+		logLevel: "info",
+	})
+	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
+		map[string]string{"Accept": "text/event-stream"})
+	br := bufio.NewReader(resp.Body)
+	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	if eof {
+		t.Fatal("the committed fragment never arrived")
+	}
+	assertChatSSE(t, lines, "srm-model", "half ")
+
+	// The client walks away mid-generation.
+	_ = resp.Body.Close()
+
+	waitForEventCount(t, p, "request_completed", 1)
+	evs := completionsFor(t, p, "srm-model")
+	if len(evs) != 1 {
+		t.Fatalf("completions = %d, want 1", len(evs))
+	}
+	if got := up.count(); got != 1 {
+		t.Fatalf("upstream dials = %d, want 1 — no exchange may be spent for a client that is gone", got)
+	}
+	logs := parseLogEvents(t, p.stderr.String())
+	for _, slug := range []string{"stream_recovery_started", "stream_recovery_failed", "stream_recovery_succeeded"} {
+		if got := len(eventsWithMessage(logs, slug)); got != 0 {
+			t.Errorf("%s events = %d, want 0 after the client left", slug, got)
+		}
+	}
+	if evs[0]["outcome"] != "client_disconnected" {
+		t.Errorf("outcome = %v, want client_disconnected", evs[0]["outcome"])
+	}
+}
+
+// TestE2EStreamRecoveryContinuesACleanEOF pins the OTHER way a committed
+// stream ends without its marker: the upstream closes the response body
+// normally. That is a clean EOF on the wire — no read error at all — and it is
+// the most common truncation a real provider produces, so the feature has to
+// continue it exactly like an aborted connection. The client ends on the hop's
+// marker, and nothing follows it: the proxy appends no terminal of its own to
+// a hop that ended, and adds none after one.
+//
+// (A provider that sends the marker twice has its bytes relayed twice, exactly
+// as it would with the feature off: the relay is byte-faithful and never edits
+// a stream. What is pinned here is the proxy's own contribution — nothing.)
+func TestE2EStreamRecoveryContinuesACleanEOF(t *testing.T) {
+	// Two sentinels travel through this request: the client's own turn, and
+	// the answer text the proxy has to hold in order to continue it. Both are
+	// asserted absent from the process's output at the end — the committed
+	// prefix is the one piece of client-visible text this feature takes
+	// custody of, and custody never means writing it to a log.
+	const (
+		userSentinel   = "USERTURNSEKRIT"
+		prefixSentinel = "PREFIXSEKRIT"
+	)
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if up.count() == 1 {
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"ce1\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":%q},\"finish_reason\":null}]}\n\n", prefixSentinel+" ")
+			w.(http.Flusher).Flush()
+			// A clean return: the response ends, the connection stays healthy.
+			return
+		}
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"ce2\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"rest\"},\"finish_reason\":null}]}\n\n")
+		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 1\n    max-elapsed: 30s\n    max-partial-bytes: 4096\n"),
+		logLevel: "info",
+	})
+	resp := openJSON(t, p.addr, "/v1/chat/completions",
+		fmt.Sprintf(`{"model":"srm-model","messages":[{"role":"user","content":%q}],"stream":true}`, userSentinel),
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	for _, want := range []string{prefixSentinel + " ", "rest"} {
+		lines, eof := nextSSEEvent(t, br, 5*time.Second)
+		if eof {
+			t.Fatalf("stream ended before %q arrived", want)
+		}
+		assertChatSSE(t, lines, "srm-model", want)
+	}
+	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	if eof || len(lines) != 1 || !strings.Contains(lines[0], "[DONE]") {
+		t.Fatalf("terminal event = %q (eof=%v), want exactly one data: [DONE]", lines, eof)
+	}
+	// The hop's marker is the stream's last byte: the proxy adds no second
+	// terminal of its own, here or after.
+	if tail, _ := io.ReadAll(br); strings.Contains(string(tail), "data:") {
+		t.Errorf("bytes followed the terminal marker: %q", tail)
+	}
+	if got := up.count(); got != 2 {
+		t.Fatalf("upstream dials = %d, want 2", got)
+	}
+	waitForEventCount(t, p, "request_completed", 1)
+	evs := completionsFor(t, p, "srm-model")
+	if len(evs) != 1 || evs[0]["outcome"] != "completed" {
+		t.Fatalf("completions = %v, want one completed", evs)
+	}
+
+	// The continuation body this proxy assembled carried the prefix as an
+	// assistant turn — and that is a REQUEST the upstream received, never a
+	// line the process wrote about itself.
+	if reqs := up.requests(); len(reqs) != 2 || !strings.Contains(string(reqs[1].Body), prefixSentinel) {
+		t.Fatalf("the hop did not carry the committed prefix to the upstream: %v", reqs)
+	}
+	if out := p.stderr.String(); strings.Contains(out, prefixSentinel) || strings.Contains(out, userSentinel) {
+		t.Errorf("the process logged client-visible text: %s", out)
+	}
+}
+
+// TestE2EStreamRecoveryRefusesAnEmptyPrefix pins the row no heuristic may
+// guess its way past: a committed stream that carries no assistant TEXT is not
+// a truncated answer, it is a stream this proxy has nothing to continue from.
+// Re-asking the upstream here would replay the whole request wearing a
+// continuation's shape — the model would answer from nothing and the client
+// would receive a second answer spliced onto a live stream. One dial, no hop,
+// and the refusal names the reason.
+func TestE2EStreamRecoveryRefusesAnEmptyPrefix(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// A role announcement and a finish_reason-free usage chunk: the shape
+		// of a stream that committed and produced no text yet.
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"ep1\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n")
+		w.(http.Flusher).Flush()
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 2\n    max-elapsed: 30s\n    max-partial-bytes: 4096\n"),
+		logLevel: "info",
+	})
+	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	// The role delta reaches the client unchanged; the gate decides whether to
+	// CONTINUE, it never edits a stream in flight.
+	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	if eof || len(lines) != 1 || !strings.Contains(lines[0], `"role":"assistant"`) {
+		t.Fatalf("role event = %q (eof=%v), want one relayed unchanged", lines, eof)
+	}
+	text, terminal := drainSSE(t, br, 10*time.Second)
+	if terminal {
+		t.Errorf("an empty prefix produced a terminal marker: %q", text)
+	}
+	if got := up.count(); got != 1 {
+		t.Fatalf("upstream dials = %d, want 1 — a stream with no text is not continued", got)
+	}
+	waitForEventCount(t, p, "stream_truncated", 1)
+	logs := parseLogEvents(t, p.stderr.String())
+	exh := eventsWithMessage(logs, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "unsafe_content" || exh[0]["unsafe_reason"] != "no_prefix" {
+		t.Fatalf("refusal = %v, want unsafe_content/no_prefix", exh)
+	}
+	if got := len(eventsWithMessage(logs, "stream_recovery_started")); got != 0 {
+		t.Errorf("stream_recovery_started events = %d, want 0", got)
+	}
+}
+
+// TestE2EStreamRecoveryHopFailureIsBounded pins what a FAILED continuation
+// costs and what it reports. A hop that dies, is answered with a status, or is
+// answered with something that is not an event stream must not become a retry
+// loop: each is recorded once, under the phase that failed, and the client's
+// stream ends exactly where it stood. `max-recoveries: 1` is deliberate — the
+// reach is one hop, so a failed hop is also the end of the reach, and the
+// assertion that no third dial ever happens is the assertion that a failure
+// never buys itself another attempt.
+func TestE2EStreamRecoveryHopFailureIsBounded(t *testing.T) {
+	cases := []struct {
+		name string
+		// hop answers the SECOND dial.
+		hop       func(w http.ResponseWriter)
+		wantPhase string
+		// wantStatus is the hop's own status when the phase reports one.
+		wantStatus float64
+		// wantBounds is the bound the loop stopped on, when a failed hop
+		// leaves it with one. A hop that never produced a stream is a
+		// refusal the loop stops AT — the failure is the whole report, and
+		// the stream truncates with no `recovery_reason` because no bound was
+		// reached. A hop that DIED MID-STREAM is the one shape where the
+		// loop re-evaluates — the failure is recorded either way, and the
+		// loop's own bounds (here: the reach) are what decide whether the
+		// stream is worth continuing again. Both readings are pinned below.
+		wantBounds string
+	}{
+		{
+			name: "the hop dies mid-stream",
+			hop: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprintf(w, "data: {\"id\":\"hf2\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"two\"},\"finish_reason\":null}]}\n\n")
+				w.(http.Flusher).Flush()
+				panic(http.ErrAbortHandler)
+			},
+			wantPhase:  "upstream_read",
+			wantBounds: "max_recoveries",
+		},
+		{
+			name: "the hop is answered with a status",
+			hop: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = fmt.Fprint(w, `{"error":{"message":"slow down","type":"rate_limit_error"}}`)
+			},
+			wantPhase:  "upstream_status",
+			wantStatus: 429,
+		},
+		{
+			name: "the hop is answered with a non-stream 2xx",
+			hop: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprint(w, `{"id":"hf2","object":"chat.completion"}`)
+			},
+			wantPhase:  "upstream_status",
+			wantStatus: 200,
+		},
+		{
+			name: "the hop's connection dies before it answers",
+			hop: func(w http.ResponseWriter) {
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Errorf("hijack: %v", err)
+					return
+				}
+				_ = conn.Close()
+			},
+			wantPhase: "dial",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFakeUpstream(t)
+			up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+				if up.count() > 1 {
+					tc.hop(w)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprintf(w, "data: {\"id\":\"hf1\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half \"},\"finish_reason\":null}]}\n\n")
+				w.(http.Flusher).Flush()
+				panic(http.ErrAbortHandler)
+			})
+
+			p := startSubprocess(t, startOpts{
+				yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 1\n    max-elapsed: 30s\n    max-partial-bytes: 4096\n"),
+				logLevel: "info",
+			})
+			resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
+				map[string]string{"Accept": "text/event-stream"})
+			defer func() { _ = resp.Body.Close() }()
+			br := bufio.NewReader(resp.Body)
+
+			lines, eof := nextSSEEvent(t, br, 5*time.Second)
+			if eof {
+				t.Fatal("the committed fragment never arrived")
+			}
+			assertChatSSE(t, lines, "srm-model", "half ")
+
+			// The stream ends. Whatever the hop did or did not deliver, the
+			// proxy never invents the marker that would claim it finished.
+			text, terminal := drainSSE(t, br, 10*time.Second)
+			if terminal {
+				t.Errorf("a failed hop produced a terminal marker at the client: %q", text)
+			}
+
+			waitForEventCount(t, p, "stream_truncated", 1)
+			logs := parseLogEvents(t, p.stderr.String())
+			if got := len(eventsWithMessage(logs, "stream_recovery_started")); got != 1 {
+				t.Errorf("stream_recovery_started events = %d, want 1", got)
+			}
+			failed := eventsWithMessage(logs, "stream_recovery_failed")
+			if len(failed) != 1 {
+				t.Fatalf("stream_recovery_failed events = %v, want exactly one", failed)
+			}
+			if failed[0]["phase"] != tc.wantPhase {
+				t.Errorf("phase = %v, want %v", failed[0]["phase"], tc.wantPhase)
+			}
+			if tc.wantStatus != 0 && failed[0]["upstream_status"] != tc.wantStatus {
+				t.Errorf("upstream_status = %v, want %v", failed[0]["upstream_status"], tc.wantStatus)
+			}
+			if got := len(eventsWithMessage(logs, "stream_recovery_succeeded")); got != 0 {
+				t.Errorf("stream_recovery_succeeded events = %d, want 0", got)
+			}
+			// The reach was ONE hop and it was spent by the failure, so the
+			// hop is never asked again — that is the whole point of the row.
+			if got := up.count(); got != 2 {
+				t.Errorf("upstream dials = %d, want 2 (one walk attempt, one hop, no retry of the hop)", got)
+			}
+			exh := eventsWithMessage(logs, "stream_recovery_exhausted")
+			switch tc.wantBounds {
+			case "":
+				if len(exh) != 0 {
+					t.Errorf("stream_recovery_exhausted = %v, want none: the hop's refusal is the whole report", exh)
+				}
+			default:
+				if len(exh) != 1 || exh[0]["reason"] != tc.wantBounds {
+					t.Errorf("stream_recovery_exhausted = %v, want one %s", exh, tc.wantBounds)
+				}
+			}
+			trunc := eventsWithMessage(parseLogEvents(t, p.stderr.String()), "stream_truncated")
+			if len(trunc) != 1 || trunc[0]["outcome"] == "client_disconnected" {
+				t.Fatalf("stream_truncated = %v, want one non-disconnect truncation", trunc)
+			}
+			if got, has := trunc[0]["recovery_reason"]; has != (tc.wantBounds != "") {
+				t.Errorf("stream_truncated recovery_reason = %v (present=%v), want %q", got, has, tc.wantBounds)
+			} else if has && got != tc.wantBounds {
+				t.Errorf("stream_truncated recovery_reason = %v, want %v", got, tc.wantBounds)
+			}
+			evs := completionsFor(t, p, "srm-model")
+			if len(evs) != 1 || evs[0]["outcome"] != "stream_truncated" {
+				t.Fatalf("completions = %v, want one stream_truncated", evs)
+			}
+			// One candidate, two attempts: the failed hop is a real outbound
+			// exchange on the SAME provider, and it never moves the walk.
+			if got := evs[0]["candidates_entered"]; got != float64(1) {
+				t.Errorf("candidates_entered = %v, want 1", got)
+			}
+			if got := evs[0]["provider_attempts"]; got != float64(2) {
+				t.Errorf("provider_attempts = %v, want 2", got)
+			}
+		})
+	}
+}
+
+// TestE2EStreamRecoveryResponsesIdentityFailsClosed is the Responses
+// continuation contract on the real wire: the MVP continues plain text from
+// exactly one message output's exactly one content stream. A stream whose
+// deltas disagree about which output they belong to is refused rather than
+// concatenated — splicing two answers into one assistant turn would hand the
+// model a conversation that never happened, which is worse than the
+// truncation it replaces.
+func TestE2EStreamRecoveryResponsesIdentityFailsClosed(t *testing.T) {
+	const (
+		first  = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`
+		second = `{"type":"response.output_text.delta","item_id":"m2","output_index":1,"content_index":0,"delta":" upon a time"}`
+	)
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		for _, payload := range []string{first, second} {
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", "response.output_text.delta", payload)
+			fl.Flush()
+		}
+		panic(http.ErrAbortHandler)
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 2\n    max-elapsed: 30s\n    max-partial-bytes: 4096\n"),
+		logLevel: "info",
+	})
+	resp := openJSON(t, p.addr, "/v1/responses",
+		`{"model":"srm-model","stream":true,"input":"tell me a story"}`,
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	// Both deltas reach the client — the gate decides whether to CONTINUE, it
+	// never edits the stream in flight.
+	text, terminal := drainSSE(t, br, 10*time.Second)
+	for _, must := range []string{"Once", " upon a time"} {
+		if !strings.Contains(text, must) {
+			t.Fatalf("the relayed stream is missing %q: %s", must, text)
+		}
+	}
+	if terminal {
+		t.Errorf("a refused stream carried a terminal marker: %q", text)
+	}
+	if got := up.count(); got != 1 {
+		t.Fatalf("upstream dials = %d, want 1 — a multi-output stream is not continued", got)
+	}
+	waitForEventCount(t, p, "stream_truncated", 1)
+	logs := parseLogEvents(t, p.stderr.String())
+	exh := eventsWithMessage(logs, "stream_recovery_exhausted")
+	if len(exh) != 1 {
+		t.Fatalf("stream_recovery_exhausted = %v, want one", exh)
+	}
+	if exh[0]["reason"] != "unsafe_content" || exh[0]["unsafe_reason"] != "multiple_outputs" {
+		t.Errorf("refusal = %v/%v, want unsafe_content/multiple_outputs", exh[0]["reason"], exh[0]["unsafe_reason"])
+	}
+	if got := len(eventsWithMessage(logs, "stream_recovery_started")); got != 0 {
+		t.Errorf("stream_recovery_started events = %d, want 0", got)
+	}
+}
+
+// TestE2EStreamRecoveryEnabledWindowBoundsTheCommittedRelay is the other half
+// of the hard-window test, and the row that keeps the window from being read
+// as "a budget for recovery hops". When the block is ENABLED, `max-elapsed`
+// is one wall-clock window over the whole committed stream: it is measured
+// from the commit, and the watchdog closes the upstream body at the deadline
+// whether or not anything is ever cut. So on the feature's own configuration a
+// slow generation is cut with `max_elapsed` — not `max_recoveries`, not an
+// upstream failure, and never a synthesized terminal marker. An operator who
+// needs longer generations sets a longer window; this pins that the window is
+// genuinely hard rather than a number consulted only between recovery attempts.
+func TestE2EStreamRecoveryEnabledWindowBoundsTheCommittedRelay(t *testing.T) {
+	up := newFakeUpstream(t)
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"st1\",\"model\":\"srm-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"thinking\"},\"finish_reason\":null}]}\n\n")
+		fl.Flush()
+		<-hold
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 2\n    max-elapsed: 2s\n    max-partial-bytes: 4096\n"),
+		logLevel: "info",
+	})
+	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	if eof {
+		t.Fatal("the committed fragment never arrived")
+	}
+	assertChatSSE(t, lines, "srm-model", "thinking")
+
+	text, terminal := drainSSE(t, br, 20*time.Second)
+	if terminal {
+		t.Errorf("a window-cut stream carried a terminal marker: %q", text)
+	}
+	if got := up.count(); got != 1 {
+		t.Fatalf("upstream dials = %d, want 1 — the window closed the body before any hop", got)
+	}
+	waitForEventCount(t, p, "stream_truncated", 1)
+	logs := parseLogEvents(t, p.stderr.String())
+	exh := eventsWithMessage(logs, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want one max_elapsed refusal", exh)
+	}
+	trunc := eventsWithMessage(logs, "stream_truncated")
+	if len(trunc) != 1 || trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Fatalf("stream_truncated = %v, want one with recovery_reason max_elapsed", trunc)
+	}
+	// The window is the operator's bound, not a diagnosis about the peer: no
+	// invented error, and not the outcome a broken upstream or a departed
+	// client would have produced.
+	if _, has := trunc[0]["error"]; has {
+		t.Errorf("the window reported an upstream error it invented: %v", trunc[0])
+	}
+	if trunc[0]["outcome"] == "client_disconnected" {
+		t.Errorf("the window was reported as a client disconnect: %v", trunc[0])
+	}
+	evs := completionsFor(t, p, "srm-model")
+	if len(evs) != 1 || evs[0]["outcome"] != "stream_truncated" {
+		t.Fatalf("completions = %v, want one stream_truncated", evs)
+	}
+}
