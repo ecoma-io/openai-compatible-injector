@@ -25,6 +25,7 @@ import (
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/inject"
+	"openai-compatible-injector/internal/memlimit"
 	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
 	"openai-compatible-injector/internal/usage"
@@ -42,6 +43,15 @@ const (
 	envelopeInvalidReq = `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeMissingMod = `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeTooLarge   = `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`
+	// envelopeAtCapacity is the local refusal of the process-wide buffering
+	// budget: this process declined to hold the bytes, either because the
+	// client's own body did not fit or because a buffered answer grew past
+	// what was left. It is a 503 in the upstream-error family's shape — no
+	// param, a code — because nothing about the request is malformed and no
+	// provider is at fault; the service is simply full for now. It carries
+	// no upstream detail because it has none, and it is a literal constant
+	// like every other envelope so the wire bytes are exact.
+	envelopeAtCapacity = `{"error":{"message":"server is out of buffering capacity","type":"server_error","code":"capacity_exceeded"}}`
 	envelopeUpInvalid  = `{"error":{"message":"upstream returned an invalid response","type":"upstream_error","code":"upstream_invalid_response"}}`
 	envelopeUpUnreach  = `{"error":{"message":"upstream request failed","type":"upstream_error","code":"upstream_unreachable"}}`
 	envelopeBadMethod  = `{"error":{"message":"method not allowed","type":"invalid_request_error","param":null,"code":null}}`
@@ -116,6 +126,33 @@ var (
 // rather than a constant so tests can shorten it, exactly like the two caps
 // above; it is not a configuration key and must not become one.
 var requestBodyReadTimeout = 5 * time.Minute
+
+// memoryBudgetBytes is the process-wide ceiling on the bytes this process
+// commits to buffering at one moment — the client bodies and the buffered
+// answers of every concurrent request together, retries and recovery hops
+// included.
+//
+// The two caps above bound a REQUEST; the failure they prevent is a PROCESS
+// failure, and the walk's retries plus the continuation loop's re-asks
+// multiply concurrency by the policy rather than by anything the operator
+// sets. 512 MiB is eight times a single request's worst case, so the budget
+// admits eight maximum-size buffers at once — or four requests each holding a
+// maximum-size body AND a maximum-size answer at the same time — which is far
+// beyond the concurrency this service sees at that size. Ordinary traffic
+// pays far less than its share: a request reserves in 64 KiB blocks as it
+// reads, so the budget admits thousands of ordinary requests, and only the
+// request that really does hold tens of megabytes spends tens of megabytes of
+// it. Documented internal constant, no configuration key — the same treatment
+// the per-request caps get.
+var memoryBudgetBytes int64 = 512 << 20 // 512 MiB
+
+// bufferBudget is the process-wide admission for the two expensive buffers.
+// It is one instance for the whole process, read per request like the caps
+// above, so every request — whatever candidate, attempt, or recovery hop it
+// is on — draws from the same ceiling. A refused reservation is refused
+// immediately and deterministically; see internal/memlimit for why that is
+// the policy rather than a bounded wait.
+var bufferBudget = memlimit.New(memoryBudgetBytes)
 
 // openAIError is the envelope shape for model-not-found responses, whose
 // message interpolates the requested model.
@@ -573,14 +610,23 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("key_id", principal.KeyID).Logger()
 	}
 
-	// The request body is bounded two ways, and they are two different
-	// bounds: maxRequestBodyBytes caps how much the client may send, and
-	// requestBodyReadTimeout caps how long it may take. Only the first is a
-	// cap on the bytes themselves; the second is what keeps a client from
-	// turning a bounded request into an unbounded hold, and there is nothing
-	// else on the path that would: ReadHeaderTimeout is satisfied by the
-	// headers alone, and no read deadline was ever armed.
+	// The request body is bounded three ways, and they are three different
+	// bounds: maxRequestBodyBytes caps how much the client may send,
+	// requestBodyReadTimeout caps how long it may take, and bufferBudget caps
+	// what the whole process may be holding at once. Only the first is
+	// per-request; the other two are what keep one client — or a hundred —
+	// from turning a bounded request into an unbounded process.
 	//
+	// The admission is released by the defer below on every path out of this
+	// function, the successful ones and the streaming ones included, and the
+	// defer runs while a panic unwinds too: a body the proxy has stopped
+	// using is a body the process is no longer holding. Nothing here releases
+	// before the request is over, because the body stays live for it — the
+	// transforms replay it on every attempt and the continuation builder
+	// re-reads it.
+	bodyAdm := &admission{budget: bufferBudget}
+	defer bodyAdm.release()
+
 	// The read deadline is armed for the body read and CLEARED the moment it
 	// returns, on every path, because this connection is about to carry the
 	// response — a long-lived SSE stream included — and then go back into the
@@ -596,25 +642,33 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// clock.
 	rc := http.NewResponseController(w)
 	deadlineArmed := rc.SetReadDeadline(time.Now().Add(requestBodyReadTimeout)) == nil
-	body, err := io.ReadAll(http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes))
+	body, err := readAllAdmitted(http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes), bodyAdm)
 	if deadlineArmed {
 		_ = rc.SetReadDeadline(time.Time{})
 	}
 	if err != nil {
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		switch {
+		case errors.As(err, &tooLarge):
 			outcome = "body_too_large"
 			reject(http.StatusRequestEntityTooLarge, []byte(envelopeTooLarge), nil)
-			return
+		case errors.Is(err, errBufferRefused):
+			outcome = "capacity_exceeded"
+			log.Warn().Str("public_model", publicModel).
+				Str("phase", "request_body").
+				Str("error_class", "capacity_exceeded").
+				Msg("buffer_capacity_exceeded")
+			reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+		default:
+			// A body that stalled past the read deadline lands here beside a
+			// connection that died mid-body and a body net/http could not
+			// frame. That is deliberate: from this handler's side a deadline
+			// breach IS a read that never completed, so it takes the read
+			// failure's outcome rather than an outcome of its own. Nothing
+			// about the client's bytes is logged or echoed on any of them.
+			outcome = "body_read_error"
+			reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		}
-		// A body that stalled past the read deadline lands here beside a
-		// connection that died mid-body and a body net/http could not frame.
-		// That is deliberate: from this handler's side a deadline breach IS a
-		// read that never completed, so it takes the read failure's outcome
-		// rather than an outcome of its own. Nothing about the client's bytes
-		// is logged or echoed on any of them.
-		outcome = "body_read_error"
-		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		return
 	}
 	bytesIn = int64(len(body))
@@ -1693,9 +1747,41 @@ walk:
 			// Buffered 2xx: read and validated INSIDE the walk, so a
 			// malformed or incomplete answer is a retryable result before
 			// commitment instead of a 502 after it.
-			bodyBytes, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
+			//
+			// The buffer is admitted against the same process-wide budget the
+			// request body drew from. An answer that outgrows what is left of
+			// that budget is the one case in this walk that is NOT a failed
+			// attempt: a process-wide condition is a condition every candidate
+			// shares, so no retry and no fallback can clear it, and walking on
+			// would spend the budgets on a walk that can only end the same
+			// way. It refuses on the spot, before commitment, with bytes
+			// written to nobody — the same judgement the local transform
+			// failure above makes, for the same reason.
+			respAdm := &admission{budget: bufferBudget}
+			bodyBytes, rerr := readAllAdmitted(io.LimitReader(resp.Body, maxBufferedResponseBytes+1), respAdm)
 			_ = resp.Body.Close()
+			if errors.Is(rerr, errBufferRefused) {
+				// Nothing of the answer survives — no evidence, no retained
+				// shape — so there is no attempt to report and no provider to
+				// blame. The walk ends here: the two envelope refusals below
+				// keep their own accounting, and this one has none to keep.
+				respAdm.release()
+				outcome = "capacity_exceeded"
+				log.Warn().Str("public_model", model).
+					Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Str("phase", "upstream_response").
+					Str("error_class", "capacity_exceeded").
+					Str("failure_origin", "envelope").
+					Int("provider_attempt", providerAttempts).
+					Int("candidate_index", i+1).
+					Int("upstream_status", status).
+					Msg("buffer_capacity_exceeded")
+				reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+				return
+			}
 			if rerr != nil {
+				respAdm.release()
 				// Ownership is the request context's, never the error chain's:
 				// a canceled OR expired caller surfaces through the upstream
 				// read as its own sentinel, and neither may be reported as an
@@ -1753,6 +1839,13 @@ walk:
 				break walk
 			}
 			if len(bodyBytes) > int(maxBufferedResponseBytes) || !json.Valid(bodyBytes) {
+				// The answer is unusable, so the bytes are about to be
+				// dropped and the reservation goes back with them — on the
+				// retry, the fallback, and the finalize alike. Holding it
+				// while the walk re-asks would charge the budget twice for
+				// one request's traffic and, with a small budget, refuse the
+				// very retry that was meant to succeed.
+				respAdm.release()
 				// Over-cap and unparseable are separate protocol causes, and
 				// the policy can name them apart: both are unusable answers
 				// that share a retry-by-default disposition and the same
@@ -1811,6 +1904,12 @@ walk:
 			}
 			// A valid 2xx answer: committed. The body rides the answer
 			// struct to the rewrite; no retry follows commitment.
+			//
+			// The reservation is kept with it — the bytes are live until the
+			// rewritten answer reaches the client — and handed back by this
+			// defer as the handler returns, on the success path, the failed
+			// write path, and the unwind of a panic alike.
+			defer respAdm.release()
 			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey}
 			break walk
 		}
