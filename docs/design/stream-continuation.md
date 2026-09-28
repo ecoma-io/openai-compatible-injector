@@ -128,7 +128,11 @@ client-facing rewrite gate, because the accumulator has to see the lines the
 gate would have skipped; the usage meter still reads inside the rewrite wrapper
 it has always used, since it wants only the lines the rewriter touched. One
 accumulator spans the whole logical stream, so hop 2's deltas extend hop 1's
-prefix. It refuses, permanently, on:
+prefix — and its latches span the logical stream too, so a refusal a hop
+latched is never released by the hop that follows it. What does NOT span the
+logical stream is the Responses identity, which is scoped to one upstream
+response; see "the identity is per upstream response" below. It refuses,
+permanently, on:
 
 | token               | trigger                                                     |
 | ------------------- | ----------------------------------------------------------- |
@@ -204,6 +208,68 @@ already accumulated under refuses the stream, rather than being treated as a
 harmless header. The alternative is splicing two answers into one assistant
 turn, which hands the model a conversation that never happened and is strictly
 worse than the truncation it replaces.
+
+#### The identity is per upstream response
+
+Every rule above is scoped to ONE upstream response, not to the logical stream.
+The accumulator holds that scope in `passStart`, the offset in `text` where the
+current response's own accumulation begins, and in the `beginUpstreamStream`
+reset the relay calls at the top of every pass — `relay` is invoked once per
+upstream HTTP response relayed into the client's one stream, so the committed
+pass and each hop each get exactly one.
+
+Three facts force it. A hop is a NEW response: it is a fresh `response.created`
+carrying a fresh `id`, and the `response.output_item.added` it announces is that
+response's own item. Every real upstream emits a fresh `item_id` for it. And it
+emits its own `response.output_text.done`, whose `text` member states the text
+of the response that sent it — which is why both branches of the `.done` check
+read `passText()` and not the cross-hop prefix. A hop that emits only a `.done`
+has a non-empty cross-hop prefix, so testing the wrong region refuses a
+correct event `unknown_shape` for being correct.
+
+What the reset does NOT touch is everything the client already holds: `text`
+(the continuation body is built from the whole prefix), `unsafe` and `terminal`.
+A hop's clean deltas cannot un-refuse a stream that carried a tool call in the
+committed pass, and a response that arrives after the generation ended is not a
+continuation — it is bytes relaying into a stream this proxy has already
+declared over.
+
+The measurements are deliberately unlike the identity. `Verdict().Text` and
+`partialBytes()` stay cross-hop: the memory bound must bound the whole prefix,
+and the continuation request needs all of it. Only the PROVENANCE is per
+response.
+
+Two consequences worth stating, because both are load-bearing in the tests.
+Within a single response, every refusal above still bites unchanged — a second
+message item, a disagreeing `output_index`, a `content_index` switch are all
+still `multiple_outputs`, and they are pinned single-pass by
+`TestPartialTextResponsesIdentityIsOneStream` and
+`TestE2EStreamRecoveryResponsesIdentityFailsClosed`. And a hop that reaches its
+own terminal marker ends the loop on the marker, BEFORE the accumulator is
+consulted — so a black-box test of this boundary must cut the hop it wants to
+observe, not let it finish. `TestStreamRecoveryTakesItsSecondResponsesHop` and
+`TestE2EStreamRecoveryResponsesHopIdentity` do exactly that.
+
+#### The meter crosses the same boundary
+
+`usage.Capture` is the other object that describes one upstream response while
+living for the whole request, and the relay closure is the same place it is
+segmented: each pass calls `Capture.Seal`, which folds the call that just
+finished into a running aggregate and clears the live observation. Without it,
+one request's event would report only the last hop's `usage` object while the
+same row's `provider_attempts` and `egress_attempts` counted every hop's dial.
+
+The counts are combined by what they measure, not by a blanket sum.
+`completion_tokens` is the answer the client read, and every call produced its
+own slice of it, so those add up. `prompt_tokens` is the context, and a
+continuation re-asks with everything the previous call had, so the last call
+that stated one describes the context that actually ran — summing prompts would
+count the same conversation once per hop. `total_tokens` is restated as that
+row's own prompt + completion so the three columns cannot contradict each
+other, and a count no call stated stays `NULL` rather than becoming a zero.
+Within one call nothing changes: adoption is still last-wins over the final
+usage object, chunks are never summed, which is why a request that never takes
+a hop reports exactly what it always did.
 
 ## The two bounds, stated exactly
 

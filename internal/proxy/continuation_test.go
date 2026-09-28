@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -12,6 +13,21 @@ func feed(api string, limit int, payloads ...string) continuationVerdict {
 	p := newPartialText(api, limit)
 	for _, s := range payloads {
 		p.Observe([]byte(s))
+	}
+	return p.Verdict()
+}
+
+// feedPasses pushes one or more UPSTREAM RESPONSES through a fresh
+// accumulator and returns its verdict. Each pass is one upstream body, and the
+// helper calls beginUpstreamStream before it exactly as the relay closure does
+// — once per relay invocation, which is once per upstream HTTP response.
+func feedPasses(api string, limit int, passes ...[]string) continuationVerdict {
+	p := newPartialText(api, limit)
+	for _, pass := range passes {
+		p.beginUpstreamStream()
+		for _, s := range pass {
+			p.Observe([]byte(s))
+		}
 	}
 	return p.Verdict()
 }
@@ -657,25 +673,218 @@ func TestPartialTextResponsesIdentityIsOneStream(t *testing.T) {
 	}
 }
 
-// TestPartialTextResponsesIdentitySpansHops: the identity contract is about
-// the LOGICAL stream, so a hop's deltas must match the prefix's identity
-// exactly as the first hop's did. This is the case a per-pass accumulator
-// would miss: the second hop reuses the same item and index, which is what an
-// upstream continuing its own answer does.
-func TestPartialTextResponsesIdentitySpansHops(t *testing.T) {
-	p := newPartialText(apiResponses, 1<<20)
-	p.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`))
-	// Hop 1 ended here; hop 2's deltas arrive on the same accumulator.
-	p.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":" upon a time"}`))
-	if got := recovered(t, p.Verdict()); got != "Once upon a time" {
-		t.Fatalf("prefix = %q, want the two hops joined", got)
+// TestPartialTextResponsesIdentityIsPerUpstreamResponse fixes the SCOPE of
+// the identity above. A continuation hop is a new upstream response: it
+// announces its own output item and emits its own deltas, so its honest
+// identity differs from the committed reply's by construction. The identity
+// therefore resets at the relay boundary while the prefix joins, because
+// judging the hop against the earlier response's item refused every real
+// second hop as multiple_outputs — after that hop was already dialed and paid
+// for out of the request's own envelope.
+//
+// The single-response half of the contract is not weakened, only scoped: see
+// TestPartialTextResponsesIdentityIsOneStream and the same-pass rows below.
+func TestPartialTextResponsesIdentityIsPerUpstreamResponse(t *testing.T) {
+	delta := func(item string, outputIndex, contentIndex int, text string) string {
+		return fmt.Sprintf(`{"type":"response.output_text.delta","item_id":%q,"output_index":%d,"content_index":%d,"delta":%q}`,
+			item, outputIndex, contentIndex, text)
+	}
+	done := func(item string, outputIndex, contentIndex int, text string) string {
+		return fmt.Sprintf(`{"type":"response.output_text.done","item_id":%q,"output_index":%d,"content_index":%d,"text":%q}`,
+			item, outputIndex, contentIndex, text)
+	}
+	added := func(item string, outputIndex int) string {
+		return fmt.Sprintf(`{"type":"response.output_item.added","output_index":%d,"item":{"type":"message","id":%q}}`,
+			outputIndex, item)
+	}
+	cases := []struct {
+		name    string
+		passes  [][]string
+		want    string // recoverable prefix
+		recover bool
+		reason  string
+	}{
+		{
+			name: "a hop's own item id joins the committed prefix",
+			passes: [][]string{
+				{added("m1", 0), delta("m1", 0, 0, "Once")},
+				{added("m2", 0), delta("m2", 0, 0, " upon a time")},
+			},
+			recover: true,
+			want:    "Once upon a time",
+		},
+		{
+			name: "a hop's own output index joins too",
+			passes: [][]string{
+				{added("m1", 0), delta("m1", 0, 0, "Once")},
+				{added("m2", 1), delta("m2", 1, 0, " upon a time")},
+			},
+			recover: true,
+			want:    "Once upon a time",
+		},
+		{
+			name: "a hop that announces nothing still joins by its deltas",
+			passes: [][]string{
+				{added("m1", 0), delta("m1", 0, 0, "Once")},
+				{delta("m2", 0, 0, " upon a time")},
+			},
+			recover: true,
+			want:    "Once upon a time",
+		},
+		{
+			name: "two item ids inside ONE response still refuse",
+			passes: [][]string{
+				{added("m1", 0), delta("m1", 0, 0, "Once"), delta("m2", 0, 0, " upon a time")},
+			},
+			reason: reasonMultipleOutputs,
+		},
+		{
+			name: "a second message item inside ONE response still refuses",
+			passes: [][]string{
+				{added("m1", 0), delta("m1", 0, 0, "Once"), added("m2", 1)},
+			},
+			reason: reasonMultipleOutputs,
+		},
+		{
+			name: "a content index change inside ONE response still refuses",
+			passes: [][]string{
+				{added("m1", 0), delta("m1", 0, 0, "Once"), delta("m1", 0, 1, " upon a time")},
+			},
+			reason: reasonMultipleOutputs,
+		},
+		{
+			name: "a hop's own .done is compared with the hop's own deltas",
+			passes: [][]string{
+				{added("m1", 0), delta("m1", 0, 0, "Once")},
+				{added("m2", 0), delta("m2", 0, 0, " upon a time"), done("m2", 0, 0, " upon a time")},
+			},
+			reason: "", // terminal, asserted below
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := feedPasses(apiResponses, 1<<20, tc.passes...)
+			switch {
+			case tc.recover:
+				if got := recovered(t, v); got != tc.want {
+					t.Fatalf("prefix = %q, want %q", got, tc.want)
+				}
+			case tc.reason == "":
+				if v.Kind != verdictTerminal {
+					t.Fatalf("verdict = %v/%q, want terminal", v.Kind, v.Reason)
+				}
+			default:
+				if v.Kind != verdictUnsafe || v.Reason != tc.reason {
+					t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, tc.reason)
+				}
+				if v.Text != "" {
+					t.Fatalf("a refused stream still offered the prefix %q", v.Text)
+				}
+			}
+		})
+	}
+}
+
+// TestPartialTextResponsesDoneIsPerUpstreamResponse pins the second facet of
+// the same seam: a .done event states the text of the response that emitted
+// it, so it is compared with that response's own deltas, never with the whole
+// cross-hop prefix. The .done-only row is the one a naive fix gets wrong — its
+// cross-hop prefix is non-empty, so testing the wrong region sends a correct
+// event into the compare branch and refuses it for being right.
+func TestPartialTextResponsesDoneIsPerUpstreamResponse(t *testing.T) {
+	const (
+		deltaM1 = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`
+		deltaM2 = `{"type":"response.output_text.delta","item_id":"m2","output_index":0,"content_index":0,"delta":" upon a time"}`
+	)
+
+	t.Run("a hop emitting only its own .done terminates", func(t *testing.T) {
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{deltaM1},
+			[]string{`{"type":"response.output_text.done","item_id":"m2","output_index":0,"content_index":0,"text":" upon a time"}`},
+		)
+		if v.Kind != verdictTerminal {
+			t.Fatalf("verdict = %v/%q, want terminal", v.Kind, v.Reason)
+		}
+	})
+
+	t.Run("a hop's .done disagreeing with its own deltas refuses", func(t *testing.T) {
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{deltaM1},
+			[]string{deltaM2, `{"type":"response.output_text.done","item_id":"m2","output_index":0,"content_index":0,"text":"Once upon a time"}`},
+		)
+		if v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("a within-pass disagreement still refuses", func(t *testing.T) {
+		v := feed(apiResponses, 1<<20,
+			`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a "}`,
+			`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`,
+		)
+		if v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+}
+
+// TestPartialTextLatchSpansUpstreamResponses is the other half of the scope
+// split: the prefix and the latches are logical-stream properties. A later
+// response must never release a refusal an earlier one latched — the stream
+// stopped being plain text when it did, and a hop's clean deltas cannot make
+// the client's answer whole again.
+func TestPartialTextLatchSpansUpstreamResponses(t *testing.T) {
+	t.Run("a refusal latches across the boundary", func(t *testing.T) {
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Let me check"}`, `{"type":"response.function_call_arguments.delta","item_id":"fc1","output_index":1,"delta":"{\"path\""}`},
+			[]string{`{"type":"response.output_text.delta","item_id":"m2","output_index":0,"content_index":0,"delta":"plain text again"}`},
+		)
+		if v.Kind != verdictUnsafe || v.Reason != reasonToolCalls {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonToolCalls)
+		}
+		if v.Text != "" {
+			t.Fatalf("a refused stream still offered the prefix %q", v.Text)
+		}
+	})
+
+	t.Run("a terminal latches across the boundary", func(t *testing.T) {
+		// response.completed is the WIRE terminal (StreamStats.Terminal); the
+		// accumulator's logical terminal is latched by the content channel's
+		// own completion, which is what this row uses. Either way the reset
+		// must not release it: a finished generation is not continued because
+		// a later response arrived.
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{
+				`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`,
+				`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once"}`,
+			},
+			[]string{`{"type":"response.output_text.delta","item_id":"m2","output_index":0,"content_index":0,"delta":"More"}`},
+		)
+		if v.Kind != verdictTerminal {
+			t.Fatalf("verdict = %v/%q, want terminal", v.Kind, v.Reason)
+		}
+	})
+}
+
+// TestPartialTextChatIdentityIsNotPerResponse: Chat latches no identity at all
+// (its own issue covers choices[i].index), so the boundary changes nothing for
+// it. This pins the quiet direction — the reset must not start refusing or
+// re-latching Chat streams.
+func TestPartialTextChatIdentityIsNotPerResponse(t *testing.T) {
+	v := feedPasses(apiChat, 1<<20,
+		[]string{`{"choices":[{"delta":{"content":"Once"},"finish_reason":null}]}`},
+		[]string{`{"choices":[{"delta":{"content":" upon a time"},"finish_reason":null}]}`},
+	)
+	if got := recovered(t, v); got != "Once upon a time" {
+		t.Fatalf("prefix = %q, want %q", got, "Once upon a time")
 	}
 
-	// A hop that continues a DIFFERENT item is refused, not appended.
-	q := newPartialText(apiResponses, 1<<20)
-	q.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`))
-	q.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m9","output_index":0,"content_index":0,"delta":" upon a time"}`))
-	if v := q.Verdict(); v.Kind != verdictUnsafe || v.Reason != reasonMultipleOutputs {
-		t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonMultipleOutputs)
+	// A Chat finish_reason in pass 1 still latches the logical terminal.
+	w := feedPasses(apiChat, 1<<20,
+		[]string{`{"choices":[{"delta":{"content":"Once"},"finish_reason":"stop"}]}`},
+		[]string{`{"choices":[{"delta":{"content":"More"},"finish_reason":null}]}`},
+	)
+	if w.Kind != verdictTerminal {
+		t.Fatalf("verdict = %v/%q, want terminal", w.Kind, w.Reason)
 	}
 }

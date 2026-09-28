@@ -382,11 +382,18 @@ func TestStreamRecoveryContinuesAChatStream(t *testing.T) {
 // other surface: the continuation items are appended after the client's own
 // input, and the hop's own `response.completed` terminates the client's one
 // stream.
+//
+// The hop carries its OWN item id, which is what a real upstream emits for a
+// new response. Reusing the committed reply's id on both dials is the fixture
+// accident that hid the identity being scoped to the logical stream, so this
+// test asserts the realistic shape: the hop's identity differs and the prefix
+// still joins.
 func TestStreamRecoveryContinuesAResponsesStream(t *testing.T) {
 	h, logBuf, pa, pb := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
 	pa.script = []dialFunc{
 		sseCut(sseResponses("Once")),
-		sseStream(sseResponses(" upon a time") + "event: response.completed\ndata: {}\n\n"),
+		sseStream(sseResponsesIdent("response.output_text.delta", "m2", 0, 0, " upon a time") +
+			"event: response.completed\ndata: {}\n\n"),
 	}
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/responses",
@@ -412,6 +419,95 @@ func TestStreamRecoveryContinuesAResponsesStream(t *testing.T) {
 	}
 	if len(logBuf.events(t, "stream_recovery_succeeded")) != 1 {
 		t.Fatalf("the Responses hop did not report success: %v", logBuf.events(t, "stream_recovery_succeeded"))
+	}
+}
+
+// TestStreamRecoveryTakesItsSecondResponsesHop is the defect itself, end to
+// end: a Responses stream cut twice. The identity the accumulator proves each
+// delta against is a property of ONE upstream response, so hop 2's own
+// item_id must not be read as a second output of hop 1's response. Holding it
+// against the earlier response refuses the hop as multiple_outputs once the
+// verdict is read — which, on a hop that was itself cut, is before the third
+// dial is ever made.
+//
+// The verdict is what this test keys on, deliberately: a hop that reaches its
+// own terminal marker breaks the loop on the marker, before the accumulator
+// is consulted, so a single-hop test would pass with the identity still
+// scoped to the logical stream.
+func TestStreamRecoveryTakesItsSecondResponsesHop(t *testing.T) {
+	h, logBuf, pa, pb := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	pa.script = []dialFunc{
+		sseCut(sseResponses("Once")),
+		sseCut(sseResponsesIdent("response.output_text.delta", "m2", 0, 0, " upon a")),
+		sseStream(sseResponsesIdent("response.output_text.delta", "m3", 0, 0, " time") +
+			"event: response.completed\ndata: {}\n\n"),
+	}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/responses",
+		`{"model":"chain-model","stream":true,"input":"hi"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Once", " upon a", " time"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("the client never saw %q: %s", want, body)
+		}
+	}
+	if n := strings.Count(body, "event: response.completed"); n != 1 {
+		t.Fatalf("terminal markers = %d, want exactly one: %s", n, body)
+	}
+	if pa.dials() != 3 || pb.dials() != 0 {
+		t.Fatalf("dials = %d/%d, want the committed candidate re-asked twice", pa.dials(), pb.dials())
+	}
+	if ev := logBuf.events(t, "stream_recovery_exhausted"); len(ev) != 0 {
+		t.Fatalf("a recovered stream reported exhaustion: %v", ev)
+	}
+	if len(logBuf.events(t, "stream_recovery_succeeded")) != 1 {
+		t.Fatalf("the second hop did not report success")
+	}
+	if len(logBuf.events(t, "stream_recovery_started")) != 2 {
+		t.Fatalf("stream_recovery_started = %v, want both hops", logBuf.events(t, "stream_recovery_started"))
+	}
+}
+
+// TestStreamRecoveryComparesADoneWithItsOwnHop is the boundary's second
+// facet, and it needs a cut after the .done on purpose. A hop's
+// output_text.done states the hop's OWN text, so it is compared with the
+// hop's own deltas; a hop that emits nothing but a .done has a non-empty
+// CROSS-HOP prefix, which is exactly the case a comparison against the whole
+// prefix gets wrong — it refuses the hop for being correct. The cut is what
+// forces the verdict to be read: the .done also latches the accumulator's
+// logical terminal, so with the boundary fixed the loop stops as
+// logical_terminal rather than as an unsafe stream.
+func TestStreamRecoveryComparesADoneWithItsOwnHop(t *testing.T) {
+	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	pa.script = []dialFunc{
+		sseCut(sseResponses("Once")),
+		sseCut(
+			"event: response.output_text.done\n" +
+				`data: {"type":"response.output_text.done","item_id":"m2","output_index":0,"content_index":0,"text":" upon a time"}` + "\n\n"),
+	}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/responses",
+		`{"model":"chain-model","stream":true,"input":"hi"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Once") || !strings.Contains(body, " upon a time") {
+		t.Fatalf("the hop's own done never reached the client: %s", body)
+	}
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 {
+		t.Fatalf("stream_recovery_exhausted = %v, want the one bound", exh)
+	}
+	if exh[0]["reason"] != recoveryLogicalTerminal {
+		t.Fatalf("reason = %v, want %q — the hop's own done was refused instead of ending the answer",
+			exh[0]["reason"], recoveryLogicalTerminal)
+	}
+	if _, ok := exh[0]["unsafe_reason"]; ok {
+		t.Fatalf("a correct hop was reported as unsafe content: %v", exh[0])
 	}
 }
 

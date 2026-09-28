@@ -207,7 +207,11 @@ recovery:
   # upstream declared failed, or whose Responses text cannot be attributed to
   # exactly one message output and one content stream is never continued — it
   # is truncated exactly as it is today, and `stream_recovery_exhausted`
-  # records why. A non-null `finish_reason` ends the effort too, but it is
+  # records why. That attribution is per upstream response rather than per
+  # logical stream, since a continuation is a NEW response announcing its own
+  # output item: a hop's own item_id may differ from the committed reply's and
+  # the prefix still joins, while two outputs inside one response still
+  # refuse. A non-null `finish_reason` ends the effort too, but it is
   # reported as `logical_terminal` rather than `unsafe_content`: the
   # generation finished, it simply finished without the marker. No ordinary
   # retry, fallback, or status handling is involved: the pre-commitment walk

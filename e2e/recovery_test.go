@@ -1684,6 +1684,116 @@ func TestE2EStreamRecoveryHopFailureIsBounded(t *testing.T) {
 	}
 }
 
+// TestE2EStreamRecoveryResponsesHopIdentity is the hop boundary black-box, on
+// the surface the defect was reported against. A continuation hop is a NEW
+// upstream response, so it announces its own output item and its own item_id
+// — which is what every real upstream emits for a new response. The proxy
+// must join the hop's text to the committed prefix anyway, and it must be
+// able to do it TWICE: the identity was scoped to the logical stream, so the
+// second hop was refused as multiple_outputs and `max-recoveries: 2` could
+// never be spent on this surface.
+//
+// The second dial is cut too, on purpose. A hop that reaches its own terminal
+// marker ends the loop on the marker, before the accumulator's verdict is
+// consulted, so a single-hop test passes whether or not the boundary is
+// right; a cut hop is what forces the verdict to be read before the next dial
+// is made.
+func TestE2EStreamRecoveryResponsesHopIdentity(t *testing.T) {
+	hops := []string{
+		`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`,
+		`{"type":"response.output_text.delta","item_id":"m2","output_index":0,"content_index":0,"delta":" upon a"}`,
+	}
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		// The request being served is already recorded, so the first dial
+		// observes 1. Dials 1 and 2 commit a fragment each and die; the third
+		// finishes the answer.
+		if n := up.count(); n <= len(hops) {
+			_, _ = fmt.Fprintf(w, "event: response.output_text.delta\ndata: %s\n\n", hops[n-1])
+			fl.Flush()
+			panic(http.ErrAbortHandler)
+		}
+		_, _ = fmt.Fprintf(w, "event: response.output_text.delta\ndata: %s\n\n",
+			`{"type":"response.output_text.delta","item_id":"m3","output_index":0,"content_index":0,"delta":" time"}`)
+		fl.Flush()
+		_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {}\n\n")
+		fl.Flush()
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     streamRecoveryYAML(up, "    enabled: true\n    max-recoveries: 2\n    max-elapsed: 30s\n    max-partial-bytes: 4096\n"),
+		logLevel: "info",
+	})
+	resp := openJSON(t, p.addr, "/v1/responses",
+		`{"model":"srm-model","stream":true,"input":"tell me a story"}`,
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	// Every hop's text reached the client, in order, on one connection.
+	line, eof := nextSSEEvent(t, br, 10*time.Second)
+	if eof {
+		t.Fatal("the committed fragment never arrived")
+	}
+	if !strings.Contains(strings.Join(line, "\n"), "Once") {
+		t.Fatalf("committed event = %q, want the m1 delta", line)
+	}
+	line, eof = nextSSEEvent(t, br, 10*time.Second)
+	if eof {
+		t.Fatal("no first continuation event: the hop's own item id was refused as a second output")
+	}
+	if !strings.Contains(strings.Join(line, "\n"), " upon a") {
+		t.Fatalf("first hop event = %q, want the m2 delta", line)
+	}
+	line, eof = nextSSEEvent(t, br, 10*time.Second)
+	if eof {
+		t.Fatal("no second continuation event: max-recoveries was never spendable past one hop")
+	}
+	if !strings.Contains(strings.Join(line, "\n"), " time") {
+		t.Fatalf("second hop event = %q, want the m3 delta", line)
+	}
+	line, eof = nextSSEEvent(t, br, 10*time.Second)
+	if eof {
+		t.Fatal("stream ended without a terminal marker")
+	}
+	if !strings.Contains(strings.Join(line, "\n"), "event: response.completed") {
+		t.Fatalf("terminal event = %q, want the one response.completed", line)
+	}
+	// A stream is terminated once: the marker is the last thing on the wire,
+	// and nothing this proxy invented follows it.
+	if tail, _ := io.ReadAll(br); strings.Contains(string(tail), "event:") || strings.Contains(string(tail), "data:") {
+		t.Errorf("bytes followed the terminal marker: %q", tail)
+	}
+	if got := up.count(); got != 3 {
+		t.Fatalf("upstream dials = %d, want 3 (the committed pass and two hops)", got)
+	}
+
+	waitForEventCount(t, p, "request_completed", 1)
+	evs := completionsFor(t, p, "srm-model")
+	if len(evs) != 1 || evs[0]["outcome"] != "completed" {
+		t.Fatalf("completions = %v, want one completed", evs)
+	}
+	if got := evs[0]["provider_attempts"]; got != float64(3) {
+		t.Errorf("provider_attempts = %v, want 3", got)
+	}
+	logs := parseLogEvents(t, p.stderr.String())
+	if got := len(eventsWithMessage(logs, "stream_recovery_started")); got != 2 {
+		t.Errorf("stream_recovery_started events = %d, want 2", got)
+	}
+	if got := len(eventsWithMessage(logs, "stream_recovery_succeeded")); got != 1 {
+		t.Errorf("stream_recovery_succeeded events = %d, want 1", got)
+	}
+	if got := eventsWithMessage(logs, "stream_recovery_exhausted"); len(got) != 0 {
+		t.Errorf("stream_recovery_exhausted = %v, want none", got)
+	}
+	if got := len(eventsWithMessage(logs, "stream_truncated")); got != 0 {
+		t.Errorf("stream_truncated events = %d, want 0", got)
+	}
+}
+
 // TestE2EStreamRecoveryResponsesIdentityFailsClosed is the Responses
 // continuation contract on the real wire: the MVP continues plain text from
 // exactly one message output's exactly one content stream. A stream whose
