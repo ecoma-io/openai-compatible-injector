@@ -25,7 +25,7 @@ func copySSEOnce(t *testing.T, input, public string) (string, int) {
 	t.Helper()
 	var buf bytes.Buffer
 	flushes := 0
-	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter(public), func() { flushes++ }, nil)
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter(public), func() { flushes++ }, nil, nil)
 	if err != nil {
 		t.Fatalf("CopySSE: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestCopySSEScopesPerAPI(t *testing.T) {
 	flushes := 0
 	stats, err := CopySSE(&buf, strings.NewReader(line),
 		func(p []byte) []byte { return inject.RewriteResponsesModel(p, "public-name") },
-		func() { flushes++ }, nil)
+		func() { flushes++ }, nil, nil)
 	if err != nil {
 		t.Fatalf("CopySSE: %v", err)
 	}
@@ -291,7 +291,7 @@ func (failingReader) Read(p []byte) (int, error) { return 0, errors.New("read bo
 func TestCopySSEPropagatesErrors(t *testing.T) {
 	// A write failure is client-side; the caller logs it as a client
 	// disconnect via the *streamWriteError marker.
-	_, err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), sseRewriter("p"), func() {}, nil)
+	_, err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), sseRewriter("p"), func() {}, nil, nil)
 	if err == nil {
 		t.Fatal("write error not propagated")
 	}
@@ -302,7 +302,7 @@ func TestCopySSEPropagatesErrors(t *testing.T) {
 
 	// A read failure is upstream-side and must NOT carry the marker — the
 	// truncation phase in the access log depends on the distinction.
-	_, err = CopySSE(io.Discard, failingReader{}, sseRewriter("p"), func() {}, nil)
+	_, err = CopySSE(io.Discard, failingReader{}, sseRewriter("p"), func() {}, nil, nil)
 	if err == nil || err == io.EOF {
 		t.Errorf("read error not propagated as-is: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestCopySSEPropagatesErrors(t *testing.T) {
 // and the write is still marked as a client-side failure.
 func TestCopySSEAccountsPartialWrite(t *testing.T) {
 	w := &limitedWriter{limit: 5}
-	stats, err := CopySSE(w, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil)
+	stats, err := CopySSE(w, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil, nil)
 	if err == nil {
 		t.Fatal("write failure not propagated")
 	}
@@ -335,7 +335,7 @@ func TestCopySSEAccountsPartialWrite(t *testing.T) {
 // must truncate the stream as a client-side failure — continuing past it
 // would relay a torn line and overcount the bytes.
 func TestCopySSERejectsShortWrite(t *testing.T) {
-	stats, err := CopySSE(&shortWriter{}, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil)
+	stats, err := CopySSE(&shortWriter{}, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil, nil)
 	if err == nil {
 		t.Fatal("short write not detected")
 	}
@@ -365,7 +365,7 @@ func TestCopySSENilFlushStillCountsEvents(t *testing.T) {
 	line := "data: {\"x\":\"" + big + "\"}\n"
 	input := line + line + "\n" + line + line + "\n"
 	var buf bytes.Buffer
-	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), nil, nil)
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CopySSE: %v (the per-event budget must reset at the boundary even without a flush)", err)
 	}
@@ -408,7 +408,7 @@ func TestRewriteSSELineAliasedResultNotMistakenForNoOp(t *testing.T) {
 func copySSEStats(t *testing.T, input string) (StreamStats, string, error) {
 	t.Helper()
 	var buf bytes.Buffer
-	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), func() {}, nil)
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), func() {}, nil, nil)
 	return stats, buf.String(), err
 }
 
@@ -483,7 +483,7 @@ func TestCopySSETerminalIsSetOnceAndSticks(t *testing.T) {
 // deliver is not a terminated stream, and reporting it as one would let a
 // recovery path believe a dead client was handed a terminator.
 func TestCopySSETerminalNeedsTheBytesToLand(t *testing.T) {
-	stats, err := CopySSE(failingWriter{}, strings.NewReader("data: [DONE]\n\n"), sseRewriter("p"), nil, nil)
+	stats, err := CopySSE(failingWriter{}, strings.NewReader("data: [DONE]\n\n"), sseRewriter("p"), nil, nil, nil)
 	if err == nil {
 		t.Fatal("write failure not propagated")
 	}
@@ -491,7 +491,7 @@ func TestCopySSETerminalNeedsTheBytesToLand(t *testing.T) {
 		t.Fatal("a marker that never reached the client set stats.Terminal")
 	}
 
-	stats, err = CopySSE(&limitedWriter{limit: 5}, strings.NewReader("data: [DONE]\n\n"), sseRewriter("p"), nil, nil)
+	stats, err = CopySSE(&limitedWriter{limit: 5}, strings.NewReader("data: [DONE]\n\n"), sseRewriter("p"), nil, nil, nil)
 	if err == nil {
 		t.Fatal("short write not propagated")
 	}

@@ -1993,7 +1993,7 @@ walk:
 					Msg("stream_event_progress")
 			}
 			afterEvent()
-		}, stripKeys)
+		}, stripKeys, nil)
 		var pings int
 		if heartbeat != nil {
 			heartbeat.stopAndWait()
