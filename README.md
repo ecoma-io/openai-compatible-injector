@@ -1248,9 +1248,18 @@ stopped talking".
 provably safe structure and nothing else. Tool calls are refused, and so is any
 Responses stream whose text cannot be attributed to exactly one message output
 and one content stream: a delta whose `item_id`, `output_index` or
-`content_index` disagrees with the prefix already accumulated — or a second
-message item, or a second text stream — refuses the whole stream rather than
-concatenating two answers into one assistant turn.
+`content_index` disagrees with the text already accumulated from **that upstream
+response** — or a second message item, or a second text stream — refuses the
+whole stream rather than concatenating two answers into one assistant turn.
+
+That attribution is a property of **one upstream response**, not of the logical
+stream, because a hop is a new response: it announces its own output item, emits
+its own deltas and its own `response.output_text.done`, and every real upstream
+gives it fresh `item_id`s. So a hop's identity may differ from the committed
+reply's and the prefix still joins; the rule above still bites unchanged within
+any single response, where two outputs really would be two answers spliced into
+one turn. What stays logical-stream-scoped is the prefix itself and the
+refusals: a later hop never releases a refusal an earlier one latched.
 
 The unbounded-accumulation case is the one that matters for memory: a stream
 whose text passes `max-partial-bytes` stops being a candidate for
@@ -1345,10 +1354,18 @@ answer strictly — that the walk's own candidate swap can silently invalidate.
 
 **Interaction with the other blocks.** `sse-keep-alive` keeps running across a
 hop, so a slow continuation still pings and the idle cut it exists to prevent
-cannot fire mid-recovery. Usage metering is unaffected and stays factual: the
-logical request contributes one event, and the final hop's usage object is the
-one recorded — never a sum of the two. A reload mid-stream cannot turn
-recovery on for a stream that started without it, nor reshape the bounds a
+cannot fire mid-recovery. Usage metering stays factual and reports the request's
+whole traffic: the logical request contributes one event, and because the client
+received text from every call, `completion_tokens` is those calls' answers
+added up while `prompt_tokens` is the **last** call that stated one — a hop
+re-asks with everything the previous call had, so the final call's prompt is the
+context that actually ran and summing prompts would count the same conversation
+once per hop. `total_tokens` is restated as that row's own prompt + completion,
+so the three columns cannot contradict each other, and a count no call stated
+stays SQL `NULL`. Within one call the rule is unchanged: the last readable
+object wins and chunks are never summed. The event's `provider_attempts` and
+`egress_attempts` already count every hop's dial. A reload mid-stream cannot
+turn recovery on for a stream that started without it, nor reshape the bounds a
 stream in flight is recovering under.
 
 **When the block is absent, nothing changes.** An SSE stream that dies without
@@ -1965,12 +1982,17 @@ drain, and of this accounting, is the operator's explicit choice.)
 
 Token facts come only from the raw upstream response before the proxy rewrites
 model aliases or simulates thinking usage. Missing upstream `usage` remains
-SQL `NULL`, not zero. For streams, the last readable API-scoped usage object
-wins; chunks are never summed. One wrongly typed count makes that member
-unstored (a stringified `"128"` or integral `1e3` still reads) — it never
-discards the members that did decode. Consequently, synthesized
-`reasoning_tokens` are never stored as provider usage. This layer intentionally
-has no pricing, currency, invoicing, or quota enforcement.
+SQL `NULL`, not zero. Within one upstream call, the last readable API-scoped
+usage object wins; chunks are never summed. A request assembled from more than
+one upstream call — a stream-recovery hop — reports the aggregate of those
+calls instead, with each count combined by its own semantics: the last call
+that stated a `prompt` wins (the context that actually ran), the calls'
+`completion`s add up (the client read all of them), and `total` is that row's
+own prompt + completion. One wrongly typed count makes that member unstored (a
+stringified `"128"` or integral `1e3` still reads) — it never discards the
+members that did decode. Consequently, synthesized `reasoning_tokens` are never
+stored as provider usage. This layer intentionally has no pricing, currency,
+invoicing, or quota enforcement.
 
 Auth and usage schemas share a module-scoped `schema_migrations` ledger. An
 existing partner-key deployment with the former global-version ledger upgrades
