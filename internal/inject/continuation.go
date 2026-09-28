@@ -159,14 +159,20 @@ func BuildContinuationChat(orig []byte, prefix string) ([]byte, error) {
 		}
 		// THE MESSAGE IS MUTATED, NOT REBUILT. Only the member this builder
 		// owns — `content` — is replaced, and every other member of the
-		// prefill message travels exactly as the client sent it: `name`,
-		// provider extensions, an opinionated `role`-adjacent field, a field
-		// this build has never heard of. Rebuilding the message from the two
-		// fields this package knows about would silently drop all of them,
-		// and a continuation that quietly rewrites a client's conversation is
-		// a corruption the client cannot see — worse than the truncated
-		// stream it was meant to repair. Members are re-emitted from the
-		// client's own bytes (json.RawMessage), so nothing is normalized.
+		// prefill message is carried through: `name`, provider extensions, an
+		// opinionated `role`-adjacent field, a field this build has never heard
+		// of. Rebuilding the message from the two fields this package knows
+		// about would silently drop all of them, and a continuation that
+		// quietly rewrites a client's conversation is a corruption the client
+		// cannot see — worse than the truncated stream it was meant to repair.
+		//
+		// Preservation is BY VALUE, not by byte: members are re-emitted from the
+		// client's own json.RawMessage bytes, so no value is re-interpreted, but
+		// the object as a whole is re-serialized, which normalizes member order
+		// and insignificant whitespace (and, for numbers Go decodes as
+		// float64, their spelling). The contract the test pins is exactly this:
+		// every member present, every member equal once decoded — never a
+		// dropped or altered field.
 		extended, err := json.Marshal(existing + prefix)
 		if err != nil {
 			return nil, err

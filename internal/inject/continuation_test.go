@@ -134,7 +134,7 @@ func TestBuildContinuationChatExtendsAPrefill(t *testing.T) {
 // extending a prefill: the message is MUTATED, not REBUILT. Only `content` is
 // the builder's to touch. Every other member of the client's assistant message
 // — a `name`, a provider extension, a field this build has never heard of —
-// must survive into the continuation byte for byte, because the alternative is
+// must survive into the continuation by value, because the alternative is
 // a continuation that silently rewrites the client's own conversation.
 //
 // A rebuild from the two fields this package knows about would pass a test
