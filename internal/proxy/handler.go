@@ -86,6 +86,37 @@ var (
 	maxBufferedResponseBytes int64 = 64 << 20 // 64 MiB
 )
 
+// requestBodyReadTimeout is the second dimension of the request-body bound:
+// maxRequestBodyBytes caps HOW MUCH a client may send, this caps HOW LONG it
+// may take to send it. ReadHeaderTimeout covers neither — it is satisfied the
+// moment the request line and headers arrive, after which a client may send
+// one byte per hour and hold a handler goroutine, its connection, and
+// everything it has already sent for as long as it likes, because there is no
+// read deadline anywhere on the path.
+//
+// http.Server.ReadTimeout is deliberately NOT the lever. It is measured from
+// the start of the request, so everything this handler does before the body
+// read — the auth gate, which in partner mode is a store lookup, and the
+// snapshot load — spends the body's allowance before a single body byte
+// arrives, and it would apply to every route the server serves, including the
+// ones with no body to bound. ReadTimeout is also a property of the
+// connection for the rest of the request; the deadline armed here belongs to
+// exactly one read and is cleared the instant that read returns, which is the
+// guarantee the streaming path depends on.
+//
+// FIVE MINUTES is derived from the cap it must not make unreachable. A
+// legitimate 64 MiB body — a multimodal upload, a large tool schema —
+// delivered inside this bound implies a sustained floor of
+// 64 MiB / 5 min ≈ 218 KiB/s (≈ 1.8 Mbit/s), which is below any link that
+// would attempt the upload at all, and the bound covers the WHOLE read rather
+// than each byte, so a fast link with a slow start is not punished. The floor
+// in the other direction is what it closes: a drip feeder is cut off after
+// five minutes instead of never, which is the difference between a bounded
+// and an unbounded hold on a goroutine and a connection. A package variable
+// rather than a constant so tests can shorten it, exactly like the two caps
+// above; it is not a configuration key and must not become one.
+var requestBodyReadTimeout = 5 * time.Minute
+
 // openAIError is the envelope shape for model-not-found responses, whose
 // message interpolates the requested model.
 type openAIError struct {
@@ -542,10 +573,33 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("key_id", principal.KeyID).Logger()
 	}
 
-	// Bound the request body before reading it: without a cap, a single
-	// oversized client request pins unbounded memory in the proxy.
-	r.Body = http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	// The request body is bounded two ways, and they are two different
+	// bounds: maxRequestBodyBytes caps how much the client may send, and
+	// requestBodyReadTimeout caps how long it may take. Only the first is a
+	// cap on the bytes themselves; the second is what keeps a client from
+	// turning a bounded request into an unbounded hold, and there is nothing
+	// else on the path that would: ReadHeaderTimeout is satisfied by the
+	// headers alone, and no read deadline was ever armed.
+	//
+	// The read deadline is armed for the body read and CLEARED the moment it
+	// returns, on every path, because this connection is about to carry the
+	// response — a long-lived SSE stream included — and then go back into the
+	// server's keep-alive pool. A deadline that outlived its read would be
+	// armed against phases that read nothing at all, and on a pooled
+	// connection against the next request's headers and body.
+	//
+	// A ResponseWriter that cannot express a deadline says so with
+	// http.ErrNotSupported — a wrapper without the method, or net/http's own
+	// test recorder — and the read then proceeds without one rather than
+	// failing a request this transport simply cannot arm. The size bound is
+	// unaffected either way: it is enforced by MaxBytesReader, not by the
+	// clock.
+	rc := http.NewResponseController(w)
+	deadlineArmed := rc.SetReadDeadline(time.Now().Add(requestBodyReadTimeout)) == nil
+	body, err := io.ReadAll(http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes))
+	if deadlineArmed {
+		_ = rc.SetReadDeadline(time.Time{})
+	}
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
@@ -553,6 +607,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			reject(http.StatusRequestEntityTooLarge, []byte(envelopeTooLarge), nil)
 			return
 		}
+		// A body that stalled past the read deadline lands here beside a
+		// connection that died mid-body and a body net/http could not frame.
+		// That is deliberate: from this handler's side a deadline breach IS a
+		// read that never completed, so it takes the read failure's outcome
+		// rather than an outcome of its own. Nothing about the client's bytes
+		// is logged or echoed on any of them.
 		outcome = "body_read_error"
 		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		return
