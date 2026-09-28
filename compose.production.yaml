@@ -72,9 +72,13 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # A ceiling the process's own admission limits must stay below. Half of
-    # this is the practical headroom for buffers, TLS state, and the response
-    # bytes of in-flight requests.
+    # A ceiling the process's own admission limits must stay below. The
+    # process-wide buffering budget the proxy admits request bodies and
+    # upstream answers against is 512 MiB, hard-coded, and it is a budget for
+    # what requests are BUFFERING rather than a promise of the resident set:
+    # slice growth rounds a reservation up, plus TLS state, connection
+    # buffers and the response bytes of in-flight requests on top. Half of
+    # this limit is the practical headroom for exactly that.
     mem_limit: 1g
     cpus: 2.0
     logging:

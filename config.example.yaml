@@ -223,10 +223,14 @@ recovery:
   #      # that is refused, answered with a status or truncated still spends
   #      # its slot; `enabled: true` alone means 1 — never a loop
   #      max-elapsed: 20s # HARD window from the commit, >= 1ms, <= 2m; one
-  #      # bound for the whole effort, checked between hops AND enforced
-  #      # during every relay by closing the upstream body on the deadline, so
-  #      # a peer that stops sending without closing the connection cannot
-  #      # outlive it. While the block is enabled this also caps how long ONE
+  #      # bound for the whole effort, checked between hops AND enforced on
+  #      # both waits a hop can park on: the deadline
+  #      # closes the upstream body a relay is blocked on, so a peer that stops
+  #      # sending without closing the connection cannot outlive it, and it
+  #      # also owns the context the ask runs under, so a peer that accepts the
+  #      # connection and then answers no response header is unblocked the same
+  #      # way. It is one instant per stream, never re-armed per hop.
+  #      # While the block is enabled this also caps how long ONE
   #      # answer may take — a generation still running at the deadline is cut
   #      # and reported `max_elapsed` — so size it above the longest generation
   #      # you relay, or leave the block off and keep the plain relay, which has

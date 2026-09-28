@@ -453,21 +453,54 @@ by accident if the other's behavior changes.
 
 ## Observability
 
-| event                       | level | fields                                                                                                                                                                                                            |
-| --------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stream_recovery_started`   | INFO  | `recovery_index`, `partial_bytes`, `provider`, `upstream`, `policy_hash`, `policy_generation`                                                                                                                     |
-| `stream_recovery_succeeded` | INFO  | `recovery_index`, `recovered_bytes`, `recovered_events`, `upstream_exchanges`, `elapsed_ms`                                                                                                                       |
-| `stream_recovery_failed`    | WARN  | `recovery_index`, `phase` (`build`/`credential`/`budget`/`dial`/`upstream_status`/`upstream_read`/`client_write`), `upstream_status`, the sanitized `err`, `upstream_credential_id` when the candidate has a pool |
-| `stream_recovery_exhausted` | WARN  | `recoveries`, `reason` (`budget_spent`/`max_recoveries`/`max_elapsed`/`logical_terminal`/`unsafe_content`), `unsafe_reason` only when the reason is `unsafe_content`                                              |
-| `stream_completed`          | DEBUG | + `stream_recoveries`                                                                                                                                                                                             |
-| `stream_truncated`          | WARN  | + `stream_recoveries`, `recovery_reason`, phase `recovery` for a marker-less stream — or outcome `client_disconnected` when the caller left during a hop                                                          |
-| `egress_attempt_failed`     | WARN  | one per endpoint a hop's pool dialed and lost                                                                                                                                                                     |
+| event                       | level | fields                                                                                                                                                               |
+| --------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stream_recovery_started`   | INFO  | `recovery_index`, `partial_bytes`, `provider`, `upstream`, `policy_hash`, `policy_generation`                                                                        |
+| `stream_recovery_succeeded` | INFO  | `recovery_index`, `recovered_bytes`, `recovered_events`, `upstream_exchanges`, `elapsed_ms`                                                                          |
+| `stream_recovery_failed`    | WARN  | `recovery_index`, `phase` (see below), `upstream_status`, the sanitized `err`, `upstream_credential_id` when the candidate has a pool                                |
+| `stream_recovery_exhausted` | WARN  | `recoveries`, `reason` (`budget_spent`/`max_recoveries`/`max_elapsed`/`logical_terminal`/`unsafe_content`), `unsafe_reason` only when the reason is `unsafe_content` |
+| `stream_completed`          | DEBUG | + `stream_recoveries`                                                                                                                                                |
+| `stream_truncated`          | WARN  | + `stream_recoveries`, `recovery_reason`, phase `recovery` for a marker-less stream — or outcome `client_disconnected` when the caller left during a hop             |
+| `egress_attempt_failed`     | WARN  | one per endpoint a hop's pool dialed and lost                                                                                                                        |
 
 Every reason is a closed-set token from a typed value, never error text — the
 same rule `transport.go` states for `AttemptFailure`. No event carries a
 credential, a body, a continuation prefix, or the continuation instruction; the
 hop's own message name is never logged, because it is client-visible text this
 proxy already relayed.
+
+### The nine hop phases, and whose fault each one is
+
+`phase` on `stream_recovery_failed` is a closed set of nine tokens, and it is
+the field that answers "which side did this". Four of them — `build`,
+`credential`, `budget` and `max_elapsed` — are refusals that never reached the
+wire, and they carry no `error` at all, because no endpoint is at fault.
+`client_write` and `upstream_limit` are equally this proxy's or the client's
+side of the wire but DO carry the relay's own error; the phase is what says
+whose it is, and it is why the error alone cannot be read as an upstream
+fault:
+
+| phase             | owner      | what it means                                                                  |
+| ----------------- | ---------- | ------------------------------------------------------------------------------ |
+| `build`           | this proxy | the continuation body could not be expressed; carries `unsafe_reason`          |
+| `credential`      | this proxy | the candidate's rotation pool had no credential ready to spend                 |
+| `budget`          | this proxy | an exchange envelope refused the dial before it happened                       |
+| `max_elapsed`     | this proxy | the window's own watchdog; the one phase that also names no **endpoint**       |
+| `upstream_limit`  | this proxy | the bounded relay's own cap stopped the pass (1 MiB per line, 2 MiB per event) |
+| `client_write`    | the client | the client's socket failed, not the upstream's                                 |
+| `dial`            | the wire   | the transport could not reach the endpoint                                     |
+| `upstream_status` | the peer   | the hop answered a non-2xx                                                     |
+| `upstream_read`   | the peer   | the hop's stream body failed mid-pass                                          |
+
+`max_elapsed` is the sharpest of these and the one this design exists to keep
+legible: it is both a hop phase and a loop reason, because it is the same fact
+seen from two places, and it is the one phase that never attaches the error it
+was called with. That error is this proxy's own closed body — the lever the
+window's watchdog uses to unblock a parked relay — so attaching it would put a
+transport error on the phase that blames no endpoint and send an operator after
+a peer that behaved perfectly. Nothing about it is visible on the wire as an
+upstream failure, and no reading of "recovery failed" may conclude "upstream
+failed" from it.
 
 The hop's `stream_recovery_failed` is deliberately NOT the walk's
 `upstream_http_error`: that record carries fields (fingerprint, error shape,

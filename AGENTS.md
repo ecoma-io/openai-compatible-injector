@@ -27,7 +27,7 @@ stripping.
 
 ## Layout and boundaries
 
-- **`internal/config`** — bootstrap env, strict runtime YAML,
+- **`internal/config`** — bootstrap env, strict runtime YAML, the
   providers/transports/pools tables, the `recovery` config surface, candidate
   chains, snapshot `Store`, content-hash `Poller`.
 - **`internal/credential`** — per-provider credential `Spec`, rotation `Pool`,
@@ -43,10 +43,15 @@ stripping.
   repository, the bounded asynchronous pipeline.
 - **`internal/transport`** — outbound paths: `Doer`/`Executor`/`Resolver` seams,
   direct/proxy/pool clients, failure classification, the exchange-budget seam.
+- **`internal/memlimit`** — the process-wide byte budget behind the proxy's
+  admission: an immediate CAS reservation, a clamped release, a `Peak`
+  diagnostic. It counts bytes and nothing else — no allocation, no lock, no I/O,
+  no knowledge of what the bytes are for.
 - **`internal/recovery`** — the recovery policy domain: `Failure`/`Match`/`Action`,
   the matrix, layer merge and `Resolve`, the policy hash, the `Engine`.
 - **`internal/proxy`** — HTTP wiring, client auth, `/v1/models`, error envelopes,
-  the candidate walk, `CopySSE`, `rewriteOut`, the stream-continuation loop.
+  the candidate walk, `CopySSE`, `rewriteOut`, the stream-continuation loop, and
+  the two buffer admissions that draw on `internal/memlimit`.
 - **`internal/server`, `cmd/…`, `e2e`** — listener lifecycle and shutdown;
   entrypoint and subcommands; black-box tests over the built binary.
 
@@ -75,10 +80,8 @@ Boundaries a helpful-looking refactor will cross:
   — every environment variable the service reads is `OAICR_`-prefixed, with no
   unprefixed fallback) come from the environment, and a runtime file defining one
   is rejected by strict decoding. Everything else — model mapping, the required
-  `api-key`, `log-level`, `sse-keep-alive` — lives in YAML only.
-- **The runtime file is a single YAML document.** A `---`-separated second document
-  is a rejection. `sse-keep-alive` defaults to enabled at 15s and accepts any
-  duration ≥ 1s.
+  `api-key`, `log-level`, `sse-keep-alive` — lives in YAML only, as a single
+  document (`---`-separated seconds are a rejection).
 - **The database URLs are infrastructure, not policy.** Empty
   `OAICR_AUTH_DATABASE_URL` = static mode, non-empty = partner mode; empty
   `OAICR_USAGE_DATABASE_URL` = metering off, non-empty = migrated and validated
@@ -105,6 +108,22 @@ Boundaries a helpful-looking refactor will cross:
 - **Injection must never corrupt.** Chat prepends to `messages` only when it is a
   JSON array; Responses merges into `instructions` (string, array, or absent) and
   touches nothing else. An empty prompt means no injection.
+- **The request path is bounded in time and in aggregate, not only per
+  request.** `maxRequestBodyBytes` (64 MiB) caps how much a client may send; a
+  per-read deadline (`requestBodyReadTimeout`, via
+  `http.NewResponseController(w).SetReadDeadline`) caps how long it may take; one
+  process-wide `memlimit.Budget` (512 MiB) caps what every in-flight request is
+  buffering at once. Only the first is per-request. Clear the read deadline the
+  moment the read returns — the connection then carries a response, an SSE
+  stream included, and goes back into the keep-alive pool — and never reach for
+  `http.Server.ReadTimeout` (it arms the whole connection) or `WriteTimeout` (it
+  cuts legitimate SSE). Reserve the budget in blocks as a buffer GROWS, never a
+  cap up front, and refuse an unmet reservation IMMEDIATELY rather than queueing
+  it. The refusal is the 503 `capacity_exceeded` envelope and is NEVER fed to the
+  recovery matrix: a process-wide condition is one every candidate shares, so no
+  retry or fallback can clear it. The ceiling is coupled to
+  `compose.production.yaml`'s `mem_limit: 1g`; README "Buffering" has the
+  rationale.
 - **Every transform is byte-preserving and API-scoped; nothing is ever
   re-serialized.** `RewriteChatModel` replaces only the top-level `"model"` string
   value; `RewriteResponsesModel` additionally replaces the `"model"` directly
@@ -122,13 +141,13 @@ Boundaries a helpful-looking refactor will cross:
   model carries a `Chain` (≥ 1 `Candidate`) and EVERY candidate carries the
   effective `recovery.Policy` its layer chain resolved — global → provider →
   model → candidate, deep-merged and re-validated at each step, so an override
-  states only what changes and a layer that contradicts the one below it is
+  states only what changes and a layer contradicting the one below it is
   rejected rather than quietly winning. Two members are position-scoped and
   rejected elsewhere, because a block that cannot be honoured reads like a
   setting and is not one: `fallback` (the walk's reach — a property of the
-  request's chain, not of a hop) is legal at the global and model layers only,
-  `stream` likewise (it changes text a client has already received), and
-  `budget.request` only in the top-level block.
+  request's chain, not of a hop) at the global and model layers only, `stream`
+  likewise (it changes text a client already received), and `budget.request`
+  only in the top-level block.
 - **What a failure MEANS is that policy's matrix, never a table in the handler.**
   Typed observations map onto `retry`/`fallback`/`terminal` through typed,
   allow-listed predicates only — no expressions, scripting or regex. The default
@@ -137,11 +156,11 @@ Boundaries a helpful-looking refactor will cross:
   happens. The effective policy lives exactly as long as the request — a reload
   mid-walk, mid-wait included, cannot reshape in-flight work.
 - **Precedence is deterministic and independent of Go map iteration and of YAML
-  order:** exact status > provider-error predicate > status class > failure cause
-  > failure class, with shorthands expanded into canonical IDs (`http-<status>`,
-  > `http-class-<class>`, `transport-cause-<cause>`, …). Equally-specific
-  > overlapping rules are REJECTED at load, so no disposition is left to whichever
-  > rule the runtime happens to reach first.
+  order:** exact status > provider-error predicate > status class > failure
+  cause > failure class, with shorthands expanded into canonical IDs
+  (`http-<status>`, `http-class-<class>`, `transport-cause-<cause>`, …). Equally-specific
+  overlapping rules are REJECTED at load, so no disposition is left to whichever
+  rule the runtime happens to reach first.
 - **Four things stay code-owned and non-configurable, and apply BEFORE the
   matrix:** a committed response is terminal; a caller cancellation or expired
   deadline is terminal, judged from the request context and never from the error
@@ -153,30 +172,27 @@ Boundaries a helpful-looking refactor will cross:
   CANDIDATE envelope forbids only another exchange on THAT candidate, and the walk
   may still fall back because `EnterCandidate` opens the next envelope fresh: a
   per-candidate number must never pin a chain the operator configured to fall
-  back. The request envelope counts REAL outbound exchanges rather than the intent
-  to make them, one unit claimed by the transport immediately before each dial.
-  A value above a cap REJECTS the file rather than being clamped.
+  back. The request envelope counts REAL outbound exchanges, one unit claimed by
+  the transport immediately before each dial. A value above a cap REJECTS the file
+  rather than being clamped.
 - **What the matrix decides, the mechanical policies only size.** A retried
   failure waits a bounded backoff (initial, doubling to a ceiling, ± jitter); a
   fallback moves immediately with no inter-candidate wait; a retryable failure
   whose candidate budget is spent takes `retries.on-exhausted`, which is also the
   answer to the one refusal no observation can describe — a transport that declined
   to dial because the envelope was already spent (`Engine.CandidateSpent`). An
-  upstream `Retry-After` can only ever RAISE a wait,
-  never past the backoff ceiling, the retry-after policy's own `max-delay`, the
-  candidate's remaining `max-elapsed` window, or the caller's remaining deadline —
-  whichever binds first. `max-delay` ceilings the DIRECTIVE, not the schedule.
-  The `max-elapsed` window is measured from the candidate's FIRST attempt and
-  checked BEFORE a wait is scheduled. `fallback.enabled: false` pins the primary
-  candidate while same-candidate retries still apply; `fallback.max-candidates`
-  counts candidates ENTERED (the primary included), never the ones the chain
-  lists; the retry budget is enforced PER CANDIDATE, never shared.
+  upstream `Retry-After` can only ever RAISE a wait, never past the backoff
+  ceiling, the retry-after policy's own `max-delay`, the candidate's remaining
+  `max-elapsed` window, or the caller's remaining deadline — whichever binds
+  first; `max-delay` ceilings the DIRECTIVE, not the schedule. The `max-elapsed`
+  window is measured from the candidate's FIRST attempt and checked BEFORE a wait
+  is scheduled. `fallback.enabled: false` pins the primary candidate while
+  same-candidate retries still apply; `fallback.max-candidates` counts candidates
+  ENTERED (the primary included), never the ones the chain lists; the retry budget
+  is enforced PER CANDIDATE, never shared.
 - **Transport failure falls to the next candidate with NO same-candidate retry
   under the shipped default** — an operator matrix CAN ask for one, since
-  `transport` and `transport-cause-*` rows are matchable. A malformed or incomplete
-  answer before commitment (an unparseable or over-cap 200 body, an error body
-  whose bounded capture fails or stalls) is judged by the matrix like any other
-  observation.
+  `transport` and `transport-cause-*` rows are matchable.
 - **Legacy spellings still load, and normalize into this one engine rather than
   running beside it.** `provider`, `endpoint`, `retries` and `provider-fallback`
   normalize into the same policy structure (the `provider`/`endpoint` forms build
@@ -215,9 +231,9 @@ Boundaries a helpful-looking refactor will cross:
   `StatusCode` set with `err == nil` is an answer. Bodies are never buffered on
   `direct`/`proxy` — but `poolDoer.Do` DOES buffer the request, because a bare
   `*http.Request` cannot carry the probed stream flag the pool's eligibility gate
-  needs; routing client traffic through `Do` for a pool silently bypasses that
-  gate, so it is a defect rather than a supported mode, and the handler always
-  hands a pool its own request facts through `Execute`.
+  needs. Routing client traffic through `Do` for a pool silently bypasses that
+  gate, so it is a defect rather than a supported mode: the handler always hands a
+  pool its own request facts through `Execute`.
 - **`socks5` and `socks5h` are not interchangeable.** `socks5` resolves the
   upstream hostname locally and CONNECTs the IP; `socks5h` sends the hostname for
   remote DNS. An unknown transport or provider reference, a bad type, or a
@@ -253,14 +269,14 @@ Boundaries a helpful-looking refactor will cross:
   byte left; everything else — a read/write op, a bare EOF, a timeout on an
   established connection — is `send_unknown`. The TLS clause is one failure, not
   the phase: any other handshake failure stays `send_unknown`, because Go produces
-  the same shapes on an established connection, and the pool gives up a fallback
+  those same shapes on an established connection, and the pool gives up a fallback
   rather than risk a duplicate.
 - **Pool state is identity-keyed and instance-owned.** Scheduler cursor, health,
   permits and in-flight leases live in the `Registry` keyed by pool identity:
   unchanged policy across a reload stays warm, changed policy starts fresh, and a
   leased state outlives its eviction until the last request releases it. Eviction
-  checks the state INSTANCE under the map key, never the key alone, so re-adding an
-  identity retired in between builds a fresh generation.
+  checks the state INSTANCE under the map key, never the key alone, so re-adding
+  an identity retired in between builds a fresh generation.
 - **Config rejects what cannot be honoured.** A pool whose members resolve to
   duplicate ENDPOINTS (identity is the canonical resolved endpoint with host case
   folded, never the YAML name), and a SOCKS5 userinfo credential over 255 decoded
@@ -276,27 +292,25 @@ Boundaries a helpful-looking refactor will cross:
 
 - **Field stripping is config-data, byte-preserving, and runs LAST.** It excises
   configured provider-added members (`strip-fields`, syntax in README "Response
-  field stripping") from every relayed 2xx response. It runs last in the composed
-  `rewriteOut` (rename → thinking synthesis → strip), deliberately, so
-  configuration can never strip the `model`/`usage` keys the proxy itself writes —
-  and the proxy's own members are rejected at load anyway, as an enumerated set of
-  EXACT paths. The strip list binds per request like the rest of the snapshot: a
-  model-level list replaces its candidates' provider lists; without one, each
-  candidate answers under its own provider's list. The usage meter observes
-  pre-rewrite bytes, so stripped fields are never metered. The SSE data-line gate
-  is widened with the strip list's first-segment patterns (`stripKeys`), re-derived
-  per candidate, so a chunk carrying only a to-be-excised key still reaches the
-  strip.
+  field stripping") from every relayed 2xx response, last in the composed
+  `rewriteOut` (rename → thinking synthesis → strip) so configuration can never
+  strip the `model`/`usage` keys the proxy itself writes — which are rejected at
+  load anyway, as an enumerated set of EXACT paths. The strip list binds per
+  request like the rest of the snapshot: a model-level list replaces its
+  candidates' provider lists; without one, each candidate answers under its own
+  provider's list. The usage meter observes pre-rewrite bytes, so stripped fields
+  are never metered. The SSE data-line gate is widened with the strip list's
+  first-segment patterns (`stripKeys`), re-derived per candidate, so a chunk
+  carrying only a to-be-excised key still reaches the strip.
 - **Simulated thinking usage is opt-in, response-side, and fail-open.** A model's
   `thinking-usage` block (absent or null = off) enriches EXISTING client-facing
   usage objects in the API-native details field, under the API's own scope; the
   share is drawn ONCE per request, before any upstream I/O, bound to the request's
-  snapshot, so every usage object in the request — streamed chunks included —
-  reports the same share. Upstream-reported reasoning always wins. It never
-  fabricates a usage object. Default off is byte-identical traffic, structurally:
-  the zero-value plan is inactive and the composed rewriter degenerates to the
-  model rename. Ratios, thresholds and `mode: auto` are in README "Simulated
-  thinking usage".
+  snapshot, so every usage object — streamed chunks included — reports the same
+  share. Upstream-reported reasoning always wins. It never fabricates a usage
+  object. Default off is byte-identical traffic, structurally: the zero-value plan
+  is inactive and the composed rewriter degenerates to the model rename. Ratios,
+  thresholds and `mode: auto` are in README "Simulated thinking usage".
 
 ### Auth
 
@@ -319,8 +333,8 @@ Boundaries a helpful-looking refactor will cross:
   crypto-random (`oaicr_` + 32 bytes) and stored as SHA-256 digests only.
   `keys list` structurally exposes no secret material, and `last_used_at` flushes
   off the request path (drop-on-full, never blocks, never fatal).
-- Startup migration and schema validation, the collision-resistant ids, and the
-  `keys` subcommand surface are in README "Partner API keys".
+- Startup migration, schema validation, the collision-resistant ids and the
+  `keys` surface are in README "Partner API keys".
 
 ### Streaming
 
@@ -346,51 +360,68 @@ Boundaries a helpful-looking refactor will cross:
   handler binds it to the continuation accumulator, while the usage capture rides
   the rewriter instead.
 - **Post-commitment stream recovery is a SECOND orchestrator, off by default, and
-  it is not a retry.** When a committed SSE stream ends without its terminal
-  marker (`data: [DONE]`, or `event: response.completed`) and the frozen policy's
-  `recovery.stream` says so, the proxy keeps the client's one connection open,
-  re-asks the SAME candidate for a continuation, and relays its events into the
-  same response. It never re-enters `recovery.Engine` — no observation can
-  describe a stream the client already holds — and it never consults the matrix:
-  it reads `answer.cand.Recovery.Stream` off the request's own snapshot and
-  nothing else.
+  it is not a retry.** A committed SSE stream that ends without its terminal
+  marker (`data: [DONE]`, `event: response.completed`) is re-asked of the SAME
+  candidate and its events relayed into the same response. The loop reads
+  `answer.cand.Recovery.Stream` off the request's own frozen snapshot and nothing
+  else — never `recovery.Engine`, whose commitment invariant correctly refuses a
+  stream a client already holds, and never the matrix.
 - **The hop is the committed candidate re-asked, not a new attempt that looks
-  similar.** Same endpoint and route suffix, same `transport.Doer` the walk
-  resolved, same `*credential.Pool` INSTANCE, and the key the walk went out with
-  as its sticky preference — resolved, never re-derived, because a fresh registry
-  lookup after a concurrent publish would acquire from a cold pool. A hop pays for
-  its dials out of the request's own `budget.request` envelope and counts as a
-  provider-level attempt (`provider_attempts` and `upstream_exchanges` move;
-  `candidates_entered` does not).
+  similar.** Same endpoint and route suffix, same `transport.Doer`, same
+  `*credential.Pool` INSTANCE, and the key the walk went out with as its sticky
+  preference — resolved, never re-derived, because a fresh registry lookup after
+  a concurrent publish would acquire from a cold pool. A hop pays its dials out of
+  the request's `budget.request` envelope and counts as a provider-level attempt
+  (`provider_attempts` and `upstream_exchanges` move; `candidates_entered` does
+  not).
 - **Four bounds, all refusals rather than clamps:** the safety gate,
   `max-recoveries`, `max-elapsed` (measured from the commit and checked BEFORE a
   hop is scheduled), and the exchange envelope. The safety gate is fail-closed and
-  the shipped default outcome on agent traffic: the accumulator (`partialText`) is
-  fed every data payload in hop order, and the moment it sees a tool
-  call, a finish reason, a `data:` line that is neither `[DONE]` nor recognizable
-  JSON, or text past `max-partial-bytes`, the stream stops being recoverable for
-  good. An empty prefix is refused too, because a hop with no committed text is a
-  blind replay wearing a continuation's shape. A body the builders cannot express
-  a continuation for (typed `ContinuationRefusal`, closed-set reason) is refused
-  the same way — `previous_response_id` especially, since the upstream would
-  resolve it against a response whose generation never finished.
-- **Hard boundaries for the continuation loop.** The client keeps its single
-  connection and its single terminal marker: NO second header block and NO error
-  body ever reaches a client already receiving a stream. NO terminal marker is
-  ever synthesized, so a hop that truncates leaves the stream exactly as
-  unterminated as it would have been — an unterminated stream is more honest than
-  a `[DONE]` after a partial answer. NO heuristic ever deletes client-visible
-  text: a repeated paragraph at the seam is visible and honest, overlap trimming is
-  not. The heartbeat runs ACROSS hops (`stopAndWait` fires after the loop), so the
-  idle cut the keep-alive exists to prevent cannot fire mid-recovery. A reload
-  mid-stream changes nothing: the policy comes off the request's frozen snapshot.
+  the shipped default outcome on agent traffic: `partialText` is fed every data
+  payload in hop order, and a tool call, a finish reason, a `data:` line that is
+  neither `[DONE]` nor recognizable JSON, or text past `max-partial-bytes` makes
+  the stream unrecoverable for good. An empty prefix is refused too — a hop with
+  no committed text is a blind replay wearing a continuation's shape — as is a
+  body the builders cannot express one for (`previous_response_id` especially,
+  whose response generation never finished).
+- **Hard boundaries for the continuation loop.** NO second header block and NO
+  error body ever reaches a client already receiving a stream, and NO terminal
+  marker is ever synthesized: a hop that truncates leaves the stream exactly as
+  unterminated as it would have been. NO heuristic ever deletes client-visible
+  text — a repeated paragraph at the seam is honest, overlap trimming is not. The
+  heartbeat runs ACROSS hops (`stopAndWait` fires after the loop), so the idle cut
+  it exists to prevent cannot fire mid-recovery, and a reload mid-stream changes
+  nothing.
+- **One owner per recovery stop, and one field name per vocabulary.** The five
+  recovery events form a matrix in README "Logging", pinned by
+  `streamrecovery_events_test.go`: `_started` announces an intent, `_succeeded`
+  means the upstream carried the stream to its marker, `_failed` means one hop
+  did not produce a continuable stream, `_exhausted` means this proxy stopped at
+  a bound, `stream_truncated` means the client's stream lost its marker. Three
+  field names, three closed sets: `phase` is the hop's, `reason` is the loop's,
+  `unsafe_reason` is the accumulator's — a builder refusal is `phase: build` with
+  `unsafe_reason` set, never the builder's token in `reason`. `phase: max_elapsed`
+  is always THIS proxy's own window, so it carries no `error` and no
+  `upstream_status`; `client_write` and `upstream_limit` are ours too. Never let
+  an operator read "recovery failed" and conclude "upstream failed" when the
+  owner was our own deadline.
+- **A hop's body owns its dial's context, and the release rides the Close.**
+  net/http aborts an UNREAD response body when the request's context is canceled,
+  so the context a hop dialed under must outlive `dialContinuation`: the hop wraps
+  it in `boundBody`, whose `Close` is the release, and `bind`'s `stop()` (the
+  header watchdog) must NOT cancel it. Releasing at the dial's return truncates
+  every successful hop.
+  `bind` is called once per hop, but the window is created ONCE per logical
+  session (at the commit), never per hop — a per-hop reset would let the last
+  lever outlive `max-elapsed` by most of a window. One instant covers both waits:
+  `armBody` closes a stalled body, `bind`'s own cancel unblocks a stalled response
+  HEADER.
 - **The compatibility hinge is exact.** Feature off (or absent — the zero
   `StreamPolicy`) leaves the relay byte-identical, and an EOF with no marker still
   logs `stream_completed` / outcome `completed`. Feature ON reports a marker-less
-  stream as truncated whether the proxy dialed for it or refused to. Every recovery
-  reason is a closed-set token from a typed value, never error text, and no
-  recovery event carries a body, a prefix, a credential, or the continuation
-  instruction.
+  stream as truncated whether the proxy dialed for it or refused to. Every
+  recovery reason is a closed-set token from a typed value, never error text, and
+  no recovery event carries a body, a prefix, or a credential.
 
 ### Errors
 
@@ -398,13 +429,9 @@ Boundaries a helpful-looking refactor will cross:
   Redirects are never followed. An upstream 4xx/5xx keeps its status and gets the
   canonical envelope, and the raw provider bytes reach neither client nor logs: a
   bounded 64 KiB prefix is read once under a short fixed internal capture timeout
-  (a test-overridable package var, never runtime configuration, with a
-  `context.AfterFunc` closing a stalled body) to classify `error_shape` and
-  fingerprint `error_fingerprint` into one `upstream_http_error` event — WARN for
-  4xx, ERROR for 5xx — carrying
-  `error_class: upstream_error`, the matching `error_cause`, the token-shaped
-  `provider_error_type` and `provider_error_code`, and the allow-listed
-  `retry_after`/`x_ratelimit_*`. The field list is in README "Errors".
+  (a test-overridable package var, never runtime configuration) to classify
+  `error_shape` and fingerprint `error_fingerprint` into one `upstream_http_error`
+  event — WARN for 4xx, ERROR for 5xx. The field list is in README "Errors".
 - **An unusable answer before commitment is retryable, not fatal.** A 200 that is
   not JSON, and an error-body read failure or stalled capture, are both judged by
   the matrix like any other observation: the same candidate is re-asked while its
@@ -426,72 +453,64 @@ Boundaries a helpful-looking refactor will cross:
   event, a metric label, a panic, or a response body. A quote of one of these is a
   security defect (SECURITY.md), not a typo. Log only scheme+host for upstream
   URLs; README "Safety and credentials" has the full list.
-- **Two counters measure different things and are deliberately apart.**
-  `provider_attempt` counts one-based LOGICAL provider-level attempts;
-  `upstream_exchange` counts real outbound dials, one-based and request-wide. They
-  differ in BOTH directions — exchanges exceed attempts when one attempt fans out
-  across a pool's members, attempts exceed exchanges when an attempt dialed
-  nothing (every member gated out, an envelope refusal before the dial) — which is
-  why they are counted apart. `provider_attempts` carries the logical count on both
-  the completion record and the usage event; the outbound total is
-  `upstream_exchanges` on the records and the `egress_attempts` COLUMN on the usage
-  event, one quantity under two names.
-- **The LOG field `egress_attempts` is the narrowest of the egress fields:** the
-  last dialed attempt's own pool report, absent when that attempt was direct, and
-  not corrected on a retained walk — it names where the last dial happened, not
-  where the relayed response came from. The usage event's `EgressKind` column is
-  the one that IS corrected to the retained answer.
-- **Counter and field traps.** `request_exchange_budget_remaining` reports the
-  REQUEST envelope's headroom — never the tighter of the two, which would read zero
-  on a candidate-envelope exhaustion.
-  `provider_attempt_started` fires before the attempt's first dial and carries the
-  index the logical counter ALREADY holds, because an attempt is counted when it
-  begins rather than when a dial succeeds: an attempt the envelope refuses before
-  any dial still reports `provider_attempt` equal to `provider_attempts`, with
-  `upstream_exchanges` alone unmoved. Egress indexes are one-based and omitted
-  when nothing was dialed, and per-dial events also carry `attempt`, a legacy
-  alias equal to `egress_attempt` — `egress_attempt` is authoritative.
-  `request_completed` adds `retries_total` (a compatibility alias of
-  `retry_attempts`), `final_candidate` (1-based) and `final_provider`. README
-  "Observability" lists the rest of the fields.
-- **One WARN `provider_attempt_failed` per failed attempt, one
-  `upstream_http_error` per received 4xx/5xx** — discarded retry/fallback attempts
-  included. Both carry `candidate_index`, `candidate_attempt`, `retry_index`,
-  `disposition` (`retry|fallback|terminal`), `reason` and `elapsed_ms`, and every
-  one of those tokens is closed-set: carry the vocabulary from README
-  "Observability" rather than inventing a token. Failure evidence additionally
-  carries the canonical `error_class`, a closed-set `error_cause` mapped from typed
-  error shapes and never from message text, a closed-set `failure_origin`
-  (`upstream_http`/`transport`/`protocol`/`caller`/`credential`/`envelope`), and —
-  on transport failures — `send_state`. Two asymmetries are easy to get wrong:
-  `provider_attempt_failed` is transport failures ONLY, and the received status
-  (`upstream_status`) plus the `upstream_*` reason tokens belong to the
+- **Three countings share names, and only one of each name is right.** The LOG
+  field `egress_attempts` is the narrowest: the relayed candidate's own pool
+  report, absent when that attempt was direct, NOT corrected on a retained walk.
+  The usage event's `EgressKind` IS corrected to the retained answer, and its
+  `egress_attempts` COLUMN is a third thing again — the request-wide exchange
+  total the log calls `upstream_exchanges` (one quantity, two names, because the
+  column predates the field).
+- **Two counter traps.** `request_exchange_budget_remaining` reports the REQUEST
+  envelope's headroom, never the tighter of the two — that would read zero on a
+  candidate-envelope exhaustion. `provider_attempt_started` fires before the
+  dial but carries the index the logical counter ALREADY holds, so an attempt the
+  envelope refuses before any dial still reports `provider_attempt` equal to
+  `provider_attempts`, with `upstream_exchanges` alone unmoved. Egress indexes
+  are one-based and omitted when nothing was dialed; per-dial events also carry
+  `attempt`, a legacy alias of `egress_attempt` — `egress_attempt` is
+  authoritative. `request_completed` adds `retries_total` (an alias of
+  `retry_attempts`), `final_candidate` (1-based) and `final_provider`.
+- **`provider_attempt_failed` is transport failures ONLY**, and the received
+  status (`upstream_status`) plus the `upstream_*` reason tokens belong to the
   unusable-answer and `upstream_http_error` events instead, because a transport
-  failure has no status to carry.
+  failure has no status to carry. `error_class`/`error_cause`/`failure_origin`/
+  `send_state`/`disposition`/`reason` are all closed sets: carry README
+  "Observability"'s vocabulary rather than inventing a token, and never map a
+  cause from message text.
 - **`egress_attempt_failed` and `candidate_exchange_budget_spent` are not the same
   kind of event.** The first is one WARN per dialed-and-failed endpoint, pooled or
-  direct, so both egress shapes emit the same record. The second is a refusal,
-  never a failed endpoint: no strike, no `egress_attempt_failed`, and no
-  `upstream_exchange`, because no exchange happened for it to index. Its
-  `policy_rule_id` is always `budget-candidate` and it carries the disposition the
-  refusal produced, so `retries.on-exhausted` still owns whether the walk moves —
-  except for a refusal by the REQUEST envelope, which never reaches that WARN at
-  all: it is terminal whatever `retries.on-exhausted` says, and the post-walk
-  `upstream_request_failed` names it under `budget-request`.
+  direct. The second is a refusal, never a failed endpoint: no strike, no
+  `egress_attempt_failed`, no `upstream_exchange` (nothing happened to index),
+  `policy_rule_id` always `budget-candidate`, and `retries.on-exhausted` still
+  owns whether the walk moves — except a refusal by the REQUEST envelope, which
+  never reaches that WARN and is terminal whatever the policy says, named
+  post-walk under `budget-request`.
 - **Logging hot-reloads like config, and leaks nothing at any level.** A top-level
   `log-level` key lives in the runtime YAML (`debug|info|warn|error`, exact match;
   absent = `info`); there is no `LOG_LEVEL`. A valid reload applies the level
   process-wide through the poller's `onPublish` hook calling
-  `zerolog.SetGlobalLevel` — an atomic store, no locks, no signal, no restart — and
-  acknowledges it with `log_level_applied` emitted at the new level, the only
-  severity visible under the level it announces, so no transition is ever silent.
-  Events are JSON lines on stderr with stable snake_case slugs; one INFO
-  `request_completed` per request binds `request_id`, outcome, byte counts,
-  duration and `config_generation`. The credential rule is level-independent. E2E
-  logging pins assert on slugs and fields, never prose.
+  `zerolog.SetGlobalLevel` — no lock, no signal, no restart — and acknowledges it
+  with `log_level_applied` emitted at the NEW level, so no transition, even
+  `error→warn`, is ever silent. Events are JSON lines on stderr with stable
+  snake_case slugs. The credential rule is level-independent, and E2E logging pins
+  assert on slugs and fields, never prose.
 
 ### Process lifecycle
 
+- **Liveness and readiness are two endpoints, and readiness goes false BEFORE
+  the listener stops accepting.** `/healthz` (proxy-owned, 200 for as long as
+  the listener exists, draining included) and `/readyz` (`server`-owned: 200
+  while ready, 503 + the state token otherwise, `no-store`). `Run` calls
+  `beginDraining()` FIRST, keeps serving for a head start
+  (`readinessPropagation` = 5s, capped at `grace/2`, DRAWN FROM the grace rather
+  than added to it, so `stop_grace_period` needs no adjustment), and only then
+  `Shutdown(grace - head)`. A probe that has not yet noticed cannot be told
+  anything by a closed port, so this ordering is not tradeable; a context
+  already cancelled at entry is never advertised ready at all. Readiness is
+  about THIS process alone — never the snapshot, a provider, or a database —
+  and the machine must stay one atomic integer with no lock and no callback, so
+  an outage cannot empty a load balancer's pool and no probe ever queues behind
+  a request. The container probe reads `/readyz`, never `/healthz`.
 - **Graceful shutdown, one signal channel.** The first SIGINT/SIGTERM runs
   `Shutdown(grace)`, forces `Close()` on overflow, closes idle connections, and
   drains the accepted usage-event queue within its bounded close window before
@@ -504,54 +523,40 @@ Boundaries a helpful-looking refactor will cross:
   one upstream call, streamed usage is last-readable-object wins, never a sum, and
   a per-member unreadable count is that member unstated rather than a discarded
   object. ACROSS the calls one request was assembled from — a stream-recovery hop
-  is a new upstream response — the capture is sealed at each pass boundary and the
-  event reports the aggregate, each count combined by its own semantics: the last
-  call that stated a prompt wins (the context that actually ran), completions add
-  up (the client read every call's text), and total is that row's own prompt +
-  completion, so the three columns cannot contradict each other and a count no call
-  stated stays NULL. `EgressKind` names the RELAYED candidate's egress mode, the
-  retained-answer case included; `Stream` records the mode actually relayed, not
-  the probe's prediction. The queue drops accountably under pressure and
-  `usage_meter_final` reports the totals after the shutdown drain — a database
-  failure never delays or mutates a client response.
-- **Healthcheck never reads YAML.** It probes `GET /healthz` (200 + `"ok\n"`), so a
-  poisoned reload cannot fail the container probe.
+  is a new upstream response — the capture is sealed at each pass boundary and
+  each count is combined by its OWN semantics: the last call that stated a prompt
+  wins (the context that actually ran), completions add up (the client read every
+  call's text), and total is that row's own prompt + completion, so the three
+  columns cannot contradict each other and no call stating a count leaves it NULL.
+  `EgressKind` names the RELAYED candidate's egress mode, the retained-answer case
+  included; `Stream` records the mode actually relayed, not the probe's
+  prediction. The queue drops accountably under pressure and `usage_meter_final`
+  reports the totals after the shutdown drain — a database failure never delays
+  or mutates a client response.
+- **Healthcheck never reads YAML.** It probes `GET /readyz` (200 + `"ok\n"`), so a
+  poisoned reload cannot fail the container probe and a draining instance fails it
+  on purpose.
 
 ## Error envelopes
 
 The client-facing bodies are byte-exact and live in **README "Errors"**, which
-carries the full condition table — every exact body, the 413 body cap, and the
-relayed-header allow-list. Treat that table as the contract and a diff against it
-as a breaking change; do not restate it here.
+carries the full condition table — every exact body, the 413 body cap, the
+capacity 503, and the relayed-header allow-list. Treat that table as the contract
+and a diff against it as a breaking change; do not restate it here.
 
-Three rules about it that are easy to get wrong:
-
-- 200 `GET /v1/models` makes no upstream call and is built from the request
-  snapshot's configured public names, lexicographically sorted, with entries
-  carrying exactly `id` and `created: 0` — no upstream name, endpoint or prompt
-  may appear.
-- 405-before-401: a non-GET `/v1/models` is answered before any authentication
-  check, and `GET /v1/models` is exact-match only, so `/v1/models/` is the
-  catch-all 404.
-- 502 `upstream_error` is only ever reached AFTER the matrix has had its say, and
-  a client cancel while the upstream request is in flight is the WARN
-  `client_disconnected` outcome instead.
-- The 404 `model_not_found` body interpolates the requested model name byte-exact,
-  with no HTML escaping. Do not "fix" it onto a JSON encoder that escapes `<` or
-  `&`; a unit test pins the property.
+One rule is easy to get wrong: the 404 `model_not_found` body interpolates the
+requested model name byte-exact, with no HTML escaping. Do not "fix" it onto a
+JSON encoder that escapes `<` or `&`; a unit test pins the property.
 
 ## Testing and CI
 
-- Unit tests are co-located under `internal/`, stdlib only, deterministic.
-  Exception: `internal/auth`, `internal/migrate` and `internal/usage` carry
-  PostgreSQL integration tests that run only when `OAICR_TEST_DATABASE_URL` names
-  a dedicated disposable test database — unset, they skip, and CI stays hermetic.
-- E2E (`e2e/`) is a black-box suite over the built binary with in-process httptest
-  upstreams. It skips under `-short`; CI runs
-  `go test ./e2e/ -count=1 -timeout 25m`.
-- CI runs `gofmt`, `go vet`, a checksum-pinned `golangci-lint`, race tests
-  excluding `e2e`, and `go build -X main.version`. The aggregate gates are
-  `ci-gate` and `analysis-gate`.
+- Unit tests are co-located under `internal/`, stdlib only, deterministic —
+  except `internal/auth`, `internal/migrate` and `internal/usage`, whose
+  PostgreSQL integration tests run only when `OAICR_TEST_DATABASE_URL` names a
+  disposable test database (unset, they skip and CI stays hermetic).
+- E2E (`e2e/`) is a black-box suite over the built binary; CI runs
+  `go test ./e2e/ -count=1 -timeout 25m`. The rest of the command list and the
+  aggregate gates (`ci-gate`, `analysis-gate`) are in CONTRIBUTING.md and `ci.yml`.
 - **A change that fails only loudly is not tested.** This service rewrites traffic
   in flight, so pin the quiet direction: a prompt that stops being applied, a
   stream that gets buffered, a request bound to the wrong snapshot after a reload.
@@ -579,6 +584,6 @@ Three rules about it that are easy to get wrong:
   Signed commits everywhere, squash merges into main only.
 - release-please (go type) owns CHANGELOG.md and the tags; the manifest tracks the
   landed version. Docker publishes `ghcr.io/ecoma-io/openai-compatible-injector`.
-- AI-assisted commits carry an `Assisted-by:` or `Generated-by:` trailer on the
-  LAST commit of the PR — one trailer per pull request, not per commit, since
-  squash merges concatenate trailers.
+- AI-assisted commits carry an `Assisted-by:`/`Generated-by:` trailer on the PR's
+  LAST commit — one per pull request, not per commit, since squash merges
+  concatenate trailers.
