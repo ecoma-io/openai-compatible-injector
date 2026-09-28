@@ -187,66 +187,70 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 // returned unchanged, so readBoundedLine remains the single place a line's
 // size against the cap is measured.
 func readToLineEnd(br *bufio.Reader) ([]byte, error) {
-	for {
-		// Peek fills the buffer when it is short, so n>=1 guarantees progress
-		// and an empty result can only be EOF. n<0 asks for no fill and would
-		// spin, so the floor of 1 is load-bearing: the line data is whatever is
-		// buffered, plus at least one more byte if the buffer is empty.
-		n := br.Buffered()
-		if n < 1 {
-			n = 1
-		}
-		b, err := br.Peek(n)
-		if err != nil && len(b) == 0 {
-			return nil, err
-		}
-		// An LF anywhere in the buffered window ends the line: every byte
-		// before it is line data whatever terminators precede it, so the whole
-		// line is one ReadSlice and a CRLF needs no special case.
-		if bytes.IndexByte(b, '\n') >= 0 {
-			chunk, rerr := br.ReadSlice('\n')
-			// ErrBufferFull is impossible here — the window held an LF, and
-			// the window is the whole buffer — so any error is the reader's
-			// own and propagates.
-			return chunk, rerr
-		}
-		// No LF buffered. A CR ends the line, as a CRLF whose LF is the next
-		// byte or as a lone CR. The distinction must be made BEFORE the CR is
-		// emitted: writing CR now and swallowing a later LF would corrupt the
-		// wire; writing both as separate lines would invent a blank event.
-		//
-		// Discard the pre-CR prefix to make room, then peek CR plus one byte.
-		// That fills when CR was the final byte buffered, so CRLF split over two
-		// upstream reads remains one byte-identical line. EOF proves a trailing
-		// CR is lone. (UnreadByte is not an option: bufio forbids it after Peek.)
-		if i := bytes.IndexByte(b, '\r'); i >= 0 {
-			chunk := append([]byte(nil), b[:i]...)
-			br.Discard(i)
-			tail, _ := br.Peek(2)
-			if len(tail) == 0 {
-				// The CR was in b, so the reader cannot have forgotten it; this
-				// guards an impossible bufio state rather than indexing empty data.
-				return chunk, io.ErrUnexpectedEOF
-			}
-			crlf := len(tail) == 2 && tail[1] == '\n'
-			chunk = append(chunk, tail[0])
-			br.Discard(1)
-			if crlf {
-				br.Discard(1)
-				return append(chunk, '\n'), nil
-			}
-			return chunk, nil
-		}
-		// No terminator in the window: it is all line data. Read it out
-		// (bufio returns the error only once its buffer is drained) and let
-		// readBoundedLine accumulate; ErrBufferFull is the "still no
-		// terminator, keep going" signal, unchanged from ReadSlice.
-		chunk := make([]byte, len(b))
-		if _, rerr := br.Read(chunk); rerr != nil {
-			return nil, rerr
-		}
-		return chunk, bufio.ErrBufferFull
+	// Peek fills the buffer when it is short, so n>=1 guarantees progress
+	// and an empty result can only be EOF. n<0 asks for no fill and would
+	// spin, so the floor of 1 is load-bearing: the line data is whatever is
+	// buffered, plus at least one more byte if the buffer is empty.
+	n := br.Buffered()
+	if n < 1 {
+		n = 1
 	}
+	b, err := br.Peek(n)
+	if err != nil && len(b) == 0 {
+		return nil, err
+	}
+	// An LF anywhere in the buffered window ends the line: every byte
+	// before it is line data whatever terminators precede it, so the whole
+	// line is one ReadSlice and a CRLF needs no special case.
+	if bytes.IndexByte(b, '\n') >= 0 {
+		chunk, rerr := br.ReadSlice('\n')
+		// ErrBufferFull is impossible here — the window held an LF, and
+		// the window is the whole buffer — so any error is the reader's
+		// own and propagates.
+		return chunk, rerr
+	}
+	// No LF buffered. A CR ends the line, as a CRLF whose LF is the next
+	// byte or as a lone CR. The distinction must be made BEFORE the CR is
+	// emitted: writing CR now and swallowing a later LF would corrupt the
+	// wire; writing both as separate lines would invent a blank event.
+	//
+	// Discard the pre-CR prefix to make room, then peek CR plus one byte.
+	// That fills when CR was the final byte buffered, so CRLF split over two
+	// upstream reads remains one byte-identical line. EOF proves a trailing
+	// CR is lone. (UnreadByte is not an option: bufio forbids it after Peek.)
+	if i := bytes.IndexByte(b, '\r'); i >= 0 {
+		chunk := append([]byte(nil), b[:i]...)
+		if _, err := br.Discard(i); err != nil {
+			return chunk, err
+		}
+		tail, _ := br.Peek(2)
+		if len(tail) == 0 {
+			// The CR was in b, so the reader cannot have forgotten it; this
+			// guards an impossible bufio state rather than indexing empty data.
+			return chunk, io.ErrUnexpectedEOF
+		}
+		crlf := len(tail) == 2 && tail[1] == '\n'
+		chunk = append(chunk, tail[0])
+		if _, err := br.Discard(1); err != nil {
+			return chunk, err
+		}
+		if crlf {
+			if _, err := br.Discard(1); err != nil {
+				return chunk, err
+			}
+			return append(chunk, '\n'), nil
+		}
+		return chunk, nil
+	}
+	// No terminator in the window: it is all line data. Read it out
+	// (bufio returns the error only once its buffer is drained) and let
+	// readBoundedLine accumulate; ErrBufferFull is the "still no
+	// terminator, keep going" signal, unchanged from ReadSlice.
+	chunk := make([]byte, len(b))
+	if _, rerr := br.Read(chunk); rerr != nil {
+		return nil, rerr
+	}
+	return chunk, bufio.ErrBufferFull
 }
 
 // readBoundedLine returns the next line from br, terminator included,
