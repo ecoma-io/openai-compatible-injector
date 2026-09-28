@@ -726,6 +726,15 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// the key that PRODUCED it, not whichever key the last failed
 		// attempt used.
 		credKey string
+		// pool is the credential pool INSTANCE the walk resolved for this
+		// candidate, nil when the candidate has no auth block. It rides
+		// because a post-commitment continuation is "the same candidate
+		// re-asked": it must acquire from the same rotation domain the walk
+		// used, with the same cooldown state, rather than re-resolving the
+		// registry (which a concurrent publish may have evicted and rebuilt
+		// cold). It is state, never configuration: nothing about it is ever
+		// logged, and PoolKey is never rendered.
+		pool *credential.Pool
 	}
 	// answerInvalid flavors: what made a 200-shaped response unusable.
 	// They share the 502 upstream_invalid_response envelope but not the
@@ -1617,7 +1626,7 @@ walk:
 				// SSE answer: the headers are the commitment. The body is
 				// not read here — it streams after the walk, and anything
 				// that kills it later truncates the committed stream.
-				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey}
+				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey, pool: pool}
 				break walk
 			}
 
@@ -1985,7 +1994,7 @@ walk:
 			}
 		}
 		events := 0
-		stats, err := CopySSE(dst, answer.resp.Body, relayRewrite, func() {
+		progress := func() {
 			events++
 			if events%sseProgressEvery == 0 {
 				log.Debug().Str("public_model", model).
@@ -1993,50 +2002,335 @@ walk:
 					Msg("stream_event_progress")
 			}
 			afterEvent()
-		}, stripKeys, nil)
+		}
+
+		// POST-COMMITMENT STREAM RECOVERY, the second orchestrator. The
+		// walk above decides WHICH candidate answers and stops at
+		// commitment; what follows only ever runs after a candidate has
+		// answered and its headers have reached the client. The engine is
+		// deliberately not re-entered: its commitment invariant is
+		// code-owned and non-configurable, and it would — correctly — refuse
+		// every observation made about a response the client already has.
+		// The one thing this loop shares with the walk is the request's own
+		// exchange envelope, so a hop pays for its dial out of the same
+		// budget rather than around it.
+		//
+		// Everything it reads is the request's own frozen policy and the
+		// committed candidate's own facts: same candidate, same endpoint,
+		// same transport, same rotation pool, sticky credential. A reload
+		// mid-stream cannot turn recovery on for a stream that started
+		// without it, nor change the bounds a stream in flight is recovering
+		// under. With the block absent, `contPolicy` is the zero value,
+		// `observe` is nil, the loop body never runs, and every byte of this
+		// path — including the log shapes below — is exactly what an
+		// unconfigured deployment has always produced.
+		contPolicy := answer.cand.Recovery.Stream
+		var partial *partialText
+		var observe func([]byte)
+		buildCont := inject.BuildContinuationChat
+		if api == apiResponses {
+			buildCont = inject.BuildContinuationResponses
+		}
+		if contPolicy.Enabled {
+			partial = newPartialText(api, contPolicy.MaxPartialBytes)
+			observe = partial.Observe
+		}
+
+		// The recovery window opens when the first hop COULD start — the
+		// instant before the committed stream begins relaying — so it bounds
+		// the whole recovery effort rather than one hop, and it is measured
+		// on the engine's clock like every other window this request obeys.
+		streamStart := eng.Now()
+		stats, err := CopySSE(dst, answer.resp.Body, relayRewrite, progress, stripKeys, observe)
+		bytesOut, eventsOut := stats.Bytes, stats.Events
+		recoveries := 0
+		credKey := answer.credKey
+		// stopReason names why the loop gave up short of a terminal stream,
+		// using the closed set below; unsafeReason carries the safety gate's
+		// own token alongside it when the refusal was about content. Both
+		// empty means the loop never had to stop — the stream ended on its
+		// own terms.
+		stopReason, unsafeReason := "", ""
+		for contPolicy.Enabled {
+			if !continuationEligible(stats, err) {
+				break
+			}
+			if recoveries >= contPolicy.MaxRecoveries {
+				stopReason = recoveryMaxRecoveries
+				break
+			}
+			if r.Context().Err() != nil {
+				// The client is gone. Dialing anyway would spend an upstream
+				// exchange on a stream nobody is reading, and the read would
+				// fail on the write anyway — the same judgement the walk's
+				// own dials make.
+				break
+			}
+			prefix, reason := partial.Safe()
+			if reason != "" {
+				// FAIL CLOSED. The stream carried a tool call, declared
+				// itself finished, was declared failed by the upstream, is
+				// not a shape this proxy understands, or is too large to
+				// hold. Guessing here is what produces duplicated tool calls
+				// and repeated output; the client keeps exactly the bytes it
+				// already has, and the stream ends as truncated as it would
+				// have with the feature off.
+				unsafeReason, stopReason = reason, recoveryUnsafeContent
+				break
+			}
+			if eng.Now().Sub(streamStart) > contPolicy.MaxElapsed {
+				stopReason = recoveryMaxElapsed
+				break
+			}
+			if eng.Budget().Exhausted() != recovery.ExhaustionNone {
+				// A continuation is real outbound traffic. The envelope
+				// bounds traffic, so a spent one refuses the hop — and the
+				// walk is already over, so nothing this request still needs
+				// is being starved by the refusal.
+				stopReason = recoveryBudgetSpent
+				break
+			}
+			hopBody, berr := buildCont(body, prefix)
+			if berr != nil {
+				// The body cannot express a continuation. The typed reason
+				// is a token; the refusal never quotes the body it refused.
+				var refusal *inject.ContinuationRefusal
+				refusalReason := ""
+				if errors.As(berr, &refusal) {
+					refusalReason = refusal.Reason()
+				}
+				log.Warn().Str("public_model", model).
+					Str("provider", answer.cand.Label()).
+					Str("upstream", origin(answer.cand.Endpoint)).
+					Int("recovery_index", recoveries+1).
+					Str("phase", "build").
+					Str("reason", refusalReason).
+					Msg("stream_recovery_failed")
+				unsafeReason, stopReason = refusalReason, recoveryUnsafeContent
+				break
+			}
+
+			recoveries++
+			index := recoveries
+			// The hop's own message name is never logged — it is
+			// client-visible text this proxy already relayed.
+			log.Info().Str("public_model", model).
+				Str("provider", answer.cand.Label()).
+				Str("upstream", origin(answer.cand.Endpoint)).
+				Int("recovery_index", index).
+				Int("partial_bytes", partial.partialBytes()).
+				Str("policy_hash", answer.cand.RecoveryHash).
+				Uint64("policy_generation", snap.Gen()).
+				Msg("stream_recovery_started")
+			// A hop is a logical provider attempt — it asks a provider for
+			// an answer — so the walk's counter carries it. Its dials are
+			// the separate axis, claimed by the envelope at the wire.
+			providerAttempts++
+			hopStart := eng.Now()
+			hopExchangeBefore := eng.Budget().RequestExchanges()
+			dial := h.dialContinuation(continuationHop{
+				ctx:       r.Context(),
+				client:    r,
+				cand:      answer.cand,
+				pool:      answer.pool,
+				credKey:   credKey,
+				transform: transform,
+				model:     m,
+				body:      hopBody,
+				suffix:    suffix,
+				budget:    eng.Budget(),
+				now:       eng.Now(),
+			})
+			// The hop's key becomes the next hop's preference, so rotation
+			// state moves forward with the flow instead of being re-derived.
+			credKey = dial.credKey
+			// The hop's own egress evidence, relayed exactly where the walk
+			// relays its own: one WARN per endpoint a pool actually dialed
+			// and lost, before any disposition is reached, carrying the
+			// fields that are TRUE of a hop. Its provider attempt is the
+			// hop's, its candidate is the committed one, and its exchange
+			// index is the real one the budget claimed — while
+			// candidate_attempt is 1 and retry_index 0 without invention: a
+			// hop is one fresh ask, not the candidate's second try.
+			for j, fl := range dial.info.Failures {
+				withCredentialFields(withPolicyFields(withAttemptFields(log.Warn().
+					Str("public_model", model).
+					Str("provider", answer.cand.Label()).
+					Str("egress_kind", fl.Kind).Str("egress_target", fl.Target).
+					Str("failure_origin", "transport").
+					Str("error_class", fl.Class).Str("error_cause", fl.Cause).
+					Str("send_state", fl.SendState).
+					Int("egress_attempt", j+1).
+					Int("attempt", j+1),
+					providerAttempts, answer.candIndex, 1, eng.Now().Sub(hopStart)),
+					"", answer.cand.RecoveryHash, snap.Gen(),
+					hopExchangeBefore+j+1, eng.Budget().RequestRemaining()),
+					dial.credKey).Msg("egress_attempt_failed")
+			}
+			// recoveryFailed reports one hop that did not produce a
+			// continuable stream. The phase is a closed token and the cause
+			// is the sanitized error — or absent, for the refusals this
+			// proxy made itself, where nothing was dialed and no endpoint is
+			// at fault. `upstream_status` is the hop's received status when
+			// there was one.
+			recoveryFailed := func(phase string, hopErr error, status int) {
+				event := log.Warn().Str("public_model", model).
+					Str("provider", answer.cand.Label()).
+					Str("upstream", origin(dial.upstream)).
+					Int("recovery_index", index).
+					Str("phase", phase)
+				if hopErr != nil {
+					event = event.Err(sanitizeUpstreamError(hopErr, dial.upstream))
+				}
+				if status != 0 {
+					event = event.Int("upstream_status", status)
+				}
+				withCredentialFields(event, dial.credKey).Msg("stream_recovery_failed")
+			}
+			if dial.phase != "" {
+				recoveryFailed(dial.phase, dial.err, 0)
+				break
+			}
+			if dial.resp.StatusCode < 200 || dial.resp.StatusCode >= 300 {
+				// The hop answered, and the answer is not a stream. It is
+				// relayed nowhere: the client's 2xx headers are long since
+				// written, so there is no status left to preserve and an
+				// upstream error body spliced into an SSE stream is not
+				// something a client can parse. The status is evidence.
+				//
+				// Deliberately NOT the walk's `upstream_http_error` record:
+				// that event is the walk's evidence about an answer it is
+				// about to hand up, and it carries fields — fingerprint,
+				// error shape, capture outcome — this hop's answer never
+				// had. Emitting a thin one under the same slug would be
+				// read as a walk event that lost its fields.
+				recoveryFailed("upstream_status", nil, dial.resp.StatusCode)
+				_ = dial.resp.Body.Close()
+				break
+			}
+			if !strings.Contains(strings.ToLower(dial.resp.Header.Get(contentTypeHeader)), eventStreamType) {
+				// A 2xx that is not a stream: the provider answered with
+				// JSON where an event stream was asked for. Splicing it in
+				// would be a non-SSE frame inside an SSE response.
+				recoveryFailed("upstream_status", nil, dial.resp.StatusCode)
+				_ = dial.resp.Body.Close()
+				break
+			}
+			hopStats, hopErr := CopySSE(dst, dial.resp.Body, relayRewrite, progress, stripKeys, observe)
+			_ = dial.resp.Body.Close()
+			bytesOut += hopStats.Bytes
+			eventsOut += hopStats.Events
+			stats, err = hopStats, hopErr
+			if hopStats.Terminal {
+				log.Info().Str("public_model", model).
+					Str("provider", answer.cand.Label()).
+					Int("recovery_index", index).
+					Int64("recovered_bytes", hopStats.Bytes).
+					Int("recovered_events", hopStats.Events).
+					Int("upstream_exchanges", eng.Budget().RequestExchanges()).
+					Int64("elapsed_ms", eng.Now().Sub(hopStart).Milliseconds()).
+					Msg("stream_recovery_succeeded")
+				break
+			}
+			// The hop itself truncated. One more hop would be a second
+			// continuation of a stream that has already failed to continue
+			// once, and the loop's own bounds are what decide whether it is
+			// worth trying; the failure is recorded either way. A hop whose
+			// relay died on the client write is not reported as an upstream
+			// fault — the phase carries the same distinction the relay's own
+			// log makes.
+			hopPhase := "upstream_read"
+			var swe *streamWriteError
+			if errors.As(hopErr, &swe) || clientSide(hopErr) {
+				hopPhase = "client_write"
+			}
+			recoveryFailed(hopPhase, hopErr, 0)
+		}
+		if stopReason != "" {
+			event := log.Warn().Str("public_model", model).
+				Str("provider", answer.cand.Label()).
+				Int("recoveries", recoveries).
+				Str("reason", stopReason)
+			if unsafeReason != "" {
+				event = event.Str("unsafe_reason", unsafeReason)
+			}
+			event.Msg("stream_recovery_exhausted")
+		}
 		var pings int
 		if heartbeat != nil {
 			heartbeat.stopAndWait()
 			pings = heartbeat.pingCount()
 		}
-		if err != nil {
-			phase := "upstream_read"
+		// The second clause is the recovery path's own honesty, and it keys
+		// on the POLICY rather than on the hop count: with recovery enabled,
+		// a stream that never reached its terminal marker is truncated
+		// whether the proxy dialed for it or refused to. A stream with no
+		// marker is one the CLIENT cannot tell from a finished answer — that
+		// is the whole reason the marker exists — so reporting it as
+		// completed is the precise lie a deployment that switched this block
+		// on is asking to stop hearing. `stream_recoveries` and
+		// `recovery_reason` then say whether anything was tried.
+		//
+		// With the block absent, `contPolicy.Enabled` is false and the
+		// classification is byte-for-byte the one every deployment already
+		// produces: an EOF without a terminal marker stays `completed`,
+		// exactly as today.
+		if err != nil || (contPolicy.Enabled && !stats.Terminal) {
+			phase := "recovery"
 			outcome = "stream_truncated"
-			// Only the upstream_read phase carries a peer-derived error, and
-			// that is the one the no-echo rule governs: a truncated read
-			// surfaces the transport's own parse failures, which interpolate
-			// the upstream's bytes. The other two cases are this package's
-			// typed errors with static text — collapsing them would replace
-			// "the client went away" with "upstream transport error".
-			eventErr := sanitizeUpstreamError(err, lastUpstream)
-			var swe *streamWriteError
-			switch {
-			case errors.As(err, &swe), clientSide(err):
-				// The client connection broke mid-stream — as a failed
-				// write (streamWriteError), or as the canceled request
-				// context surfacing through the next upstream read — and
-				// the upstream may have been fine. The outcome names the
-				// disconnect, the same accounting the buffered and verbatim
-				// paths apply, while the WARN keeps the truncation's phase.
-				phase = "client_write"
-				outcome = "client_disconnected"
-				eventErr = err
-			case errors.Is(err, ErrSSELineTooLong) || errors.Is(err, ErrSSEEventTooLarge):
-				// The upstream crossed a bounded-relay cap: a hostile or
-				// broken peer, stopped cleanly at the wall. The logged
-				// error carries counts only, never the bytes themselves.
-				phase = "upstream_limit"
-				outcome = "stream_limit_exceeded"
-				eventErr = err
+			// A relay that failed and a continuation that never arrived are
+			// two reports under one outcome. The first carries a cause; the
+			// second carries none, because nothing failed at the wire — the
+			// hop was refused, ran out of bounds, or was not safe to build,
+			// and `recovery_reason` names which.
+			var eventErr error
+			if err != nil {
+				// Only the upstream_read phase carries a peer-derived error,
+				// and that is the one the no-echo rule governs: a truncated
+				// read surfaces the transport's own parse failures, which
+				// interpolate the upstream's bytes. The other two cases are
+				// this package's typed errors with static text — collapsing
+				// them would replace "the client went away" with "upstream
+				// transport error".
+				phase = "upstream_read"
+				eventErr = sanitizeUpstreamError(err, lastUpstream)
+				var swe *streamWriteError
+				switch {
+				case errors.As(err, &swe), clientSide(err):
+					// The client connection broke mid-stream — as a failed
+					// write (streamWriteError), or as the canceled request
+					// context surfacing through the next upstream read — and
+					// the upstream may have been fine. The outcome names the
+					// disconnect, the same accounting the buffered and verbatim
+					// paths apply, while the WARN keeps the truncation's phase.
+					phase = "client_write"
+					outcome = "client_disconnected"
+					eventErr = err
+				case errors.Is(err, ErrSSELineTooLong) || errors.Is(err, ErrSSEEventTooLarge):
+					// The upstream crossed a bounded-relay cap: a hostile or
+					// broken peer, stopped cleanly at the wall. The logged
+					// error carries counts only, never the bytes themselves.
+					phase = "upstream_limit"
+					outcome = "stream_limit_exceeded"
+					eventErr = err
+				}
 			}
-			log.Warn().Err(eventErr).Str("public_model", model).Str("phase", phase).
-				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
+			event := log.Warn().Str("public_model", model).Str("phase", phase).
+				Int64("bytes_out", bytesOut).Int("events", eventsOut).
 				Int("keep_alive_pings", pings).
-				Msg("stream_truncated")
+				Int("stream_recoveries", recoveries)
+			if eventErr != nil {
+				event = event.Err(eventErr)
+			}
+			if stopReason != "" {
+				event = event.Str("recovery_reason", stopReason)
+			}
+			event.Msg("stream_truncated")
 		} else {
 			log.Debug().Str("public_model", model).
-				Int64("bytes_out", stats.Bytes).Int("events", stats.Events).
+				Int64("bytes_out", bytesOut).Int("events", eventsOut).
 				Int("keep_alive_pings", pings).
+				Int("stream_recoveries", recoveries).
 				Msg("stream_completed")
 		}
 		complete()
