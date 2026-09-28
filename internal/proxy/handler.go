@@ -2069,6 +2069,26 @@ walk:
 		if contPolicy.Enabled {
 			windowEnd := time.Now().Add(contPolicy.MaxElapsed)
 			relay = func(src io.ReadCloser) (StreamStats, error) {
+				// THE UPSTREAM-RESPONSE BOUNDARY. relay is invoked once per
+				// upstream HTTP response relayed into this one client stream:
+				// the committed pass below, then once per continuation hop.
+				// State that describes a single response must not outlive it,
+				// and a hop is a NEW response — it announces its own output
+				// item, emits its own .done and states its own usage. So the
+				// accumulator's Responses identity and the meter's per-call
+				// observation are reset here, at the top of the pass, before
+				// its first line is observed.
+				//
+				// Only the enabled closure gets this. With the feature off
+				// there is exactly one pass, the accumulator does not exist
+				// and the meter — if there is one — spans one upstream
+				// response anyway; calling a nil `observe` through this seam
+				// would panic, so the disabled path stays the plain relay it
+				// has always been.
+				partial.beginUpstreamStream()
+				if usageCapture != nil {
+					usageCapture.Seal()
+				}
 				stopWindow := armRecoveryWindow(windowEnd, src, &windowClosed)
 				defer stopWindow()
 				return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)

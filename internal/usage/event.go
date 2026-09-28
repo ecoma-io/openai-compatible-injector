@@ -16,8 +16,11 @@ import (
 )
 
 // Event is one metered request. Token fields are deliberately pointers:
-// nil means the upstream reported no usage object (or none readable), and
-// that absence must survive as SQL NULL rather than a fabricated zero.
+// nil means no upstream call reported that count (no usage object at all, or
+// none readable), and that absence must survive as SQL NULL rather than a
+// fabricated zero. A request assembled from more than one upstream call —
+// a recovered stream — reports the aggregate of those calls; see
+// Capture.Seal and foldTokens for how each count is combined.
 type Event struct {
 	// EventID is a UUIDv4 generated in Go — stable identity without a
 	// database-side extension.

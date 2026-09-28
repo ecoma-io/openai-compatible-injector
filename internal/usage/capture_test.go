@@ -226,6 +226,143 @@ func TestCaptureAPIScope(t *testing.T) {
 	assertTokens(t, tokens, Tokens{PromptTokens: i64(5), CompletionTokens: i64(6), TotalTokens: i64(11)})
 }
 
+// Seal: the boundary between two upstream calls answering one request. The
+// two token counts are deliberately NOT combined the same way — a hop re-asks
+// with the same conversation, so its prompt is the context seen again and the
+// last call that stated one wins, while its completion is text the client
+// also received and the two add up. A blank Seal must stay a no-op so a
+// caller can invoke it unconditionally at every boundary.
+func TestCaptureSealsAcrossUpstreamCalls(t *testing.T) {
+	c := NewCapture("chat")
+	c.Observe([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}`))
+	c.Seal()
+	c.Observe([]byte(`{"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+
+	tokens, ok := c.Tokens()
+	if !ok {
+		t.Fatal("no usage after two sealed calls")
+	}
+	// prompt: the LAST call's context, never the two added. completion: the
+	// two calls' answers added. total: the row's own sum of the two counts it
+	// reports, never either upstream's own total (each describes one call).
+	assertTokens(t, tokens, Tokens{PromptTokens: i64(5), CompletionTokens: i64(27), TotalTokens: i64(32)})
+}
+
+func TestCaptureSealIsAnIdempotentBoundary(t *testing.T) {
+	// A boundary with nothing to fold must be a no-op, and must not
+	// manufacture usage: the feature-off path and a hop that states nothing
+	// both go through this.
+	c := NewCapture("chat")
+	c.Seal()
+	c.Seal()
+	if _, ok := c.Tokens(); ok {
+		t.Fatal("a capture that never observed usage reported some")
+	}
+
+	c.Observe([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}`))
+	c.Seal()
+	c.Seal()
+	tokens, ok := c.Tokens()
+	if !ok {
+		t.Fatal("double Seal lost the sealed observation")
+	}
+	assertTokens(t, tokens, Tokens{PromptTokens: i64(10), CompletionTokens: i64(20), TotalTokens: i64(30)})
+}
+
+// The second job Seal does: a hop that never states usage must not leave the
+// PREVIOUS hop's object standing as the current observation. Without the
+// boundary the next hop's first usage-bearing payload would be read as a
+// continuation of the previous hop's counts.
+func TestCaptureSealSegmentsTheCurrentCall(t *testing.T) {
+	c := NewCapture("chat")
+	c.Observe([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}`))
+	c.Seal()
+
+	// The new call has stated nothing yet. The request's usage is the sealed
+	// call's — reported as an aggregate, not as a live observation that the
+	// next payload would silently extend.
+	tokens, ok := c.Tokens()
+	if !ok {
+		t.Fatal("the sealed call's usage disappeared")
+	}
+	assertTokens(t, tokens, Tokens{PromptTokens: i64(10), CompletionTokens: i64(20), TotalTokens: i64(30)})
+
+	// The new call's own object is its own: sealed before it, so the sum is
+	// the two calls with the second call's prompt as the context.
+	c.Observe([]byte(`{"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}`))
+	tokens, _ = c.Tokens()
+	assertTokens(t, tokens, Tokens{PromptTokens: i64(4), CompletionTokens: i64(21), TotalTokens: i64(25)})
+
+	// A cumulative chunk inside that call still replaces, never adds.
+	c.Observe([]byte(`{"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`))
+	tokens, _ = c.Tokens()
+	assertTokens(t, tokens, Tokens{PromptTokens: i64(4), CompletionTokens: i64(22), TotalTokens: i64(26)})
+}
+
+func TestFoldTokensCombinesCountsByTheirOwnSemantics(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b Tokens
+		want Tokens
+	}{
+		{
+			name: "complete objects on both sides",
+			a:    Tokens{PromptTokens: i64(100), CompletionTokens: i64(10), TotalTokens: i64(110)},
+			b:    Tokens{PromptTokens: i64(120), CompletionTokens: i64(5), TotalTokens: i64(125)},
+			want: Tokens{PromptTokens: i64(120), CompletionTokens: i64(15), TotalTokens: i64(135)},
+		},
+		{
+			name: "neither side stated anything",
+			want: Tokens{},
+		},
+		{
+			name: "a nil side is the zero-value observation",
+			a:    Tokens{PromptTokens: i64(100), CompletionTokens: i64(10), TotalTokens: i64(110)},
+			want: Tokens{PromptTokens: i64(100), CompletionTokens: i64(10), TotalTokens: i64(110)},
+		},
+		{
+			name: "a nil side never clears what the other stated",
+			b:    Tokens{PromptTokens: i64(100), CompletionTokens: i64(10), TotalTokens: i64(110)},
+			want: Tokens{PromptTokens: i64(100), CompletionTokens: i64(10), TotalTokens: i64(110)},
+		},
+		{
+			name: "the later prompt wins",
+			a:    Tokens{PromptTokens: i64(100), CompletionTokens: i64(10), TotalTokens: i64(110)},
+			b:    Tokens{PromptTokens: i64(7), CompletionTokens: i64(1), TotalTokens: i64(8)},
+			want: Tokens{PromptTokens: i64(7), CompletionTokens: i64(11), TotalTokens: i64(18)},
+		},
+		{
+			name: "an unstated later prompt keeps the earlier context",
+			a:    Tokens{PromptTokens: i64(100), CompletionTokens: i64(10), TotalTokens: i64(110)},
+			b:    Tokens{CompletionTokens: i64(1)},
+			want: Tokens{PromptTokens: i64(100), CompletionTokens: i64(11), TotalTokens: i64(111)},
+		},
+		{
+			name: "a stated zero is a count, not an absence",
+			a:    Tokens{CompletionTokens: i64(0), TotalTokens: i64(0)},
+			b:    Tokens{PromptTokens: i64(9), CompletionTokens: i64(0), TotalTokens: i64(9)},
+			want: Tokens{PromptTokens: i64(9), CompletionTokens: i64(0), TotalTokens: i64(9)},
+		},
+		{
+			name: "a total-only call contributes its total when no count is known",
+			a:    Tokens{TotalTokens: i64(30)},
+			b:    Tokens{TotalTokens: i64(12)},
+			want: Tokens{TotalTokens: i64(12)},
+		},
+		{
+			name: "a stated count replaces a lone unpaired total",
+			a:    Tokens{TotalTokens: i64(30)},
+			b:    Tokens{PromptTokens: i64(4)},
+			want: Tokens{PromptTokens: i64(4), TotalTokens: i64(4)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertTokens(t, foldTokens(tc.a, tc.b), tc.want)
+		})
+	}
+}
+
 func assertTokens(t *testing.T, got, want Tokens) {
 	t.Helper()
 	if !samePtr(got.PromptTokens, want.PromptTokens) ||

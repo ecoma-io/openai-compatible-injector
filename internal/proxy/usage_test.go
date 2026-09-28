@@ -595,3 +595,121 @@ func TestUsageNilMeterRecordsNothing(t *testing.T) {
 		t.Fatalf("usage off changed the response body: %s", rec.Body.String())
 	}
 }
+
+// recoveryUsageHandler is recoveryHandler plus a meter: the same two-candidate
+// chain and scripted doers, with a usage sink wired in. The metering side of a
+// recovered request needs both halves — recoveryHandler passes nil for the
+// meter, and usageHandler has no recovery block.
+func recoveryUsageHandler(t *testing.T, block string, meter *recordingMeter) (http.Handler, *scriptedDoer, *scriptedDoer) {
+	t.Helper()
+	store := newChainStore(t, block)
+	pa := &scriptedDoer{}
+	pb := &scriptedDoer{}
+	return NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, meter, quietLogger()), pa, pb
+}
+
+// chatUsage renders the usage-bearing final chunk the OpenAI contract sends,
+// as an SSE data line.
+func chatUsage(prompt, completion, total int) string {
+	return `data: {"model":"up-a","choices":[],"usage":{"prompt_tokens":` + itoa(prompt) +
+		`,"completion_tokens":` + itoa(completion) + `,"total_tokens":` + itoa(total) + `}}` + "\n\n"
+}
+
+// A recovered request is assembled from more than one upstream call, and the
+// client received the answer from all of them. The persisted event must say
+// so: the completion is every call's text added up, while the prompt is the
+// LAST call's context — a hop re-asks with everything the previous call had,
+// so summing prompts would count the same conversation once per hop. The
+// row's total is restated as its own two counts, never carried from one call,
+// while the attempt counters beside them already count every hop's dial.
+func TestUsageRecoveredStreamSumsCompletionAcrossHops(t *testing.T) {
+	meter := &recordingMeter{}
+	h, pa, pb := recoveryUsageHandler(t, recoveryBlock(t, "    enabled: true\n"), meter)
+	pa.script = []dialFunc{
+		sseCut(sseChat("Hello") + chatUsage(10, 20, 30)),
+		sseStream(sseChat(" world") + chatUsage(15, 5, 20) + "data: [DONE]\n\n"),
+	}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	if pa.dials() != 2 || pb.dials() != 0 {
+		t.Fatalf("dials = %d/%d, want the committed candidate re-asked once", pa.dials(), pb.dials())
+	}
+	ev := meter.single(t)
+	if ev.PromptTokens == nil || *ev.PromptTokens != 15 {
+		t.Fatalf("prompt_tokens = %v, want the last call's 15, never the two summed", ev.PromptTokens)
+	}
+	if ev.CompletionTokens == nil || *ev.CompletionTokens != 25 {
+		t.Fatalf("completion_tokens = %v, want both hops' 25", ev.CompletionTokens)
+	}
+	if ev.TotalTokens == nil || *ev.TotalTokens != 40 {
+		t.Fatalf("total_tokens = %v, want the row's own 15+25", ev.TotalTokens)
+	}
+	if ev.ProviderAttempts != 2 || ev.EgressAttempts != 2 {
+		t.Fatalf("attempts = %d/%d, want the counters to keep matching the two dials", ev.ProviderAttempts, ev.EgressAttempts)
+	}
+	if !ev.Stream || ev.API != "chat" || ev.Outcome != "completed" {
+		t.Fatalf("event facts = %+v", ev)
+	}
+}
+
+// The boundary's second job: a hop that states no usage at all must not erase
+// what the committed call already reported. Without the per-hop seal the last
+// observation would be the empty one and the event would carry NULLs for a
+// request whose first call was perfectly well metered.
+func TestUsageRecoveredStreamKeepsTheEarlierCallWhenAHopStatesNoUsage(t *testing.T) {
+	meter := &recordingMeter{}
+	h, pa, _ := recoveryUsageHandler(t, recoveryBlock(t, "    enabled: true\n"), meter)
+	pa.script = []dialFunc{
+		sseCut(sseChat("Hello") + chatUsage(10, 20, 30)),
+		sseStream(sseChat(" world") + "data: [DONE]\n\n"),
+	}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the hop dialed", pa.dials())
+	}
+	ev := meter.single(t)
+	if ev.PromptTokens == nil || *ev.PromptTokens != 10 ||
+		ev.CompletionTokens == nil || *ev.CompletionTokens != 20 ||
+		ev.TotalTokens == nil || *ev.TotalTokens != 30 {
+		t.Fatalf("metered tokens = %v/%v/%v, want the committed call's 10/20/30, not NULLs", ev.PromptTokens, ev.CompletionTokens, ev.TotalTokens)
+	}
+	if ev.ProviderAttempts != 2 {
+		t.Fatalf("provider_attempts = %d, want 2", ev.ProviderAttempts)
+	}
+}
+
+// A stream the safety gate refuses never reaches a hop, so no boundary is
+// crossed and the meter reports the one call that ran — with the counters
+// agreeing that only one did.
+func TestUsageUnsafeStreamReportsTheOneCallThatRan(t *testing.T) {
+	meter := &recordingMeter{}
+	h, pa, pb := recoveryUsageHandler(t, recoveryBlock(t, "    enabled: true\n"), meter)
+	pa.script = []dialFunc{
+		sseCut(sseChat("Let me check") + chatUsage(7, 3, 10) +
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}` + "\n\n"),
+	}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	if pa.dials() != 1 || pb.dials() != 0 {
+		t.Fatalf("dials = %d/%d, want no hop on an unsafe stream", pa.dials(), pb.dials())
+	}
+	ev := meter.single(t)
+	if ev.PromptTokens == nil || *ev.PromptTokens != 7 ||
+		ev.CompletionTokens == nil || *ev.CompletionTokens != 3 ||
+		ev.TotalTokens == nil || *ev.TotalTokens != 10 {
+		t.Fatalf("metered tokens = %v/%v/%v, want the one call's 7/3/10", ev.PromptTokens, ev.CompletionTokens, ev.TotalTokens)
+	}
+	if ev.ProviderAttempts != 1 || ev.EgressAttempts != 1 {
+		t.Fatalf("attempts = %d/%d, want the one dial counted once", ev.ProviderAttempts, ev.EgressAttempts)
+	}
+}
