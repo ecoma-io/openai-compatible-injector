@@ -2218,7 +2218,13 @@ walk:
 					Str("upstream", origin(answer.cand.Endpoint)).
 					Int("recovery_index", recoveries+1).
 					Str("phase", "build").
-					Str("reason", refusalReason).
+					// The refusal travels as `unsafe_reason`, the field the
+					// exhausted event already uses for this same token. `reason`
+					// on this event would be a second vocabulary under a name
+					// that means the LOOP's stop reason one event below, and the
+					// two closed sets share no token today — which is exactly
+					// why an operator would not notice when one day they do.
+					Str("unsafe_reason", refusalReason).
 					Msg("stream_recovery_failed")
 				unsafeReason, stopReason = refusalReason, recoveryUnsafeContent
 				break
@@ -2435,11 +2441,25 @@ walk:
 			// hop failure and a bound below. So the window is checked first and
 			// wins: the loop's next iteration, which never runs, is the only
 			// other place `max_elapsed` could be recorded.
+			if cutByWindow {
+				// The bound's record, and NOT a peer's. `hopErr` here is this
+				// proxy's own closed body — the lever the watchdog uses to
+				// unblock a parked relay — so attaching it would put a transport
+				// error on the one phase that blames no endpoint and send an
+				// operator after an upstream that behaved perfectly. Same rule as
+				// the dial branch above, for the same reason: the error belongs
+				// to nothing outside this process and is deliberately not
+				// attached. Closing the loop here rather than letting the gates
+				// re-derive the same reason is what keeps one cause to one
+				// record: the window is shut for the rest of the request, so
+				// nothing below can run.
+				recoveryFailed(recoveryMaxElapsed, nil, 0)
+				windowShut, stopReason = true, recoveryMaxElapsed
+				break
+			}
 			hopPhase := "upstream_read"
 			var swe *streamWriteError
 			switch {
-			case cutByWindow:
-				hopPhase = recoveryMaxElapsed
 			case errors.As(hopErr, &swe), clientSide(hopErr):
 				hopPhase = "client_write"
 			case errors.Is(hopErr, ErrSSELineTooLong), errors.Is(hopErr, ErrSSEEventTooLarge):
@@ -2448,14 +2468,6 @@ walk:
 				hopPhase = "upstream_limit"
 			}
 			recoveryFailed(hopPhase, hopErr, 0)
-			if cutByWindow {
-				// Close the loop here rather than letting the gates above
-				// re-derive the same reason: the window is shut for the rest of
-				// the request, and `err` is this proxy's closed body, so the
-				// window is the only thing that ended the stream.
-				windowShut, stopReason = true, recoveryMaxElapsed
-				break
-			}
 		}
 		if windowShut {
 			// The pass that ended this loop was ended by the window's own

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -96,30 +97,60 @@ func TestRecoveryWindowBindsEveryLeverToOneDeadline(t *testing.T) {
 	// the deadline, and its release cancels without claiming the window was
 	// reached — the release fires on a hop that SUCCEEDED.
 	fresh := newRecoveryWindow(time.Now(), window)
-	ctx, release := fresh.bind(context.Background(), time.Now())
-	if err := ctx.Err(); err != nil {
+	b := fresh.bind(context.Background(), time.Now())
+	if err := b.ctx.Err(); err != nil {
 		t.Fatalf("a hop was refused a context while the window was open: %v", err)
 	}
 	select {
-	case <-ctx.Done():
+	case <-b.ctx.Done():
 		t.Fatal("the dial's context was canceled before the window was reached")
 	case <-time.After(window / 3):
 	}
 	select {
-	case <-ctx.Done():
+	case <-b.ctx.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("the dial's context outlived the window: a header wait is unbounded")
 	}
 	if !fresh.shut() {
 		t.Error("the dial watchdog canceled without recording the window as shut")
 	}
-	release()
+	b.release()
 
+	// The two levers end different waits, and that separation is load-bearing:
+	// net/http aborts an unread response body when the request's context is
+	// canceled, so a hop releases its header watchdog when the dial returns
+	// while the CONTEXT lives until the body is closed. stop() is the first
+	// half — and it must leave the context alone.
 	open := newRecoveryWindow(time.Now(), 10*time.Second)
-	_, releaseOpen := open.bind(context.Background(), time.Now())
-	releaseOpen()
+	live := open.bind(context.Background(), time.Now())
+	live.stop()
+	if err := live.ctx.Err(); err != nil {
+		t.Errorf("releasing a hop's header watchdog canceled the context its body is read under: %v", err)
+	}
+	if open.shut() {
+		t.Error("stopping a hop's header watchdog recorded the window as reached")
+	}
+	live.release()
+	if err := live.ctx.Err(); err == nil {
+		t.Error("releasing a hop's context left it live")
+	}
 	if open.shut() {
 		t.Error("releasing a hop's context recorded the window as reached")
+	}
+
+	// boundBody is the second half: the release rides the hop's own Close, so
+	// the context cannot be released while a relay is still reading.
+	var null io.ReadCloser = io.NopCloser(strings.NewReader(""))
+	bounds := newRecoveryWindow(time.Now(), 10*time.Second).bind(context.Background(), time.Now())
+	wrapped := &boundBody{ReadCloser: null, release: bounds.release}
+	if err := bounds.ctx.Err(); err != nil {
+		t.Fatalf("a fresh hop context was already done: %v", err)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("closing a hop body: %v", err)
+	}
+	if err := bounds.ctx.Err(); err == nil {
+		t.Error("closing a hop's body left its context live: a hop would leak one context per attempt")
 	}
 
 	// armBody: the lever for a stalled body. It closes at the deadline and not

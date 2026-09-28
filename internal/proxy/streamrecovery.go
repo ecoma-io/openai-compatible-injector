@@ -152,10 +152,11 @@ type continuationDial struct {
 //     TCP connection and then answers nothing parks this call in Do until the
 //     client's own context dies — the transport has no ResponseHeaderTimeout
 //     on purpose, since an SSE body legitimately outlives any fixed header
-//     deadline. The derived context is released the moment headers arrive: past
-//     that point the body watchdog (armBody) owns the bound, and a canceled
-//     request context there would surface as a different error with a
-//     different owner.
+//     deadline. That context's watchdog is released the moment the dial
+//     returns, but the CONTEXT lives on until the hop's body is closed: a
+//     canceled request context aborts the body read that is still to come, so
+//     releasing it here would truncate the very bytes this loop exists to
+//     deliver (boundBody).
 func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial {
 	var dial continuationDial
 	dial.credKey = hop.credKey
@@ -174,15 +175,28 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 	upstream.RawPath = ""
 	dial.upstream = &upstream
 
-	hopCtx, releaseHop := hop.window.bind(hop.ctx, hop.now)
-	defer releaseHop()
+	bounds := hop.window.bind(hop.ctx, hop.now)
+	// handedOff records that an answer left this function with its body unread,
+	// so the context now belongs to that body. It is set on exactly the one path
+	// that wraps the body, and read by the release rule below.
+	handedOff := false
+	// ONE rule for the derived context, on every path out of this function: the
+	// header watchdog is released as soon as the dial is over, and the context
+	// is released here — the moment nothing can read a body — unless a body was
+	// handed off, in which case that body's own Close releases it.
+	defer func() {
+		bounds.stop()
+		if !handedOff {
+			bounds.release()
+		}
+	}()
 
 	out, terr := hop.transform(hop.body, hop.model)
 	if terr != nil {
 		dial.phase, dial.err = "build", terr
 		return dial
 	}
-	req, rerr := http.NewRequestWithContext(hopCtx, http.MethodPost, upstream.String(), bytes.NewReader(out))
+	req, rerr := http.NewRequestWithContext(bounds.ctx, http.MethodPost, upstream.String(), bytes.NewReader(out))
 	if rerr != nil {
 		dial.phase, dial.err = "build", rerr
 		return dial
@@ -213,7 +227,7 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 		// envelope, so a continuation pays for its dials out of the same
 		// budget rather than around it.
 		dial.resp, dial.info, dial.err = ex.Execute(&transport.AttemptRequest{
-			Ctx:       hopCtx,
+			Ctx:       bounds.ctx,
 			Method:    http.MethodPost,
 			URL:       &upstream,
 			Header:    req.Header.Clone(),
@@ -254,6 +268,12 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 		// walk gives it. Naming the phase here is what keeps the caller off
 		// dial.resp: an answer that never arrived must never be dereferenced.
 		dial.phase = "budget"
+	} else {
+		// An answer is in hand and its body has not been read yet — the caller
+		// relays it. The context this dial ran under must therefore outlive this
+		// call, and the hop's body is what says when it may be released.
+		dial.resp.Body = &boundBody{ReadCloser: dial.resp.Body, release: bounds.release}
+		handedOff = true
 	}
 	return dial
 }
@@ -380,26 +400,67 @@ func (w *recoveryWindow) dialable(now time.Time) bool {
 	return false
 }
 
+// hopBounds is the context ONE hop runs under and the two levers that end it.
+// They are separate because they bound different waits, and conflating them was
+// a defect: the timer cancels the context a hop is PARKED IN while it waits for
+// response headers, while the hop's body, once those headers arrive, is bounded
+// by the window's body watchdog (armBody).
+type hopBounds struct {
+	ctx    context.Context
+	timer  *time.Timer
+	cancel context.CancelFunc
+}
+
+// stop releases the header watchdog without touching the context, and a hop
+// calls it the moment its dial returns — headers or error. The wait it bounds
+// is over at that point, and leaving it armed would be worse than useless: the
+// watchdog writes `closed` and cancels the context, and net/http ties the
+// LIFETIME of a response body to the context of the request that produced it,
+// so a timer firing during the hop's own body read would abort that read with
+// a canceled context — reported as the client leaving, or as an upstream read
+// failure, when the owner was this proxy's own bound.
+func (b *hopBounds) stop() { b.timer.Stop() }
+
+// release stops the watchdog and cancels the derived context. Nothing may be
+// reading the hop's body when it is called, which is exactly why it is NOT
+// called when the dial returns: a successful dial's context is released by the
+// hop's own Body.Close (see boundBody), and every other path here has no body
+// to outlive this call.
+func (b *hopBounds) release() {
+	b.timer.Stop()
+	b.cancel()
+}
+
 // bind derives the context ONE hop runs under: the caller's context — the
 // client's request context, so a hop still dies with the reader exactly as
 // every other dial this request makes — plus a cancel at this window's
-// deadline. release stops the watchdog and releases the derived context; a hop
-// calls it when its DIAL is over, because past response headers the body
-// watchdog is what bounds the read (armBody) and a canceled request context
-// would surface as a different error with a different owner.
-//
-// It is called only after dialable has agreed, so the window is open here by
-// construction and the watchdog always has a positive distance to arm for.
-func (w *recoveryWindow) bind(parent context.Context, now time.Time) (ctx context.Context, release func()) {
+// deadline. It is called only after dialable has agreed, so the window is open
+// here by construction and the watchdog always has a positive distance to arm
+// for.
+func (w *recoveryWindow) bind(parent context.Context, now time.Time) *hopBounds {
 	ctx, cancel := context.WithCancel(parent)
 	timer := time.AfterFunc(w.deadline.Sub(now), func() {
 		w.closed.Store(true)
 		cancel()
 	})
-	return ctx, func() {
-		timer.Stop()
-		cancel()
-	}
+	return &hopBounds{ctx: ctx, timer: timer, cancel: cancel}
+}
+
+// boundBody releases a hop's derived context when the hop's body is closed: the
+// one moment nothing can be reading it any more. It exists because net/http
+// aborts an unread response body the instant the request's context is canceled
+// (a cancel after Do returns loses every byte the transport had not already
+// buffered with the headers), so the release cannot happen at the dial, and
+// wrapping the body is what keeps it from happening anywhere later than it must.
+type boundBody struct {
+	io.ReadCloser
+	release func()
+}
+
+func (b *boundBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.release()
+	return err
 }
 
 // continuationEligible reports whether a finished relay pass ended in the one
