@@ -129,7 +129,20 @@ type continuationDial struct {
 	// without a pool. It is the NEXT hop's preferred key, so rotation state
 	// moves forward with the flow instead of being re-derived.
 	credKey string
+	// callerGone reports that the client left, read from the REQUEST's own
+	// context and never from an error chain. It is set at most once, on the
+	// one classification the error text alone cannot make: a hop that failed
+	// under a canceled context, which is the hop that would otherwise be
+	// recorded as a peer refusing a connection. The flag is what lets the
+	// loop's final record name the disconnect — the loop's own gate already
+	// stopped the NEXT hop from being dialed for a reader who is gone, so
+	// without it a reader who left during a hop is reported as a truncated
+	// stream the upstream caused.
+	callerLeft bool
 }
+
+// callerGone reports whether the client left, once, for the caller to read.
+func (d *continuationDial) callerGone() bool { return d.callerLeft }
 
 // dialContinuation builds and sends one continuation request. It is
 // deliberately a near-copy of the walk's own attempt path — same transform,
@@ -254,9 +267,27 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 		// only writer of it — every other pass has released its body watchdog
 		// before the loop could reach a hop, and a shut window ends the loop
 		// rather than dialing through it.
-		if hop.window.shut() {
+		//
+		// The reader is the second owner, and it is read from the REQUEST
+		// context rather than from the error chain: this hop ran under a
+		// context derived from that one, so a cancellation surfacing here is
+		// indistinguishable from a canceled dial by shape — net/http reports
+		// both the same way, and a cancellation this window itself raised to
+		// stop a stalled hop reaches it too. A reader who hung up must never
+		// appear as an upstream that refused a connection, so the hop says so
+		// and the caller classifies the request as a disconnect. A hop that
+		// failed because the client hung up is still a failed hop and is still
+		// recorded; what changes is the owner it is recorded under, and
+		// `callerLeft` is what lets the loop's final record name the same
+		// cause once more, so one cause keeps one owner across both events.
+		// The window is checked FIRST because a deadline this proxy set is
+		// the more specific fact when both fired.
+		switch {
+		case hop.window.shut():
 			dial.phase = recoveryMaxElapsed
-		} else {
+		case hop.ctx.Err() != nil:
+			dial.phase, dial.callerLeft = "client_write", true
+		default:
 			dial.phase = "dial"
 		}
 	} else if dial.resp == nil {

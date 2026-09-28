@@ -135,16 +135,28 @@ var requestBodyReadTimeout = 5 * time.Minute
 // The two caps above bound a REQUEST; the failure they prevent is a PROCESS
 // failure, and the walk's retries plus the continuation loop's re-asks
 // multiply concurrency by the policy rather than by anything the operator
-// sets. 512 MiB is eight times a single request's worst case, so the budget
-// admits eight maximum-size buffers at once — or four requests each holding a
-// maximum-size body AND a maximum-size answer at the same time — which is far
-// beyond the concurrency this service sees at that size. Ordinary traffic
-// pays far less than its share: a request reserves in 64 KiB blocks as it
-// reads, so the budget admits thousands of ordinary requests, and only the
-// request that really does hold tens of megabytes spends tens of megabytes of
-// it. Documented internal constant, no configuration key — the same treatment
-// the per-request caps get.
-var memoryBudgetBytes int64 = 512 << 20 // 512 MiB
+// sets. 256 MiB admits four maximum-size buffers at once — four requests each
+// holding a maximum-size body, or two holding a maximum-size body AND a
+// maximum-size answer at the same time — which is far beyond the concurrency
+// this service sees at that size. Ordinary traffic pays far less than its
+// share: a request reserves in 64 KiB blocks as it reads, so the budget admits
+// thousands of ordinary requests, and only the request that really does hold
+// tens of megabytes spends tens of megabytes of it. Documented internal
+// constant, no configuration key — the same treatment the per-request caps
+// get.
+//
+// It is HALF of what an admitted buffer really costs the process, and that is
+// the point. An admitted buffer is never the only copy of itself: the
+// transform that injects the prompt decodes the request body and marshals it
+// into a second buffer of the same size — live for the attempt, beside the
+// body the replay needs — and the composed response rewriter builds a
+// same-size copy of the answer before it is written to the client. Neither
+// copy is admitted separately; they are bounded by their sources, which are.
+// So the process peak is roughly twice this budget plus a few MiB per
+// in-flight stream, and a container's `mem_limit` must be sized against THAT
+// number rather than against the budget — which is why compose.production.yaml
+// pairs 1 GiB with the 256 MiB below.
+var memoryBudgetBytes int64 = 256 << 20 // 256 MiB
 
 // bufferBudget is the process-wide admission for the two expensive buffers.
 // It is one instance for the whole process, read per request like the caps
@@ -2280,9 +2292,11 @@ walk:
 		// empty means the loop never had to stop — the stream ended on its
 		// own terms.
 		stopReason, unsafeReason := "", ""
-		// clientGone records that the loop stopped at the caller gate rather
-		// than at any bound. It is the one stop with no `recovery_reason`,
-		// because nothing about the recovery was wrong: the reader left.
+		// clientGone records that the CLIENT was the reason the loop produced
+		// no further answer — either the caller gate below refused to dial, or a
+		// hop in flight failed because the reader left. It is the one stop
+		// with no `recovery_reason`, because nothing about the recovery was
+		// wrong: the reader went away.
 		clientGone := false
 		for contPolicy.Enabled {
 			// The gates run in a fixed order, and every one of them is a
@@ -2444,6 +2458,16 @@ walk:
 			if dial.credKey != "" {
 				lastCredentialID = dial.credKey
 			}
+			// The reader left DURING the hop, rather than before it: the loop's
+			// own caller gate checks this on every iteration, so a hop is only
+			// ever dialed for a client that was there a moment ago, and this is
+			// the interleaving it cannot see. Classified from the hop's dial,
+			// on the request context — never from the error chain, whose
+			// cancellation this proxy itself raises to stop a stalled hop.
+			// The hop that failed is still recorded below; what this keeps out
+			// of the completion record is the claim that a stream nobody was
+			// reading was cut by the provider.
+			clientGone = clientGone || dial.callerGone()
 			// The hop's own egress evidence, relayed exactly where the walk
 			// relays its own: one WARN per endpoint a pool actually dialed
 			// and lost, before any disposition is reached, carrying the
@@ -2493,12 +2517,23 @@ walk:
 			// failure, not a bound.
 			recoveryFailed := func(phase string, hopErr error, status int) {
 				event := log.Warn().Str("public_model", model).
-					Str("provider", answer.cand.Label()).
-					Str("upstream", origin(dial.upstream)).
-					Int("recovery_index", index).
-					Str("phase", phase)
+					Str("provider", answer.cand.Label())
+				// The endpoint is named only when this hop resolved one. A
+				// window refusal happens BEFORE the hop builds its URL — the
+				// check is deliberately first, so a hop that has outlived the
+				// window builds no body, acquires no credential and claims no
+				// exchange on its way to being refused — so there is no
+				// endpoint to name there, and naming one (or dereferencing a
+				// nil one) would be the same misattribution the cause rule
+				// below avoids.
+				if dial.upstream != nil {
+					event = event.Str("upstream", origin(dial.upstream))
+				}
+				event = event.Int("recovery_index", index).Str("phase", phase)
 				if hopErr != nil {
-					event = event.Err(sanitizeUpstreamError(hopErr, dial.upstream))
+					if cause := hopFailureCause(phase, hopErr, dial.upstream); cause != nil {
+						event = event.Err(cause)
+					}
 				}
 				if status != 0 {
 					event = event.Int("upstream_status", status)
@@ -2909,6 +2944,43 @@ func dialedAttempt(pooled bool, info *transport.AttemptInfo) bool {
 		return true
 	}
 	return info.Attempts > 0
+}
+
+// hopFailureCause decides what a hop-failure record may say about the error it
+// was handed, by the rule the committed pass's own truncation record already
+// follows: an error this process or the reader produced is logged as this
+// package's typed value, whose text is static, and only a failure that came
+// off the wire goes through the sanitizer, because a truncated read surfaces
+// the transport's own parse failures and those interpolate the upstream's
+// bytes.
+//
+// The distinction is not cosmetic. sanitizeUpstreamError answers an error it
+// does not recognize with the static string "upstream transport error", so
+// routing a bounded-relay cap or a failed client write through it would report
+// a stop this proxy or the reader caused as a peer's — one field away from the
+// `phase` token that says the opposite, on the one event an operator reads to
+// learn WHO cut the stream. Both of those errors are this package's own typed
+// values carrying sizes and counts, never bytes, and the committed path logs
+// them raw for exactly that reason.
+//
+// A phase that never dialed gets no cause at all. The phase token is the whole
+// story there: nothing outside this process took part, and the error the
+// caller holds describes a step (a transform, an acquire, an envelope claim)
+// that failed before any endpoint was reachable.
+func hopFailureCause(phase string, err error, upstream *url.URL) error {
+	switch phase {
+	case "build", "credential", "budget", recoveryMaxElapsed:
+		// Refusals this proxy made: nothing was dialed, so there is no
+		// endpoint the cause could belong to.
+		return nil
+	case "client_write", "upstream_limit":
+		// The reader's socket, and this proxy's own bounded-relay cap.
+		return err
+	default:
+		// `dial`, `upstream_status`, `upstream_read`: the wire, and the only
+		// causes the no-echo rule governs.
+		return sanitizeUpstreamError(err, upstream)
+	}
 }
 
 // sanitizeUpstreamError rebuilds a client.Do error without the full request
