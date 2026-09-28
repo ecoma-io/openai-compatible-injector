@@ -130,6 +130,12 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 			if n < len(out) {
 				return stats, &streamWriteError{err: io.ErrShortWrite}
 			}
+			// The terminal fact is recorded on the bytes that actually
+			// reached the client — the same buffer the write was handed —
+			// never on a line the relay read but could not deliver.
+			if isTerminalSSELine(out) {
+				stats.Terminal = true
+			}
 			if boundary {
 				// Accounting and budget reset belong to the boundary, not to
 				// the flush: stats.Events counts dispatched events and the
@@ -195,11 +201,20 @@ func readBoundedLine(br *bufio.Reader) ([]byte, error) {
 }
 
 // StreamStats reports what a finished CopySSE pass put on the wire: byte
-// count and dispatched events. Metadata for the access log only — payloads
-// never reach logs at any level.
+// count, dispatched events, and whether the stream was terminated. Metadata
+// for the access log only — payloads never reach logs at any level.
 type StreamStats struct {
 	Bytes  int64
 	Events int
+	// Terminal reports that one of the two terminal markers reached the
+	// client: chat's `data: [DONE]`, responses' `event: response.completed`.
+	// It is the fact that separates a stream that ENDED from a stream that
+	// was CUT — CopySSE maps io.EOF to a nil error in both cases (an
+	// upstream that closes a finished stream and one that closes a dying
+	// generation look identical on the wire), so the caller cannot tell them
+	// apart from the error alone. Once set it stays set: a stream cannot
+	// un-terminate.
+	Terminal bool
 }
 
 // streamWriteError marks a CopySSE failure that happened writing to the
@@ -210,6 +225,23 @@ type streamWriteError struct{ err error }
 
 func (e *streamWriteError) Error() string { return "writing SSE stream to client: " + e.err.Error() }
 func (e *streamWriteError) Unwrap() error { return e.err }
+
+// isTerminalSSELine reports the two terminal markers this proxy serves.
+// Chat's terminal payload is literally [DONE]. Responses identifies the
+// terminal envelope with its event name; recognizing it at the event line
+// (rather than waiting for its data line or EOF) makes the guarantee
+// stronger: no comment can appear in the middle of, or after, the terminal
+// event, and the relay can report a terminated stream without waiting for
+// the read that follows it.
+//
+// It lives beside CopySSE rather than beside the heartbeat that first needed
+// it, because the relay is where the fact is RECORDED (StreamStats.Terminal)
+// and the heartbeat is only where it was first USED — the predicate is a
+// property of the wire, not of keep-alive. The bytes are never touched.
+func isTerminalSSELine(b []byte) bool {
+	content, _ := splitSSELineTerminator(b)
+	return bytes.Equal(content, []byte("data: [DONE]")) || bytes.Equal(content, []byte("event: response.completed"))
+}
 
 // isEventBoundary reports whether the raw line (terminator included) is a
 // blank line — the terminator that completes an SSE event.
