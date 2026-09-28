@@ -132,6 +132,44 @@ type RetryAfterPolicy struct {
 	MaxDelay time.Duration
 }
 
+// StreamPolicy is the data of the post-commitment stream recovery policy: what
+// this proxy may do when a COMMITTED SSE stream ends without a terminal
+// marker.
+//
+// It is deliberately not part of the matrix, the retry mechanics, or the
+// fallback walk. Those three describe what happens to a failure the provider
+// walk can still answer, and every one of them is gated by the engine's
+// code-owned commitment invariant (engine.go Observe). A stream that has
+// already reached the client is past that invariant by definition, so it needs
+// its own policy — one that states only safety bounds and cannot be reached
+// from the matrix.
+//
+// It is also deliberately four scalars with no nested block and no matrix: a
+// continuation hop is not a retry, and every knob here is a bound on how much
+// of the client's request lifetime the proxy may spend trying to finish a
+// sentence. A bound an operator cannot turn DOWN would be a defect, which is
+// why none of these is fixed.
+type StreamPolicy struct {
+	// Enabled turns post-commitment recovery on at all. false — the zero
+	// value, and what an absent block resolves to — means a truncated stream
+	// is exactly what it has always been: truncated, and nothing more.
+	Enabled bool
+	// MaxRecoveries is how many continuation hops one logical stream may
+	// start. 0 with Enabled true is a policy that never recovers, which is
+	// what the merge produces when a layer states `enabled: false`; the
+	// per-host default is 1 and the cap is MaxStreamRecoveriesCap.
+	MaxRecoveries int
+	// MaxElapsed closes the recovery window, measured from the instant the
+	// stream's headers were committed. It is checked BEFORE a hop is
+	// scheduled, so no hop ever starts past it.
+	MaxElapsed time.Duration
+	// MaxPartialBytes bounds the accumulated committed output the proxy
+	// holds in memory to build a continuation request. Past it the stream is
+	// not recoverable and the prefix is discarded — a bounded refusal, never
+	// unbounded accumulation.
+	MaxPartialBytes int
+}
+
 // Policy is one complete, resolved recovery policy: everything the engine
 // needs to decide, and nothing that depends on the request's live state.
 //
@@ -145,6 +183,10 @@ type Policy struct {
 	Fallback   FallbackPolicy
 	Budget     BudgetPolicy
 	RetryAfter RetryAfterPolicy
+	// Stream is the post-commitment stream recovery policy. It rides the
+	// same layering and the same freeze as every field above, so a stream in
+	// flight recovers under the policy its own request resolved.
+	Stream StreamPolicy
 }
 
 // Absolute runtime safety caps. Configuration is validated against these and
@@ -172,6 +214,19 @@ const (
 	// MinBackoff is the smallest meaningful initial backoff; below it the
 	// schedule is indistinguishable from no wait at all.
 	MinBackoff = time.Millisecond
+	// MaxStreamRecoveriesCap bounds StreamPolicy.MaxRecoveries. It is small
+	// on purpose: each recovery hop is a full extra upstream generation on
+	// the client's dime, and the product of the walk's attempts with the
+	// recovery count is what a single client request can cost a provider.
+	MaxStreamRecoveriesCap = 2
+	// MinStreamPartialBytes is the smallest accumulation worth continuing
+	// from. Below it the "prefix" is a handful of characters, and re-asking
+	// with them costs a whole generation for nothing.
+	MinStreamPartialBytes = 1 << 10 // 1 KiB
+	// MaxStreamPartialBytesCap bounds StreamPolicy.MaxPartialBytes. It
+	// matches the relay's own per-line cap: the accumulator must never be
+	// able to pin more memory than one SSE line already can.
+	MaxStreamPartialBytesCap = 1 << 20 // 1 MiB
 )
 
 // Validate rejects an incoherent or over-cap policy. Every rejection is
@@ -248,6 +303,27 @@ func (p Policy) Validate() error {
 	}
 	if p.RetryAfter.MaxDelay > MaxCandidateElapsedCap {
 		return errors.New("recovery: retry-after.max-delay exceeds the allowed maximum")
+	}
+	if p.Stream.MaxRecoveries < 0 || p.Stream.MaxRecoveries > MaxStreamRecoveriesCap {
+		return fmt.Errorf("recovery: stream.max-recoveries must be between 0 and %d", MaxStreamRecoveriesCap)
+	}
+	if p.Stream.MaxElapsed < MinBackoff || p.Stream.MaxElapsed > MaxCandidateElapsedCap {
+		return errors.New("recovery: stream.max-elapsed is outside the allowed range")
+	}
+	if p.Stream.MaxPartialBytes < MinStreamPartialBytes || p.Stream.MaxPartialBytes > MaxStreamPartialBytesCap {
+		return fmt.Errorf("recovery: stream.max-partial-bytes must be between %d and %d", MinStreamPartialBytes, MaxStreamPartialBytesCap)
+	}
+	if !p.Stream.Enabled {
+		// A disabled recovery is a zero-recovery policy; carrying any other
+		// value would mean the file states a reach the policy does not have.
+		// The same rule the walk bound follows when fallback is off.
+		if p.Stream.MaxRecoveries != 0 {
+			return errActionNotAllowed("recovery: stream.max-recoveries", "0 while stream recovery is disabled")
+		}
+	} else if p.Stream.MaxRecoveries < 1 {
+		// Enabled with nothing to spend is a policy that states intent and
+		// can never act on it. Say so rather than silently doing nothing.
+		return errors.New("recovery: stream.enabled requires stream.max-recoveries of at least 1")
 	}
 	return nil
 }

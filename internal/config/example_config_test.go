@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"openai-compatible-injector/internal/recovery"
 )
 
 // TestExampleConfigLoads pins the shipped template as a real runtime file:
@@ -54,5 +56,71 @@ func TestExampleConfigLoads(t *testing.T) {
 			// The failure names the violation, never the value it found.
 			t.Fatalf("example key %s carries non-placeholder material", k.ID)
 		}
+	}
+	// The shipped template must not turn post-commitment stream recovery on.
+	// It is the one setting that changes output a client has already
+	// received, so the template documents it and leaves it off; an operator
+	// opts in deliberately, per deployment or per model.
+	for i, cand := range m.Chain {
+		if cand.Recovery.Stream.Enabled {
+			t.Fatalf("the example enables stream recovery on candidate %d", i+1)
+		}
+	}
+}
+
+// TestPreStreamRecoveryConfigStillLoads is the backward-compatibility pin, in
+// the form the risk actually takes. A deployment upgrading into this feature
+// runs a file written before the block existed: it states no `stream` key at
+// all, and — the second case, which is the one a reviewer is likely to miss —
+// it may state a `recovery` block whose members predate the addition. Both
+// must load under the strict decoder and resolve to the DISABLED policy, so a
+// truncated stream keeps behaving exactly as it did.
+//
+// The bodies are frozen literals rather than a read of the shipped template:
+// the template is expected to gain the new block as documentation, and a test
+// that read it could not tell "an old file still loads" from "the new file
+// loads".
+func TestPreStreamRecoveryConfigStillLoads(t *testing.T) {
+	const oldNoRecovery = "api-key: unit-test-key\n" +
+		"transports:\n  t1:\n    type: direct\n" +
+		"providers:\n  pa:\n    base-url: https://a.example/v1\n    transport: t1\n" +
+		"models:\n  m:\n    provider: pa\n    upstream-model: up-a\n"
+
+	const oldWithRecovery = oldNoRecovery +
+		"recovery:\n" +
+		"  matrix:\n    default: terminal\n" +
+		"  retries:\n    max-retries: 2\n" +
+		"  fallback:\n    enabled: true\n    max-candidates: 2\n" +
+		"  budget:\n    request:\n      max-exchanges: 32\n" +
+		"    candidate:\n      max-exchanges: 16\n" +
+		"  retry-after:\n    enabled: true\n    mode: max\n    max-delay: 5s\n"
+
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{"a file with no recovery block", oldNoRecovery},
+		{"a file whose recovery block predates the stream member", oldWithRecovery},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, err := LoadRuntime([]byte(tc.data))
+			if err != nil {
+				t.Fatalf("a pre-existing config stopped loading: %v", err)
+			}
+			m, ok := snap.Model("m")
+			if !ok {
+				t.Fatal("model not found")
+			}
+			st := m.Recovery.Stream
+			if st.Enabled || st.MaxRecoveries != 0 {
+				t.Fatalf("a pre-existing config resolved to an enabled stream policy: %+v", st)
+			}
+			// The documented bounds are still materialized, so an operator who
+			// later writes only `enabled: true` inherits a sane window rather
+			// than a zero — but nothing reads them until they do.
+			if st.MaxElapsed != recovery.DefaultStreamMaxElapsed || st.MaxPartialBytes != recovery.DefaultStreamMaxPartialBytes {
+				t.Fatalf("unstated stream bounds = %+v, want the documented defaults", st)
+			}
+		})
 	}
 }

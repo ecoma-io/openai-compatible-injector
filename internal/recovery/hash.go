@@ -14,7 +14,13 @@ import (
 // v2 added the credential-cause predicate to the per-rule encoding; a policy
 // hashed by a v1 build is never equal to one hashed by a v2 build, whatever
 // its content.
-const hashTag = "recovery-policy-v2"
+//
+// v3 added the post-commitment stream recovery bounds. Note that this is the
+// tag's job and not a formality: the four new fields are hashed even when
+// recovery is disabled, because `stream.enabled` decides whether a truncated
+// stream is resumed or left truncated — two deployments that differ only
+// there must never report the same policy_hash.
+const hashTag = "recovery-policy-v3"
 
 // Hash returns a short, stable identity for the policy's DATA.
 //
@@ -88,6 +94,15 @@ func (p Policy) Hash() string {
 	w.bool(p.RetryAfter.Enabled)
 	w.int(int(p.RetryAfter.Mode))
 	w.duration(p.RetryAfter.MaxDelay)
+
+	// The post-commitment stream recovery policy, in full — including the
+	// enabled flag and the byte bound, because a policy that recovers and one
+	// that truncates are different policies even when every walk-facing field
+	// matches.
+	w.bool(p.Stream.Enabled)
+	w.int(p.Stream.MaxRecoveries)
+	w.duration(p.Stream.MaxElapsed)
+	w.int(p.Stream.MaxPartialBytes)
 
 	h.Write(w.buf)
 	return hex.EncodeToString(h.Sum(nil))[:16]

@@ -58,6 +58,10 @@ func TestPolicyHashDistinguishesDifferingPolicies(t *testing.T) {
 		"retry-after on":    func(p *Policy) { p.RetryAfter.Enabled = false },
 		"retry-after mode":  func(p *Policy) { p.RetryAfter.Mode = RetryAfterIgnore },
 		"retry-after delay": func(p *Policy) { p.RetryAfter.MaxDelay += time.Second },
+		"stream enabled":    func(p *Policy) { p.Stream.Enabled = true },
+		"stream recoveries": func(p *Policy) { p.Stream.MaxRecoveries++ },
+		"stream window":     func(p *Policy) { p.Stream.MaxElapsed += time.Second },
+		"stream partial":    func(p *Policy) { p.Stream.MaxPartialBytes += 1024 },
 	}
 	for name, mutate := range mutations {
 		p := base

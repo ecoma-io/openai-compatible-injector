@@ -171,14 +171,3 @@ func endsWithBlankLine(b []byte) bool {
 	last := b[j+1 : i]
 	return len(last) == 0 || (len(last) == 1 && last[0] == '\r')
 }
-
-// isTerminalSSELine reports the two terminal markers this proxy serves.
-// Chat's terminal payload is literally [DONE]. Responses identifies the
-// terminal envelope with its event name; recognizing it at the event line
-// (rather than waiting for its data line or EOF) makes the guarantee
-// stronger: no comment can appear in the middle of, or after, the terminal
-// event. The bytes remain untouched — this only disables the heartbeat.
-func isTerminalSSELine(b []byte) bool {
-	content, _ := splitSSELineTerminator(b)
-	return bytes.Equal(content, []byte("data: [DONE]")) || bytes.Equal(content, []byte("event: response.completed"))
-}

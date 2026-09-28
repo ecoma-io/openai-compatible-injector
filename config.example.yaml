@@ -110,7 +110,7 @@ transports:
 # envelopes, and over-cap values REJECT the whole file rather than being
 # clamped to something the operator did not write.
 #
-# Two members are scoped to the layers that can honor them, and writing
+# Three members are scoped to the layers that can honor them, and writing
 # them anywhere else REJECTS the file instead of loading a block that would
 # never be consulted:
 #   - `fallback` steers how far the candidate walk reaches, which is a
@@ -118,6 +118,11 @@ transports:
 #     MODEL layers, and rejected on a provider or a single candidate.
 #   - `budget.request` bounds the whole request's exchanges — so it is legal
 #     only in the top-level GLOBAL block.
+#   - `stream` changes text the client has ALREADY received, and a provider
+#     entry is shared by every model that routes through it — so it is legal
+#     at the GLOBAL and MODEL layers, and rejected on a provider or a single
+#     candidate, where it would silently extend to models whose answers a
+#     strict client parses.
 recovery:
   # Which failure takes which action. The shorthand forms expand into
   # stable, ID-identified rules under a deterministic precedence (exact
@@ -182,6 +187,35 @@ recovery:
     enabled: true # default true
     mode: max # max (default, a floor) | ignore (discard it)
     max-delay: 5s # this policy's own ceiling on the directive
+  # OPTIONAL, OFF BY DEFAULT — and left commented out on purpose, since it
+  # is the only setting here that changes output the client has already
+  # received.
+  #
+  # When a COMMITTED SSE stream ends without its terminal marker (`data:
+  # [DONE]` for Chat, `event: response.completed` for Responses) the upstream
+  # generation was cut short. With this block enabled the proxy keeps the
+  # client's single connection open, re-asks the SAME candidate for a
+  # continuation that carries the text already sent, and relays the new
+  # events into the same response. The client sees one stream and one
+  # terminal marker.
+  #
+  # This is SEMANTIC continuation, not token-level resumption: no
+  # OpenAI-compatible provider exposes a resume token, so the upstream is
+  # asked to keep writing from the point it stopped, and it may rephrase a
+  # little at the seam. It is also fail-closed by construction. A stream that
+  # carried tool calls or a finish reason, or whose shape the proxy does not
+  # recognize, is never continued — it is truncated exactly as it is today,
+  # and `stream_recovery_exhausted` records why. No ordinary retry, fallback,
+  # or status handling is involved: the pre-commitment walk is untouched.
+  #
+  #    stream:
+  #      enabled: true # default false; absent means streams are never continued
+  #      max-recoveries: 1 # continuation hops per stream, 0..2; `enabled: true`
+  #      # alone means 1 — one extra upstream request, never a loop
+  #      max-elapsed: 20s # window measured from the commit, >= 1ms, <= 2m;
+  #      # checked BEFORE a hop is scheduled, so none ever starts past it
+  #      max-partial-bytes: 262144 # committed output held in memory to build
+  #      # the continuation, 1KiB..1MiB; past it the stream is not recoverable
 
 # Optional. Named upstream bases, so several models can share one endpoint
 # and one egress. base-url is validated exactly like a model endpoint;

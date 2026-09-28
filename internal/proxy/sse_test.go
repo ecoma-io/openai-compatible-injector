@@ -25,7 +25,7 @@ func copySSEOnce(t *testing.T, input, public string) (string, int) {
 	t.Helper()
 	var buf bytes.Buffer
 	flushes := 0
-	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter(public), func() { flushes++ }, nil)
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter(public), func() { flushes++ }, nil, nil)
 	if err != nil {
 		t.Fatalf("CopySSE: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestCopySSEScopesPerAPI(t *testing.T) {
 	flushes := 0
 	stats, err := CopySSE(&buf, strings.NewReader(line),
 		func(p []byte) []byte { return inject.RewriteResponsesModel(p, "public-name") },
-		func() { flushes++ }, nil)
+		func() { flushes++ }, nil, nil)
 	if err != nil {
 		t.Fatalf("CopySSE: %v", err)
 	}
@@ -291,7 +291,7 @@ func (failingReader) Read(p []byte) (int, error) { return 0, errors.New("read bo
 func TestCopySSEPropagatesErrors(t *testing.T) {
 	// A write failure is client-side; the caller logs it as a client
 	// disconnect via the *streamWriteError marker.
-	_, err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), sseRewriter("p"), func() {}, nil)
+	_, err := CopySSE(failingWriter{}, strings.NewReader("data: x\n"), sseRewriter("p"), func() {}, nil, nil)
 	if err == nil {
 		t.Fatal("write error not propagated")
 	}
@@ -302,7 +302,7 @@ func TestCopySSEPropagatesErrors(t *testing.T) {
 
 	// A read failure is upstream-side and must NOT carry the marker — the
 	// truncation phase in the access log depends on the distinction.
-	_, err = CopySSE(io.Discard, failingReader{}, sseRewriter("p"), func() {}, nil)
+	_, err = CopySSE(io.Discard, failingReader{}, sseRewriter("p"), func() {}, nil, nil)
 	if err == nil || err == io.EOF {
 		t.Errorf("read error not propagated as-is: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestCopySSEPropagatesErrors(t *testing.T) {
 // and the write is still marked as a client-side failure.
 func TestCopySSEAccountsPartialWrite(t *testing.T) {
 	w := &limitedWriter{limit: 5}
-	stats, err := CopySSE(w, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil)
+	stats, err := CopySSE(w, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil, nil)
 	if err == nil {
 		t.Fatal("write failure not propagated")
 	}
@@ -335,7 +335,7 @@ func TestCopySSEAccountsPartialWrite(t *testing.T) {
 // must truncate the stream as a client-side failure — continuing past it
 // would relay a torn line and overcount the bytes.
 func TestCopySSERejectsShortWrite(t *testing.T) {
-	stats, err := CopySSE(&shortWriter{}, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil)
+	stats, err := CopySSE(&shortWriter{}, strings.NewReader("data: x\ndata: y\n"), sseRewriter("p"), nil, nil, nil)
 	if err == nil {
 		t.Fatal("short write not detected")
 	}
@@ -365,7 +365,7 @@ func TestCopySSENilFlushStillCountsEvents(t *testing.T) {
 	line := "data: {\"x\":\"" + big + "\"}\n"
 	input := line + line + "\n" + line + line + "\n"
 	var buf bytes.Buffer
-	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), nil, nil)
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CopySSE: %v (the per-event budget must reset at the boundary even without a flush)", err)
 	}
@@ -399,5 +399,103 @@ func TestRewriteSSELineAliasedResultNotMistakenForNoOp(t *testing.T) {
 	out := rewriteSSELine(line, func(p []byte) []byte { return p[:3] }, nil)
 	if string(out) != "data: {\"m\n" {
 		t.Errorf("aliased sub-slice rewrite = %q, want the rebuilt shortened line", out)
+	}
+}
+
+// copySSEStats runs CopySSE over input and returns the raw stats beside the
+// error, so a test can ask what the relay REPORTED rather than only what it
+// wrote.
+func copySSEStats(t *testing.T, input string) (StreamStats, string, error) {
+	t.Helper()
+	var buf bytes.Buffer
+	stats, err := CopySSE(&buf, strings.NewReader(input), sseRewriter("public-name"), func() {}, nil, nil)
+	return stats, buf.String(), err
+}
+
+// TestCopySSERecordsTheTerminalMarker pins the one fact StreamStats.Terminal
+// exists to carry. CopySSE maps io.EOF to a nil error whether the upstream
+// closed a finished stream or closed a dying generation, so the error alone
+// cannot tell a stream that ENDED from one that was CUT — and everything
+// built on top of it (the heartbeat's stop rule, post-commitment recovery)
+// needs exactly that distinction.
+func TestCopySSERecordsTheTerminalMarker(t *testing.T) {
+	cases := []struct {
+		name       string
+		input      string
+		want       bool
+		wantMarker string
+	}{
+		{"chat [DONE]", "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n", true, "chat"},
+		{"chat [DONE] with CRLF", "data: [DONE]\r\n\r\n", true, "chat"},
+		{"chat [DONE] unterminated", "data: [DONE]", true, "chat"},
+		{"responses completed", "event: response.completed\ndata: {}\n\n", true, "responses"},
+		{"responses completed with CRLF", "event: response.completed\r\n\r\n", true, "responses"},
+		// The stream simply stops. No marker ever reached the client, which
+		// is the case the whole feature is about.
+		{"truncated before any marker", "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"there\"}}]}\n\n", false, "none"},
+		// A final partial line: the relay forwarded it, and it is not a
+		// terminal marker — the stream was cut, not finished.
+		{"partial final line", "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: [DO", false, "none"},
+		{"empty stream", "", false, "none"},
+		// The predicate is an exact line match, never a substring test: a
+		// payload that merely quotes the token is client data, and treating
+		// it as a terminator would let a model's own output masquerade as the
+		// end of a stream.
+		{"payload quoting [DONE]", "data: {\"choices\":[{\"delta\":{\"content\":\"data: [DONE]\"}}]}\n\n", false, "none"},
+		{"other responses event", "event: response.output_text.delta\ndata: {}\n\n", false, "none"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stats, out, err := copySSEStats(t, tc.input)
+			if err != nil {
+				t.Fatalf("CopySSE: %v", err)
+			}
+			if out != tc.input {
+				t.Fatalf("relayed bytes changed: %q", out)
+			}
+			if stats.Terminal != tc.want {
+				t.Fatalf("stats.Terminal = %v, want %v (%s marker)", stats.Terminal, tc.want, tc.wantMarker)
+			}
+		})
+	}
+}
+
+// TestCopySSETerminalIsSetOnceAndSticks: a marker in the middle of a stream
+// that then dies still reports Terminal. The stat is a record of what the
+// client was told, not a prediction that the connection ended well — a
+// caller that later sees EOF must be able to ask "was a terminator forwarded
+// at any point", and answer it without replaying the bytes.
+func TestCopySSETerminalIsSetOnceAndSticks(t *testing.T) {
+	stats, _, err := copySSEStats(t, "data: [DONE]\n\ndata: after-the-end\n")
+	if err != nil {
+		t.Fatalf("CopySSE: %v", err)
+	}
+	if !stats.Terminal {
+		t.Fatal("a forwarded marker left stats.Terminal false")
+	}
+	if stats.Events != 1 {
+		t.Fatalf("stats.Events = %d, want 1", stats.Events)
+	}
+}
+
+// TestCopySSETerminalNeedsTheBytesToLand pins that the fact is recorded on
+// what actually reached the client. A marker the relay read but could not
+// deliver is not a terminated stream, and reporting it as one would let a
+// recovery path believe a dead client was handed a terminator.
+func TestCopySSETerminalNeedsTheBytesToLand(t *testing.T) {
+	stats, err := CopySSE(failingWriter{}, strings.NewReader("data: [DONE]\n\n"), sseRewriter("p"), nil, nil, nil)
+	if err == nil {
+		t.Fatal("write failure not propagated")
+	}
+	if stats.Terminal {
+		t.Fatal("a marker that never reached the client set stats.Terminal")
+	}
+
+	stats, err = CopySSE(&limitedWriter{limit: 5}, strings.NewReader("data: [DONE]\n\n"), sseRewriter("p"), nil, nil, nil)
+	if err == nil {
+		t.Fatal("short write not propagated")
+	}
+	if stats.Terminal {
+		t.Fatal("a torn marker write set stats.Terminal")
 	}
 }

@@ -81,6 +81,18 @@ var (
 // Comments, event lines, blank lines, and terminators such as [DONE] pass
 // through byte-for-byte.
 //
+// observe, when non-nil, is called with the payload of EVERY data line —
+// before the acceptance gate above, and therefore before the rewrite — and
+// its return value is ignored. That is deliberately a different seam from
+// rewriter: the gate is an optimization keyed on the two keys the REWRITER
+// owns, and a payload that carries neither is exactly the case an observer
+// of, say, assistant text deltas must still see. (A Responses
+// `response.output_text.delta` event carries no `model` member at all, so
+// composing an observer into rewriter would silently miss every token of a
+// Responses stream.) A nil observe costs nothing: the unconfigured path does
+// not parse the line twice. observe must not write to dst and must not block
+// — it runs inline on the relay's goroutine.
+//
 // Limit breaches stop the relay: the offending (partial) line is never
 // written, no further reads happen, and the returned error wraps
 // ErrSSELineTooLong or ErrSSEEventTooLarge so the caller can log the
@@ -88,7 +100,7 @@ var (
 // error is returned so the caller can truncate the stream. A failure
 // writing to dst is returned wrapped in *streamWriteError — the client side
 // went away — so the caller can log the two truncation causes apart.
-func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func(), stripKeys [][]byte) (StreamStats, error) {
+func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func(), stripKeys [][]byte, observe func(payload []byte)) (StreamStats, error) {
 	var stats StreamStats
 	br := bufio.NewReaderSize(src, sseReadBuffer)
 	// pending counts the bytes of the event in flight — every line since
@@ -115,6 +127,11 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 						ErrSSEEventTooLarge, pending, MaxEventBytes)
 				}
 			}
+			if observe != nil {
+				if payload, ok := sseDataPayload(line); ok {
+					observe(payload)
+				}
+			}
 			out := rewriteSSELine(line, rewrite, stripKeys)
 			n, werr := dst.Write(out)
 			// Account exactly what dst accepted — on a failed or torn write
@@ -129,6 +146,12 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 			}
 			if n < len(out) {
 				return stats, &streamWriteError{err: io.ErrShortWrite}
+			}
+			// The terminal fact is recorded on the bytes that actually
+			// reached the client — the same buffer the write was handed —
+			// never on a line the relay read but could not deliver.
+			if isTerminalSSELine(out) {
+				stats.Terminal = true
 			}
 			if boundary {
 				// Accounting and budget reset belong to the boundary, not to
@@ -195,11 +218,20 @@ func readBoundedLine(br *bufio.Reader) ([]byte, error) {
 }
 
 // StreamStats reports what a finished CopySSE pass put on the wire: byte
-// count and dispatched events. Metadata for the access log only — payloads
-// never reach logs at any level.
+// count, dispatched events, and whether the stream was terminated. Metadata
+// for the access log only — payloads never reach logs at any level.
 type StreamStats struct {
 	Bytes  int64
 	Events int
+	// Terminal reports that one of the two terminal markers reached the
+	// client: chat's `data: [DONE]`, responses' `event: response.completed`.
+	// It is the fact that separates a stream that ENDED from a stream that
+	// was CUT — CopySSE maps io.EOF to a nil error in both cases (an
+	// upstream that closes a finished stream and one that closes a dying
+	// generation look identical on the wire), so the caller cannot tell them
+	// apart from the error alone. Once set it stays set: a stream cannot
+	// un-terminate.
+	Terminal bool
 }
 
 // streamWriteError marks a CopySSE failure that happened writing to the
@@ -210,6 +242,23 @@ type streamWriteError struct{ err error }
 
 func (e *streamWriteError) Error() string { return "writing SSE stream to client: " + e.err.Error() }
 func (e *streamWriteError) Unwrap() error { return e.err }
+
+// isTerminalSSELine reports the two terminal markers this proxy serves.
+// Chat's terminal payload is literally [DONE]. Responses identifies the
+// terminal envelope with its event name; recognizing it at the event line
+// (rather than waiting for its data line or EOF) makes the guarantee
+// stronger: no comment can appear in the middle of, or after, the terminal
+// event, and the relay can report a terminated stream without waiting for
+// the read that follows it.
+//
+// It lives beside CopySSE rather than beside the heartbeat that first needed
+// it, because the relay is where the fact is RECORDED (StreamStats.Terminal)
+// and the heartbeat is only where it was first USED — the predicate is a
+// property of the wire, not of keep-alive. The bytes are never touched.
+func isTerminalSSELine(b []byte) bool {
+	content, _ := splitSSELineTerminator(b)
+	return bytes.Equal(content, []byte("data: [DONE]")) || bytes.Equal(content, []byte("event: response.completed"))
+}
 
 // isEventBoundary reports whether the raw line (terminator included) is a
 // blank line — the terminator that completes an SSE event.
@@ -225,17 +274,9 @@ func isEventBoundary(line []byte) bool {
 // when nothing is in scope) is what the pointer-identity shortcut below
 // relies on.
 func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte, stripKeys [][]byte) []byte {
-	content, term := splitSSELineTerminator(line)
-	rest, ok := bytes.CutPrefix(content, sseDataPrefix)
+	payload, ok := sseDataPayload(line)
 	if !ok {
 		return line
-	}
-	prefix := content[:len(content)-len(rest)]
-	sep := rest[:0]
-	payload := rest
-	if len(payload) > 0 && payload[0] == ' ' {
-		sep = payload[:1]
-		payload = payload[1:]
 	}
 	if !bytes.Contains(payload, sseModelKey) && !bytes.Contains(payload, sseUsageKey) && !mentionsAnyKey(payload, stripKeys) {
 		return line
@@ -250,15 +291,37 @@ func rewriteSSELine(line []byte, rewrite func(payload []byte) []byte, stripKeys 
 		// Skip the rebuild for lines that merely mention a gate key.
 		return line
 	}
+	content, term := splitSSELineTerminator(line)
+	// head is everything the payload sits behind — "data:" plus the optional
+	// separator space — recovered by length so the exact bytes are reused
+	// rather than re-derived from a case analysis.
+	head := content[:len(content)-len(payload)]
 	// Capacity is never precomputed as a length sum: that arithmetic is the
 	// integer-overflow class CodeQL flags, and the per-line cost of append
 	// growth is negligible next to the bufio read and network I/O anyway.
 	var buf []byte
-	buf = append(buf, prefix...)
-	buf = append(buf, sep...)
+	buf = append(buf, head...)
 	buf = append(buf, out...)
 	buf = append(buf, term...)
 	return buf
+}
+
+// sseDataPayload returns the payload of a data line — the bytes after
+// "data:" and one optional separator space — and reports whether the line is
+// a data line at all. This is the ONE place the SSE data-line prefix is
+// parsed: the relay's observer hook, the rewrite, and the terminal check all
+// read lines through it or through splitSSELineTerminator, so a change to
+// what "a data line" means cannot diverge between them.
+func sseDataPayload(line []byte) ([]byte, bool) {
+	content, _ := splitSSELineTerminator(line)
+	payload, ok := bytes.CutPrefix(content, sseDataPrefix)
+	if !ok {
+		return nil, false
+	}
+	if len(payload) > 0 && payload[0] == ' ' {
+		payload = payload[1:]
+	}
+	return payload, true
 }
 
 // mentionsAnyKey reports whether payload contains any of the strip

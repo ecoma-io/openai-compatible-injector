@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -576,6 +577,176 @@ func TestE2ERecoveryCommittedSSENeverRetried(t *testing.T) {
 	}
 	if trunc[0]["phase"] != "upstream_read" {
 		t.Errorf("stream_truncated phase = %v, want upstream_read", trunc[0]["phase"])
+	}
+}
+
+// TestE2EStreamRecoveryContinuesACutStream drives the real binary with
+// post-commitment stream recovery switched on. The upstream commits a
+// fragment and dies mid-generation; the proxy re-asks the SAME upstream with
+// the committed text as an assistant turn and relays the second answer into
+// the client's still-open stream. The client holds one connection and sees
+// exactly one terminal marker across both hops.
+//
+// Its sibling above — TestE2ERecoveryCommittedSSENeverRetried — is the same
+// wire with the block absent. Read together they are the whole compatibility
+// claim: the identical truncation that is nothing but a truncation by default
+// is the one this block exists to continue, and nothing about the default
+// path changes to make that possible.
+func TestE2EStreamRecoveryContinuesACutStream(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl := w.(http.Flusher)
+		// The first dial commits a fragment and dies; the second — the
+		// continuation — finishes the answer. The request being served is
+		// already recorded, so the first dial observes 1.
+		if up.count() == 1 {
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"sr1\",\"model\":\"sr-up-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one \"},\"finish_reason\":null}]}\n\n")
+			fl.Flush()
+			panic(http.ErrAbortHandler)
+		}
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"sr2\",\"model\":\"sr-up-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"two\"},\"finish_reason\":null}]}\n\n")
+		fl.Flush()
+		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+		fl.Flush()
+	})
+
+	top := `recovery:
+  stream:
+    enabled: true
+    max-recoveries: 1
+    max-elapsed: 30s
+    max-partial-bytes: 4096
+`
+	providers := fmt.Sprintf(`providers:
+  sr-p1:
+    base-url: %s/v1
+`, up.url())
+	models := `models:
+  sr-model:
+    providers:
+      - provider: sr-p1
+        upstream-model: sr-up-1
+`
+	p := startSubprocess(t, startOpts{yaml: recoveryFile(top, providers, models), logLevel: "info"})
+
+	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("sr-model"),
+		map[string]string{"Accept": "text/event-stream"})
+	defer func() { _ = resp.Body.Close() }()
+	br := bufio.NewReader(resp.Body)
+
+	// Hop 1's fragment, hop 2's continuation, then the ONE terminal marker —
+	// three events on one connection, in order, the public model rewritten in
+	// both payloads.
+	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	if eof {
+		t.Fatal("stream ended before the committed fragment arrived")
+	}
+	assertChatSSE(t, lines, "sr-model", "one ")
+
+	lines, eof = nextSSEEvent(t, br, 5*time.Second)
+	if eof {
+		t.Fatal("no continuation event: the stream was truncated instead of recovered")
+	}
+	assertChatSSE(t, lines, "sr-model", "two")
+
+	lines, eof = nextSSEEvent(t, br, 5*time.Second)
+	if eof {
+		t.Fatal("stream ended without a terminal marker: the continuation's [DONE] never reached the client")
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], "[DONE]") {
+		t.Fatalf("terminal event = %q, want exactly one data: [DONE]", lines)
+	}
+	// Nothing follows the marker: a stream is terminated once, not twice.
+	if tail, _ := io.ReadAll(br); strings.Contains(string(tail), "data:") {
+		t.Errorf("bytes followed the terminal marker: %q", tail)
+	}
+
+	// Two dials and no third: the walk stopped at commitment, and the
+	// continuation was the one extra request the block's reach allows.
+	if got := up.count(); got != 2 {
+		t.Fatalf("upstream dials = %d, want 2 (one walk attempt plus one continuation)", got)
+	}
+
+	// The continuation is the same candidate RE-ASKED, not a blind replay: the
+	// second request carries the committed text as an assistant turn, and it
+	// is still a stream.
+	reqs := up.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("recorded requests = %d, want 2", len(reqs))
+	}
+	var sent struct {
+		Stream   bool `json:"stream"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(reqs[1].Body, &sent); err != nil {
+		t.Fatalf("decode the continuation body: %v", err)
+	}
+	if len(sent.Messages) != 2 {
+		t.Fatalf("continuation messages = %d, want the client's one plus the assistant turn: %s", len(sent.Messages), reqs[1].Body)
+	}
+	if sent.Messages[1].Role != "assistant" || sent.Messages[1].Content != "one " {
+		t.Fatalf("the continuation did not carry the committed prefix as an assistant turn: %s", reqs[1].Body)
+	}
+	if !sent.Stream {
+		t.Fatalf("the continuation request is not a stream: %s", reqs[1].Body)
+	}
+
+	waitForEventCount(t, p, "request_completed", 1)
+	evs := completionsFor(t, p, "sr-model")
+	if len(evs) != 1 {
+		t.Fatalf("sr-model completions = %d, want 1", len(evs))
+	}
+	// The request is completed, not truncated: the continuation carried the
+	// stream all the way to its marker, so the outcome a client would act on
+	// is the honest one.
+	if evs[0]["outcome"] != "completed" {
+		t.Errorf("outcome = %v, want completed", evs[0]["outcome"])
+	}
+	// A continuation is a real outbound exchange on the SAME provider, so the
+	// walk's own counters see it: two provider-level attempts, two dials, one
+	// candidate, no retry.
+	if got := evs[0]["provider_attempts"]; got != float64(2) {
+		t.Errorf("provider_attempts = %v, want 2 (the walk attempt plus the continuation)", got)
+	}
+	if got := evs[0]["upstream_exchanges"]; got != float64(2) {
+		t.Errorf("upstream_exchanges = %v, want 2", got)
+	}
+	if got := evs[0]["candidates_entered"]; got != float64(1) {
+		t.Errorf("candidates_entered = %v, want 1 (a continuation never moves candidate)", got)
+	}
+	if got := evs[0]["final_provider"]; got != "sr-p1" {
+		t.Errorf("final_provider = %v, want sr-p1", got)
+	}
+
+	// The recovery evidence itself. started and succeeded are exactly paired,
+	// and nothing reported a truncation of a stream that finished.
+	logs := parseLogEvents(t, p.stderr.String())
+	if got := len(eventsWithMessage(logs, "stream_recovery_started")); got != 1 {
+		t.Errorf("stream_recovery_started events = %d, want 1", got)
+	}
+	succeeded := eventsWithMessage(logs, "stream_recovery_succeeded")
+	if len(succeeded) != 1 {
+		t.Fatalf("stream_recovery_succeeded events = %d, want 1", len(succeeded))
+	}
+	if got := succeeded[0]["public_model"]; got != "sr-model" {
+		t.Errorf("stream_recovery_succeeded public_model = %v, want sr-model", got)
+	}
+	if got := succeeded[0]["provider"]; got != "sr-p1" {
+		t.Errorf("stream_recovery_succeeded provider = %v, want sr-p1", got)
+	}
+	if got := len(eventsWithMessage(logs, "stream_recovery_failed")); got != 0 {
+		t.Errorf("stream_recovery_failed events = %d, want 0", got)
+	}
+	if got := len(eventsWithMessage(logs, "stream_recovery_exhausted")); got != 0 {
+		t.Errorf("stream_recovery_exhausted events = %d, want 0", got)
+	}
+	if got := len(eventsWithMessage(logs, "stream_truncated")); got != 0 {
+		t.Errorf("stream_truncated events = %d, want 0", got)
 	}
 }
 

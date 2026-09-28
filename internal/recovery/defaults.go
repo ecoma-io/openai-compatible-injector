@@ -50,6 +50,23 @@ const (
 	// ceiling, so by default the backoff ceiling is what binds — exactly the
 	// behavior that shipped before retry-after became configurable.
 	DefaultRetryAfterMaxDelay = 5 * time.Second
+	// DefaultMaxStreamRecoveries is how many continuation hops a stream may
+	// start once post-commitment recovery is switched on. It is what
+	// `recovery.stream.enabled: true` alone means: one extra upstream
+	// request, never a loop.
+	DefaultMaxStreamRecoveries = 1
+	// DefaultStreamMaxElapsed bounds the recovery window, measured from the
+	// instant the stream's headers committed. It is generous relative to the
+	// work it bounds (a single extra generation) because it is a runaway
+	// backstop, not a latency budget — the caller's own deadline and the
+	// request-wide exchange envelope bind first in practice.
+	DefaultStreamMaxElapsed = 20 * time.Second
+	// DefaultStreamMaxPartialBytes bounds the committed output held in
+	// memory to build a continuation request. 256 KiB is far above any
+	// legitimate interrupted answer and far below the relay's own 1 MiB
+	// per-line cap, so the accumulator can never be the process's largest
+	// allocation.
+	DefaultStreamMaxPartialBytes = 256 << 10
 )
 
 // Default returns the built-in policy every configuration starts from: what
@@ -172,6 +189,20 @@ func Default() Policy {
 			Enabled:  true,
 			Mode:     RetryAfterMax,
 			MaxDelay: DefaultRetryAfterMaxDelay,
+		},
+		// Post-commitment stream recovery is OFF by default, and that is the
+		// whole compatibility story: a file that never mentions the block
+		// resolves to exactly this, and a truncated stream stays exactly
+		// what it has always been. MaxRecoveries is 0 rather than 1 because
+		// this policy is also the base every layer merges onto, and a
+		// disabled policy that carried a reach would state a bound it cannot
+		// use — the same rule the walk bound follows. A layer that states
+		// `enabled: true` gets DefaultMaxStreamRecoveries from the merge.
+		Stream: StreamPolicy{
+			Enabled:         false,
+			MaxRecoveries:   0,
+			MaxElapsed:      DefaultStreamMaxElapsed,
+			MaxPartialBytes: DefaultStreamMaxPartialBytes,
 		},
 	}
 }

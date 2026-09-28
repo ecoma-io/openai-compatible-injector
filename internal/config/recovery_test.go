@@ -652,6 +652,15 @@ func TestRecoveryRejections(t *testing.T) {
 		// no observation carries a transport cause and an HTTP status at once.
 		{"mixed-layer free-form rule", "recovery:\n  matrix:\n    rules:\n      - id: r1\n        when: {status: 429, transport-cause: tls}\n        action: retry\n", "predicates from a single layer"},
 		{"disabled fallback with a reach", "recovery:\n  fallback:\n    enabled: false\n    max-candidates: 3\n", "fallback.max-candidates"},
+		{"unknown stream key", "recovery:\n  stream:\n    maxrecoveries: 1\n", "line"},
+		{"over-cap stream recoveries", "recovery:\n  stream:\n    enabled: true\n    max-recoveries: 3\n", "stream.max-recoveries"},
+		{"negative stream recoveries", "recovery:\n  stream:\n    max-recoveries: -1\n", "stream.max-recoveries"},
+		{"stream enabled with no reach", "recovery:\n  stream:\n    enabled: true\n    max-recoveries: 0\n", "stream.max-recoveries"},
+		{"disabled stream with a reach", "recovery:\n  stream:\n    enabled: false\n    max-recoveries: 1\n", "stream.max-recoveries"},
+		{"bad stream duration", "recovery:\n  stream:\n    max-elapsed: " + marker + "\n", "must be a valid duration"},
+		{"stream window above the cap", "recovery:\n  stream:\n    enabled: true\n    max-elapsed: 3m\n", "stream.max-elapsed"},
+		{"stream partial below the minimum", "recovery:\n  stream:\n    enabled: true\n    max-partial-bytes: 1023\n", "stream.max-partial-bytes"},
+		{"stream partial above the cap", "recovery:\n  stream:\n    enabled: true\n    max-partial-bytes: 1048577\n", "stream.max-partial-bytes"},
 		// NaN survives every comparison, so a bare range check admits it and
 		// the spread arithmetic collapses to a zero wait. It must be named.
 		{"nan jitter", "recovery:\n  retries:\n    backoff:\n      jitter: .nan\n", "jitter"},
@@ -881,5 +890,133 @@ func TestRecoveryHashIsStableAcrossLoadsAndNamesTheData(t *testing.T) {
 	}
 	if perCand.RecoveryHash != perCand.Chain[0].RecoveryHash {
 		t.Error("model hash does not mirror the primary candidate's")
+	}
+}
+
+// TestRecoveryStreamBlockParsesEveryFieldAndDefaultsOff pins the two halves
+// of the compatibility contract in one place: a file that never mentions the
+// block resolves to a disabled policy with the documented bounds, and a file
+// that states every field gets exactly what it stated.
+func TestRecoveryStreamBlockParsesEveryFieldAndDefaultsOff(t *testing.T) {
+	simple := "  m:\n    provider: pa\n    upstream-model: up-a\n"
+
+	absent := recoveryModel(t, recoveryYAML("", "", simple), "m")
+	if absent.Recovery.Stream.Enabled {
+		t.Fatal("a file with no stream block resolved to an enabled policy")
+	}
+	if absent.Recovery.Stream.MaxRecoveries != 0 {
+		t.Fatalf("a file with no stream block carries %d recoveries", absent.Recovery.Stream.MaxRecoveries)
+	}
+	if absent.Recovery.Stream.MaxElapsed != recovery.DefaultStreamMaxElapsed ||
+		absent.Recovery.Stream.MaxPartialBytes != recovery.DefaultStreamMaxPartialBytes {
+		t.Fatalf("unstated bounds = %+v, want the documented defaults", absent.Recovery.Stream)
+	}
+
+	// The one-line opt-in: `enabled: true` alone must produce a policy that
+	// can act — the documented reach, and the default bounds beside it.
+	optIn := recoveryModel(t, recoveryYAML("recovery:\n  stream:\n    enabled: true\n", "", simple), "m")
+	want := recovery.StreamPolicy{
+		Enabled:         true,
+		MaxRecoveries:   recovery.DefaultMaxStreamRecoveries,
+		MaxElapsed:      recovery.DefaultStreamMaxElapsed,
+		MaxPartialBytes: recovery.DefaultStreamMaxPartialBytes,
+	}
+	if optIn.Recovery.Stream != want {
+		t.Fatalf("`enabled: true` alone resolved to %+v, want %+v", optIn.Recovery.Stream, want)
+	}
+
+	// Every field, stated. The block cannot change anything the walk reads.
+	all := recoveryModel(t, recoveryYAML(
+		"recovery:\n"+
+			"  retries:\n    max-retries: 2\n"+
+			"  stream:\n"+
+			"    enabled: true\n"+
+			"    max-recoveries: 2\n"+
+			"    max-elapsed: 45s\n"+
+			"    max-partial-bytes: 65536\n", "", simple), "m")
+	want = recovery.StreamPolicy{Enabled: true, MaxRecoveries: 2, MaxElapsed: 45 * time.Second, MaxPartialBytes: 65536}
+	if all.Recovery.Stream != want {
+		t.Fatalf("stated stream block = %+v, want %+v", all.Recovery.Stream, want)
+	}
+	if all.Recovery.Retry.MaxRetries != 2 {
+		t.Fatalf("the stream block moved the retry policy: %+v", all.Recovery.Retry)
+	}
+	// The identity follows the data: a deployment that continues streams and
+	// one that truncates must never report the same policy_hash.
+	if all.RecoveryHash == absent.RecoveryHash {
+		t.Fatal("a stream block left the policy hash unchanged")
+	}
+}
+
+// TestRecoveryStreamScopeIsTheDeployment pins the position rule. Stream
+// continuation changes text the client has ALREADY received, so the opt-in
+// belongs where an operator names a deployment or a model — not on a shared
+// provider entry, whose every model would inherit it silently.
+func TestRecoveryStreamScopeIsTheDeployment(t *testing.T) {
+	rejects := []struct {
+		name string
+		data string
+	}{
+		{
+			"provider",
+			recoveryYAML("", "    recovery:\n      stream:\n        enabled: true\n",
+				"  m:\n    provider: pa\n    upstream-model: up-a\n"),
+		},
+		{
+			"candidate",
+			recoveryYAML("", "",
+				"  m:\n    providers:\n      - provider: pa\n        upstream-model: up-a\n"+
+					"        recovery:\n          stream:\n            enabled: true\n"),
+		},
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadRuntime([]byte(tc.data))
+			if err == nil {
+				t.Fatal("accepted, want rejection")
+			}
+			if !strings.Contains(err.Error(), "recovery.stream") {
+				t.Fatalf("err = %v, want the stream-scope position", err)
+			}
+		})
+	}
+
+	// The global and model positions accept the block, and the model's
+	// statement reaches every candidate of that model.
+	data := recoveryYAML(
+		"recovery:\n  stream:\n    enabled: true\n    max-recoveries: 2\n",
+		"",
+		"  m:\n    providers:\n"+
+			"      - provider: pa\n        upstream-model: up-a\n"+
+			"      - provider: pb\n        upstream-model: up-b\n"+
+			"    recovery:\n      stream:\n        enabled: true\n        max-elapsed: 30s\n")
+	m := recoveryModel(t, data, "m")
+	if len(m.Chain) != 2 {
+		t.Fatalf("chain = %d candidates, want 2", len(m.Chain))
+	}
+	for i, cand := range m.Chain {
+		if !cand.Recovery.Stream.Enabled {
+			t.Fatalf("candidate %d did not inherit the stream opt-in", i+1)
+		}
+		// The model stated only the window; the reach and the partial bound
+		// are inherited from the global layer.
+		if cand.Recovery.Stream.MaxElapsed != 30*time.Second {
+			t.Fatalf("candidate %d window = %v, want the model's 30s", i+1, cand.Recovery.Stream.MaxElapsed)
+		}
+		if cand.Recovery.Stream.MaxRecoveries != 2 {
+			t.Fatalf("candidate %d recoveries = %d, want the global 2", i+1, cand.Recovery.Stream.MaxRecoveries)
+		}
+	}
+
+	// Turning it off at the model position forces the reach to zero rather
+	// than leaving the global layer's bound in place — a disabled policy that
+	// stated a reach it cannot use is a contradiction, not an inheritance.
+	off := recoveryModel(t, recoveryYAML(
+		"recovery:\n  stream:\n    enabled: true\n    max-recoveries: 2\n",
+		"",
+		"  m:\n    provider: pa\n    upstream-model: up-a\n"+
+			"    recovery:\n      stream:\n        enabled: false\n"), "m")
+	if off.Recovery.Stream.Enabled || off.Recovery.Stream.MaxRecoveries != 0 {
+		t.Fatalf("a model opt-out resolved to %+v, want a disabled zero-reach policy", off.Recovery.Stream)
 	}
 }
