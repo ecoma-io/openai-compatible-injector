@@ -2243,6 +2243,18 @@ walk:
 			// The hop's key becomes the next hop's preference, so rotation
 			// state moves forward with the flow instead of being re-derived.
 			credKey = dial.credKey
+			// ... and it is what the completion record must name, for the
+			// same reason `credKey` moves: when a hop rotates off a key the
+			// walk committed on, the last bytes the client received came out
+			// under the HOP's key. Reporting the walk's would attribute an
+			// answer to an account that did not produce it — the one field on
+			// the completion record an operator reads to line a rate limit up
+			// with a key. A candidate with no pool leaves it empty, so the
+			// record keeps saying nothing rather than naming a previous
+			// candidate's key.
+			if dial.credKey != "" {
+				lastCredentialID = dial.credKey
+			}
 			// The hop's own egress evidence, relayed exactly where the walk
 			// relays its own: one WARN per endpoint a pool actually dialed
 			// and lost, before any disposition is reached, carrying the
@@ -2321,6 +2333,22 @@ walk:
 				// error shape, capture outcome — this hop's answer never
 				// had. Emitting a thin one under the same slug would be
 				// read as a walk event that lost its fields.
+				//
+				// A 429 marks the KEY, exactly as it does on the walk's own
+				// answer path, and for the same reason: a rate limit is an
+				// account fact, so the account this hop went out with is out
+				// of rotation however the recovery itself ends. Without this
+				// the mark is walk-only, and a provider that answers the
+				// COMMITTING stream with 429 (rather than cutting it) would
+				// leave its key in rotation — the next request would acquire
+				// the same key in cursor order and be rate-limited again, so
+				// the continuation would be what silently defeats the
+				// rotation the pool exists to provide. The mark is taken off
+				// the raw status, before the body is closed and never read.
+				if dial.resp.StatusCode == http.StatusTooManyRequests && answer.pool != nil && dial.credKey != "" {
+					answer.pool.MarkRateLimited(eng.Now(), dial.credKey,
+						credentialCooldown(parseRetryAfter(dial.resp.Header.Get("Retry-After"), eng.Now()), answer.cand.Cred.RateLimit))
+				}
 				recoveryFailed("upstream_status", nil, dial.resp.StatusCode)
 				_ = dial.resp.Body.Close()
 				break

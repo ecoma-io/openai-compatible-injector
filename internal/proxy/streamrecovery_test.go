@@ -17,6 +17,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/transport"
 )
 
@@ -1709,5 +1710,73 @@ func TestStreamRecoveryWindowOwnsACommittedRelayCutIt(t *testing.T) {
 	}
 	if ev := logBuf.events(t, "stream_recovery_failed"); len(ev) != 0 {
 		t.Errorf("a bound-owned cut was reported as a hop failure: %v", ev)
+	}
+}
+
+// TestStreamRecoveryHop429MarksTheCredential closes the gap that made the
+// credential seam dead on the continuation path: every other recovery test
+// wires `NewHandler(..., nil, ...)`, so `hop.pool` is always nil and a
+// continuation has never once been observed against a real rotation pool.
+//
+// The defect it pins: a rate limit is an ACCOUNT fact, so the account a hop
+// went out with must leave rotation however the recovery ends. `MarkRateLimited`
+// used to be called on the walk's answer path only, which made the mark
+// walk-only — a provider answering the COMMITTING stream with 429 (rather
+// than cutting it) left its key in rotation, and the next request acquired the
+// same key in cursor order. The continuation would then be the thing that
+// silently defeats the rotation the pool exists to provide.
+func TestStreamRecoveryHop429MarksTheCredential(t *testing.T) {
+	store := newCredChainRecoveryStore(t)
+	creds := credential.NewRegistry()
+	pool := credPool(t, store, creds)
+
+	pa := &scriptedDoer{}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pa}, creds, nil, nil, log)
+
+	// The committed stream is cut, so a hop is made — and the hop is answered
+	// with 429, the shape that only reaches the status branch on a hop.
+	pa.script = []dialFunc{
+		sseCut(sseChat("Hello")),
+		func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(&errBody{data: []byte(`{"error":"rate limited"}`)}),
+			}, nil
+		},
+	}
+	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the hop", pa.dials())
+	}
+
+	// The hop went out under a key. That key must now be cooling, so the NEXT
+	// request cannot acquire it.
+	var used string
+	for _, ev := range logBuf.events(t, "stream_recovery_failed") {
+		if ev["phase"] == "upstream_status" {
+			used, _ = ev["upstream_credential_id"].(string)
+		}
+	}
+	if used == "" {
+		t.Fatal("the 429 hop named no credential id; cannot tell which key to check")
+	}
+	// The handler marks against the REAL clock (no frozen test clock is wired
+	// here), so the check reads the real one: asking at the frozen instant
+	// would predate the deadline and report the key as ready.
+	after := time.Now()
+	if until := pool.CoolingUntil(after, used); until.IsZero() {
+		t.Errorf("credential %q was NOT marked rate-limited by the hop's 429", used)
+	}
+	// And the state is real: an Acquire that PREFERS the key the hop used must
+	// skip it. The pool still has a healthy key, so this is a rotation, not a
+	// refusal — what matters is that the rate-limited one is not handed out.
+	next, ok := pool.Acquire(after, used)
+	if !ok {
+		t.Fatalf("no credential was acquirable at all: %q", used)
+	}
+	if next.ID == used {
+		t.Errorf("credential %q was still acquirable after a 429", used)
 	}
 }
