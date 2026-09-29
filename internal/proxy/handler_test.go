@@ -1852,8 +1852,12 @@ func TestUpstreamHTTPErrorStalledCaptureRetainedAnswersInvalid(t *testing.T) {
 		t.Errorf("body:\n got %s\nwant %s", body, envelopeUpInvalid)
 	}
 	completed := findLogEvent(t, logs.String(), "request_completed")
-	if completed["outcome"] != "upstream_read_failed" {
-		t.Errorf("outcome = %v, want upstream_read_failed", completed["outcome"])
+	// The capture stalled past the capture deadline (the envelope is an hour
+	// under the test clock, so only the capture's own 50 ms deadline can bind):
+	// an answer did arrive with a status, so the 502 is the invalid-response
+	// cause, never a read failure.
+	if completed["outcome"] != "upstream_invalid_response" {
+		t.Errorf("outcome = %v, want upstream_invalid_response", completed["outcome"])
 	}
 	if completed["final_provider"] != "pa" || completed["final_candidate"] != float64(1) {
 		t.Errorf("final = %v/%v, want pa/1", completed["final_provider"], completed["final_candidate"])

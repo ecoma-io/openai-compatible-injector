@@ -1802,7 +1802,7 @@ func (e *budgetScriptExecutor) Execute(ar *transport.AttemptRequest) (*http.Resp
 	e.mu.Unlock()
 	info := transport.AttemptInfo{Kind: "direct", Target: "direct"}
 	for i := 0; i < e.perCall; i++ {
-		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+		if ar.Budget != nil && !ar.Budget.AcquireExchange().Granted {
 			info.BudgetExhausted = true
 			if info.Attempts == 0 {
 				// The same distinction poolDoer draws: an envelope that

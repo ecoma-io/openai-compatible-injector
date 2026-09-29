@@ -238,7 +238,9 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 		// The pool owns the egress loop and claims its own exchanges; the hop
 		// hands it the same facts the walk does, including the request's
 		// envelope, so a continuation pays for its dials out of the same
-		// budget rather than around it.
+		// budget rather than around it. No stream flag: whether the answer is
+		// an event stream is read from its own content type at
+		// acceptHopAnswer, never assumed from the request that asked for it.
 		dial.resp, dial.info, dial.err = ex.Execute(&transport.AttemptRequest{
 			Ctx:       bounds.ctx,
 			Method:    http.MethodPost,
@@ -252,7 +254,18 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 		// One dial, claimed here exactly as the walk claims it: the envelope
 		// counts real exchanges, so a direct hop is one unit and a refused
 		// claim is a hop that never reached the wire.
-		if !hop.budget.ConsumeExchange() {
+		//
+		// The hop does NOT take the envelope's own time bound, and the
+		// asymmetry is deliberate. This dial runs under the recovery window's
+		// context (bounds.ctx), which already cuts a hop that stalls before
+		// headers — at the bound derived from `stream.max-elapsed`, the one
+		// number that path's configuration actually states. Applying the
+		// request envelope's elapsed half on top would bound a continuation
+		// with a number the continuation's own policy does not name, and
+		// would report that cut as the endpoint's timeout when it is
+		// this proxy's own `max_elapsed` (the window's flag, checked first at
+		// the failure read below). One bound per hop, owned by the window.
+		if !hop.budget.AcquireExchange().Granted {
 			dial.phase = "budget"
 			return dial
 		}
@@ -601,6 +614,16 @@ func (b *boundBody) Close() error {
 	b.once.Do(b.release)
 	return err
 }
+
+// Unwrap exposes the body this wrapper was placed on. It changes nothing about
+// how the body reads or closes — the release still rides Close, and only
+// Close — and it exists for one caller: transport.HandoffStream, which needs
+// to reach the exchange window underneath to disarm it once a hop's answer is
+// confirmed to be an event stream. A hop through a POOLED member carries a
+// window from the transport under the pool's own permit wrapper, and this is
+// the third layer above it; without this method the handoff would stop at the
+// hop and the window would cut a stream the client already holds.
+func (b *boundBody) Unwrap() io.ReadCloser { return b.ReadCloser }
 
 // continuationEligible reports whether a finished relay pass ended in the one
 // way a continuation can answer: the stream stopped without a terminal marker,

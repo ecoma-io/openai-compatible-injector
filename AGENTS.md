@@ -167,6 +167,16 @@ Boundaries a helpful-looking refactor will cross:
   back. The request envelope counts REAL outbound exchanges, one unit claimed by
   the transport immediately before each dial. A value above a cap REJECTS the file
   rather than being clamped.
+- **The exchange window reaches a buffered attempt through EOF, and stops at the
+  commitment — decided by the RESPONSE, never by the request's `stream` flag.** A
+  pre-commitment exchange is bounded end to end: a stalled header and a stalled
+  buffered body are the same window, and only `transport.HandoffStream`, called at a
+  confirmed `text/event-stream` and at the verbatim 3xx/204/304 relays, hands a body
+  out of it. Guessing the phase from the request (a `stream: true` answered with
+  `200 application/json`) re-opens the unbounded-pre-body hole #96 closed. A body the
+  window cuts is this proxy's own bound, so its evidence is
+  `error_cause: exchange_elapsed` over `failure_origin: envelope` — never a peer read
+  fault.
 - **What the matrix decides, the mechanical policies only size.** A retried
   failure waits a bounded backoff (initial, doubling to a ceiling, ± jitter); a
   fallback moves immediately with no inter-candidate wait; a retryable failure

@@ -581,7 +581,7 @@ func (e *twoMemberExecutor) Execute(ar *transport.AttemptRequest) (*http.Respons
 	// request byte (replay-safe), so the pool replays on member two with
 	// the SAME request — same bytes, same headers, same key.
 	for member := 0; ; member++ {
-		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+		if ar.Budget != nil && !ar.Budget.AcquireExchange().Granted {
 			return nil, transport.AttemptInfo{BudgetExhausted: true, Attempts: member}, errors.New("exchange budget exhausted")
 		}
 		e.mu.Lock()
