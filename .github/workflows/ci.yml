@@ -32,6 +32,24 @@ concurrency:
 permissions: read-all
 
 jobs:
+  # AGENTS.md is formatted by the pre-commit hook, so the artifact the
+  # reviewer inspected can differ from the one that lands. Check the checkout
+  # itself, and self-test the exact boundary so a permissive regression fails.
+  agents-guide-budget:
+    name: AGENTS guide budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exercise the budget boundary
+        run: ./scripts/check-agents-md-budget.sh --self-test
+
+      - name: Check the checked-out guide
+        run: ./scripts/check-agents-md-budget.sh
+
   verify:
     name: verify
     runs-on: ubuntu-latest
@@ -147,7 +165,7 @@ jobs:
     # so a future matrix job is still one entry; add a job here and the gate
     # tightens without editing repository settings — forgetting to add it is
     # the only way to widen what green means.
-    needs: [verify, pr-title, e2e]
+    needs: [agents-guide-budget, verify, pr-title, e2e]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

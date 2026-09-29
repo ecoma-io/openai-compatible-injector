@@ -46,6 +46,13 @@ pull request. A document that lags the code is a defect, not a follow-up.
 | `go test -fuzz FuzzRewriteModel -fuzztime 30s ./internal/inject/`                                                  | A 30-second fuzz run (also: `FuzzProbe`, `FuzzRewriteSSELine`, `FuzzLoadRuntime`)                              |
 | `go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector ./cmd/openai-compatible-injector` | Build the binary                                                                                               |
 | `pnpm format` / `pnpm format:check`                                                                                | Prettier over the docs, workflows, and config files                                                            |
+| `./scripts/check-agents-md-budget.sh`                                                                              | Check the checked-out `AGENTS.md` artifact is at most 40,000 bytes                                             |
+| `./scripts/check-agents-md-budget.sh --self-test`                                                                  | Exercise the exact 40,000-byte acceptance boundary and the one-byte rejection path                             |
+
+The guide budget check measures the checked-out artifact rather than a
+pre-commit working tree: lefthook may run Prettier after a contributor has
+measured the latter. It reports the actual size and exact overage, and its
+self-test pins both the 40,000-byte boundary and the one-byte failure path.
 
 Benchmarks never run in CI: every CI `go test` invocation omits `-bench`,
 and `go test` executes benchmark functions only under that flag. The one
