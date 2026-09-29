@@ -64,6 +64,39 @@ exists:
 and load-bearing, and nothing would fail if it broke. Every `GAP` is a
 Phase 1 deliverable, not an optional extra.
 
+### 0.1a What the safety net cannot reach
+
+Recorded here so a later reader does not mistake a green harness for a
+complete one. The outbound path has **no socket-level seam**:
+
+- `http.RoundTripper` appears in no non-test file.
+- `net.Conn` appears only inside `internal/transport` (the SOCKS5 dialer).
+- `DialContext` is assigned in exactly two places, both hardcoded locals:
+  `internal/transport/direct.go:64` and `internal/transport/proxy.go:47`.
+  It is never a struct field or an exported constructor parameter.
+
+`transport.sendStateOf` (`internal/transport/errors.go:256-275`) reads
+`ProxyAuthError`, `ProxyConnectError`, `*tls.CertificateVerificationError`,
+and the `dial`/`proxyconnect` ops of a `*net.OpError`. **Every other op is
+`send_unknown`, by construction.** So of the thirteen faults a fault-injection
+harness should express, two are injectable but INERT:
+
+| Fault                        | Why inert                                                                                                                                                               |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WriteFailAfterPartialWrite` | A `write` op carries no distinct send state; only the error text differs, and no production decision reads it.                                                          |
+| `RSTAfterHeaders`            | A real RST needs `SetLinger(0)` on a `*net.TCPConn`. A body `io.ReadCloser` cannot produce one, and a synthetic `ECONNRESET` is `send_unknown` exactly like a bare EOF. |
+
+A test asserting on those two asserts on the fake, not on the system. This is
+the repo's own position — `internal/transport/sendstate_test.go:17` says a
+hand-built `*net.OpError` "can only pin the mapping, never the shapes
+production actually produces".
+
+Closing the gap means adding a `DialContext func(ctx, network, addr)
+(net.Conn, error)` seam to `transport.Member` and threading it through
+`newBaseTransport()`. That is a **HARDEN** change, not a test change: it adds
+capability, so it lands in its own pull request with its own review, never
+inside a refactor that is only meant to move code.
+
 ### 0.2 Baseline drift
 
 If a change to this file's baseline table is accompanied by a claim that the
@@ -773,11 +806,18 @@ behavior.
   outcome.
 - **Regression tests**: `internal/proxy/streamrecovery_deadline_test.go` (739
   lines), `internal/proxy/streamrecovery_events_test.go` (1013 lines),
-  `TestStreamRecoveryWindowOwnsACommittedRelayCutIt`.
-  **GAP**: the exact interleavings (timer fires as headers arrive; timer
-  fires as handoff happens; handoff concurrent with timeout; body Close
-  concurrent with timeout) are exercised but not pinned as a dedicated
-  deterministic race matrix.
+  `TestStreamRecoveryWindowOwnsACommittedRelayCutIt`, and the deterministic
+  interleaving matrix in `internal/proxy/window_race_test.go`:
+  `TestWindowDeadlineMovesOnProgress` (the per-hop-reset tripwire),
+  `TestWindowArmBodyClosesAStalledBodyExactlyOnce`,
+  `TestHopBoundsHeaderWatchdogOwnsTheContextUntilPromote`,
+  `TestHopBoundsPromoteReplacesTheHeaderWatchdogWithABodyOne`,
+  `TestHopBoundsHeaderArrivingExactlyAtTheDeadlineLosesToTheWatchdog`,
+  `TestHopBoundsHeaderArrivingOneNanosecondBeforeTheDeadlineWins`,
+  `TestHopBoundsPromoteRefusesOnceTheHeaderWatchdogHasFired`,
+  `TestBoundBodyReleasesTheHopContextOnCloseAndOnlyOnClose`,
+  `TestBoundBodyUnwrapReachesTheBodyUnderneathForHandoff`,
+  `TestWindowProgressAndExpiryRace`, `TestHopBoundsReleaseRacesPromote`.
 
 ### INV-CONT-03 — The safety gate is fail-closed and the loop never deletes text
 
