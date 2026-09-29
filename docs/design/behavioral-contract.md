@@ -39,6 +39,52 @@ Per-package test surface: 988 test functions, 200 subtests — `internal/proxy`
 `internal/credential` 33, `internal/auth` 33, `internal/server` 15,
 `internal/memlimit` 7.
 
+### 0.0 Performance baseline (S5)
+
+45 benchmarks at the same commit, median of 6 runs, spread `(max-min)/median`.
+**37 are usable; 2 are flagged `marginal` and must not be used as a
+regression signal** — `EngineObserve/http_429_retry` (42.6% spread) and
+`PipelineRecordParallel/par1` (32.6%). Several transform and SSE rows are
+likewise too noisy for a threshold: `Transform/chat/1MB` at 128% spread and
+`CopySSEFragmented/read256` at only 1 sample. **A regression verdict needs a
+clean before/after pair on the same machine, not a comparison against a number
+whose own spread is 128%.**
+
+The numbers that are stable enough to matter, and the only ones any
+optimization claim will be measured against:
+
+| Surface                     | ns/op | B/op  | allocs/op |
+| --------------------------- | ----- | ----- | --------- |
+| `Budget.Acquire`            | 13.2  | 0     | 0         |
+| `Budget.Acquire` refused    | 2.0   | 0     | 0         |
+| `Budget.Acquire` /par32     | 123.6 | 0     | 0         |
+| `Pipeline.Record`           | 45.2  | 0     | 0         |
+| `StaticAuth`                | 1907  | 0     | 0         |
+| `Policy.Validate`           | 8.3   | 0     | 0         |
+| `Engine.Observe` 503 retry  | 392   | 0     | 0         |
+| `Engine.New`                | 165.6 | 592   | 2         |
+| `Engine.Walk` (any variant) | ~32µs | 21896 | 52        |
+| `Policy.Hash`               | 14675 | 11168 | 7         |
+
+`Engine.Walk` costs 21896 B and 52 allocs per walk **regardless of whether
+the walk retries once, twice, or falls back across two or three candidates**
+— the same numbers to the byte across five variants. That is the single most
+useful measurement in the set: the walk's per-candidate cost is not in the
+policy evaluation, it is somewhere upstream of it, and optimizing
+`recovery.Engine` cannot move a request's cost. Full table, including the
+injection-transform and SSE-relay rows, is the artifact referenced by
+`refactor-roadmap.md` §2 S5.
+
+**Transform repetition, the number island 10 needs.** A same-candidate retry
+re-transforms the request body on every attempt: the body is rebuilt and
+re-injected per attempt, not once per candidate and reused. `Transform/chat`
+at 1 MB is 93 ms / 10.3 MB / 63 allocs, against `chat_noinject` at 68 ms /
+5.3 MB / 38 allocs. With a `max-retries: 8` policy and a large body, the
+transform is the dominant per-attempt cost and it is paid once per attempt.
+Whether reuse is legal is a _semantics_ question, not a speed one — the reuse
+must not cross a boundary that changes model, transport or strip semantics —
+so this is Phase 4 work, measured here and not acted on now.
+
 ### 0.1 What the baseline does and does not freeze
 
 The suite is strong on **scenario** coverage: commitment, send-state
@@ -96,6 +142,52 @@ Closing the gap means adding a `DialContext func(ctx, network, addr)
 `newBaseTransport()`. That is a **HARDEN** change, not a test change: it adds
 capability, so it lands in its own pull request with its own review, never
 inside a refactor that is only meant to move code.
+
+### 0.1b Findings that are records, not changes
+
+Three audits (recovery/budget, adversarial, performance) each surfaced an
+item that is _correct today_ but is a hazard for a specific island. None is a
+defect, so none changes behaviour; they are recorded here so a refactor does
+not rediscover them as surprises.
+
+**A budget refusal is one condition deep.** Covered under INV-EG-02. The
+`attempts == 0` guard is now mutation-tested against the real `poolDoer`.
+
+**`Observation.Committed` is dead in-walk.** Covered under INV-REC-03. The
+commitment invariant is carried by control flow, not by the flag.
+
+**The hop deliberately discards its granted window.** `streamrecovery.go:277`
+takes `hop.budget.AcquireExchange().Granted` and drops `Window`, where the
+walk (`handler.go:1440-1454`) and the pool (`pool.go:399`) both bind it. This
+is intentional and documented at `streamrecovery.go:262-273`: the hop dials
+under the recovery window's context, which cuts a stalled hop at the bound
+`stream.max-elapsed` actually names, and applying the request envelope's
+elapsed half on top would report that cut as the endpoint's timeout when it is
+this proxy's own `max_elapsed`. One bound per hop, owned by the window. Left
+alone deliberately — island 7 must not "fix" the asymmetry.
+
+**Two documentation drifts**, both verified and neither behavioural:
+
+- `recovery/budget.go:252-254` says the transport "anchors [the window] on the
+  machine's own wall clock with `context.WithTimeout`". The code uses
+  `context.WithCancel(context.WithoutCancel(ctx))` plus a `time.AfterFunc`
+  armed through the `armWindow` seam (`transport.go:487, 459, 509-514`). Same
+  bound, wrong mechanism in the doc — and it is the exact document a future
+  reader will trust when reasoning about the window's clock.
+- `Budget.RemainingElapsed()` has no production caller, by its own doc comment
+  (`budget.go:274-278`). Retained deliberately as the package's read-only view.
+  Do not wire it into a wait ceiling during island 5; see INV-REC-08.
+
+**One gap that is real and deliberately not closed.** `retryDelay`
+(`engine.go:281-323`) bounds a wait by `Retry.MaxElapsed` and the caller's
+deadline, and never consults `Budget.Request.MaxElapsed`. A request whose
+envelope has already elapsed can therefore sleep out a `Retry-After` ceiling
+before the next `AcquireExchange` refuses the dial. This is **not** a
+violation of any stated invariant — the four ceilings AGENTS.md names are the
+directive ceiling, the backoff ceiling, the candidate's remaining
+`max-elapsed`, and the caller's deadline, and all four hold. The request
+envelope is simply not a fifth. Recorded rather than changed: adding it would
+be a behaviour change, and this is the phase where behaviour does not move.
 
 ### 0.2 Baseline drift
 
@@ -179,7 +271,17 @@ to run, and it must be re-run after any refactor touching that invariant.
   `TestProxyRequestIDAbsentOnHealthz`, `TestStreamRecoveryHopForwardsTheSameRequestID`,
   `TestProxyRequestIDSurvivesAMidRequestReload`,
   `TestUpstreamRequestIDHeadersAreNotRelayed`,
-  `TestClientRequestIDNeverReachesTheLogs`.
+  `TestClientRequestIDNeverReachesTheLogs`,
+  `TestUsageRequestIDIsTheOneTheClientWasGiven`,
+  `TestUsageRequestIDIgnoresTheClientSuppliedOne`
+  (`internal/proxy/usage_identity_test.go`).
+
+  The last two are the **join** this invariant exists for. Every other
+  citation checks one surface in isolation; none asserted that the usage row
+  and the response header carry the _same_ value. They read one local today,
+  so they cannot diverge without a future change routing one through a
+  different source — which is exactly the regression they make loud. Both are
+  mutation-verified: re-minting at `handler.go:600` fails them.
 
 ### INV-LIFE-05 — One request binds one immutable snapshot
 
@@ -393,7 +495,23 @@ behavior.
 - **Regression tests**: `TestProviderChainStreamingCommitment`,
   `TestProviderChainStreamDeathAfterCommitment`,
   `TestStreamRecoveryWindowOwnsACommittedRelayCutIt`,
-  `TestCredentialSSECommitEndsRotation`.
+  `TestCredentialSSECommitEndsRotation`, `TestEngineCommittedIsAbsolute`.
+
+  **The flag is provably dead on every in-walk path; the control flow is what
+  protects this.** `answer` is assigned only immediately before `break walk`
+  (`handler.go:1825, 1839, 1855, 1970, 2034, 2045`), and every in-walk
+  observation reads `Committed: answer != nil` (`:1226, 1540, 1709, 1938,
+1997`) — on all of which `answer` is provably nil, because every assignment
+  is followed by the `break`. The `engine.go:174-176` gate is therefore
+  unreachable from the handler, and the invariant is upheld structurally by
+  two independent walls: the gate, and the absence of a call path.
+
+  Recorded because it is a landmine for island 6 (commitment as a type). A
+  refactor that set `answer` earlier — to hold a response while re-asking —
+  would begin exercising a path nothing covers, and the flag would appear to
+  be doing work it has never done. Island 6 must either keep the "assign only
+  before the break" shape or add a test asserting the flag is never true
+  in-walk.
 
 ### INV-REC-04 — The last received answer wins, including retention
 
@@ -546,6 +664,27 @@ behavior.
 - **Observable**: Per-member request counts; the handler's candidate path.
 - **Regression tests**: `internal/transport/pool_test.go`,
   `internal/transport/pool_sched_test.go`, `e2e/egress_test.go`.
+
+  **An envelope refusal is not an endpoint verdict, and the load-bearing link
+  is a single condition.** `poolDoer` refuses a dial the request envelope will
+  not fund, and `handler.go:1502-1507` reads a first-dial refusal as
+  `egress_exhausted` / `no_eligible_endpoint`. That rewrite is correct only
+  because of `if attempts == 0` at `pool.go:381`, which suppresses the
+  zero-dial exhaustion sentinel on a budget refusal. Remove it and a dial this
+  proxy declined to make is reported as though every pool member were
+  ineligible — blaming endpoints for nothing.
+
+  `TestPoolRefusesTheDialWhenTheEnvelopeIsSpent`,
+  `TestPoolRefusalAfterADialKeepsTheEndpointFailureInForce`,
+  `TestPoolRefusalReturnsTheMemberPermit`,
+  `TestPoolRefusalReleasesTheStateLease`,
+  `TestPoolWithoutABudgetDialsAsUsual`
+  (`internal/transport/pool_budget_refusal_test.go`) drive the **real**
+  `poolDoer`. A fake repeating the same `attempts == 0` condition would pass
+  unchanged when `pool.go`'s copy is deleted — which is the shape of test that
+  makes a guard look covered while leaving it uncovered. Mutation-verified:
+  deleting the guard fails three of the five, with
+  `egress pool: no eligible endpoint available` naming the defect.
 
 ### INV-EG-03 — Lock order and no I/O under a lock
 
@@ -883,9 +1022,21 @@ behavior.
   being a discarded object; two rows for one request.
 - **Observable**: The usage event count and its columns.
 - **Regression tests**: `internal/proxy/usage_test.go`, `internal/usage`
-  suite. **GAP**: the "one event across a hop sequence" property is asserted
-  per-scenario; there is no fingerprint assertion that counts events across
-  a multi-hop stream.
+  suite, plus `TestUsageDisconnectIsMeteredExactlyOnceWithNoTokens` and
+  `TestUsageDisconnectAfterAnExchangeReportsTheAttemptHonestly`
+  (`internal/proxy/usage_identity_test.go`). **GAP**: the "one event across
+  a hop sequence" property is asserted per-scenario; there is no fingerprint
+  assertion that counts events across a multi-hop stream.
+
+  The disconnect case is pinned separately because the completion record and
+  the metered row are two different emissions and only the row was unverified.
+  `outcome: client_disconnected` is asserted in ~15 places across the logging,
+  pool, fallback and stream-recovery suites — what none of them checked is
+  that a disconnect still produces **exactly one usage row**, with a
+  non-zero `provider_attempts` and NULL token columns. A disconnect is a
+  request the upstream billed for; dropping the row is silent revenue loss.
+  Mutation-verified: deleting `complete()` from the caller-cancel exit
+  (`handler.go:1586`) fails both tests.
 
 ### INV-USG-03 — The three `egress_attempts` are three different things
 
