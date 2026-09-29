@@ -1747,15 +1747,22 @@ walk:
 					withCredentialFields(event, credKey).Msg("upstream_http_error")
 				} else {
 					w := log.Warn().Str("public_model", model)
-					if cerr == captureDeadline {
+					// The two bounded causes are named by their own
+					// sentinel rather than by the error's type, and they
+					// are NOT the same owner: the capture deadline is this
+					// proxy's fixed internal read timer, while the envelope
+					// is the candidate's exchange window. The first is a
+					// protocol bound, the second belongs to the budget.
+					switch cerr {
+					case captureDeadline:
 						w = w.Str("error_class", "upstream_error_body_timeout").
 							Str("error_cause", "capture_deadline_exceeded").
 							Str("failure_origin", "protocol")
-					} else if cerr == captureEnvelopeElapsed {
+					case captureEnvelopeElapsed:
 						w = w.Str("error_class", "upstream_error_body_timeout").
 							Str("error_cause", "exchange_elapsed").
 							Str("failure_origin", "envelope")
-					} else {
+					default:
 						w = w.Str("error_class", "upstream_error").
 							Str("error_cause", "body_read_failed").
 							Str("failure_origin", "protocol")
