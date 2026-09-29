@@ -375,7 +375,7 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			}
 			break
 		}
-		resp, err := ms.client.Do(req)
+		resp, err := DialWithDeadline(ar.Budget, ar.Ctx, ms.client, req)
 		attempts++
 		info.Attempts = attempts
 		info.Kind = p.pool.Members[idx].Endpoint.kindName()

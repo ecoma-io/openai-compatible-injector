@@ -173,3 +173,45 @@ func (b *Budget) CandidateExchanges() int {
 	defer b.mu.Unlock()
 	return b.candUsed
 }
+
+// RemainingElapsed is how much wall-clock time the exchange envelopes still
+// allow before an exchange that starts now must have finished: the smaller
+// of the two envelopes' remaining elapsed halves, each measured on this
+// budget's own clock (the request's from NewBudget, the candidate's from
+// BeginCandidate).
+//
+// It is what makes `max-elapsed` a bound on an exchange itself rather than
+// only a gap between exchanges. The elapsed halves are otherwise consulted at
+// exactly two moments — before a wait is scheduled, and before a dial is
+// claimed — and both are before the exchange that then blocks for as long as
+// the peer makes it. A provider that completes the handshake and sends no
+// status line parks the walk in Do until the client gives up, which no
+// operator-set number prevents. A timeout the transport applies to the
+// exchange itself is the only place that wait can be cut.
+//
+// It returns a remaining DURATION measured on this budget's clock, not an
+// absolute instant: the transport anchors it on the machine's own wall clock
+// with context.WithTimeout. In production the two clocks are the same reading.
+// In tests the policy clock is a fake the test advances by hand, and a fake
+// clock that has barely ticked must report a full remaining window rather
+// than an absolute period anchored to the fake's epoch — otherwise every dial
+// under a slow test clock would fire instantly. A spent window (the returned
+// duration is zero or negative) is reported as-is: the caller is about to
+// spend real outbound traffic, and a spent envelope is ConsumeExchange's
+// answer to refuse, not this method's. Clamping here would hand the transport
+// a fresh window and turn a spent envelope into one more dial.
+//
+// The smaller of the two, not the candidate's alone: an exchange is funded by
+// both envelopes, so an exchange outliving either one outlives a bound that
+// was written to hold it. In the shipped defaults the candidate window is the
+// tighter of the two, so this reduces to the candidate's ceiling whenever an
+// operator has not set a request window shorter than the candidate's.
+func (b *Budget) RemainingElapsed() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	rem := b.req.MaxElapsed - b.now().Sub(b.start)
+	if cand := b.cand.MaxElapsed - b.now().Sub(b.candStart); cand < rem {
+		rem = cand
+	}
+	return rem
+}
