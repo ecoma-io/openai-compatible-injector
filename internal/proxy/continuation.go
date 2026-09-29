@@ -19,14 +19,22 @@ const (
 // text — the same rule the transport's attempt failures follow — because they
 // are logged verbatim and an error string can carry upstream bytes.
 //
-// Six of them describe what the accumulator SAW; partialText.Verdict produces
-// reasonNoPrefix for the one case where it saw nothing at all.
+// Seven of them describe what the accumulator SAW; partialText.Verdict
+// produces reasonNoPrefix for the one case where it saw nothing at all.
 const (
 	// reasonToolCalls — the stream assembled a tool call. Arguments are
 	// accumulated by the CLIENT across deltas, so a continuation that
 	// re-asks the model cannot reproduce the exact byte sequence those
 	// deltas are opening, and a second call would execute twice.
 	reasonToolCalls = "tool_calls"
+	// reasonRefusal — the stream carried the upstream's refusal CHANNEL: a
+	// response.refusal.delta event, or a response.refusal.done whose refusal
+	// is non-empty. A refusal is not assistant text (the model declined to
+	// answer), so it is never accumulated, and its arrival is its own
+	// refusal rather than a generic upstream terminal: the generation was
+	// not cut short and the upstream did not fail — the model said no, and
+	// no continuation of the message it declined to write exists.
+	reasonRefusal = "refusal"
 	// reasonUpstreamTerminal — the upstream declared the stream over in a way
 	// the relay's terminal predicate does not recognize: a chat error event,
 	// or a Responses response.failed/response.incomplete/response.error. Not
@@ -160,6 +168,26 @@ type partialText struct {
 	streamBound  bool
 	contentIndex int
 	streamKind   string
+	// Chat choice provenance. A Chat stream addresses its answer by
+	// choices[i].index — the same identity the Responses surface states as
+	// output_index — and the accumulator is held to the same standard for it:
+	// the index must be PRESENT on every chunk that carries a choice, and it
+	// must be the one the committed prefix has been read from.
+	//
+	// The value this proxy can continue is the FIRST choice, index 0. It does
+	// not assume that: a chunk whose index is absent, null, non-integer or
+	// negative proves no provenance and is refused as unknown_shape, and a
+	// chunk whose index disagrees with the bound one — or is any nonzero
+	// value, which is the same statement about a one-choice prefix — is
+	// refused as multiple_outputs, exactly as a second message item on the
+	// Responses surface is. So a provider that streams choice 1 alone, or
+	// that renumbers its choices mid-stream, is refused rather than spliced.
+	//
+	// The binding is per upstream response like the Responses identity, but
+	// the reset is behaviorally inert: 0 is the only value that ever binds,
+	// so a hop's own first chunk binds the same value the committed pass did.
+	choiceBound bool
+	choiceIndex int
 	// passStart is where the CURRENT upstream response's own accumulation
 	// begins in text. Everything before it was relayed from an earlier
 	// response of the same logical stream, and the identity above describes
@@ -210,6 +238,11 @@ func (p *partialText) beginUpstreamStream() {
 	p.passStart = len(p.text)
 	p.itemSeen, p.itemBound, p.itemID, p.outputIndex = false, false, "", 0
 	p.streamBound, p.contentIndex, p.streamKind = false, 0, ""
+	// Chat's choice index is an identity too, and belongs to the response
+	// that stated it. The reset is inert in practice — 0 is the only index
+	// that ever binds — and is kept so the two surfaces' identities are
+	// scoped identically rather than by a per-surface argument.
+	p.choiceBound, p.choiceIndex = false, 0
 }
 
 // passText returns the region of text this upstream response contributed. It is
@@ -346,21 +379,22 @@ func (p *partialText) observeChatChunk(obj map[string]json.RawMessage) {
 	}
 	// n>1 streams several independent answers over one connection. Their
 	// deltas interleave on the wire, so accumulating them into one prefix
-	// would splice answers together. Refused rather than guessed at: a
-	// continuation of a multi-choice stream is not something this proxy can
-	// reason about, and the request is one the client can simply repeat.
+	// would splice answers together. Refused rather than guessed at, and with
+	// the token that names the fact: this is a multi-output stream, not an
+	// unrecognized shape, and it is refused for the same reason a Responses
+	// response carrying two message items is.
 	if len(choices) > 1 {
-		p.refuse(reasonUnknownShape)
+		p.refuse(reasonMultipleOutputs)
 		return
 	}
 	for _, choice := range choices {
-		raw, ok := choice["delta"]
-		if !ok || jsonNull(raw) {
-			// A choice with no delta is a structural chunk (role-only
-			// opening, or a bare finish_reason). The finish_reason check
-			// below handles the terminal case; there is no content to
-			// accumulate here.
-		} else {
+		// The delta is read first, so that a tool call is refused under its
+		// OWN token: it is the more specific fact about the stream, and a
+		// chunk that both calls a tool and mis-states its provenance must not
+		// report the weaker of the two.
+		var content string
+		var hasContent bool
+		if raw, ok := choice["delta"]; ok && !jsonNull(raw) {
 			var delta map[string]json.RawMessage
 			if err := json.Unmarshal(raw, &delta); err != nil {
 				p.refuse(reasonUnknownShape)
@@ -378,29 +412,38 @@ func (p *partialText) observeChatChunk(obj map[string]json.RawMessage) {
 				p.refuse(reasonToolCalls)
 				return
 			}
-			content, ok := delta["content"]
-			if ok && !jsonNull(content) {
-				var s string
-				if err := json.Unmarshal(content, &s); err != nil {
+			if raw, ok := delta["content"]; ok && !jsonNull(raw) {
+				if err := json.Unmarshal(raw, &content); err != nil {
 					// A structured (multi-part) content value is not text
 					// this accumulator can splice back into a request.
 					p.refuse(reasonUnknownShape)
 					return
 				}
-				p.append(s)
-				if p.unsafe != "" {
-					return
-				}
+				hasContent = true
 			}
 			// If the delta carried nothing but the finish_reason, the
 			// accumulator is unchanged — the logical terminal below will
 			// latch without discarding anything.
 		}
+		// Provenance, proven BEFORE any of this chunk's text enters the
+		// prefix. A choice that does not state which answer it belongs to (or
+		// states one the prefix was not read from) is a stream whose prefix
+		// has no single origin, and the text of such a chunk must never be
+		// folded into a continuation body even momentarily.
+		if !p.bindChoiceIndex(choice) {
+			return
+		}
+		if hasContent {
+			p.append(content)
+			if p.unsafe != "" {
+				return
+			}
+		}
 		// The finish_reason check runs AFTER reading the delta. A chunk
 		// carrying BOTH content and finish_reason accumulates the content,
 		// then latches the logical terminal — it does NOT discard the
 		// prefix. Only an explicit refusal (tool_calls, oversize,
-		// unknown_shape) clears the text.
+		// unknown_shape, multiple_outputs) clears the text.
 		if raw, ok := choice["finish_reason"]; ok && !jsonNull(raw) {
 			p.finish()
 			return
@@ -411,9 +454,88 @@ func (p *partialText) observeChatChunk(obj map[string]json.RawMessage) {
 	}
 }
 
-// observeResponsesEvent reads one Responses envelope event. The text arrives
-// as output_text/refusal deltas; everything else is a refusal, an item
-// announcement, or a lifecycle event.
+// bindChoiceIndex proves that one Chat choice belongs to the single answer the
+// committed prefix has been read from, reading choices[i].index with the same
+// rule the Responses identity members follow: a missing, null, non-integer or
+// negative index is unprovable provenance, and an index that differs from the
+// one already bound — including a nonzero first index, which says the stream
+// carries a choice other than the first — is a multi-output stream.
+//
+// It reports whether the chunk's content may be accumulated. Nothing is
+// accumulated when it reports false: the caller returns immediately.
+func (p *partialText) bindChoiceIndex(choice map[string]json.RawMessage) bool {
+	index, ok := responsesIndexMember(choice, "index")
+	if !ok {
+		p.refuse(reasonUnknownShape)
+		return false
+	}
+	if !p.choiceBound {
+		p.choiceBound, p.choiceIndex = true, index
+	}
+	if p.choiceIndex != index || p.choiceIndex != 0 {
+		p.refuse(reasonMultipleOutputs)
+		return false
+	}
+	return true
+}
+
+// observeResponsesEvent reads one Responses envelope event, dispatching it
+// into one of the accumulator's event classes. The classification is
+// deliberate and exhaustive-by-default: an event belongs to a class only
+// because of a property that class states, and anything left over is
+// fail-closed.
+//
+// The classes, and why each event is in the one it is in:
+//
+//	A. TEXT — the assistant text the client received.
+//	   response.output_text.delta / .done. Accumulated, under the identity
+//	   contract bindTextStream proves.
+//	B. REFUSAL — the model declined. response.refusal.delta / .done. Never
+//	   accumulated; a refusal latches reasonRefusal. (See
+//	   observeResponsesRefusalDelta and observeResponsesRefusalDone.)
+//	C. CALLS — a tool, an interpreter, a search or any other machine-readable
+//	   surface. Load-bearing as a whole: their arguments are assembled by the
+//	   CLIENT across events, so no prefix of them can be continued. A call
+//	   announces itself as response.output_item.added with a non-message item
+//	   type, which observeResponseItem refuses before ANY of the call's own
+//	   events can arrive; the two argument families whose deltas are listed
+//	   here are enumerated so that a stream whose announcement was lost is
+//	   still refused under the same token rather than the generic one.
+//	D. FAILURE — response.failed / .incomplete / .error: the upstream
+//	   declared the generation over without finishing it.
+//	E. BOUND — events that name the text content part the prefix was read
+//	   from: response.content_part.added / .done and
+//	   response.output_text.annotation.added. They are held to the delta
+//	   identity contract and then ignored, and a refusal part is detected
+//	   rather than ignored. What makes the IGNORE sound is the shape of the
+//	   part, not the identity: the part's `type` is the same claim the deltas
+//	   make, and for an `output_text` part a payload whose `text` disagrees
+//	   with what this pass accumulated is a shape this build does not read —
+//	   see observeContentPart and issue #101. (response.output_text.done, by
+//	   contrast, is class A: its text IS read, because that event does state
+//	   the output text in full.)
+//	F. METADATA — response.created / .queued / .in_progress / .completed and
+//	   the reasoning channel (reasoning_text.*, reasoning_summary_*). The
+//	   reasoning channel is a SEPARATE output the client renders beside the
+//	   message, not part of it, so its text is not assistant text and is not
+//	   accumulated; the envelope's own status events carry no output at all.
+//
+// Anything else is refused as unknown_shape. That default is the rule, not a
+// fallback: this parser must never become an "ignore whatever you do not
+// recognize" pass-through, because the events it would ignore are exactly the
+// ones a future upstream could use to stream text this proxy would then omit
+// from a continuation body.
+//
+// The event class comes from the DATA PAYLOAD alone, and that is the whole of
+// the evidence: the SSE `event:` line that precedes it is not passed to
+// `observe` at all, so the class is read from the payload's own `type` member
+// and the two are never compared. The relay's terminal predicate makes the
+// opposite choice deliberately — it trusts `event: response.completed` and
+// explicitly refuses a data payload naming it — because for a terminal marker
+// the safe error is to send one more event, while for the safety gate it is
+// not. That asymmetry is tracked as issue #100 rather than resolved here:
+// refusing on a mismatch is a behaviour change, not a fix, and it belongs to
+// the issue.
 func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 	raw, ok := obj["type"]
 	if !ok {
@@ -426,37 +548,50 @@ func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 		return
 	}
 	switch typ {
+	// A. TEXT
 	case "response.output_text.delta":
 		// A text delta is only accumulated once its identity has been proven
 		// to match the ONE message output and content stream this prefix has
-		// been read from. A refusal delta is held to the same identity: it is
-		// a different channel of the SAME content stream, and switching
-		// channels mid-prefix would splice a decline into an answer.
+		// been read from.
 		p.appendDelta(typ, obj)
-	case "response.refusal.delta":
-		p.appendDelta(typ, obj)
-	case "response.output_item.added":
-		p.observeResponseItem(obj)
-	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-		p.refuse(reasonToolCalls)
-	case "response.failed", "response.incomplete", "response.error":
-		p.refuse(reasonUpstreamTerminal)
 	case "response.output_text.done":
 		p.observeResponsesTextDone(obj)
+
+	// B. REFUSAL
+	case "response.refusal.delta":
+		p.observeResponsesRefusalDelta()
 	case "response.refusal.done":
 		p.observeResponsesRefusalDone(obj)
+
+	// C. CALLS
+	case "response.output_item.added":
+		p.observeResponseItem(obj)
+	case "response.output_item.done":
+		p.observeResponseItemDone(obj)
+	case "response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
+		p.refuse(reasonToolCalls)
+
+	// D. FAILURE
+	case "response.failed", "response.incomplete", "response.error":
+		p.refuse(reasonUpstreamTerminal)
+
+	// E. BOUND
+	case "response.content_part.added", "response.content_part.done":
+		p.observeContentPart(obj)
+	case "response.output_text.annotation.added":
+		p.observeAnnotation(obj)
+
+	// F. METADATA
 	case "response.created", "response.queued", "response.in_progress",
-		"response.output_item.done",
-		"response.content_part.added", "response.content_part.done",
+		"response.completed",
 		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
 		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-		"response.reasoning_text.delta", "response.reasoning_text.done",
-		"response.completed":
+		"response.reasoning_text.delta", "response.reasoning_text.done":
 		// Structural lifecycle and reasoning-channel events. None carries
-		// client-visible assistant text — the reasoning channel is a
-		// separate output the client renders beside the message, not part of
-		// it — and a Responses stream is largely made of them, so refusing
-		// here would refuse every Responses stream.
+		// client-visible assistant text and a Responses stream is largely
+		// made of them, so refusing here would refuse every Responses
+		// stream.
 	default:
 		// An event this build does not know. It is assumed to matter until
 		// proven otherwise: an unrecognized event is one that could have
@@ -509,6 +644,26 @@ func (p *partialText) observeResponsesTextDone(obj map[string]json.RawMessage) {
 	}
 }
 
+// observeResponsesRefusalDelta latches the refusal the refusal channel opened.
+//
+// It takes no payload, and that is the design rather than an accident: the
+// delta member of a response.refusal.delta event is the model's decline, which
+// must never reach the continuation body — the proxy would be asking the model
+// to continue a sentence it refused to write — so the accumulator refuses the
+// stream without ever looking at those bytes. There is no branch on the
+// payload's value for refusal text to slip through, and an empty or unreadable
+// refusal delta, a shape no conforming upstream emits, is not worth the hole
+// such a branch would open.
+//
+// The refusal is latched for the LOGICAL STREAM: beginUpstreamStream resets
+// identities, never latches, so a later hop's clean text deltas cannot release
+// it. refuse() also releases whatever prefix was accumulated, so no part of
+// the answer the client already saw can be put into a continuation body either
+// — the whole stream is refused, not just the declined part of it.
+func (p *partialText) observeResponsesRefusalDelta() {
+	p.refuse(reasonRefusal)
+}
+
 // observeResponsesRefusalDone reads the terminal event of the refusal channel.
 // Its text member is `refusal` — the deltas carry `delta` — and a refusal can
 // arrive with no delta at all, so this event is the only place some declines
@@ -516,11 +671,19 @@ func (p *partialText) observeResponsesTextDone(obj map[string]json.RawMessage) {
 //
 // A non-empty refusal is the upstream's final word on the request: the client
 // watched the model decline, and nothing the proxy could ask afterwards is a
-// continuation of the assistant text the prefix holds. An absent, null or
-// empty member declines nothing — it is the structural terminator of a content
-// part this stream never carried — and is ignored, identity and all: binding
-// the text stream here would refuse a later delta on a stream that is still
-// perfectly continuable.
+// continuation of the assistant text the prefix holds. It is refused as
+// reasonRefusal, not as upstream_terminal: the generation was not cut short
+// and the upstream did not fail.
+//
+// An absent, null or empty member declines nothing and is ignored, identity
+// and all — and that asymmetry with the delta above is deliberate, not an
+// oversight. A .done is the structural terminator the API emits for EVERY
+// content part the response declares, including a part that never carried
+// text, so a textless one is an ordinary shape and refusing it would refuse
+// streams that are still perfectly continuable. A .delta exists only to carry
+// text, so its event type alone is the declaration that the model declined.
+// Binding the text stream here would refuse a later delta on a stream whose
+// terminator was merely structural.
 func (p *partialText) observeResponsesRefusalDone(obj map[string]json.RawMessage) {
 	raw, ok := obj["refusal"]
 	if !ok || jsonNull(raw) {
@@ -528,13 +691,17 @@ func (p *partialText) observeResponsesRefusalDone(obj map[string]json.RawMessage
 	}
 	var text string
 	if err := json.Unmarshal(raw, &text); err != nil {
+		// A refusal member that is not a string states a decline this
+		// accumulator cannot read. It is unknown_shape rather than refusal:
+		// an operator reading the token must be able to tell "the model
+		// declined" from "this proxy could not tell".
 		p.refuse(reasonUnknownShape)
 		return
 	}
 	if text == "" {
 		return
 	}
-	p.refuse(reasonUpstreamTerminal)
+	p.refuse(reasonRefusal)
 }
 
 // observeResponseItem classifies a response.output_item.added event by the
@@ -543,24 +710,14 @@ func (p *partialText) observeResponsesRefusalDone(obj map[string]json.RawMessage
 // computer_call, web_search_call, file_search_call — and is treated as a tool
 // call, because a new surface arriving as a new item type must not slip past
 // a gate that only knew to look for function_call.
+//
+// This event is also where a call family is stopped before any of its own
+// events arrive: a call item is announced before its arguments stream, so the
+// refusal is a property of the announced TOPOLOGY rather than of its payload,
+// and no argument delta of a known call surface is ever observed after it.
 func (p *partialText) observeResponseItem(obj map[string]json.RawMessage) {
-	raw, ok := obj["item"]
-	if !ok || jsonNull(raw) {
-		p.refuse(reasonUnknownShape)
-		return
-	}
-	var item map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &item); err != nil {
-		p.refuse(reasonUnknownShape)
-		return
-	}
-	traw, ok := item["type"]
+	item, typ, ok := responsesItem(obj)
 	if !ok {
-		p.refuse(reasonUnknownShape)
-		return
-	}
-	var typ string
-	if err := json.Unmarshal(traw, &typ); err != nil {
 		p.refuse(reasonUnknownShape)
 		return
 	}
@@ -576,28 +733,158 @@ func (p *partialText) observeResponseItem(obj map[string]json.RawMessage) {
 			return
 		}
 		p.itemSeen = true
-		// The announcement carries the item's OWN identity — its id, and the
-		// index it occupies in the response — which the deltas repeat. Where
-		// the two disagree the prefix has no single provenance; where the
-		// announcement is missing one of them there is nothing to prove the
-		// deltas against, and the item is refused rather than trusted.
-		id, ok := responsesStringMember(item, "id")
-		if !ok {
-			p.refuse(reasonUnknownShape)
-			return
-		}
-		index, ok := responsesIndexMember(obj, "output_index")
-		if !ok {
-			p.refuse(reasonUnknownShape)
-			return
-		}
-		p.bindItemIdentity(id, index)
+		p.bindMessageItem(item, obj)
 	case "reasoning":
 		// Reasoning items carry no client-visible assistant text and are
 		// never accumulated, so their identity is not part of the contract.
 	default:
 		p.refuse(reasonToolCalls)
 	}
+}
+
+// observeResponseItemDone classifies a response.output_item.done event — the
+// closing event of an item an earlier announcement opened.
+//
+// It is held to the announcing event's identity contract rather than being
+// ignored as a lifecycle detail, because the event names the same output item
+// and must name the SAME one: a completion whose item id or output_index
+// disagrees with the prefix's is a second answer on the wire, which is exactly
+// what the MVP refuses. It does NOT latch itemSeen: this is the completion of
+// the item the announcement already counted, so latching here would refuse
+// every ordinary stream at its own item's end.
+func (p *partialText) observeResponseItemDone(obj map[string]json.RawMessage) {
+	item, typ, ok := responsesItem(obj)
+	if !ok {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	switch typ {
+	case "message":
+		p.bindMessageItem(item, obj)
+	case "reasoning":
+		// Same rule as the announcement: a reasoning item's identity is none
+		// of the text contract's business.
+	default:
+		p.refuse(reasonToolCalls)
+	}
+}
+
+// bindMessageItem proves the identity of one message output item: its own id
+// and the index it occupies in the response, stated by the announcing and the
+// closing event alike and repeated by every delta of it. Where the sources
+// disagree the prefix has no single provenance; where a source omits one of
+// them there is nothing to prove the deltas against, and the item is refused
+// rather than trusted.
+func (p *partialText) bindMessageItem(item, obj map[string]json.RawMessage) {
+	id, ok := responsesStringMember(item, "id")
+	if !ok {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	index, ok := responsesIndexMember(obj, "output_index")
+	if !ok {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	p.bindItemIdentity(id, index)
+}
+
+// responsesItem reads the item object an output_item event announces or
+// closes, and its type. ok is false when the event states no readable item, or
+// an item with no readable type, and both are the caller's unknown_shape.
+func responsesItem(obj map[string]json.RawMessage) (map[string]json.RawMessage, string, bool) {
+	raw, ok := obj["item"]
+	if !ok || jsonNull(raw) {
+		return nil, "", false
+	}
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return nil, "", false
+	}
+	traw, ok := item["type"]
+	if !ok || jsonNull(traw) {
+		return nil, "", false
+	}
+	var typ string
+	if err := json.Unmarshal(traw, &typ); err != nil {
+		return nil, "", false
+	}
+	return item, typ, true
+}
+
+// observeContentPart reads a content-part lifecycle event —
+// response.content_part.added or .done. The event announces or closes one
+// content part of one output item; the part's text arrives on the deltas.
+//
+// It is not ignored as a lifecycle detail, because it names the exact content
+// part a delta names and it names the part's CHANNEL: an event whose identity
+// does not match the prefix's is a second content stream, and one whose part
+// is a refusal is the refusal channel announced structurally. So the identity
+// is proven with the deltas' own contract, and the part's type — when the
+// event states one — is read: refusal latches reasonRefusal, an output_text
+// part is the channel the prefix is made of, and any other part type is a
+// shape this accumulator does not know how to continue from.
+//
+// KNOWN GAP (issue #101): the part's own `text` member is not read for either
+// event name, so a `content_part.done` carrying a text that disagrees with what
+// this pass accumulated is ignored rather than refused. The ignore is sound for
+// `.added` — a part being opened has no content yet — and not established for
+// `.done`, which is why the two share one function and the stronger invariant
+// is left unenforced. `response.output_text.done` is the event that states the
+// output text in full, and it IS read (observeResponsesTextDone); the gap is
+// specific to this part-level event and is tracked rather than guessed at.
+//
+// A part object that is absent is not refused. The provider then states the
+// identity without stating the channel, and the identity is what the contract
+// is made of: there is nothing here that could have carried text.
+func (p *partialText) observeContentPart(obj map[string]json.RawMessage) {
+	if !p.bindTextStream("response.output_text.delta", obj) {
+		return
+	}
+	raw, ok := obj["part"]
+	if !ok || jsonNull(raw) {
+		return
+	}
+	var part map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &part); err != nil || part == nil {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	traw, ok := part["type"]
+	if !ok || jsonNull(traw) {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	var kind string
+	if err := json.Unmarshal(traw, &kind); err != nil {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	switch kind {
+	case "output_text":
+		// The channel the committed prefix is made of.
+	case "refusal":
+		p.refuse(reasonRefusal)
+	default:
+		p.refuse(reasonUnknownShape)
+	}
+}
+
+// observeAnnotation reads a response.output_text.annotation.added event: a
+// citation the client renders alongside the text part it belongs to.
+//
+// It is the one event class admitted on the strength of its payload rather
+// than refused, and the reasoning is narrow enough to state: the event is
+// bound to the SAME content part the prefix was read from — it carries the
+// same three identity members a delta carries, and is held to the same
+// contract here — and its payload is the annotation itself (a url citation, a
+// file citation, a span into the text), never assistant text. There is no
+// member of it a continuation body could be built from, and the identity
+// check is what proves it cannot have come from another stream. Refusing it
+// would refuse every citation-bearing answer, which is a shape this proxy has
+// no reason to treat as unreadable.
+func (p *partialText) observeAnnotation(obj map[string]json.RawMessage) {
+	p.bindTextStream("response.output_text.delta", obj)
 }
 
 // appendDelta reads one Responses text-bearing event and accumulates it once

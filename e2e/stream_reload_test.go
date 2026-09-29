@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -96,12 +95,12 @@ func TestChatStreamIncremental(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest(chatPublic),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// Chunk 1 must arrive while the upstream is still blocked on gate (we
 	// only close gate after reading it), proving incremental delivery.
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 
 	if eof {
 		t.Fatal("stream ended before chunk1 arrived")
@@ -111,13 +110,13 @@ func TestChatStreamIncremental(t *testing.T) {
 
 	close(gate)
 	for _, want := range []string{"chunk2", "chunk3"} {
-		lines, eof = nextSSEEvent(t, br, 3*time.Second)
+		lines, eof = s.event(3 * time.Second)
 		if eof {
 			t.Fatalf("stream ended before %s arrived", want)
 		}
 		assertChatSSE(t, lines, chatPublic, want)
 	}
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] terminator (eof=%v lines=%q)", eof, lines)
 	}
@@ -167,17 +166,17 @@ func TestChatStreamNoModelByteIdentical(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest(chatPublic),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before data line")
 	}
 	if len(lines) != 1 || lines[0] != sentLine {
 		t.Fatalf("no-model line not forwarded byte-identically:\n got %q\nwant %q", lines, sentLine)
 	}
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
 	}
@@ -353,11 +352,11 @@ func TestActiveStreamSurvivesReload(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("common"),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	<-chunk1Sent // upstream has flushed chunk 1
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before chunk1")
 	}
@@ -371,12 +370,12 @@ func TestActiveStreamSurvivesReload(t *testing.T) {
 	}
 
 	close(gate)
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before chunk2")
 	}
 	assertChatSSE(t, lines, "common", "two") // still A's public model
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
 	}
@@ -431,17 +430,17 @@ func TestMalformedSSEForwardedVerbatum(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest(chatPublic),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before malformed line")
 	}
 	if len(lines) != 1 || lines[0] != sentLine {
 		t.Fatalf("malformed line not forwarded verbatim:\n got %q\nwant %q", lines, sentLine)
 	}
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
 	}
@@ -474,8 +473,8 @@ func TestResponsesStreamEnvelopeRewrite(t *testing.T) {
 	resp := openJSON(t, p.addr, "/v1/responses",
 		`{"model":"resp-public","input":"hello","stream":true}`,
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	type envelope struct {
 		Type     string `json:"type"`
@@ -486,7 +485,7 @@ func TestResponsesStreamEnvelopeRewrite(t *testing.T) {
 	rewritten := 0
 	sawDelta := false
 	for {
-		lines, eof := nextSSEEvent(t, br, 3*time.Second)
+		lines, eof := s.event(3 * time.Second)
 		for _, ln := range lines {
 			if !strings.HasPrefix(ln, "data:") {
 				continue
@@ -600,11 +599,11 @@ func TestActiveStreamPromptBoundToOldSnapshot(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("common"),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	<-chunk1Sent
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before chunk1")
 	}
@@ -627,12 +626,12 @@ func TestActiveStreamPromptBoundToOldSnapshot(t *testing.T) {
 	}
 
 	close(gate)
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before chunk2")
 	}
 	assertChatSSE(t, lines, "common", "two")
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
 	}
@@ -684,11 +683,11 @@ func TestResponsesStreamIncremental(t *testing.T) {
 	resp := openJSON(t, p.addr, "/v1/responses",
 		`{"model":"resp-public","input":"hi","stream":true}`,
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// Event 1 must arrive while the upstream is still blocked on the gate.
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before the first response event")
 	}
@@ -696,7 +695,7 @@ func TestResponsesStreamIncremental(t *testing.T) {
 
 	close(gate)
 	for i := 1; i < 3; i++ {
-		lines, eof = nextSSEEvent(t, br, 3*time.Second)
+		lines, eof = s.event(3 * time.Second)
 		if eof {
 			t.Fatalf("stream ended before event %d", i+1)
 		}

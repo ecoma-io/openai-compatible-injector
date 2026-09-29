@@ -104,8 +104,8 @@ func TestUsageChatBufferedUpstreamTokensOnly(t *testing.T) {
 func TestUsageChatStreamingLastWins(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"model\":\"upstream-name\",\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n" +
-			"data: {\"model\":\"upstream-name\",\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":25,\"total_tokens\":40}}\n\n" +
+		_, _ = w.Write([]byte("data: {\"model\":\"upstream-name\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n" +
+			"data: {\"model\":\"upstream-name\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":25,\"total_tokens\":40}}\n\n" +
 			"data: [DONE]\n\n"))
 	}))
 	defer up.Close()
@@ -693,7 +693,7 @@ func TestUsageUnsafeStreamReportsTheOneCallThatRan(t *testing.T) {
 	h, pa, pb := recoveryUsageHandler(t, recoveryBlock(t, "    enabled: true\n"), meter)
 	pa.script = []dialFunc{
 		sseCut(sseChat("Let me check") + chatUsage(7, 3, 10) +
-			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}` + "\n\n"),
+			`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}` + "\n\n"),
 	}
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)

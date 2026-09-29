@@ -27,4 +27,27 @@ COPY --from=build /out/openai-compatible-injector /app/openai-compatible-injecto
 USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/app/openai-compatible-injector"]
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["/app/openai-compatible-injector", "healthcheck"]
+# The probe reads READINESS (GET /readyz), not liveness. That is the fact a
+# scheduler needs: a draining instance answers 503 here while GET /healthz
+# keeps answering 200, so a rolling restart — or any orchestrator that keys
+# off this status — stops routing to a process that is stopping correctly
+# instead of mistaking a clean drain for a broken process.
+#
+#   interval=2s timeout=2s  an observation cadence tight enough to matter
+#                           during a rollout, and the cadence the drain's
+#                           readiness head start is sized against.
+#   start-period=90s        the service may spend up to 30s opening and
+#                           migrating the partner-key store and another 30s
+#                           doing the same for usage metering, before the
+#                           listener exists at all. Failures inside this
+#                           window are ignored, so a slow database never
+#                           marks a starting container unhealthy.
+#   retries=1               one failed probe. This subcommand is served by
+#                           this process out of memory — it reads no YAML, no
+#                           database, and no upstream — so a failure is a
+#                           real answer, and diluting it would delay the
+#                           drain notification the head start exists for.
+#                           Docker never restarts a container because it is
+#                           unhealthy; restart is the `restart:` policy's
+#                           business, and a user-defined SIGTERM is unaffected.
+HEALTHCHECK --interval=2s --timeout=2s --start-period=90s --retries=1 CMD ["/app/openai-compatible-injector", "healthcheck"]

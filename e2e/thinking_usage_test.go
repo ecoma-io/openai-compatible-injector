@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -141,16 +140,16 @@ func TestThinkingUsageStreamChat(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions",
 		`{"model":"chat-public","messages":[],"stream":true}`, nil)
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof || len(lines) == 0 {
 		t.Fatalf("first chunk missing (eof=%v lines=%q)", eof, lines)
 	}
 	assertChatSSE(t, lines, chatPublic, "hi")
 
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || len(lines) != 1 {
 		t.Fatalf("usage chunk missing (eof=%v lines=%q)", eof, lines)
 	}
@@ -158,7 +157,7 @@ func TestThinkingUsageStreamChat(t *testing.T) {
 		t.Fatalf("streamed reasoning_tokens %v, want 75", got)
 	}
 
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
 	}
@@ -183,10 +182,10 @@ func TestThinkingUsageStreamResponses(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/responses",
 		`{"model":"chat-public","input":"hello","stream":true}`, nil)
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof || len(lines) != 2 || !strings.HasPrefix(lines[0], "event:") {
 		t.Fatalf("response.completed event missing (eof=%v lines=%q)", eof, lines)
 	}
@@ -337,12 +336,12 @@ func TestThinkingUsageStreamConsistentShare(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions",
 		`{"model":"chat-public","messages":[],"stream":true}`, nil)
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	wantShares := []float64{75, 30} // the third chunk reports its own number
 	for i, want := range wantShares {
-		lines, eof := nextSSEEvent(t, br, 3*time.Second)
+		lines, eof := s.event(3 * time.Second)
 		if eof || len(lines) != 1 {
 			t.Fatalf("usage chunk %d missing (eof=%v lines=%q)", i, eof, lines)
 		}
@@ -353,7 +352,7 @@ func TestThinkingUsageStreamConsistentShare(t *testing.T) {
 	// The third chunk reports reasoning_tokens directly (Claude-style): the
 	// upstream's own 40 wins — untouched, and no synthesized details member
 	// appears beside it.
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof || len(lines) != 1 {
 		t.Fatalf("third usage chunk missing (eof=%v lines=%q)", eof, lines)
 	}
@@ -368,7 +367,7 @@ func TestThinkingUsageStreamConsistentShare(t *testing.T) {
 	if _, has := usage["completion_tokens_details"]; has {
 		t.Fatalf("third chunk gained a synthesized details member beside the upstream's own number: %v", usage)
 	}
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
 	}
@@ -404,11 +403,11 @@ func TestThinkingUsageReloadBindsStreamToOldSnapshot(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions",
 		`{"model":"chat-public","messages":[],"stream":true}`, nil)
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// First chunk under the old config: fixed 0.75 default share.
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof || len(lines) != 1 {
 		t.Fatalf("first usage chunk missing (eof=%v lines=%q)", eof, lines)
 	}
@@ -424,14 +423,14 @@ func TestThinkingUsageReloadBindsStreamToOldSnapshot(t *testing.T) {
 	close(gate)
 	// The in-flight stream stays bound to the OLD snapshot: second chunk
 	// still synthesized at 75.
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || len(lines) != 1 {
 		t.Fatalf("second usage chunk missing (eof=%v lines=%q)", eof, lines)
 	}
 	if got := chatReasoning(t, []byte(sseDataContent(t, lines[0]))); got != 75 {
 		t.Fatalf("second chunk reasoning_tokens %v, want 75 (in-flight request keeps its snapshot)", got)
 	}
-	lines, eof = nextSSEEvent(t, br, 3*time.Second)
+	lines, eof = s.event(3 * time.Second)
 	if eof || !strings.Contains(strings.Join(lines, "\n"), "[DONE]") {
 		t.Fatalf("missing [DONE] (eof=%v lines=%q)", eof, lines)
 	}
@@ -441,9 +440,9 @@ func TestThinkingUsageReloadBindsStreamToOldSnapshot(t *testing.T) {
 	// windows), so the first chunk must already report nothing.
 	resp2 := openJSON(t, p.addr, "/v1/chat/completions",
 		`{"model":"chat-public","messages":[],"stream":true}`, nil)
-	defer func() { _ = resp2.Body.Close() }()
-	br2 := bufio.NewReader(resp2.Body)
-	lines, eof = nextSSEEvent(t, br2, 3*time.Second)
+	s2 := newSSEStream(t, resp2)
+	defer s2.close()
+	lines, eof = s2.event(3 * time.Second)
 	if eof || len(lines) != 1 {
 		t.Fatalf("post-reload first chunk missing (eof=%v lines=%q)", eof, lines)
 	}

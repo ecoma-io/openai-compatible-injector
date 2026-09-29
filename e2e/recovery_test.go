@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -540,19 +539,19 @@ func TestE2ERecoveryCommittedSSENeverRetried(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("cs-model"),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// The committed event reaches the client: the response was produced before
 	// the upstream died, which is exactly why nothing may be retried after it.
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	lines, eof := s.event(3 * time.Second)
 	if eof {
 		t.Fatal("stream ended before the committed event arrived")
 	}
 	assertChatSSE(t, lines, "cs-model", "one")
 
 	// Whatever follows is a truncation, never a second event or a [DONE].
-	tail, _ := io.ReadAll(br)
+	tail, _ := io.ReadAll(s.br)
 	if strings.Contains(string(tail), "data:") || strings.Contains(string(tail), "[DONE]") {
 		t.Errorf("bytes followed the committed event after the upstream died: %q", tail)
 	}
@@ -633,25 +632,25 @@ func TestE2EStreamRecoveryContinuesACutStream(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("sr-model"),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// Hop 1's fragment, hop 2's continuation, then the ONE terminal marker —
 	// three events on one connection, in order, the public model rewritten in
 	// both payloads.
-	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	lines, eof := s.event(5 * time.Second)
 	if eof {
 		t.Fatal("stream ended before the committed fragment arrived")
 	}
 	assertChatSSE(t, lines, "sr-model", "one ")
 
-	lines, eof = nextSSEEvent(t, br, 5*time.Second)
+	lines, eof = s.event(5 * time.Second)
 	if eof {
 		t.Fatal("no continuation event: the stream was truncated instead of recovered")
 	}
 	assertChatSSE(t, lines, "sr-model", "two")
 
-	lines, eof = nextSSEEvent(t, br, 5*time.Second)
+	lines, eof = s.event(5 * time.Second)
 	if eof {
 		t.Fatal("stream ended without a terminal marker: the continuation's [DONE] never reached the client")
 	}
@@ -659,7 +658,7 @@ func TestE2EStreamRecoveryContinuesACutStream(t *testing.T) {
 		t.Fatalf("terminal event = %q, want exactly one data: [DONE]", lines)
 	}
 	// Nothing follows the marker: a stream is terminated once, not twice.
-	if tail, _ := io.ReadAll(br); strings.Contains(string(tail), "data:") {
+	if tail, _ := io.ReadAll(s.br); strings.Contains(string(tail), "data:") {
 		t.Errorf("bytes followed the terminal marker: %q", tail)
 	}
 
@@ -1087,11 +1086,11 @@ func TestE2ERecoverySpentCandidateEnvelopeStillFallsBack(t *testing.T) {
 // drainSSE reads every remaining SSE line until EOF and reports the whole
 // text plus whether a terminal marker was among it. A cut stream ends here
 // exactly as a client experiences it: bytes, then the connection.
-func drainSSE(t *testing.T, br *bufio.Reader, timeout time.Duration) (text string, terminal bool) {
+func drainSSE(t *testing.T, s *sseStream, timeout time.Duration) (text string, terminal bool) {
 	t.Helper()
 	var sb strings.Builder
 	for {
-		line, err := readSSELine(t, br, timeout)
+		line, err := s.line(timeout)
 		if err == io.EOF {
 			sb.WriteString(line)
 			break
@@ -1102,8 +1101,8 @@ func drainSSE(t *testing.T, br *bufio.Reader, timeout time.Duration) (text strin
 		sb.WriteString(line)
 		sb.WriteString("\n")
 	}
-	s := sb.String()
-	return s, strings.Contains(s, "[DONE]") || strings.Contains(s, "event: response.completed")
+	text = sb.String()
+	return text, strings.Contains(text, "[DONE]") || strings.Contains(text, "event: response.completed")
 }
 
 // streamRecoveryYAML renders the standard recovery-on file for one upstream.
@@ -1195,16 +1194,16 @@ func TestE2EStreamRecoveryRefusalMatrix(t *testing.T) {
 			})
 			resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
 				map[string]string{"Accept": "text/event-stream"})
-			defer func() { _ = resp.Body.Close() }()
-			br := bufio.NewReader(resp.Body)
+			s := newSSEStream(t, resp)
+			defer s.close()
 
-			lines, eof := nextSSEEvent(t, br, 5*time.Second)
+			lines, eof := s.event(5 * time.Second)
 			if eof {
 				t.Fatal("the committed fragment never arrived")
 			}
 			assertChatSSE(t, lines, "srm-model", "half ")
 
-			text, terminal := drainSSE(t, br, 10*time.Second)
+			text, terminal := drainSSE(t, s, 10*time.Second)
 			if terminal {
 				t.Errorf("a refused stream carried a terminal marker: %q", text)
 			}
@@ -1281,10 +1280,10 @@ func TestE2EStreamRecoveryMaxElapsedCutsAStalledUpstream(t *testing.T) {
 	})
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
-	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	lines, eof := s.event(5 * time.Second)
 	if eof {
 		t.Fatal("the committed fragment never arrived")
 	}
@@ -1292,7 +1291,7 @@ func TestE2EStreamRecoveryMaxElapsedCutsAStalledUpstream(t *testing.T) {
 
 	// The bound fires and the stream ends. Generous read window: the assertion
 	// is that it ends at all, not how fast the timer is.
-	text, terminal := drainSSE(t, br, 20*time.Second)
+	text, terminal := drainSSE(t, s, 20*time.Second)
 	if terminal {
 		t.Errorf("an abandoned stream carried a terminal marker: %q", text)
 	}
@@ -1355,15 +1354,15 @@ func TestE2EStreamRecoverySpendsNothingForADepartedClient(t *testing.T) {
 	})
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
 		map[string]string{"Accept": "text/event-stream"})
-	br := bufio.NewReader(resp.Body)
-	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	s := newSSEStream(t, resp)
+	lines, eof := s.event(5 * time.Second)
 	if eof {
 		t.Fatal("the committed fragment never arrived")
 	}
 	assertChatSSE(t, lines, "srm-model", "half ")
 
 	// The client walks away mid-generation.
-	_ = resp.Body.Close()
+	s.close()
 
 	waitForEventCount(t, p, "request_completed", 1)
 	evs := completionsFor(t, p, "srm-model")
@@ -1427,23 +1426,23 @@ func TestE2EStreamRecoveryContinuesACleanEOF(t *testing.T) {
 	resp := openJSON(t, p.addr, "/v1/chat/completions",
 		fmt.Sprintf(`{"model":"srm-model","messages":[{"role":"user","content":%q}],"stream":true}`, userSentinel),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	for _, want := range []string{prefixSentinel + " ", "rest"} {
-		lines, eof := nextSSEEvent(t, br, 5*time.Second)
+		lines, eof := s.event(5 * time.Second)
 		if eof {
 			t.Fatalf("stream ended before %q arrived", want)
 		}
 		assertChatSSE(t, lines, "srm-model", want)
 	}
-	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	lines, eof := s.event(5 * time.Second)
 	if eof || len(lines) != 1 || !strings.Contains(lines[0], "[DONE]") {
 		t.Fatalf("terminal event = %q (eof=%v), want exactly one data: [DONE]", lines, eof)
 	}
 	// The hop's marker is the stream's last byte: the proxy adds no second
 	// terminal of its own, here or after.
-	if tail, _ := io.ReadAll(br); strings.Contains(string(tail), "data:") {
+	if tail, _ := io.ReadAll(s.br); strings.Contains(string(tail), "data:") {
 		t.Errorf("bytes followed the terminal marker: %q", tail)
 	}
 	if got := up.count(); got != 2 {
@@ -1490,16 +1489,16 @@ func TestE2EStreamRecoveryRefusesAnEmptyPrefix(t *testing.T) {
 	})
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// The role delta reaches the client unchanged; the gate decides whether to
 	// CONTINUE, it never edits a stream in flight.
-	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	lines, eof := s.event(5 * time.Second)
 	if eof || len(lines) != 1 || !strings.Contains(lines[0], `"role":"assistant"`) {
 		t.Fatalf("role event = %q (eof=%v), want one relayed unchanged", lines, eof)
 	}
-	text, terminal := drainSSE(t, br, 10*time.Second)
+	text, terminal := drainSSE(t, s, 10*time.Second)
 	if terminal {
 		t.Errorf("an empty prefix produced a terminal marker: %q", text)
 	}
@@ -1609,10 +1608,10 @@ func TestE2EStreamRecoveryHopFailureIsBounded(t *testing.T) {
 			})
 			resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
 				map[string]string{"Accept": "text/event-stream"})
-			defer func() { _ = resp.Body.Close() }()
-			br := bufio.NewReader(resp.Body)
+			s := newSSEStream(t, resp)
+			defer s.close()
 
-			lines, eof := nextSSEEvent(t, br, 5*time.Second)
+			lines, eof := s.event(5 * time.Second)
 			if eof {
 				t.Fatal("the committed fragment never arrived")
 			}
@@ -1620,7 +1619,7 @@ func TestE2EStreamRecoveryHopFailureIsBounded(t *testing.T) {
 
 			// The stream ends. Whatever the hop did or did not deliver, the
 			// proxy never invents the marker that would claim it finished.
-			text, terminal := drainSSE(t, br, 10*time.Second)
+			text, terminal := drainSSE(t, s, 10*time.Second)
 			if terminal {
 				t.Errorf("a failed hop produced a terminal marker at the client: %q", text)
 			}
@@ -1730,32 +1729,32 @@ func TestE2EStreamRecoveryResponsesHopIdentity(t *testing.T) {
 	resp := openJSON(t, p.addr, "/v1/responses",
 		`{"model":"srm-model","stream":true,"input":"tell me a story"}`,
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// Every hop's text reached the client, in order, on one connection.
-	line, eof := nextSSEEvent(t, br, 10*time.Second)
+	line, eof := s.event(10 * time.Second)
 	if eof {
 		t.Fatal("the committed fragment never arrived")
 	}
 	if !strings.Contains(strings.Join(line, "\n"), "Once") {
 		t.Fatalf("committed event = %q, want the m1 delta", line)
 	}
-	line, eof = nextSSEEvent(t, br, 10*time.Second)
+	line, eof = s.event(10 * time.Second)
 	if eof {
 		t.Fatal("no first continuation event: the hop's own item id was refused as a second output")
 	}
 	if !strings.Contains(strings.Join(line, "\n"), " upon a") {
 		t.Fatalf("first hop event = %q, want the m2 delta", line)
 	}
-	line, eof = nextSSEEvent(t, br, 10*time.Second)
+	line, eof = s.event(10 * time.Second)
 	if eof {
 		t.Fatal("no second continuation event: max-recoveries was never spendable past one hop")
 	}
 	if !strings.Contains(strings.Join(line, "\n"), " time") {
 		t.Fatalf("second hop event = %q, want the m3 delta", line)
 	}
-	line, eof = nextSSEEvent(t, br, 10*time.Second)
+	line, eof = s.event(10 * time.Second)
 	if eof {
 		t.Fatal("stream ended without a terminal marker")
 	}
@@ -1764,7 +1763,7 @@ func TestE2EStreamRecoveryResponsesHopIdentity(t *testing.T) {
 	}
 	// A stream is terminated once: the marker is the last thing on the wire,
 	// and nothing this proxy invented follows it.
-	if tail, _ := io.ReadAll(br); strings.Contains(string(tail), "event:") || strings.Contains(string(tail), "data:") {
+	if tail, _ := io.ReadAll(s.br); strings.Contains(string(tail), "event:") || strings.Contains(string(tail), "data:") {
 		t.Errorf("bytes followed the terminal marker: %q", tail)
 	}
 	if got := up.count(); got != 3 {
@@ -1825,12 +1824,12 @@ func TestE2EStreamRecoveryResponsesIdentityFailsClosed(t *testing.T) {
 	resp := openJSON(t, p.addr, "/v1/responses",
 		`{"model":"srm-model","stream":true,"input":"tell me a story"}`,
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
 	// Both deltas reach the client — the gate decides whether to CONTINUE, it
 	// never edits the stream in flight.
-	text, terminal := drainSSE(t, br, 10*time.Second)
+	text, terminal := drainSSE(t, s, 10*time.Second)
 	for _, must := range []string{"Once", " upon a time"} {
 		if !strings.Contains(text, must) {
 			t.Fatalf("the relayed stream is missing %q: %s", must, text)
@@ -1885,16 +1884,16 @@ func TestE2EStreamRecoveryEnabledWindowBoundsTheCommittedRelay(t *testing.T) {
 	})
 	resp := openJSON(t, p.addr, "/v1/chat/completions", chatStreamRequest("srm-model"),
 		map[string]string{"Accept": "text/event-stream"})
-	defer func() { _ = resp.Body.Close() }()
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 
-	lines, eof := nextSSEEvent(t, br, 5*time.Second)
+	lines, eof := s.event(5 * time.Second)
 	if eof {
 		t.Fatal("the committed fragment never arrived")
 	}
 	assertChatSSE(t, lines, "srm-model", "thinking")
 
-	text, terminal := drainSSE(t, br, 20*time.Second)
+	text, terminal := drainSSE(t, s, 20*time.Second)
 	if terminal {
 		t.Errorf("a window-cut stream carried a terminal marker: %q", text)
 	}

@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -200,16 +199,16 @@ func TestLongStreamStabilityAndOrdering(t *testing.T) {
 
 	resp := openJSON(t, p.addr, "/v1/chat/completions",
 		`{"model":"chat-public","stream":true,"messages":[{"role":"user","content":"go"}]}`, nil)
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	br := bufio.NewReader(resp.Body)
+	s := newSSEStream(t, resp)
+	defer s.close()
 	deadline := 30 * time.Second
 	var got []string
 	for {
-		line, err := readSSELine(t, br, deadline)
+		line, err := s.line(deadline)
 		if err != nil {
 			t.Fatalf("stream ended early after %d events: %v", len(got), err)
 		}

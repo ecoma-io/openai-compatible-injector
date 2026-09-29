@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -116,8 +115,9 @@ func TestStripFieldsStreamedChat(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d, want 200", resp.StatusCode)
 	}
-	br := bufio.NewReader(resp.Body)
-	lines, eof := nextSSEEvent(t, br, 3*time.Second)
+	s := newSSEStream(t, resp)
+	defer s.close()
+	lines, eof := s.event(3 * time.Second)
 	if eof {
 		t.Fatalf("stream ended before the content event")
 	}
@@ -130,7 +130,7 @@ func TestStripFieldsStreamedChat(t *testing.T) {
 			t.Fatalf("streamed chunk lost its choices payload: %s", payload)
 		}
 	}
-	lines, _ = nextSSEEvent(t, br, 3*time.Second)
+	lines, _ = s.event(3 * time.Second)
 	foundDone := false
 	for _, ln := range lines {
 		if ln == "data: [DONE]" {

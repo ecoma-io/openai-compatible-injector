@@ -1221,21 +1221,22 @@ continued only when all of the following hold; anything else ends the stream
 exactly as it would with the block absent, and `stream_recovery_exhausted`
 records which gate fired:
 
-| gate            | refuses when                                                     | reported as                                      |
-| --------------- | ---------------------------------------------------------------- | ------------------------------------------------ |
-| terminal marker | a marker was already forwarded — the stream is over              | no reason (it ended on its own terms)            |
-| client          | the client connection is gone, or a relay cap stopped the pass   | no reason (`client_disconnected` on the request) |
-| generation over | the upstream declared the answer finished (`finish_reason`)      | `logical_terminal`                               |
-| tool calls      | any `delta.tool_calls`/`delta.function_call` was seen            | `unsafe_content` / `tool_calls`                  |
-| stream failed   | the upstream declared the stream failed (an error event)         | `unsafe_content` / `upstream_terminal`           |
-| output topology | Responses text not provably from ONE message output's ONE stream | `unsafe_content` / `multiple_outputs`            |
-| readable shape  | a `data:` line was neither `[DONE]` nor recognizable JSON        | `unsafe_content` / `not_object`/`unknown_shape`  |
-| prefix bound    | the committed text reached `max-partial-bytes`                   | `unsafe_content` / `oversize`                    |
-| usable prefix   | no text was committed at all, so a hop would be a blind replay   | `unsafe_content` / `no_prefix`                   |
-| request body    | the client's body cannot express a continuation (see below)      | `unsafe_content` / the builder's token           |
-| reach           | `max-recoveries` continuation requests were already made         | `max_recoveries`                                 |
-| window          | `max-elapsed` passed since the stream committed                  | `max_elapsed`                                    |
-| envelope        | the request's `budget.request` envelope is spent                 | `budget_spent`                                   |
+| gate            | refuses when                                                                         | reported as                                      |
+| --------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------ |
+| terminal marker | a marker was already forwarded — the stream is over                                  | no reason (it ended on its own terms)            |
+| client          | the client connection is gone, or a relay cap stopped the pass                       | no reason (`client_disconnected` on the request) |
+| generation over | the upstream declared the answer finished (`finish_reason`)                          | `logical_terminal`                               |
+| tool calls      | any `delta.tool_calls`/`delta.function_call` was seen                                | `unsafe_content` / `tool_calls`                  |
+| stream failed   | the upstream declared the stream failed (an error event)                             | `unsafe_content` / `upstream_terminal`           |
+| refusal         | the upstream used the refusal channel (`response.refusal.delta` / non-empty `.done`) | `unsafe_content` / `refusal`                     |
+| output topology | Responses text not provably from ONE message output's ONE stream                     | `unsafe_content` / `multiple_outputs`            |
+| readable shape  | a `data:` line was neither `[DONE]` nor recognizable JSON                            | `unsafe_content` / `not_object`/`unknown_shape`  |
+| prefix bound    | the committed text reached `max-partial-bytes`                                       | `unsafe_content` / `oversize`                    |
+| usable prefix   | no text was committed at all, so a hop would be a blind replay                       | `unsafe_content` / `no_prefix`                   |
+| request body    | the client's body cannot express a continuation (see below)                          | `unsafe_content` / the builder's token           |
+| reach           | `max-recoveries` continuation requests were already made                             | `max_recoveries`                                 |
+| window          | `max-elapsed` passed since the stream committed                                      | `max_elapsed`                                    |
+| envelope        | the request's `budget.request` envelope is spent                                     | `budget_spent`                                   |
 
 A non-null `finish_reason` is **not** an unsafe-content refusal and is never
 reported as one: the generation ended, it simply ended without the marker the
@@ -1243,6 +1244,15 @@ client keys on. Nothing is left to continue, and no marker is invented to paper
 over the missing one. The distinction is what keeps `unsafe_content` readable —
 it means "this proxy could not safely continue this stream", not "the model
 stopped talking".
+
+A **refusal** is the same distinction one layer down, and it is not assistant
+text: `response.refusal.delta` (or a `response.refusal.done` carrying a
+non-empty refusal) means the model declined to answer, so the bytes on that
+channel are not part of what the client is reading as an answer and must never
+enter the continuation prefix. It is reported as its own token rather than as
+a generic `upstream_terminal` because the reason a hop is refused is
+diagnostic — an operator paging on `unsafe_content` needs to tell "our
+continuation correctness gate" from "the model said no".
 
 **MVP scope: plain text only.** The feature continues plain assistant text with
 provably safe structure and nothing else. Tool calls are refused, and so is any
@@ -1290,17 +1300,31 @@ it.
 
 **`max-elapsed` is a hard runtime bound, not a check between reads.** It is one
 window measured from the moment the stream committed, shared by the committed
-relay and every hop. A peer that sends a partial event and then holds the TCP
-connection open cannot outlive it: at the deadline the proxy closes the body
-the relay is blocked on, the read returns, no further hop is dialed, and the
-stream is reported `stream_truncated` with `recovery_reason: max_elapsed`. The
-window is also read off the frozen clock between hops, so an effort that ends
-cleanly just past the deadline stops too. A client that disconnects is a
-different thing altogether and is reported as `client_disconnected`: the
-client's own context remains the higher hard stop, and it is never confused
-with the operator's window. A client disconnect also means **zero** further
-upstream requests — the proxy never spends an exchange on a stream nobody is
-reading.
+relay and every hop, and **one instant** — the same deadline covers every wait
+a hop can be parked in, so no lever re-arms the clock and no later hop gets a
+fresh window. Both the waits a peer can leave this proxy in are bounded:
+
+- **A stalled body.** A peer that sends a partial event and then holds the TCP
+  connection open cannot outlive the window: at the deadline the proxy closes
+  the body the relay is blocked on, the read returns, no further hop is
+  dialed, and the stream is reported `stream_truncated` with
+  `recovery_reason: max_elapsed`.
+- **A stalled response header.** A peer that accepts a continuation request
+  and then answers nothing has produced no body to close, so nothing but the
+  request's own context can unblock it — and for a client that is still
+  reading, that context would live forever. The window carries its own cancel
+  for exactly this case, so the dial returns at the deadline rather than
+  parking the request until the client gives up.
+
+The window is also read off the frozen clock between hops, so an effort that
+ends cleanly just past the deadline stops too. In every case the hop's failure
+is reported as `phase: max_elapsed`, which is this proxy's own bound and never
+a peer's fault — see the event matrix in [Logging](#logging). A client that
+disconnects is a different thing altogether and is reported as
+`client_disconnected`: the client's own context remains the higher hard stop,
+and it is never confused with the operator's window. A client disconnect also
+means **zero** further upstream requests — the proxy never spends an exchange
+on a stream nobody is reading.
 
 > **Size the window for your longest generation, not your shortest outage.**
 > The window is armed on the committed stream itself, so while the block is
@@ -1708,6 +1732,18 @@ The usage **meter** is deliberately not part of this argument: it reads
 pre-rewrite bytes, so excising anything under `usage` cannot change what is
 attributed.
 
+**One path class to avoid, and only with stream recovery on.** The stream
+recovery accumulator also reads pre-rewrite bytes: it accumulates the text the
+upstream sent, while the client is shown what survived the strip. A strip path
+aimed at the streamed text itself (`delta.content`, `response.output_text`,
+their like) therefore makes the continuation body disagree with what the client
+read — the seam shows a divergence instead of a repetition. Nothing about it is
+unsafe and the proxy does not refuse it, because excising a member is a
+deliberate operator choice; if a continuation block and a strip list are
+configured on the same model, keep the strip list off the text members. The
+meter is unaffected either way, and with stream recovery off the two never
+interact at all.
+
 **Streaming parity.** The same composed rewriter serves both relay paths.
 The SSE data-line gate, which admits a line only when its payload carries
 the two keys the rewriter owns (`"model"`/`"usage"`), is widened with the
@@ -1748,8 +1784,15 @@ live stream with correct per-chunk latency. Behavior:
   keeps the client connection alive across the gap and stops for good when
   the effort ends. It starts only once
   the upstream response headers are committed to the client: silence while
-  waiting for upstream headers is **not** covered (that window is bounded
-  by the upstream's response-header timeout, not this relay heartbeat).
+  waiting for upstream headers is **not** covered, and the wait is not bounded
+  by this proxy at all. There is no response-header timeout on the direct
+  transport, and no overall request timeout, by design — a provider that queues
+  a request behind its own load legitimately takes minutes to send a status
+  line, and no configuration states a time-to-first-header budget. A peer that
+  accepts the connection and then answers nothing therefore holds the request
+  until the caller's own context ends (its deadline, its disconnect, or
+  process shutdown). A continuation hop IS bounded: it runs under the
+  recovery window's deadline, so the same peer cannot park a hop either.
   Why: Cloudflare silently cuts a client HTTP/2 stream after ~125s with
   zero bytes from origin (measured on 2026-09-22 — client
   `stream error … INTERNAL_ERROR` at 125.39s, origin-side close at
@@ -1792,6 +1835,65 @@ live stream with correct per-chunk latency. Behavior:
   access log's outcome says so.
 - Reloads never interrupt a stream: it is bound to its request's snapshot.
 
+## Buffering
+
+Two buffers on the request path are proportional to what a client or an
+upstream sends: the client's **request body**, read once and replayed through
+the candidate's transform on every attempt, and a buffered (**non-streaming**)
+**upstream answer**. Both are capped at 64 MiB per request. A per-request cap
+bounds one request; three things bound the process:
+
+| bound                  | scope       | value                              | what it stops                                                        |
+| ---------------------- | ----------- | ---------------------------------- | -------------------------------------------------------------------- |
+| request body size      | one request | 64 MiB                             | one client sending an oversized body                                 |
+| request body read time | one request | 5 minutes                          | one client sending a body slowly enough to pin the goroutine forever |
+| buffering budget       | the process | 256 MiB outstanding, reserved live | N concurrent requests each holding a cap's worth at once             |
+
+The third one is the gap a per-request cap cannot close. `N` concurrent
+requests may each be under the cap and together exceed what the container
+has; the walk's retries and the recovery loop's re-asks multiply `N` by
+whatever the policy does rather than by anything an operator sets. So the
+bytes are admitted against one process-wide counter before they are held, and
+released when the buffer is done with — a body when the request ends, an
+answer when it is relayed or discarded — on every path out, panics included.
+
+Three properties make the refusal readable rather than mysterious:
+
+- **Immediate, never queued.** A reservation that cannot be met is refused on
+  the spot; nothing waits for room. A bounded wait would park exactly the
+  resource the budget protects — the goroutine, the connection, and the bytes
+  already sent — and would make the moment of refusal depend on unrelated
+  traffic. Same input, same answer, regardless of what else is in flight.
+- **Reserved as it grows, not up front.** A buffer reserves in blocks as it
+  fills (64 KiB, doubling to 1 MiB), because a cap is what a request _may_
+  hold and almost no request holds it. Reserving 64 MiB to read a 2 KiB
+  prompt would convert a memory ceiling into a concurrency ceiling nobody
+  configured. An ordinary request costs one small block; a request that
+  really does grow towards the cap pays for it block by block.
+- **Local, and outside the recovery policy.** The refusal is answered with the
+  503 envelope above at both call sites. It is never a failed attempt: no
+  provider is at fault, no exchange is spent, no retry or fallback can clear
+  a process-wide condition, and no observation is fed to the recovery matrix.
+
+The accounting is a bound on the bytes this process buffers, not a byte-exact
+map of the heap: Go's slice growth may round a block's allocation up, and the
+last block is reserved whole however little of it the input uses.
+
+**An admitted buffer is not the only copy of itself, and the budget is sized
+for that.** The transform that injects the prompt decodes the request body and
+marshals it into a second buffer of the same size, live for the attempt beside
+the body the replay needs; the composed response rewriter builds a same-size
+copy of the answer before it is written. Neither copy is admitted separately —
+each is bounded by its admitted source — so the process peak is roughly
+**twice the budget** plus a few MiB per in-flight stream, and `mem_limit` has
+to be sized against that number rather than against the budget.
+
+The budget is a package constant (256 MiB), not runtime configuration, and
+`compose.production.yaml` pairs it with `mem_limit: 1g`: twice the budget for
+the derived copies, with the rest as headroom for TLS state and the response
+bytes of in-flight requests. Raising the limit alone buys nothing; lowering it
+towards the budget is the way to turn a clean refusal into an OOM kill.
+
 ## Errors
 
 Upstream and client failures are classified, never fogged:
@@ -1804,6 +1906,7 @@ Upstream and client failures are classified, never fogged:
 | Body is not JSON                                                                                                                      | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`                                            |
 | Missing `model`                                                                                                                       | 400                    | `invalid_request_error` — exact body: `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`                                      |
 | Request body over the 64 MiB cap                                                                                                      | 413                    | `invalid_request_error` — exact body: `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`                                                  |
+| A buffer this request is filling cannot be funded from the process-wide buffering budget                                              | 503                    | `server_error` / `capacity_exceeded` — exact body: `{"error":{"message":"server is out of buffering capacity","type":"server_error","param":null,"code":"capacity_exceeded"}}`                  |
 | Request names an unmapped model                                                                                                       | 404                    | `model_not_found` — exact body: `{"error":{"message":"The model '<X>' does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`  |
 | Request path matches no route (unknown path, trailing slash, wrong case)                                                              | 404                    | `invalid_request_error` — exact body: `{"error":{"message":"Invalid URL (<METHOD> <PATH>)","type":"invalid_request_error","param":null,"code":null}}`                                           |
 | Upstream unreachable (dial/network, no candidate answered)                                                                            | 502                    | `upstream_error` / `upstream_unreachable`                                                                                                                                                       |
@@ -1850,6 +1953,18 @@ Consequences of the table:
   `text/event-stream` is normalized too (never streamed to the client),
   while a 200 SSE stream that has already committed headers is never
   converted into an error mid-flight.
+- **The 503 capacity refusal is local, deterministic, and never a walk
+  outcome.** Two buffers on the request path draw from one process-wide
+  ceiling: the client's request body, and a buffered (non-streaming) upstream
+  answer. When either cannot be funded, the request is refused on the spot
+  with the envelope above and outcome `capacity_exceeded`, and a WARN
+  `buffer_capacity_exceeded` names the phase (`request_body` or
+  `upstream_response`). It is deliberately not `502 upstream_unreachable`:
+  nothing was dialed that failed, no provider is at fault, and the refusal is
+  the same fact for every candidate — so it never enters the recovery matrix,
+  never retries, never falls back, and never spends an exchange. A retry would
+  walk a chain that can only end the same way. See
+  [Buffering](#buffering) for the budget itself.
 - There is **no overall request timeout**. A slow upstream is a slow
   response, not a timeout race. Dial and TLS handshake timeouts bound the
   connection phase only.
@@ -2117,9 +2232,11 @@ What each level carries:
   `stream_recovery_failed` (one per hop that refused, answered with a status
   instead of a stream, or truncated again — `recovery_index`, `provider`,
   `upstream`, `phase` from the closed set `build`/`credential`/`budget`/
-  `dial`/`upstream_status`/`upstream_read`/`client_write`, and
-  `upstream_status` when the hop answered with one, plus
-  `upstream_credential_id` when the candidate has a pool) and
+  `dial`/`max_elapsed`/`upstream_status`/`upstream_read`/`upstream_limit`/
+  `client_write`, `upstream_status` when the hop answered with one,
+  `unsafe_reason` when the refusal was a body this proxy declined to build
+  (`phase: build`), and `upstream_credential_id` when the candidate has a
+  pool) and
   `stream_recovery_exhausted` (the effort stopped at a gate —
   `recoveries`, `reason` from `budget_spent`/`max_recoveries`/`max_elapsed`/
   `logical_terminal`/`unsafe_content`, and `unsafe_reason` naming the
@@ -2147,6 +2264,54 @@ What each level carries:
   the `upstream_invalid_response` outcome on the INFO completion line with
   the 502 envelope on the wire only when the walk finalizes on it: the
   candidate may still be re-asked, or the next candidate may answer.
+
+**Who owns a stopped recovery.** Five events describe the post-commitment
+recovery loop, and an operator reads exactly one of them as the answer to
+"who ended this effort":
+
+| event                       | owner              | it means                                                                                                                                                                     |
+| --------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stream_recovery_started`   | this proxy         | a hop was built and dialed — an intent, emitted before its first dial                                                                                                        |
+| `stream_recovery_succeeded` | upstream           | the hop's events carried the stream to its terminal marker                                                                                                                   |
+| `stream_recovery_failed`    | the hop            | one hop that did not produce a continuable stream; `phase` names what went wrong                                                                                             |
+| `stream_recovery_exhausted` | this proxy         | the effort stopped at a bound; `reason` names the bound it stopped at                                                                                                        |
+| `stream_truncated`          | whoever stopped it | the committed stream reached the client without its terminal marker; `phase` names the side that stopped it, and `client_disconnected` outcomes are not the provider's fault |
+
+Three readings are wrong and the field names exist to prevent them:
+
+- **`phase: max_elapsed` never blames a peer.** It is this proxy's own window
+  closing, whether it cut a header wait or closed a parked body. The error the
+  cancel produced belongs to nothing outside this process and is deliberately
+  not attached, so a hop cut by our own deadline carries no `error` and no
+  `upstream_status` — an operator must never read it as "upstream failed". It
+  names no `upstream` either, because the window is checked before the hop
+  builds its URL: a refusal that never dialed has no endpoint to name, and the
+  field is omitted rather than invented.
+- **`client_write` and `upstream_limit` are this proxy's own work too** (a
+  client that left, a relay cap reached), and their errors are this package's
+  own typed values — so they are logged as they are, not through the no-echo
+  sanitizer, which would replace them with the static "upstream transport
+  error" and blame a peer for a stop we caused. Only `dial`,
+  `upstream_status` and `upstream_read` point at a peer, and only those go
+  through the sanitizer. A client that leaves DURING a hop is one of them:
+  the hop reads the request's own context (the hop runs under a context
+  derived from it, so a cancellation arriving through the transport cannot be
+  told apart by shape) and reports `client_write`, and the request's outcome
+  becomes `client_disconnected` rather than a truncated stream the provider
+  caused. The failed hop is still recorded — the cause just has one owner,
+  and it is not the provider's.
+- **`unsafe_content` on `stream_recovery_exhausted` with no `unsafe_reason`
+  never happens**, and `unsafe_reason` never appears on `logical_terminal`. The
+  two are different facts: one is a stream this proxy must not continue, the
+  other is a generation the upstream declared finished.
+- **One field name, one vocabulary.** `phase` is the hop's, `reason` is the
+  loop's, `unsafe_reason` is the accumulator's. The three closed sets share no
+  token today, and they are kept in separate fields precisely so that a future
+  overlap stays legible instead of silently meaning two things at once. A body
+  the continuation builder refuses is reported as `phase: build` with
+  `unsafe_reason` set to the builder's own token — the same field name the
+  accumulator uses for the same kind of fact — and the loop's `reason` is
+  `unsafe_content`.
 
 **The upstream 4xx/5xx evidence event.** Every received upstream 4xx/5xx
 emits one `upstream_http_error` event (WARN for 4xx, ERROR for 5xx) bound
@@ -2202,7 +2367,9 @@ tokens, and `upstream_invalid_response` /
 `upstream_body_timeout` / `upstream_body_read_failed` for unusable
 answers, which ride the unusable-answer events rather than
 `provider_attempt_failed`), `failure_origin` (`upstream_http` | `transport` |
-`protocol` | `caller` | `envelope` — the layer the failure belongs to) and
+`protocol` | `caller` | `credential` | `envelope` — the layer the failure
+belongs to; `credential` is a candidate whose rotation pool had no usable key,
+which is a local refusal rather than a wire failure) and
 `elapsed_ms`. Transport failures additionally carry `send_state`
 (`definitely_not_sent` | `send_unknown`): whether this dialed attempt
 provably never carried a request byte. It is evidence about a **dialed**
@@ -2213,7 +2380,17 @@ the received HTTP status as `upstream_status` — a transport failure has no
 status to carry — so failures correlate by
 `request_id + candidate_index + candidate_attempt + egress_attempt`.
 
-Two naming notes, so a dashboard is not built on the wrong reading.
+Three naming notes, so a dashboard is not built on the wrong reading.
+
+**The counters carry compatibility aliases, and the new names are
+authoritative.** `candidate_attempts` is also emitted as
+`provider_attempts`, `retry_attempts` as `retries_total`, and the per-dial
+`egress_attempt` as `attempt` — each pair is one quantity under two names,
+kept so a dashboard built against an earlier release keeps reading the
+number it was built on. Every pair is incremented at a single site, so the
+alias can never disagree with its authoritative name; where a table below
+names one of them, it names the pair once rather than restating it.
+
 `provider_attempt_started` replaced the former `upstream_request_started`
 (the slug now names what it announces), and it is emitted **before** the
 dial, so it announces an attempt whose outcome is not yet known — but the
@@ -2239,11 +2416,31 @@ rejection, dial-failure, and provider-echo traffic at maximum verbosity.
 
 ## Healthcheck
 
-`GET /healthz` answers `200` with the body `ok\n` whenever the HTTP listener
-is up.
+Two probes, and they answer two different questions. They are separate
+endpoints because they must be able to disagree:
+
+| endpoint       | question                     | answer                                                                                            |
+| -------------- | ---------------------------- | ------------------------------------------------------------------------------------------------- |
+| `GET /healthz` | is this process alive?       | `200` + `ok\n` for as long as the listener exists, **including while draining**                   |
+| `GET /readyz`  | should traffic be sent here? | `200` + `ok\n` while serving; `503` + the state token (`starting`/`draining`/`stopped`) otherwise |
+
+Both are unauthenticated, exact-match (`/readyz/` is the catch-all 404, like
+`/v1/models/`), and both answer `405` for a non-GET. `/readyz` is
+deliberately **not** part of the OpenAI-compatible surface, so it answers a
+plain-text 405 rather than the proxy's JSON envelope. Readiness responses are
+sent `Cache-Control: no-store`: a cached `200` replayed after a drain began
+would route traffic into a socket about to close, which is the failure the
+endpoint exists to prevent.
+
+Readiness is a statement about **this process alone**. It is not derived from
+the config snapshot, from a provider, or from either database: a provider
+outage is no reason to stop routing to an instance that can still serve the
+models it has left, and a database blip must not empty a load balancer's
+whole pool. The healthcheck subcommand's rule is unchanged — it reads no YAML
+and makes no upstream or database call.
 
 The `healthcheck` subcommand (used by the Docker image and compose) probes
-the running service and requires `200` + `ok\n`:
+**readiness** and requires `200` + `ok\n`:
 
 ```sh
 ./openai-compatible-injector healthcheck    # OAICR_LISTEN env decides what is probed
@@ -2251,21 +2448,56 @@ the running service and requires `200` + `ok\n`:
 
 It reads only the `OAICR_LISTEN` environment variable (a wildcard address is
 rewritten to the loopback) and **never reads the YAML file** — a poisoned
-reload must not fail the container probe.
+reload must not fail the container probe. It reads `/readyz` rather than
+`/healthz` because a scheduler needs the readiness fact: a draining instance
+answers `503` there while `/healthz` keeps answering `200`, so a rolling
+restart stops routing to a process that is stopping correctly instead of
+mistaking a clean drain for a broken process. The shipped cadence is
+`interval=2s timeout=2s retries=1` with a long `start_period` (the service may
+spend up to 30s migrating the partner-key store and another 30s on usage
+metering before the listener exists), and the drain's readiness head start is
+sized against that cadence — see below.
 
 ## Graceful shutdown
 
-On SIGTERM or SIGINT the service stops accepting new connections and drains:
+On SIGTERM or SIGINT the service takes a readiness head start, then stops
+accepting and drains:
 
-1. `http.Server.Shutdown(grace)` — in-flight requests and streams get up to
-   `OAICR_SHUTDOWN_GRACE` (default 55s) to complete.
-2. If the budget runs out, `Close()` force-terminates the remainder.
-3. If usage metering is enabled, its accepted event backlog is then flushed through its bounded close window; events that cannot be persisted are explicitly counted and reported.
-4. Idle keep-alive connections are closed; the process exits `0`.
+1. **Readiness goes false first, while the listener is still accepting.**
+   `/readyz` starts answering `503 draining` at this instant; `/healthz` and
+   the API keep serving. The head start is 5s, capped at half the drain
+   budget — drawn from `grace` rather than added to it, so the time from
+   signal to exit is unchanged and a container's `stop_grace_period` needs no
+   adjustment. Without it, "no longer ready" and "no longer accepting" happen
+   at the same instant, and every probe already scheduled, every in-flight
+   check, and every load-balancer view one interval out of date lands on a
+   closed port. A process signalled during startup was never advertised as
+   ready at all.
+2. `http.Server.Shutdown(grace - head start)` — in-flight requests and
+   streams get the remainder of `OAICR_SHUTDOWN_GRACE` (default 55s) to
+   complete.
+3. If the drain budget runs out, `Close()` force-terminates the remainder.
+4. Idle egress connections are closed — the listener is already gone, and the
+   upstream pools are what is left to release.
+5. Then the defers run, and they are **outside** the drain budget: if usage
+   metering is enabled, its accepted event backlog is flushed through a 10s
+   close window with a 5s join grace behind it (events that cannot be
+   persisted are explicitly counted and reported, and `usage_meter_final`
+   logs the totals); in partner mode the key store closes within its own 5s.
+   The process then exits `0`.
 
-A second signal while draining forces an immediate `exit 1`. Compose's
-`stop_grace_period: 60s` is deliberately larger than the default drain
-budget so Docker's SIGKILL never cuts a drain short.
+A second signal while draining forces an immediate `exit 1` — defers do not
+run, so the metering accounting above is that path's deliberate casualty.
+Compose's `stop_grace_period` is deliberately larger than the drain budget,
+by the defers in step 5: 55s of default grace plus 15s of metering drain plus
+5s of key-store close is 75s worst case, which is why the shipped files use
+`75s` and not `60s`. Docker's SIGKILL must not land on that accounting. The
+head start is inside the drain budget rather than in front of it.
+
+The lifecycle transitions are logged: DEBUG `readiness_ready`, INFO
+`readiness_unready` (with `grace` and `propagation`), INFO `drain_started`
+(with `drain`), and WARN `drain_deadline_exceeded` when the drain had to
+force-close.
 
 ## Deployment
 
@@ -2290,6 +2522,30 @@ docker run --rm -p 8080:8080 \
 `compose.yaml` wires the same shape: `8080:8080`, read-only bind mount of
 `config.yaml`, healthcheck, `stop_grace_period: 60s`, bounded JSON logging,
 `restart: unless-stopped`.
+
+`compose.production.yaml` is the hardened variant, and its settings are
+**coupled to the binary's own limits** — changing one without the other is the
+mistake to avoid:
+
+- `mem_limit: 1g` is sized against the process's 256 MiB buffering budget
+  (see [Buffering](#buffering)): twice the budget, because an admitted buffer
+  has a same-size derived copy beside it, plus headroom for TLS state and the
+  response bytes of in-flight requests. The budget is a constant in the
+  binary, so raising `mem_limit` alone buys nothing, and lowering it towards
+  the budget converts a clean `503 capacity_exceeded` refusal into an OOM
+  kill.
+- The `healthcheck` reads `/readyz` and never `/healthz` — see
+  [Healthcheck](#healthcheck).
+- `read_only: true`, `cap_drop: ALL`, `no-new-privileges` and a `tmpfs` for
+  `/tmp` are safe because the image is `scratch` with one binary: it reads
+  its config, its CA bundle, and nothing else. The health probe is the
+  binary's own subcommand, so no shell is needed.
+
+The rollout it documents is a two-phase drain, and both phases depend on the
+readiness ordering above: start the new container and wait for it to report
+ready, then SIGTERM the old one and wait for the drain. An orchestrator's
+`stop_grace_period` covers readiness head start and drain together, since the
+head start is drawn from the grace rather than added to it.
 
 > **Compose + atomic edits:** the `config.yaml` bind mount is a single file,
 > and a host-side `mv`/safe-save splices in a new inode the mount does not
@@ -2338,13 +2594,21 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
   exit 1 — by design, for orchestrators that need a hard stop. After the
   drain finishes, duplicate signals are ignored: the process keeps the exit
   code it earned.
-- Connection hygiene is bounded: request bodies are capped at 64 MiB,
-  request headers must arrive within 10s, idle keep-alive connections
-  are closed after 120s, and SSE relay input is capped per line and per
-  event (see [Streaming](#streaming)) — a quiet client cannot pin a
-  goroutine and a file descriptor forever, and a hostile upstream cannot
-  pin unbounded memory. An active response (including a long SSE stream)
-  is never touched by the idle timeout.
+- Connection hygiene is bounded in time and in aggregate, not only per
+  request: request bodies are capped at 64 MiB **and** must arrive within 5
+  minutes, request headers must arrive within 10s, idle keep-alive
+  connections are closed after 120s, SSE relay input is capped per line and
+  per event (see [Streaming](#streaming)), and the bytes every in-flight
+  request is buffering are admitted against one process-wide ceiling, so
+  concurrent requests cannot add up to an unbounded process (see
+  [Buffering](#buffering)). A quiet client cannot pin a goroutine and a file
+  descriptor forever, a slow client cannot pin one by dribbling its body, and
+  a hostile upstream cannot pin unbounded memory. An active response
+  (including a long SSE stream) is never touched by the idle timeout — the
+  request-body deadline is armed for the body read and cleared the moment it
+  returns, so it cannot reach a stream or the next request on a pooled
+  connection, and no overall write deadline exists to cut a legitimate SSE
+  mid-flight.
 
 ## Out of scope
 

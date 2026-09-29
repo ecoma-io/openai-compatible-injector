@@ -85,7 +85,7 @@ func (d *scriptedDoer) body(i int) string {
 
 // sseChat renders one chat content delta as a complete SSE event.
 func sseChat(content string) string {
-	return `data: {"model":"up-a","choices":[{"delta":{"content":"` + content + `"}}]}` + "\n\n"
+	return `data: {"model":"up-a","choices":[{"index":0,"delta":{"content":"` + content + `"}}]}` + "\n\n"
 }
 
 // sseResponses renders one Responses output-text delta, carrying the full
@@ -544,7 +544,7 @@ func TestStreamRecoverySkipsATerminatedStream(t *testing.T) {
 func TestStreamRecoveryRefusesToolCalls(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
 	pa.script = []dialFunc{sseCut(sseChat("Let me check") +
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}` + "\n\n")}
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}` + "\n\n")}
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 	if rec.Code != http.StatusOK {
@@ -577,7 +577,7 @@ func TestStreamRecoveryRefusesToolCalls(t *testing.T) {
 // the original question — a blind retry wearing a continuation's shape.
 func TestStreamRecoveryRefusesAStreamWithNoText(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
-	pa.script = []dialFunc{sseCut(`data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n")}
+	pa.script = []dialFunc{sseCut(`data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n")}
 
 	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 	if pa.dials() != 1 {
@@ -651,7 +651,7 @@ func TestStreamRecoveryStopsAtItsWindow(t *testing.T) {
 // can read, so it is refused rather than guessed at.
 func TestStreamRecoveryRefusesATruncatedLine(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
-	pa.script = []dialFunc{sseStream(`data: {"choices":[{"delta":{"content":"Hi","fi`)}
+	pa.script = []dialFunc{sseStream(`data: {"choices":[{"index":0,"delta":{"content":"Hi","fi`)}
 
 	doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 	if pa.dials() != 1 {
@@ -948,6 +948,144 @@ func TestStreamRecoveryStopsWhenTheClientLeavesMidHop(t *testing.T) {
 	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
 		t.Fatalf("request_completed = %v, want client_disconnected", done)
 	}
+}
+
+// TestStreamRecoveryClientGoneDuringTheHopDialIsNotAnUpstreamFault: the same
+// departure, one step earlier. When the reader cancels while the hop's DIAL is
+// in flight the hop fails, and the failure used to be recorded as `dial` —
+// this proxy's transport, an upstream origin, a sanitized transport error —
+// for a stop the reader caused, with the request then reported as a truncated
+// stream. A hop running under a context DERIVED from the request's cannot tell
+// the two apart by shape, so the hop reads the request's own context and says
+// so, and the loop's final record keeps naming the same cause.
+func TestStreamRecoveryClientGoneDuringTheHopDialIsNotAnUpstreamFault(t *testing.T) {
+	store := newChainStore(t, recoveryBlock(t, "    enabled: true\n    max-recoveries: 2\n"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pa := &scriptedDoer{script: []dialFunc{
+		sseStream(sseChat("Hello")),
+		func(*http.Request) (*http.Response, error) {
+			cancel() // the client leaves with the hop's dial in flight
+			return nil, context.Canceled
+		},
+		sseStream(sseChat("never asked")),
+	}}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: &scriptedDoer{}}, nil, nil, nil, log)
+
+	doRequestWithContext(t, h, ctx, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if pa.dials() != 2 {
+		t.Fatalf("dials = %d, want the walk attempt and the one hop that was in flight", pa.dials())
+	}
+	failed := logBuf.events(t, "stream_recovery_failed")
+	if len(failed) != 1 {
+		t.Fatalf("stream_recovery_failed = %v, want the one failed hop", failed)
+	}
+	if failed[0]["phase"] != "client_write" {
+		t.Errorf("phase = %v, want client_write: the reader canceled, not the wire", failed[0])
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "client_disconnected" {
+		t.Fatalf("request_completed = %v, want client_disconnected", done)
+	}
+	if ev := logBuf.events(t, "stream_truncated"); len(ev) != 1 {
+		t.Fatalf("stream_truncated = %v, want exactly one", ev)
+	}
+}
+
+// TestStreamRecoveryWindowBackstopIsALogRecordNotACrash: the loop's own gate
+// reads the clock and the hop reads it again, so a window that expires in the
+// gap between them is refused by `dialable` — the loop's BACKSTOP, reached
+// before the hop has built its URL and therefore with no endpoint to name.
+// That record is built without dereferencing an endpoint the hop never
+// produced, so the refusal is a WARN line rather than a panic that would drop
+// the client's already-committed stream.
+//
+// The clock is stepped rather than slept on, and the step is keyed to the
+// client: it stands still until the relay has written its first chunk, which
+// is the last reading before the loop's gate, and then advances a little over
+// the recovery window per read. The gate therefore sees an open window and
+// admits the hop; the hop's own reading is already past the deadline, so
+// `dialable` refuses.
+//
+// Two things this has to out-wait on the same clock, and both are configured
+// wide rather than slept around: the request envelope's own elapsed half,
+// which the loop checks immediately before the window's gate and which would
+// otherwise stop the loop at `budget_spent` — a different bound, with a
+// different record — and the relay's own body watchdog, armed before the read
+// that marks the step and therefore only ever reaches a bound the real clock
+// would have reached long before. `max-elapsed` is the only bound under test.
+func TestStreamRecoveryWindowBackstopIsALogRecordNotACrash(t *testing.T) {
+	origNow := retryNow
+	t.Cleanup(func() { retryNow = origNow })
+	base := time.Now()
+	var clientWrote, gateRead atomic.Bool
+	retryNow = func() time.Time {
+		if !clientWrote.Load() || !gateRead.Swap(true) {
+			return base
+		}
+		return base.Add(90 * time.Second)
+	}
+
+	const bounds = `  budget:
+    request:
+      max-exchanges: 64
+      max-elapsed: 5m
+  retries:
+    max-elapsed: 2m
+`
+	pa := &scriptedDoer{script: []dialFunc{
+		func(*http.Request) (*http.Response, error) {
+			resp, err := sseCut(sseChat("Hello"))(nil)
+			// Flip the clock from inside the relay — the writer, so the
+			// ordering is: this chunk reaches the client, then the relay
+			// finishes, then the loop's gate reads, then the hop reads.
+			resp.Body = &relayMarkBody{ReadCloser: resp.Body, mark: &clientWrote}
+			return resp, err
+		},
+	}}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(newChainStore(t, recoveryBlock(t, "    enabled: true\n    max-elapsed: 5s\n")+bounds),
+		kindResolver{direct: pa, proxied: &scriptedDoer{}}, nil, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	// The gate read the clock before the step and let the hop run; the hop
+	// read it after and refused. Exactly one hop-failure record, and it is
+	// this proxy's own bound rather than a dial that reached an endpoint.
+	failed := logBuf.events(t, "stream_recovery_failed")
+	if len(failed) != 1 || failed[0]["phase"] != recoveryMaxElapsed {
+		t.Fatalf("stream_recovery_failed = %v, want one max_elapsed backstop", failed)
+	}
+	if _, has := failed[0]["upstream"]; has {
+		t.Errorf("a hop that never dialed named an endpoint: %v", failed[0])
+	}
+	if _, has := failed[0]["error"]; has {
+		t.Errorf("a proxy-owned phase blamed an endpoint with an error: %v", failed[0])
+	}
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != recoveryMaxElapsed {
+		t.Errorf("stream_recovery_exhausted = %v, want one max_elapsed bound", exh)
+	}
+}
+
+// relayMarkBody flips a flag the first time the relay WRITES, so a test can
+// step the clock at an exact point in the request's life: after the client has
+// the chunk, before the loop's own gate reads the clock.
+type relayMarkBody struct {
+	io.ReadCloser
+	mark *atomic.Bool
+	done bool
+}
+
+func (b *relayMarkBody) Read(p []byte) (int, error) {
+	if !b.done {
+		b.done = true
+		b.mark.Store(true)
+	}
+	return b.ReadCloser.Read(p)
 }
 
 // selfCancelingBody yields its bytes once, then cancels the request context
@@ -1352,7 +1490,7 @@ func TestStreamRecoveryFinishReasonIsNotUnsafeContent(t *testing.T) {
 		t.Run(finish, func(t *testing.T) {
 			h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
 			pa.script = []dialFunc{sseCut(sseChat("Hello") +
-				`data: {"choices":[{"delta":{},"finish_reason":"` + finish + `"}]}` + "\n\n")}
+				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"` + finish + `"}]}` + "\n\n")}
 
 			rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
 			if rec.Code != http.StatusOK {
@@ -1398,7 +1536,7 @@ func TestStreamRecoveryFinishReasonIsNotUnsafeContent(t *testing.T) {
 func TestStreamRecoveryFinishReasonThenMarkerIsTheClientTerminal(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
 	pa.script = []dialFunc{sseStream(sseChat("Hello") +
-		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
 		"data: [DONE]\n\n")}
 
 	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
@@ -1432,7 +1570,7 @@ func TestStreamRecoveryFinishReasonWithADelayedEOF(t *testing.T) {
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 			Body: io.NopCloser(&stagedReader{chunks: []string{
 				sseChat("Hello"),
-				`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
 			}}),
 		}, nil
 	}}
@@ -1805,7 +1943,7 @@ func TestStreamRecoveryWindowOwnsACommittedRelayCutIt(t *testing.T) {
 	h, logBuf, pa, _ := recoveryHandler(t,
 		recoveryBlock(t, "    enabled: true\n    max-elapsed: 150ms\n    max-recoveries: 2\n"))
 	body := &partialLineBody{
-		data:   []byte(`data: {"choices":[{"delta":{"content":"hel`),
+		data:   []byte(`data: {"choices":[{"index":0,"delta":{"content":"hel`),
 		closed: make(chan struct{}),
 	}
 	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {

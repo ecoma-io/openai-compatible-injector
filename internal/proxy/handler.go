@@ -16,7 +16,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,6 +25,7 @@ import (
 	"openai-compatible-injector/internal/config"
 	"openai-compatible-injector/internal/credential"
 	"openai-compatible-injector/internal/inject"
+	"openai-compatible-injector/internal/memlimit"
 	"openai-compatible-injector/internal/recovery"
 	"openai-compatible-injector/internal/transport"
 	"openai-compatible-injector/internal/usage"
@@ -43,6 +43,15 @@ const (
 	envelopeInvalidReq = `{"error":{"message":"invalid JSON in request body","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeMissingMod = `{"error":{"message":"you must provide a model parameter","type":"invalid_request_error","param":null,"code":null}}`
 	envelopeTooLarge   = `{"error":{"message":"request body too large","type":"invalid_request_error","param":null,"code":null}}`
+	// envelopeAtCapacity is the local refusal of the process-wide buffering
+	// budget: this process declined to hold the bytes, either because the
+	// client's own body did not fit or because a buffered answer grew past
+	// what was left. It is a 503 in the upstream-error family's shape — no
+	// param, a code — because nothing about the request is malformed and no
+	// provider is at fault; the service is simply full for now. It carries
+	// no upstream detail because it has none, and it is a literal constant
+	// like every other envelope so the wire bytes are exact.
+	envelopeAtCapacity = `{"error":{"message":"server is out of buffering capacity","type":"server_error","code":"capacity_exceeded"}}`
 	envelopeUpInvalid  = `{"error":{"message":"upstream returned an invalid response","type":"upstream_error","code":"upstream_invalid_response"}}`
 	envelopeUpUnreach  = `{"error":{"message":"upstream request failed","type":"upstream_error","code":"upstream_unreachable"}}`
 	envelopeBadMethod  = `{"error":{"message":"method not allowed","type":"invalid_request_error","param":null,"code":null}}`
@@ -86,6 +95,76 @@ var (
 	maxRequestBodyBytes      int64 = 64 << 20 // 64 MiB
 	maxBufferedResponseBytes int64 = 64 << 20 // 64 MiB
 )
+
+// requestBodyReadTimeout is the second dimension of the request-body bound:
+// maxRequestBodyBytes caps HOW MUCH a client may send, this caps HOW LONG it
+// may take to send it. ReadHeaderTimeout covers neither — it is satisfied the
+// moment the request line and headers arrive, after which a client may send
+// one byte per hour and hold a handler goroutine, its connection, and
+// everything it has already sent for as long as it likes, because there is no
+// read deadline anywhere on the path.
+//
+// http.Server.ReadTimeout is deliberately NOT the lever. It is measured from
+// the start of the request, so everything this handler does before the body
+// read — the auth gate, which in partner mode is a store lookup, and the
+// snapshot load — spends the body's allowance before a single body byte
+// arrives, and it would apply to every route the server serves, including the
+// ones with no body to bound. ReadTimeout is also a property of the
+// connection for the rest of the request; the deadline armed here belongs to
+// exactly one read and is cleared the instant that read returns, which is the
+// guarantee the streaming path depends on.
+//
+// FIVE MINUTES is derived from the cap it must not make unreachable. A
+// legitimate 64 MiB body — a multimodal upload, a large tool schema —
+// delivered inside this bound implies a sustained floor of
+// 64 MiB / 5 min ≈ 218 KiB/s (≈ 1.8 Mbit/s), which is below any link that
+// would attempt the upload at all, and the bound covers the WHOLE read rather
+// than each byte, so a fast link with a slow start is not punished. The floor
+// in the other direction is what it closes: a drip feeder is cut off after
+// five minutes instead of never, which is the difference between a bounded
+// and an unbounded hold on a goroutine and a connection. A package variable
+// rather than a constant so tests can shorten it, exactly like the two caps
+// above; it is not a configuration key and must not become one.
+var requestBodyReadTimeout = 5 * time.Minute
+
+// memoryBudgetBytes is the process-wide ceiling on the bytes this process
+// commits to buffering at one moment — the client bodies and the buffered
+// answers of every concurrent request together, retries and recovery hops
+// included.
+//
+// The two caps above bound a REQUEST; the failure they prevent is a PROCESS
+// failure, and the walk's retries plus the continuation loop's re-asks
+// multiply concurrency by the policy rather than by anything the operator
+// sets. 256 MiB admits four maximum-size buffers at once — four requests each
+// holding a maximum-size body, or two holding a maximum-size body AND a
+// maximum-size answer at the same time — which is far beyond the concurrency
+// this service sees at that size. Ordinary traffic pays far less than its
+// share: a request reserves in 64 KiB blocks as it reads, so the budget admits
+// thousands of ordinary requests, and only the request that really does hold
+// tens of megabytes spends tens of megabytes of it. Documented internal
+// constant, no configuration key — the same treatment the per-request caps
+// get.
+//
+// It is HALF of what an admitted buffer really costs the process, and that is
+// the point. An admitted buffer is never the only copy of itself: the
+// transform that injects the prompt decodes the request body and marshals it
+// into a second buffer of the same size — live for the attempt, beside the
+// body the replay needs — and the composed response rewriter builds a
+// same-size copy of the answer before it is written to the client. Neither
+// copy is admitted separately; they are bounded by their sources, which are.
+// So the process peak is roughly twice this budget plus a few MiB per
+// in-flight stream, and a container's `mem_limit` must be sized against THAT
+// number rather than against the budget — which is why compose.production.yaml
+// pairs 1 GiB with the 256 MiB below.
+var memoryBudgetBytes int64 = 256 << 20 // 256 MiB
+
+// bufferBudget is the process-wide admission for the two expensive buffers.
+// It is one instance for the whole process, read per request like the caps
+// above, so every request — whatever candidate, attempt, or recovery hop it
+// is on — draws from the same ceiling. A refused reservation is refused
+// immediately and deterministically; see internal/memlimit for why that is
+// the policy rather than a bounded wait.
+var bufferBudget = memlimit.New(memoryBudgetBytes)
 
 // openAIError is the envelope shape for model-not-found responses, whose
 // message interpolates the requested model.
@@ -543,19 +622,65 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			Str("key_id", principal.KeyID).Logger()
 	}
 
-	// Bound the request body before reading it: without a cap, a single
-	// oversized client request pins unbounded memory in the proxy.
-	r.Body = http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	// The request body is bounded three ways, and they are three different
+	// bounds: maxRequestBodyBytes caps how much the client may send,
+	// requestBodyReadTimeout caps how long it may take, and bufferBudget caps
+	// what the whole process may be holding at once. Only the first is
+	// per-request; the other two are what keep one client — or a hundred —
+	// from turning a bounded request into an unbounded process.
+	//
+	// The admission is released by the defer below on every path out of this
+	// function, the successful ones and the streaming ones included, and the
+	// defer runs while a panic unwinds too: a body the proxy has stopped
+	// using is a body the process is no longer holding. Nothing here releases
+	// before the request is over, because the body stays live for it — the
+	// transforms replay it on every attempt and the continuation builder
+	// re-reads it.
+	bodyAdm := &admission{budget: bufferBudget}
+	defer bodyAdm.release()
+
+	// The read deadline is armed for the body read and CLEARED the moment it
+	// returns, on every path, because this connection is about to carry the
+	// response — a long-lived SSE stream included — and then go back into the
+	// server's keep-alive pool. A deadline that outlived its read would be
+	// armed against phases that read nothing at all, and on a pooled
+	// connection against the next request's headers and body.
+	//
+	// A ResponseWriter that cannot express a deadline says so with
+	// http.ErrNotSupported — a wrapper without the method, or net/http's own
+	// test recorder — and the read then proceeds without one rather than
+	// failing a request this transport simply cannot arm. The size bound is
+	// unaffected either way: it is enforced by MaxBytesReader, not by the
+	// clock.
+	rc := http.NewResponseController(w)
+	deadlineArmed := rc.SetReadDeadline(time.Now().Add(requestBodyReadTimeout)) == nil
+	body, err := readAllAdmitted(http.MaxBytesReader(sw, r.Body, maxRequestBodyBytes), bodyAdm)
+	if deadlineArmed {
+		_ = rc.SetReadDeadline(time.Time{})
+	}
 	if err != nil {
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		switch {
+		case errors.As(err, &tooLarge):
 			outcome = "body_too_large"
 			reject(http.StatusRequestEntityTooLarge, []byte(envelopeTooLarge), nil)
-			return
+		case errors.Is(err, errBufferRefused):
+			outcome = "capacity_exceeded"
+			log.Warn().Str("public_model", publicModel).
+				Str("phase", "request_body").
+				Str("error_class", "capacity_exceeded").
+				Msg("buffer_capacity_exceeded")
+			reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+		default:
+			// A body that stalled past the read deadline lands here beside a
+			// connection that died mid-body and a body net/http could not
+			// frame. That is deliberate: from this handler's side a deadline
+			// breach IS a read that never completed, so it takes the read
+			// failure's outcome rather than an outcome of its own. Nothing
+			// about the client's bytes is logged or echoed on any of them.
+			outcome = "body_read_error"
+			reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		}
-		outcome = "body_read_error"
-		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
 		return
 	}
 	bytesIn = int64(len(body))
@@ -1634,9 +1759,41 @@ walk:
 			// Buffered 2xx: read and validated INSIDE the walk, so a
 			// malformed or incomplete answer is a retryable result before
 			// commitment instead of a 502 after it.
-			bodyBytes, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponseBytes+1))
+			//
+			// The buffer is admitted against the same process-wide budget the
+			// request body drew from. An answer that outgrows what is left of
+			// that budget is the one case in this walk that is NOT a failed
+			// attempt: a process-wide condition is a condition every candidate
+			// shares, so no retry and no fallback can clear it, and walking on
+			// would spend the budgets on a walk that can only end the same
+			// way. It refuses on the spot, before commitment, with bytes
+			// written to nobody — the same judgement the local transform
+			// failure above makes, for the same reason.
+			respAdm := &admission{budget: bufferBudget}
+			bodyBytes, rerr := readAllAdmitted(io.LimitReader(resp.Body, maxBufferedResponseBytes+1), respAdm)
 			_ = resp.Body.Close()
+			if errors.Is(rerr, errBufferRefused) {
+				// Nothing of the answer survives — no evidence, no retained
+				// shape — so there is no attempt to report and no provider to
+				// blame. The walk ends here: the two envelope refusals below
+				// keep their own accounting, and this one has none to keep.
+				respAdm.release()
+				outcome = "capacity_exceeded"
+				log.Warn().Str("public_model", model).
+					Str("provider", cand.Label()).
+					Str("upstream", origin(&upstream)).
+					Str("phase", "upstream_response").
+					Str("error_class", "capacity_exceeded").
+					Str("failure_origin", "envelope").
+					Int("provider_attempt", providerAttempts).
+					Int("candidate_index", i+1).
+					Int("upstream_status", status).
+					Msg("buffer_capacity_exceeded")
+				reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+				return
+			}
 			if rerr != nil {
+				respAdm.release()
 				// Ownership is the request context's, never the error chain's:
 				// a canceled OR expired caller surfaces through the upstream
 				// read as its own sentinel, and neither may be reported as an
@@ -1694,6 +1851,13 @@ walk:
 				break walk
 			}
 			if len(bodyBytes) > int(maxBufferedResponseBytes) || !json.Valid(bodyBytes) {
+				// The answer is unusable, so the bytes are about to be
+				// dropped and the reservation goes back with them — on the
+				// retry, the fallback, and the finalize alike. Holding it
+				// while the walk re-asks would charge the budget twice for
+				// one request's traffic and, with a small budget, refuse the
+				// very retry that was meant to succeed.
+				respAdm.release()
 				// Over-cap and unparseable are separate protocol causes, and
 				// the policy can name them apart: both are unusable answers
 				// that share a retry-by-default disposition and the same
@@ -1752,6 +1916,12 @@ walk:
 			}
 			// A valid 2xx answer: committed. The body rides the answer
 			// struct to the rewrite; no retry follows commitment.
+			//
+			// The reservation is kept with it — the bytes are live until the
+			// rewritten answer reaches the client — and handed back by this
+			// defer as the handler returns, on the success path, the failed
+			// write path, and the unwind of a panic alike.
+			defer respAdm.release()
 			answer = &walkAnswer{kind: answerBuffered, body: bodyBytes, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey}
 			break walk
 		}
@@ -2037,37 +2207,41 @@ walk:
 			observe = partial.Observe
 		}
 
-		// The recovery window opens when the first hop COULD start — the
-		// instant before the committed stream begins relaying — so it bounds
-		// the whole recovery effort rather than one hop, and it is measured
-		// on the engine's clock like every other window this request obeys.
-		streamStart := eng.Now()
-		// ... and it is ALSO armed as a hard wall-clock deadline here, because
-		// the engine's clock can only be consulted between reads. A peer that
-		// sends a partial event and then holds the connection open parks the
-		// relay inside Body.Read, where no amount of checking the policy
-		// afterwards can reach it; the deadline's watchdog closes the body and
-		// the read returns. Every pass of this loop — the committed relay and
-		// each hop — is armed against the SAME instant, so `max-elapsed`
-		// remains one window since the commit rather than a per-hop budget.
+		// The recovery window is ONE absolute instant, opened here — the
+		// instant before the committed stream begins relaying — and every
+		// bound this session has is measured against it: the loop's own gate,
+		// the body watchdog each pass is armed with, and the context each hop
+		// dials under. It is read on the engine's clock like every other
+		// window this request obeys, and read ONCE: `max-elapsed` is a bound
+		// since the commit, never a per-hop budget that a long stream could
+		// extend by making a hop.
 		//
-		// windowClosed is written only by that watchdog, so it is the one
-		// authority on "this relay was cut by the operator's bound" as opposed
-		// to "the upstream cut it" or "the client left".
+		// It exists as a deadline rather than only as an elapsed check because
+		// a clock can only be consulted between operations. A peer that sends
+		// a partial event and then holds the connection open parks the relay
+		// inside Body.Read; a peer that accepts a connection and answers
+		// nothing at all parks the hop inside Do. Neither can be reached by
+		// re-checking the policy afterwards, so each is bound by a watchdog
+		// armed for the distance that REMAINS to this same instant
+		// (recoveryWindow): the body is closed, the dial's context canceled.
 		//
-		// The watchdog is armed ONLY when the block is enabled. The resolved
+		// Its `closed` flag is written only by those watchdogs, so it is the
+		// one authority on "this relay was cut by the operator's bound" as
+		// opposed to "the upstream cut it" or "the client left".
+		//
+		// The window is opened ONLY when the block is enabled. The resolved
 		// policy carries a nonzero `max-elapsed` even when it is disabled —
 		// that is what makes the default meaningful when a layer turns it on —
 		// so an unconditional arm would close the body of every healthy stream
 		// twenty seconds in, on deployments that never asked for any of this.
 		// The disabled path therefore keeps the plain relay it has always had:
 		// no timer, no deadline, no window state.
-		var windowClosed atomic.Bool
+		var window *recoveryWindow
 		relay := func(src io.ReadCloser) (StreamStats, error) {
 			return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
 		}
 		if contPolicy.Enabled {
-			windowEnd := time.Now().Add(contPolicy.MaxElapsed)
+			window = newRecoveryWindow(eng.Now(), contPolicy.MaxElapsed)
 			relay = func(src io.ReadCloser) (StreamStats, error) {
 				// THE UPSTREAM-RESPONSE BOUNDARY. relay is invoked once per
 				// upstream HTTP response relayed into this one client stream:
@@ -2089,7 +2263,7 @@ walk:
 				if usageCapture != nil {
 					usageCapture.Seal()
 				}
-				stopWindow := armRecoveryWindow(windowEnd, src, &windowClosed)
+				stopWindow := window.armBody(eng.Now(), src)
 				defer stopWindow()
 				return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
 			}
@@ -2118,9 +2292,11 @@ walk:
 		// empty means the loop never had to stop — the stream ended on its
 		// own terms.
 		stopReason, unsafeReason := "", ""
-		// clientGone records that the loop stopped at the caller gate rather
-		// than at any bound. It is the one stop with no `recovery_reason`,
-		// because nothing about the recovery was wrong: the reader left.
+		// clientGone records that the CLIENT was the reason the loop produced
+		// no further answer — either the caller gate below refused to dial, or a
+		// hop in flight failed because the reader left. It is the one stop
+		// with no `recovery_reason`, because nothing about the recovery was
+		// wrong: the reader went away.
 		clientGone := false
 		for contPolicy.Enabled {
 			// The gates run in a fixed order, and every one of them is a
@@ -2136,7 +2312,7 @@ walk:
 				stopReason = recoveryMaxRecoveries
 				break
 			}
-			if windowClosed.Load() {
+			if window.shut() {
 				// The hard bound fired: the watchdog closed the body this
 				// relay was blocked on, which is what ended the pass. The
 				// window is shut for the rest of the request, so no hop can
@@ -2182,14 +2358,14 @@ walk:
 				unsafeReason, stopReason = verdict.Reason, recoveryUnsafeContent
 				break
 			}
-			if eng.Now().Sub(streamStart) > contPolicy.MaxElapsed {
-				// The same window the watchdog arms, read on the frozen clock
-				// the policy was resolved with. The watchdog is what bounds a
-				// blocked read; this check is what bounds the effort even if a
-				// pass ends cleanly just past the deadline, or a caller's
-				// clock disagrees with the wall's. The pass ended by itself
-				// here, so its error — if any — is the upstream's and is
-				// reported as such: `windowShut` stays false.
+			if window.expired(eng.Now()) {
+				// The same instant the watchdogs are armed against, read on
+				// the same clock the policy was resolved with. A watchdog is
+				// what bounds an operation the proxy is parked inside; this
+				// check is what bounds the effort when a pass ends cleanly
+				// just past the deadline. The pass ended by itself here, so
+				// its error — if any — is the upstream's and is reported as
+				// such: `windowShut` stays false.
 				stopReason = recoveryMaxElapsed
 				break
 			}
@@ -2215,7 +2391,13 @@ walk:
 					Str("upstream", origin(answer.cand.Endpoint)).
 					Int("recovery_index", recoveries+1).
 					Str("phase", "build").
-					Str("reason", refusalReason).
+					// The refusal travels as `unsafe_reason`, the field the
+					// exhausted event already uses for this same token. `reason`
+					// on this event would be a second vocabulary under a name
+					// that means the LOOP's stop reason one event below, and the
+					// two closed sets share no token today — which is exactly
+					// why an operator would not notice when one day they do.
+					Str("unsafe_reason", refusalReason).
 					Msg("stream_recovery_failed")
 				unsafeReason, stopReason = refusalReason, recoveryUnsafeContent
 				break
@@ -2249,6 +2431,7 @@ walk:
 			hopExchangeBefore := eng.Budget().RequestExchanges()
 			dial := h.dialContinuation(continuationHop{
 				ctx:       r.Context(),
+				window:    window,
 				client:    r,
 				cand:      answer.cand,
 				pool:      answer.pool,
@@ -2275,6 +2458,16 @@ walk:
 			if dial.credKey != "" {
 				lastCredentialID = dial.credKey
 			}
+			// The reader left DURING the hop, rather than before it: the loop's
+			// own caller gate checks this on every iteration, so a hop is only
+			// ever dialed for a client that was there a moment ago, and this is
+			// the interleaving it cannot see. Classified from the hop's dial,
+			// on the request context — never from the error chain, whose
+			// cancellation this proxy itself raises to stop a stalled hop.
+			// The hop that failed is still recorded below; what this keeps out
+			// of the completion record is the claim that a stream nobody was
+			// reading was cut by the provider.
+			clientGone = clientGone || dial.callerGone()
 			// The hop's own egress evidence, relayed exactly where the walk
 			// relays its own: one WARN per endpoint a pool actually dialed
 			// and lost, before any disposition is reached, carrying the
@@ -2324,12 +2517,23 @@ walk:
 			// failure, not a bound.
 			recoveryFailed := func(phase string, hopErr error, status int) {
 				event := log.Warn().Str("public_model", model).
-					Str("provider", answer.cand.Label()).
-					Str("upstream", origin(dial.upstream)).
-					Int("recovery_index", index).
-					Str("phase", phase)
+					Str("provider", answer.cand.Label())
+				// The endpoint is named only when this hop resolved one. A
+				// window refusal happens BEFORE the hop builds its URL — the
+				// check is deliberately first, so a hop that has outlived the
+				// window builds no body, acquires no credential and claims no
+				// exchange on its way to being refused — so there is no
+				// endpoint to name there, and naming one (or dereferencing a
+				// nil one) would be the same misattribution the cause rule
+				// below avoids.
+				if dial.upstream != nil {
+					event = event.Str("upstream", origin(dial.upstream))
+				}
+				event = event.Int("recovery_index", index).Str("phase", phase)
 				if hopErr != nil {
-					event = event.Err(sanitizeUpstreamError(hopErr, dial.upstream))
+					if cause := hopFailureCause(phase, hopErr, dial.upstream); cause != nil {
+						event = event.Err(cause)
+					}
 				}
 				if status != 0 {
 					event = event.Int("upstream_status", status)
@@ -2337,6 +2541,20 @@ walk:
 				withCredentialFields(event, dial.credKey).Msg("stream_recovery_failed")
 			}
 			if dial.phase != "" {
+				if dial.phase == recoveryMaxElapsed {
+					// The window, not a peer. This is the one hop phase that
+					// names an owner this proxy chose rather than an endpoint
+					// that misbehaved: nothing was dialed for the refusal, or
+					// the dial was canceled by this window's own watchdog, so
+					// the error — if there is one — belongs to nothing outside
+					// this process and is deliberately not attached. The
+					// phase token is the loop's own stop reason, because it is
+					// the same fact, and `windowShut` makes the recorder treat
+					// this as the bound it is rather than as an upstream read.
+					recoveryFailed(recoveryMaxElapsed, nil, 0)
+					windowShut, stopReason = true, recoveryMaxElapsed
+					break
+				}
 				recoveryFailed(dial.phase, dial.err, 0)
 				break
 			}
@@ -2389,7 +2607,7 @@ walk:
 			// Read the window's own flag BEFORE the terminal check: a hop cut
 			// short by the watchdog is a bound, never a success, however its
 			// partial bytes happen to land.
-			cutByWindow := windowClosed.Load()
+			cutByWindow := window.shut()
 			if hopStats.Terminal && !cutByWindow {
 				log.Info().Str("public_model", model).
 					Str("provider", answer.cand.Label()).
@@ -2417,11 +2635,25 @@ walk:
 			// hop failure and a bound below. So the window is checked first and
 			// wins: the loop's next iteration, which never runs, is the only
 			// other place `max_elapsed` could be recorded.
+			if cutByWindow {
+				// The bound's record, and NOT a peer's. `hopErr` here is this
+				// proxy's own closed body — the lever the watchdog uses to
+				// unblock a parked relay — so attaching it would put a transport
+				// error on the one phase that blames no endpoint and send an
+				// operator after an upstream that behaved perfectly. Same rule as
+				// the dial branch above, for the same reason: the error belongs
+				// to nothing outside this process and is deliberately not
+				// attached. Closing the loop here rather than letting the gates
+				// re-derive the same reason is what keeps one cause to one
+				// record: the window is shut for the rest of the request, so
+				// nothing below can run.
+				recoveryFailed(recoveryMaxElapsed, nil, 0)
+				windowShut, stopReason = true, recoveryMaxElapsed
+				break
+			}
 			hopPhase := "upstream_read"
 			var swe *streamWriteError
 			switch {
-			case cutByWindow:
-				hopPhase = recoveryMaxElapsed
 			case errors.As(hopErr, &swe), clientSide(hopErr):
 				hopPhase = "client_write"
 			case errors.Is(hopErr, ErrSSELineTooLong), errors.Is(hopErr, ErrSSEEventTooLarge):
@@ -2430,14 +2662,6 @@ walk:
 				hopPhase = "upstream_limit"
 			}
 			recoveryFailed(hopPhase, hopErr, 0)
-			if cutByWindow {
-				// Close the loop here rather than letting the gates above
-				// re-derive the same reason: the window is shut for the rest of
-				// the request, and `err` is this proxy's closed body, so the
-				// window is the only thing that ended the stream.
-				windowShut, stopReason = true, recoveryMaxElapsed
-				break
-			}
 		}
 		if windowShut {
 			// The pass that ended this loop was ended by the window's own
@@ -2720,6 +2944,43 @@ func dialedAttempt(pooled bool, info *transport.AttemptInfo) bool {
 		return true
 	}
 	return info.Attempts > 0
+}
+
+// hopFailureCause decides what a hop-failure record may say about the error it
+// was handed, by the rule the committed pass's own truncation record already
+// follows: an error this process or the reader produced is logged as this
+// package's typed value, whose text is static, and only a failure that came
+// off the wire goes through the sanitizer, because a truncated read surfaces
+// the transport's own parse failures and those interpolate the upstream's
+// bytes.
+//
+// The distinction is not cosmetic. sanitizeUpstreamError answers an error it
+// does not recognize with the static string "upstream transport error", so
+// routing a bounded-relay cap or a failed client write through it would report
+// a stop this proxy or the reader caused as a peer's — one field away from the
+// `phase` token that says the opposite, on the one event an operator reads to
+// learn WHO cut the stream. Both of those errors are this package's own typed
+// values carrying sizes and counts, never bytes, and the committed path logs
+// them raw for exactly that reason.
+//
+// A phase that never dialed gets no cause at all. The phase token is the whole
+// story there: nothing outside this process took part, and the error the
+// caller holds describes a step (a transform, an acquire, an envelope claim)
+// that failed before any endpoint was reachable.
+func hopFailureCause(phase string, err error, upstream *url.URL) error {
+	switch phase {
+	case "build", "credential", "budget", recoveryMaxElapsed:
+		// Refusals this proxy made: nothing was dialed, so there is no
+		// endpoint the cause could belong to.
+		return nil
+	case "client_write", "upstream_limit":
+		// The reader's socket, and this proxy's own bounded-relay cap.
+		return err
+	default:
+		// `dial`, `upstream_status`, `upstream_read`: the wire, and the only
+		// causes the no-echo rule governs.
+		return sanitizeUpstreamError(err, upstream)
+	}
 }
 
 // sanitizeUpstreamError rebuilds a client.Do error without the full request

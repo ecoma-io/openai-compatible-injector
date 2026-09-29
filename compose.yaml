@@ -1,4 +1,12 @@
-# Homelab deployment for openai-compatible-injector.
+# Homelab deployment for openai-compatible-injector — the SINGLE-HOST mode.
+#
+# `container_name: injector` and the published `8080:8080` are deliberate and
+# belong to this mode: a human curls the service directly, one instance exists,
+# and a stable name is what makes `docker logs injector` mean something. They
+# are also exactly what a rollout cannot have, which is why production is a
+# different file (compose.production.yaml) with neither: two instances must be
+# able to run side by side, and a fixed name plus a published port forbids it.
+#
 # config.yaml is the Git-ignored runtime file at the repo root; copy
 # config.example.yaml to config.yaml first. Hot reload polls file content, so
 # editing config.yaml in place on the host applies without a restart. One
@@ -17,14 +25,19 @@ services:
       # variable the service reads is OAICR_-prefixed.
       OAICR_LISTEN: :8080
       OAICR_CONFIG_FILE: /app/config.yaml
-      # Optional. The drain budget must stay below stop_grace_period so
-      # docker's SIGKILL never cuts it short.
+      # Optional. The whole post-signal budget: the readiness head start plus
+      # the in-flight drain are both drawn from it. Keep it below
+      # stop_grace_period, with room left for the usage flush.
       # OAICR_SHUTDOWN_GRACE: 45s
       # OAICR_CONFIG_POLL_INTERVAL: 1s
-    # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
-    # above the service's OAICR_SHUTDOWN_GRACE (default 55s) plus a little
-    # margin so an active SSE stream gets its full drain before the kill.
-    stop_grace_period: 60s
+    # docker stop sends SIGTERM and waits this long before SIGKILL. The whole
+    # post-signal budget is the drain grace (default 55s) PLUS the defers that
+    # follow it: the usage drain's 10s window and its 5s join grace, and the
+    # key store's own 5s close in partner mode — 75s worst case, which is why
+    # 60s is too short. A healthy drain finishes far sooner; this is only the
+    # backstop. The readiness transition is NOT an addition to the number: the
+    # head start is drawn from the same grace as the drain.
+    stop_grace_period: 75s
     logging:
       driver: json-file
       options:
@@ -33,9 +46,12 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     healthcheck:
+      # Reads /readyz: 200 while the process should be sent traffic, 503 from
+      # the instant it starts draining. See the Dockerfile for the cadence's
+      # derivation.
       test: ["CMD", "/app/openai-compatible-injector", "healthcheck"]
-      interval: 30s
-      timeout: 5s
-      start_period: 15s
-      retries: 3
+      interval: 2s
+      timeout: 2s
+      start_period: 90s
+      retries: 1
     restart: unless-stopped

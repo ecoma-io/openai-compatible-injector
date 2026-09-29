@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -331,11 +330,14 @@ func perfStreamRead(tb testing.TB, addr, path, body string) (ttfb, total time.Du
 	if resp.StatusCode != http.StatusOK {
 		tb.Fatalf("status = %d", resp.StatusCode)
 	}
-	br := bufio.NewReader(resp.Body)
-	// The first event ends at its blank line; every shape emits one.
+	s := newSSEStream(tb, resp)
+	// The first event ends at its blank line; every shape emits one. The
+	// owner's reader is used directly: this helper measures first-byte and
+	// total time against a threshold, so its reads are deliberately
+	// unbounded — a per-line goroutine and timer would be measured too.
 	sawBoundary := false
 	for !sawBoundary {
-		line, err := br.ReadString('\n')
+		line, err := s.readLine()
 		if err != nil {
 			tb.Fatalf("stream read: %v", err)
 		}
@@ -344,7 +346,7 @@ func perfStreamRead(tb testing.TB, addr, path, body string) (ttfb, total time.Du
 		}
 	}
 	ttfb = time.Since(start)
-	if _, err := io.Copy(io.Discard, br); err != nil {
+	if _, err := io.Copy(io.Discard, s.br); err != nil {
 		tb.Fatalf("copy: %v", err)
 	}
 	return ttfb, time.Since(start)
