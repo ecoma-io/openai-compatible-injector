@@ -55,11 +55,12 @@ const (
 	// `recovery.stream.enabled: true` alone means: one extra upstream
 	// request, never a loop.
 	DefaultMaxStreamRecoveries = 1
-	// DefaultStreamMaxElapsed bounds the recovery window, measured from the
-	// instant the stream's headers committed. It is generous relative to the
-	// work it bounds (a single extra generation) because it is a runaway
-	// backstop, not a latency budget — the caller's own deadline and the
-	// request-wide exchange envelope bind first in practice.
+	// DefaultStreamMaxElapsed is the longest silence the proxy tolerates from
+	// an upstream during the committed relay or any continuation hop. Every
+	// upstream byte moves the bound forward, so a healthy long generation is
+	// never cut; a peer that goes quiet is still a runaway backstop rather than
+	// a latency budget. The caller's own deadline and the request-wide exchange
+	// envelope bind first in practice.
 	DefaultStreamMaxElapsed = 20 * time.Second
 	// DefaultStreamMaxPartialBytes bounds the committed output held in
 	// memory to build a continuation request. 256 KiB is far above any

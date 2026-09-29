@@ -2242,6 +2242,21 @@ walk:
 		}
 		if contPolicy.Enabled {
 			window = newRecoveryWindow(eng.Now(), contPolicy.MaxElapsed)
+			// The source-read wrapper is where upstream progress is observed,
+			// so the window's silence restarts there and nowhere else. CopySSE's
+			// event hook happens AFTER it has parsed and written an event: a
+			// healthy peer may send one fragmented event for longer than the
+			// bound, and a slow client may take longer than that to accept a
+			// write. Neither makes the upstream silent. Binding the wrapper here
+			// rather than inside CopySSE also keeps the relay unaware of the
+			// bound: a feature-off relay is still the plain CopySSE it has always
+			// been.
+			//
+			// The clock is the REQUEST's, read when the source yielded bytes. It
+			// is upstream progress only: the keep-alive ping is written to the
+			// client, never read from the peer, so it cannot revive a window
+			// whose upstream has actually gone quiet.
+			relayProgress := func() { window.progress(eng.Now()) }
 			relay = func(src io.ReadCloser) (StreamStats, error) {
 				// THE UPSTREAM-RESPONSE BOUNDARY. relay is invoked once per
 				// upstream HTTP response relayed into this one client stream:
@@ -2265,7 +2280,7 @@ walk:
 				}
 				stopWindow := window.armBody(eng.Now(), src)
 				defer stopWindow()
-				return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
+				return CopySSE(dst, upstreamProgressReader{Reader: src, progress: relayProgress}, relayRewrite, progress, stripKeys, observe)
 			}
 		}
 		stats, err := relay(answer.resp.Body)

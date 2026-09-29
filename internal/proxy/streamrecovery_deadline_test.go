@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -9,12 +10,23 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // The suite in this file is the ADVERSARIAL half of `max-elapsed`: it exists to
 // prove the bound holds on every way a peer can leave this proxy waiting, and
 // that the answer to "who ended this?" is never ambiguous when it is this
 // proxy's own window.
+//
+// The bound is IDLE time — the silence this proxy tolerates from an upstream —
+// not total time since the commit. An absolute deadline could not tell a
+// healthy long generation from a stalled peer and cut both with the same event;
+// production measured healthy streams of 73s, 83s and 106s losing their marker
+// to a 20s default. The window is still ONE measure for the whole session and
+// is never re-opened by a hop, so every lever below shares it — but every
+// accepted upstream byte moves it forward by a full interval, and only genuine
+// silence spends it.
 //
 // The waits a continuation hop can be parked in are two, and they need
 // different levers:
@@ -27,8 +39,8 @@ import (
 //     exists; Body.Read takes no context, so only closing the body returns the
 //     read (recoveryWindow.armBody).
 //
-// Both levers are armed against the SAME instant, computed once when the
-// committed stream began, and the tests below assert on that instant rather
+// Both levers are armed against the SAME window, opened once when the
+// committed stream began, and the tests below assert on that window rather
 // than on any individual timer.
 
 // headerParkedDial answers a dial by refusing to answer it: it never writes a
@@ -174,24 +186,26 @@ func TestRecoveryWindowBindsEveryLeverToOneDeadline(t *testing.T) {
 		t.Error("the body watchdog closed a body without recording the window as shut")
 	}
 
-	// One window, several levers, still one instant: a lever armed after part
-	// of the window has already run fires on what is LEFT of it. A per-hop
-	// reset would let this second lever outlive the deadline by most of a
-	// window, which is exactly the property `max-elapsed` claims not to have.
+	// One window across separate passes: a body watchdog is inherently owned
+	// by the ONE response body it can close, so it is stopped as that pass ends
+	// before a later pass arms its own. The later lever gets only what was left
+	// of the same window; a per-hop reset would let it outlive the first timer
+	// by most of a window, which is exactly the property `max-elapsed` must not
+	// have.
 	shared := newRecoveryWindow(time.Now(), window)
 	first := &closeRecorder{}
 	stopFirst := shared.armBody(time.Now(), first)
-	defer stopFirst()
 	time.Sleep(window * 2 / 3)
+	stopFirst()
+	if first.closed.Load() {
+		t.Error("stopping a healthy first pass closed its body")
+	}
 	second := &closeRecorder{}
 	stopSecond := shared.armBody(time.Now(), second)
 	defer stopSecond()
 	time.Sleep(window * 2 / 3)
 	if !second.closed.Load() {
-		t.Error("a lever re-armed mid-window restarted the bound instead of sharing it")
-	}
-	if !first.closed.Load() {
-		t.Error("the lever armed when the window opened never fired")
+		t.Error("a lever armed for the later pass restarted the bound instead of sharing it")
 	}
 
 	// The already-expired arm is the commit that itself outlived the window:
@@ -401,3 +415,350 @@ func TestStreamRecoverySecondHopHeaderWaitIsBounded(t *testing.T) {
 		t.Fatalf("stream_recovery_exhausted = %v, want one max_elapsed refusal", exh)
 	}
 }
+
+// TestRecoveryWindowIdleTimeIsExtendedByUpstreamProgress is the QUIET
+// direction of the bound, and the one the absolute deadline could not express.
+//
+// A generation that keeps talking is healthy, however long it talks. Under the
+// old window, a stream whose total length exceeded `max-elapsed` was cut with
+// `max_elapsed` while it was still producing tokens — the same event the
+// proxy emits for a peer that has genuinely stopped, so an operator reading
+// the log could not tell a runaway from a long answer. That is the failure
+// this pins: the answer below runs for roughly three and a half windows end to
+// end, so an absolute deadline would have fired in the middle of it, and every
+// one of its events is the proof that keeps the window alive.
+//
+// The shape is a steady stream with gaps well INSIDE the bound, and that is
+// deliberate rather than convenient: silence longer than the bound is not a
+// long answer, it is the stall, and a fixture that outran the window with gaps
+// longer than it would be testing the opposite property. Its inverse is pinned
+// separately by TestStreamRecoveryIdleWindowStillCutsAStalledBody: the same
+// bound, on an upstream that goes quiet, still ends the request.
+func TestRecoveryWindowIdleTimeIsExtendedByUpstreamProgress(t *testing.T) {
+	const window = 200 * time.Millisecond
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 200ms\n"))
+	// Eight events spread over roughly three and a half windows: every gap is
+	// HALF the bound, so the only thing carrying the stream past the total is
+	// that the upstream keeps saying something. A per-read or per-event bound
+	// would also survive this; only a bound that MOVES on upstream progress
+	// does. Under the old absolute deadline this request would have been cut
+	// around its second event, with the same `max_elapsed` record a genuinely
+	// stalled peer produces.
+	upstream := &pacedReader{
+		segments: []string{
+			sseChat("One"), sseChat(" two"), sseChat(" three"), sseChat(" four"),
+			sseChat(" five"), sseChat(" six"), sseChat(" seven"), sseChat(" eight"),
+		},
+		pause:  window / 2,
+		final:  "data: [DONE]\n\n",
+		closed: make(chan struct{}),
+	}
+	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       upstream,
+		}, nil
+	}}
+
+	start := time.Now()
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"One", " two", " three", " four", " five", " six", " seven", " eight", "[DONE]"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("a healthy stream outliving the window lost %q: %s", want, body)
+		}
+	}
+	// The proof that the window was genuinely outrun rather than merely not
+	// armed: the whole answer took several windows, so an absolute deadline
+	// would have fired in the middle of it. The floor is below the fixture's
+	// own arithmetic (seven gaps of half a window) so a loaded machine cannot
+	// fail it, while still being more than twice the absolute bound.
+	if elapsed < 2*window {
+		t.Errorf("the answer arrived in %v; the test did not outrun the %v window", elapsed, window)
+	}
+	if upstream.closedEarly.Load() {
+		t.Error("the window closed a body whose upstream was still producing events")
+	}
+	if pa.dials() != 1 {
+		t.Errorf("dials = %d, want the primary once and no continuation", pa.dials())
+	}
+	for _, slug := range []string{"stream_recovery_started", "stream_recovery_failed", "stream_recovery_succeeded", "stream_recovery_exhausted", "stream_truncated"} {
+		if ev := logBuf.events(t, slug); len(ev) != 0 {
+			t.Errorf("%s fired for a healthy stream that outran the window: %v", slug, ev)
+		}
+	}
+	completed := logBuf.events(t, "stream_completed")
+	if len(completed) != 1 || completed[0]["stream_recoveries"] != float64(0) {
+		t.Fatalf("stream_completed = %v, want one completion with no recovery", completed)
+	}
+}
+
+// TestRecoveryWindowCountsFragmentedUpstreamBytesBeforeEventDispatch pins the
+// source-read boundary. A legitimate SSE event can be large enough, or arrive
+// fragmented enough, that it takes longer than max-elapsed to reach its blank
+// line. The peer is still talking throughout. Counting only event boundaries
+// would cut it before the parser could dispatch its first event; counting
+// client writes would be even later and would make a slow client part of the
+// liveness decision. Every successful upstream read is the one fact that is
+// both early enough and true.
+func TestRecoveryWindowCountsFragmentedUpstreamBytesBeforeEventDispatch(t *testing.T) {
+	const window = 200 * time.Millisecond
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 200ms\n"))
+	// No complete SSE line exists until the last segment, more than two
+	// windows after the first. The source yields a fragment every half-window,
+	// so an idle bound has to see those reads while CopySSE is still waiting
+	// for its first event boundary.
+	upstream := &pacedReader{
+		segments: []string{
+			`data: {"model":"up-a","choices":[{"index":0,"delta":{"content":"`,
+			`one `,
+			`fragmented `,
+			`SSE `,
+			`event` + "\"}}]}\n\n",
+		},
+		pause:  window / 2,
+		final:  "data: [DONE]\n\n",
+		closed: make(chan struct{}),
+	}
+	pa.script = []dialFunc{func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       upstream,
+		}, nil
+	}}
+
+	start := time.Now()
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "one fragmented SSE event") ||
+		!strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("fragmented healthy event did not finish: %s", rec.Body.String())
+	}
+	if elapsed < 2*window {
+		t.Errorf("stream arrived in %v; the test did not outrun its %v window before dispatch", elapsed, window)
+	}
+	if upstream.closedEarly.Load() {
+		t.Error("the window closed a peer that was still feeding one fragmented event")
+	}
+	for _, slug := range []string{"stream_recovery_exhausted", "stream_truncated"} {
+		if ev := logBuf.events(t, slug); len(ev) != 0 {
+			t.Errorf("%s fired before the fragmented event could dispatch: %v", slug, ev)
+		}
+	}
+}
+
+// TestStreamRecoveryIdleWindowStillCutsAStalledBody is the OTHER half of the
+// same property, and the one that keeps the change from being a relaxation.
+//
+// Moving the bound is only correct if the bound still bites. The upstream here
+// is exactly the one from the quiet test's opposite: it says one thing and
+// then stops. The stream was healthy up to that point and the bound is still
+// reached, still reported as this proxy's own and never as a peer's fault,
+// and still spends no hop — the request ends where it stopped rather than
+// parking the client on a silent connection.
+func TestStreamRecoveryIdleWindowStillCutsAStalledBody(t *testing.T) {
+	const window = 250 * time.Millisecond
+	h, logBuf, pa, _ := recoveryHandler(t,
+		recoveryBlock(t, "    enabled: true\n    max-elapsed: 250ms\n"))
+	// A generation that is well past the point of proving it is alive, then
+	// stops for good. The window may be extended by what came before, but the
+	// silence after it is what spends it.
+	body, dial := sseParked(context.Background(), sseChat("Hello ")+sseChat("world"))
+	pa.script = []dialFunc{dial}
+
+	start := time.Now()
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	// What already reached the client stays: the bound cuts the recovery, it
+	// does not retract the committed answer.
+	if !strings.Contains(rec.Body.String(), "Hello ") {
+		t.Fatalf("the committed text never reached the client: %s", rec.Body.String())
+	}
+	if !body.released.Load() {
+		t.Fatal("the parked read never returned: the window did not reach the body")
+	}
+	if elapsed > window+1500*time.Millisecond {
+		t.Errorf("request took %v against a %v idle window: silence is not bounded", elapsed.Round(time.Millisecond), window)
+	}
+	if pa.dials() != 1 {
+		t.Errorf("dials = %d, want no hop past the window", pa.dials())
+	}
+	if ev := logBuf.events(t, "stream_recovery_started"); len(ev) != 0 {
+		t.Errorf("a hop was dialed past the window: %v", ev)
+	}
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want one max_elapsed refusal", exh)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 || trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Fatalf("stream_truncated = %v, want one with recovery_reason max_elapsed", trunc)
+	}
+	// The window is this proxy's own bound, not a diagnosis about the peer, so
+	// it carries no error and is never reported as a departed client.
+	if _, has := trunc[0]["error"]; has {
+		t.Errorf("the window reported an upstream error it invented: %v", trunc[0])
+	}
+	if trunc[0]["outcome"] == "client_disconnected" {
+		t.Errorf("the window was reported as a client disconnect: %v", trunc[0])
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 || done[0]["outcome"] != "stream_truncated" {
+		t.Fatalf("request_completed = %v, want stream_truncated", done)
+	}
+}
+
+// pacedReader streams one segment at a time with a pause between each, then a
+// terminal marker, then EOF: a slow but perfectly healthy upstream whose total
+// length is many times any window. It is pacedReader rather than
+// pausedReader because the property under test is the WHOLE session's length,
+// not one gap — a single long gap is indistinguishable from a stall, and a
+// bound that treated it as one would be a bound nobody could safely raise.
+type pacedReader struct {
+	segments []string
+	pause    time.Duration
+	final    string
+	closed   chan struct{}
+	i        int
+	offset   int
+	// closedEarly records a Close that arrived while segments remained — the
+	// watchdog firing on a body whose upstream was still producing. It is the
+	// quiet direction's own evidence, because a test that only checked the
+	// relayed bytes could not tell a close that lost a race from one that
+	// never happened.
+	closedEarly atomic.Bool
+}
+
+func (r *pacedReader) Close() error {
+	select {
+	case <-r.closed:
+	default:
+		close(r.closed)
+	}
+	return nil
+}
+
+func (r *pacedReader) Read(p []byte) (int, error) {
+	if r.i < len(r.segments) {
+		if r.i > 0 && r.offset == 0 {
+			select {
+			case <-time.After(r.pause):
+			case <-r.closed:
+				// Close after the terminal marker is ordinary handler cleanup,
+				// not a watchdog firing early. While segments remain, though,
+				// it proves a bound cut a still-speaking upstream.
+				r.closedEarly.Store(true)
+				return 0, errors.New("http: read on closed response body")
+			}
+		}
+		seg := r.segments[r.i]
+		n := copy(p, seg[r.offset:])
+		r.offset += n
+		if r.offset == len(seg) {
+			r.i++
+			r.offset = 0
+		}
+		return n, nil
+	}
+	if r.i == len(r.segments) {
+		r.i++
+		return copy(p, r.final), nil
+	}
+	return 0, io.EOF
+}
+
+// TestRecoveryWindowIsNotRevivedByThisProxysOwnKeepAlive is the ping.
+//
+// The bound measures whether the UPSTREAM is alive, and the SSE keep-alive is
+// this proxy talking to its own client: it is written on a timer, it is never
+// read from the peer, and it says nothing whatever about whether the model is
+// still generating. Wiring it to the window's progress would let a dead
+// upstream stay alive indefinitely — every ping would restart the silence, and
+// a client that kept reading would sit on a stream that would never end. It is
+// the one way an idle bound is strictly worse than the absolute deadline it
+// replaced, so the guard is a test rather than a comment.
+//
+// The floor on the ping interval is 1s, so the bound here is set just UNDER
+// two ping intervals: a ping-driven window would be restarted before it ever
+// fell, and the request would never end. The real window falls well inside the
+// first gap between pings, so the request is expected to be CUT at its bound.
+// The test fails if it survives — which is the only shape that failure can
+// take, since a bound that stopped biting would hang rather than truncate.
+func TestRecoveryWindowIsNotRevivedByThisProxysOwnKeepAlive(t *testing.T) {
+	// Just under two ping intervals, so the stall below spans more than one
+	// ping and a window fed by pings could not expire anywhere in it.
+	const window = 1900 * time.Millisecond
+	store := newChainStore(t, recoveryBlock(t,
+		"    enabled: true\n    max-elapsed: 1900ms\n")+"\n"+keepAliveYAML)
+	pa := &scriptedDoer{}
+	pb := &scriptedDoer{}
+	logBuf, log := captureLog(zerolog.DebugLevel)
+	h := NewHandler(store, kindResolver{direct: pa, proxied: pb}, nil, nil, nil, log)
+
+	// One healthy event, then silence for good. The heartbeat fires inside the
+	// stall; the window must not notice it.
+	//
+	// The timeout makes the sabotage failure finite: if a future change lets
+	// our own pings revive the window, this request returns as a caller stop
+	// rather than hanging the test forever. It is deliberately well past the
+	// real window (and its scheduling headroom), so a correct run never reaches
+	// it and the event assertions below still distinguish the two owners.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	body, dial := sseParked(ctx, sseChat("Hello"))
+	pa.script = []dialFunc{dial}
+
+	start := time.Now()
+	rec := doRequestWithContext(t, h, ctx, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the already-committed 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Hello") {
+		t.Fatalf("the committed event never reached the client: %s", rec.Body.String())
+	}
+	if !body.released.Load() {
+		t.Fatal("the parked read never returned: the keep-alive kept a dead upstream alive")
+	}
+	if elapsed > window+1500*time.Millisecond {
+		t.Errorf("request took %v against a %v window: a dead upstream outlived it anyway",
+			elapsed.Round(time.Millisecond), window)
+	}
+	// The ping may be visible in the relayed bytes — it is an ignorable
+	// comment and its presence is not the defect. The defect is the window
+	// surviving it, so the outcome is the assertion.
+	exh := logBuf.events(t, "stream_recovery_exhausted")
+	if len(exh) != 1 || exh[0]["reason"] != "max_elapsed" {
+		t.Fatalf("stream_recovery_exhausted = %v, want one max_elapsed refusal: the "+
+			"window was kept alive by this proxy's own client traffic", exh)
+	}
+	trunc := logBuf.events(t, "stream_truncated")
+	if len(trunc) != 1 || trunc[0]["recovery_reason"] != "max_elapsed" {
+		t.Fatalf("stream_truncated = %v, want one with recovery_reason max_elapsed", trunc)
+	}
+}
+
+// keepAliveYAML turns the SSE keep-alive on at its 1s floor — the shortest
+// interval the configuration accepts, and therefore the one that gives a
+// ping-driven window the best chance of outliving a bound. It is a constant
+// rather than a parameter because exactly one test needs it, and every other
+// keep-alive test asserts on the ping's own behaviour rather than on a window.
+const keepAliveYAML = "sse-keep-alive:\n  enabled: true\n  interval: 1s\n"

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -309,15 +310,15 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 	return dial
 }
 
-// recoveryWindow is ONE logical stream's recovery bound: the single absolute
-// instant, computed once when the committed stream begins relaying, past which
-// this proxy stops trying to finish the answer.
+// recoveryWindow is ONE logical stream's recovery bound: the silence this
+// proxy tolerates from an upstream before it stops trying to finish the
+// answer.
 //
 // It is a value rather than a handful of locals because the bound has to be
-// the SAME instant for four different mechanisms, and the defect this type
-// replaces was that it was not: the loop's "is the window over" gate read one
-// clock while the hard deadline was computed from another, and the hop dial
-// was bounded by neither.
+// the SAME measure for four different mechanisms, and the defect this type
+// replaces was that it was not: the loop's own gate read one clock while the
+// hard deadline was computed from another, and the hop dial was bounded by
+// neither.
 //
 //   - the loop's own gate, read on the request's clock (expired);
 //   - the body watchdog that closes an upstream body the relay is parked on
@@ -328,54 +329,143 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 //     ResponseHeaderTimeout, because an SSE body legitimately outlives any
 //     fixed header deadline, so the only header bound a hop can have is the
 //     one the operator's own max-elapsed already implies;
-//   - the hop's refusal to dial at all once the instant has passed (dialable).
+//   - the hop's refusal to dial at all once the measure is spent (dialable).
 //
-// A window is never reset and no hop re-opens it. Every pass and every hop
-// arms its own watchdog — a body must be closed to unblock a read and a
-// context must be canceled to abort a dial, and those are different levers on
-// different objects — but each is armed for the distance that REMAINS to the
-// same deadline. `max-elapsed` is one window since the commit, never a
-// per-hop budget.
+// The bound is IDLE time, not total time. Every upstream byte the relay
+// accepts moves it forward by a full interval, so a generation that is
+// healthy for an hour is never cut, while an upstream that goes quiet stops
+// costing the client after one interval of silence. The previous absolute
+// deadline could not tell those two apart: it killed long healthy answers
+// (production measured 73s, 83s and 106s streams completing normally) with
+// the same event it used for a genuinely stalled peer.
+//
+// Progress is counted from UPSTREAM bytes only. The keep-alive ping is
+// written to the client, never read from the peer, so it cannot reset the
+// window — a proxy that kept itself alive by talking to its own client would
+// report a dead upstream as a live one.
 //
 // The clock is the caller's, deliberately: this type never reads time itself.
 // Every caller passes a reading of the REQUEST's one clock — the engine's, the
 // same source the walk, the budget and the frozen policy were timed by — so a
 // recovery session cannot drift between two notions of "now", and so a test
 // can drive the whole session through the same seam it already drives the
-// engine through. In production that seam is time.Now, so deadline carries
+// engine through. In production that seam is time.Now, so the instant carries
 // Go's monotonic reading and every comparison below survives a wall-clock
 // step; a fake clock only ever replaces it in tests.
 type recoveryWindow struct {
-	// deadline is the one instant. Read once, at construction, and never
-	// recomputed — that is what makes it a bound rather than a per-hop clock.
+	// idle is how much silence the bound permits. It is fixed for the life
+	// of the window; only the deadline below moves.
+	idle time.Duration
+	// deadline is the instant this silence ends, and it MOVES: every
+	// accepted upstream byte pushes it a full `idle` into the future, so it
+	// answers "when has this upstream last said anything, plus the bound"
+	// rather than "when did this request start". It is read and written
+	// under mu, because the relay's progress hook and the window's own
+	// gate run concurrently — the relay goroutine records progress while
+	// the loop below decides whether that progress was enough.
 	deadline time.Time
-	// closed records that the window has been REACHED. It is set by whichever
-	// watchdog gets there first, or by a caller that finds the instant already
-	// past, and it is the single authority on "this proxy's own bound ended
-	// that pass" as opposed to "the upstream cut it" or "the caller left". It
-	// is stored BEFORE the body is closed or the context canceled, so a caller
-	// that reads it after an unblocked read or an aborted dial can never miss
-	// it and never misattribute the stop to a peer.
+	// mu guards deadline and the live body watchdog. It is never held across a
+	// body close, a context cancel or any other call that could block: the
+	// watchdog stores `closed` and closes its lever OUTSIDE it, so a read parked
+	// in Body.Read can never be waiting on this mutex.
+	mu sync.Mutex
+	// closed records that the bound has been REACHED. It is set by whichever
+	// watchdog gets there first, or by a caller that finds the silence
+	// already spent, and it is the single authority on "this proxy's own
+	// bound ended that pass" as opposed to "the upstream cut it" or "the
+	// caller left". It is stored BEFORE the body is closed or the context
+	// canceled, so a caller that reads it after an unblocked read or an
+	// aborted dial can never miss it and never misattribute the stop to a
+	// peer.
 	closed atomic.Bool
+	// armed is the live body watchdog, or nil when no pass is inside a read.
+	// A moving deadline needs a MOVING timer: an AfterFunc armed at the pass's
+	// start still fires at the instant it was armed for, so extending the
+	// bound without resetting it would leave the relay parked on a body this
+	// proxy had already promised to keep reading. armedUntil is the physical
+	// timer deadline, separate from the injected-clock deadline above: the
+	// timer runs on real time while tests drive the policy clock. It lets a
+	// callback that raced a Reset see that progress already moved the timer
+	// before it closes the body.
+	//
+	// Both are guarded by mu alongside deadline, and are cleared by the same
+	// stop() the relay defers, so the timer cannot outlive the pass that armed
+	// it.
+	armed      *time.Timer
+	armedUntil time.Time
 }
 
 // newRecoveryWindow opens the window: start is the instant the committed
-// stream began relaying, maxElapsed the frozen policy's bound.
-func newRecoveryWindow(start time.Time, maxElapsed time.Duration) *recoveryWindow {
-	return &recoveryWindow{deadline: start.Add(maxElapsed)}
+// stream began relaying, maxIdle the frozen policy's tolerated silence.
+func newRecoveryWindow(start time.Time, maxIdle time.Duration) *recoveryWindow {
+	return &recoveryWindow{idle: maxIdle, deadline: start.Add(maxIdle)}
 }
 
-// expired reports whether the window is over at a reading of the request's
-// clock. It compares against the deadline itself rather than recomputing an
-// elapsed duration, so there is exactly one place the bound is expressed.
-func (w *recoveryWindow) expired(now time.Time) bool { return now.After(w.deadline) }
+// progress records that the upstream produced bytes at `now`, extending the
+// silence to a full `idle` from here. It is the one function that moves the
+// deadline, and it is called at the SOURCE read boundary — not after a client
+// write and not only after an SSE event boundary. A peer can legitimately send
+// one large, fragmented event for longer than the interval; the bytes prove it
+// is alive even before the parser sees its blank line. Conversely, a slow
+// client and this proxy's keep-alive ping are downstream facts, not upstream
+// progress, and must never revive the bound.
+//
+// A byte that arrives at or after the current deadline does NOT revive the
+// window: by then a watchdog has already closed the body, and re-opening the
+// bound from under it would leave a stream no longer bound at all. The
+// deadline is also never moved once closed is set, so a late byte and a bound
+// that already fired agree on the outcome.
+//
+// The armed body watchdog is reset with the deadline. That is the whole reason
+// this function exists rather than a plain field write: `max-elapsed` used to
+// be an instant, so a timer armed once for it stayed right for the life of the
+// pass. An idle bound is not an instant, and a timer that outlives the
+// extension would cut exactly the healthy stream the extension exists to
+// protect. The timer is reset rather than re-created so the relay holds no
+// second handle and stop() stays the single release.
+func (w *recoveryWindow) progress(now time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed.Load() {
+		return
+	}
+	next := now.Add(w.idle)
+	if next.After(w.deadline) {
+		w.deadline = next
+		if w.armed != nil {
+			w.armedUntil = time.Now().Add(w.idle)
+			w.armed.Reset(w.idle)
+		}
+	}
+}
+
+// remaining reports how much silence is left at a reading of the request's
+// clock, and whether any is left at all. It is the single place the moving
+// deadline is read, so the loop's gate and both watchdogs cannot disagree
+// about when the bound falls.
+func (w *recoveryWindow) remaining(now time.Time) time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.deadline.Sub(now)
+}
+
+// expired reports whether the tolerated silence is spent at a reading of the
+// request's clock. It reads the moving deadline through remaining, so it takes
+// the same lock progress writes under and the four mechanisms below can never
+// disagree about when the bound falls.
+//
+// The instant itself is not yet spent: a bound that fired on the tick rather
+// than after it would cut a stream one nanosecond early, and the boundary
+// belongs here rather than in each caller.
+func (w *recoveryWindow) expired(now time.Time) bool { return w.remaining(now) < 0 }
 
 // shut reports whether a watchdog has already reached the window.
 func (w *recoveryWindow) shut() bool { return w.closed.Load() }
 
-// armBody arms this window's hard bound against one relay pass: at the
-// deadline the returned watchdog closes the upstream body the pass is reading
-// from, which is what unblocks a relay sitting inside a read.
+// armBody arms this window's hard bound against one relay pass: after the
+// upstream has been silent for the tolerated interval the returned watchdog
+// closes the body the pass is reading from, which is what unblocks a relay
+// sitting inside a read.
 //
 // Closing the body is the only lever a Go response body offers: Body.Read
 // takes no context, so a peer that sends a partial event and then holds the
@@ -392,30 +482,62 @@ func (w *recoveryWindow) shut() bool { return w.closed.Load() }
 //     disconnect is not the window closing, and the two must stay
 //     distinguishable in the record: the request context already aborts the
 //     read on its own, so a watchdog hung off it would be unable to tell
-//     "the operator's window elapsed" from "the reader left".
+//     "the operator's bound elapsed" from "the reader left".
 //   - It creates no goroutine of its own. time.AfterFunc runs its function on
 //     the runtime's timer goroutine, and the caller's stop() — deferred by
 //     the relay closure — releases the timer on every path, including the one
-//     where the pass ended long before the deadline.
+//     where the pass ended long before the silence fell.
 //   - The distance it arms for is measured from the caller's own reading of
-//     the request's clock to the window's one deadline, so arming it per pass
-//     shares one window rather than restarting it.
+//     the request's clock to the window's deadline, so arming it per pass
+//     shares one window rather than restarting it. Upstream progress MOVES
+//     that deadline and resets this timer with it, so a pass that keeps
+//     receiving events is never cut by a timer armed for an earlier one.
 func (w *recoveryWindow) armBody(now time.Time, body io.Closer) (stop func()) {
-	remaining := w.deadline.Sub(now)
-	if remaining <= 0 {
-		// The window is already shut — the only way a pass can start here is
-		// a commit that itself outlived the window. Close the body now: the
-		// pass returns immediately and the loop reports the bound instead of
-		// relaying bytes past a deadline the operator set.
+	left := w.remaining(now)
+	if left <= 0 {
+		// The silence is already spent — the only way a pass can start here
+		// is a pass that was itself idle past the bound. Close the body now:
+		// the pass returns immediately and the loop reports the bound instead
+		// of relaying bytes past a deadline the operator set.
 		w.closed.Store(true)
 		_ = body.Close()
 		return func() {}
 	}
-	timer := time.AfterFunc(remaining, func() {
+	// Reset cannot retract a callback already scheduled by the runtime, so the
+	// callback re-checks the physical timer deadline under mu before it closes
+	// the body: a source read racing an old deadline either moves the timer
+	// first (the old callback becomes a no-op), or loses the race honestly and
+	// sees the body close.
+	var timer *time.Timer
+	w.mu.Lock()
+	w.armedUntil = time.Now().Add(left)
+	timer = time.AfterFunc(left, func() {
+		w.mu.Lock()
+		if w.armed != timer || time.Now().Before(w.armedUntil) {
+			w.mu.Unlock()
+			return
+		}
 		w.closed.Store(true)
+		w.mu.Unlock()
 		_ = body.Close()
 	})
-	return func() { timer.Stop() }
+	// Published under mu so progress cannot reset a timer it has not been
+	// told about: a byte accepted between the AfterFunc above and this store
+	// would otherwise move the deadline with no timer following it, and the
+	// pass would be cut at the instant the byte should have moved.
+	w.armed = timer
+	w.mu.Unlock()
+	return func() {
+		timer.Stop()
+		// Cleared under mu so a progress arriving after the pass ends cannot
+		// reach in and reset a timer this stop has already released.
+		w.mu.Lock()
+		if w.armed == timer {
+			w.armed = nil
+			w.armedUntil = time.Time{}
+		}
+		w.mu.Unlock()
+	}
 }
 
 // dialable reports whether a hop may still be dialed at a reading of the
@@ -465,12 +587,12 @@ func (b *hopBounds) release() {
 // bind derives the context ONE hop runs under: the caller's context — the
 // client's request context, so a hop still dies with the reader exactly as
 // every other dial this request makes — plus a cancel at this window's
-// deadline. It is called only after dialable has agreed, so the window is open
-// here by construction and the watchdog always has a positive distance to arm
-// for.
+// current deadline. It is called only after dialable has agreed, so there is
+// silence left to bound here by construction and the watchdog always has a
+// positive distance to arm for.
 func (w *recoveryWindow) bind(parent context.Context, now time.Time) *hopBounds {
 	ctx, cancel := context.WithCancel(parent)
-	timer := time.AfterFunc(w.deadline.Sub(now), func() {
+	timer := time.AfterFunc(w.remaining(now), func() {
 		w.closed.Store(true)
 		cancel()
 	})

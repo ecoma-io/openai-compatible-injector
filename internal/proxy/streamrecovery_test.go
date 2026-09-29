@@ -1002,11 +1002,20 @@ func TestStreamRecoveryClientGoneDuringTheHopDialIsNotAnUpstreamFault(t *testing
 // the client's already-committed stream.
 //
 // The clock is stepped rather than slept on, and the step is keyed to the
-// client: it stands still until the relay has written its first chunk, which
-// is the last reading before the loop's gate, and then advances a little over
-// the recovery window per read. The gate therefore sees an open window and
-// admits the hop; the hop's own reading is already past the deadline, so
-// `dialable` refuses.
+// client: it stands still until the relay has finished its first event —
+// which is the last reading before the loop's gate, and the last reading the
+// window's own progress hook takes — and then advances a little over the
+// recovery window per read. The gate therefore sees an open window and admits
+// the hop; the hop's own reading is already past the deadline, so `dialable`
+// refuses.
+//
+// Stepping AFTER the event rather than at the first read is what an idle
+// window requires. The window's deadline moves with upstream progress, so a
+// step taken before the relay dispatched its event would be paid for by that
+// event: the hop would find a full budget still remaining and dial. Stepping
+// once the event is dispatched is the honest ordering — the upstream said
+// something, the clock then went quiet for longer than the bound, and the hop
+// that follows is the first one the bound can refuse.
 //
 // Two things this has to out-wait on the same clock, and both are configured
 // wide rather than slept around: the request envelope's own elapsed half,
@@ -1037,10 +1046,10 @@ func TestStreamRecoveryWindowBackstopIsALogRecordNotACrash(t *testing.T) {
 	pa := &scriptedDoer{script: []dialFunc{
 		func(*http.Request) (*http.Response, error) {
 			resp, err := sseCut(sseChat("Hello"))(nil)
-			// Flip the clock from inside the relay — the writer, so the
-			// ordering is: this chunk reaches the client, then the relay
-			// finishes, then the loop's gate reads, then the hop reads.
-			resp.Body = &relayMarkBody{ReadCloser: resp.Body, mark: &clientWrote}
+			// Flip the clock from inside the relay — after the writer has
+			// dispatched the event, so the window's progress hook has already
+			// taken its reading at `base` and the step below is real silence.
+			resp.Body = &relayMarkBody{ReadCloser: resp.Body, mark: &clientWrote, afterEvent: true}
 			return resp, err
 		},
 	}}
@@ -1074,15 +1083,29 @@ func TestStreamRecoveryWindowBackstopIsALogRecordNotACrash(t *testing.T) {
 // relayMarkBody flips a flag the first time the relay WRITES, so a test can
 // step the clock at an exact point in the request's life: after the client has
 // the chunk, before the loop's own gate reads the clock.
+//
+// afterEvent moves that flip one step later — to the SECOND read, which is the
+// read that follows the blank line ending the first event. The boundary is
+// where the window's progress hook takes its reading, so a clock stepped at
+// the first read is paid for by that event and the hop finds a fresh budget;
+// a clock stepped at the read AFTER the event is not, and the elapsed time is
+// genuine silence. That ordering is the whole difference an idle window makes.
 type relayMarkBody struct {
 	io.ReadCloser
-	mark *atomic.Bool
-	done bool
+	mark       *atomic.Bool
+	afterEvent bool
+	reads      int
 }
 
 func (b *relayMarkBody) Read(p []byte) (int, error) {
-	if !b.done {
-		b.done = true
+	b.reads++
+	flip := b.reads == 1
+	if b.afterEvent {
+		// The second read is the one the relay makes after dispatching the
+		// first event, so the progress hook for that event has already run.
+		flip = b.reads == 2
+	}
+	if flip {
 		b.mark.Store(true)
 	}
 	return b.ReadCloser.Read(p)
@@ -1251,24 +1274,30 @@ func TestStreamRecoveryMaxElapsedCutsABlockedRead(t *testing.T) {
 	}
 }
 
-// TestStreamRecoveryWindowCoversEveryHop: one window since the commit, not a
-// fresh one per hop.
+// TestStreamRecoveryWindowCoversEveryHop: one window per stream, not a fresh
+// one per hop.
 //
 // The first relay ends cleanly but only after most of the window has already
-// run, so the hop starts with almost nothing left. The SAME instant the relay
+// run, so the hop starts with almost nothing left. The SAME window the relay
 // used must be the one that closes the hop's parked read.
 //
+// The arithmetic is the whole point, and it differs from an absolute deadline's.
+// The committed pass relays an event and then waits firstPause, which RESTARTS
+// the silence: the deadline is then that last event plus one full window, and
+// the hop parked after it is cut there. A per-hop window would instead give the
+// hop its own full window counted from the moment it started, so the request
+// would run for the pause plus TWO windows.
+//
 // Measuring the WHOLE request is the only assertion that tells one shared
-// window from N per-hop ones: with a fresh window per hop the total would be
-// the committed relay's pause PLUS a full window for the hop, so the request
-// would run for roughly twice the configured bound. A test that only asserted
-// "the hop was cut as max_elapsed" cannot tell the two apart — a per-hop
-// window cuts it too, just later — and that is exactly how a per-hop budget
-// passes a test named for a shared one.
+// window from N per-hop ones: a test that only asserted "the hop was cut as
+// max_elapsed" cannot tell the two apart — a per-hop window cuts it too, just
+// later — and that is exactly how a per-hop window passes a test named for a
+// shared one.
 func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
 	const window = 300 * time.Millisecond
-	// The committed relay spends ~200ms of the 300ms window before its stream
-	// ends cleanly, leaving the hop ~100ms of the SAME window.
+	// The committed relay spends ~200ms of wall clock before its stream ends
+	// cleanly, and the window is measured from that last event rather than from
+	// the commit, so the hop is cut one full window after it.
 	const firstPause = 200 * time.Millisecond
 	h, logBuf, pa, _ := recoveryHandler(t,
 		recoveryBlock(t, "    enabled: true\n    max-elapsed: 300ms\n    max-recoveries: 2\n"))
@@ -1276,8 +1305,8 @@ func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
 	pa.script = []dialFunc{
 		func(*http.Request) (*http.Response, error) {
 			// A slow but perfectly healthy committed stream: it yields text,
-			// pauses, then ends at EOF. The pause is real time the window
-			// must account for.
+			// pauses, then ends at EOF. The pause sits inside the tolerated
+			// silence, so the window follows the event rather than the clock.
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -1318,11 +1347,18 @@ func TestStreamRecoveryWindowCoversEveryHop(t *testing.T) {
 	}
 	// THE ASSERTION THAT SEPARATES ONE WINDOW FROM N. Generous headroom on
 	// both sides, because CI scheduling is not a clock this test can trust to
-	// the millisecond: the bound must be beaten by a comfortable margin, and a
-	// per-hop window (pause + a fresh full window ≈ 2×) must miss it by one.
-	if elapsed > window+150*time.Millisecond {
-		t.Errorf("request took %v against a %v window: a fresh window per hop would let the "+
-			"hop outlive the instant the committed relay used", elapsed.Round(time.Millisecond), window)
+	// the millisecond. The shared window puts the whole request at roughly
+	// firstPause + window — the committed pass's silence, then one full window
+	// measured from its last event — while a per-hop window would put it near
+	// firstPause + 2×window. The floor is well under the shared total and the
+	// ceiling well under the per-hop one.
+	if elapsed < firstPause+window/2 {
+		t.Errorf("request returned in %v, before the shared window could fall: a hop "+
+			"restarted the bound instead of inheriting it", elapsed.Round(time.Millisecond))
+	}
+	if elapsed > firstPause+2*window {
+		t.Errorf("request took %v against a shared %v window: a fresh window per hop let the "+
+			"hop outlive the bound the committed relay already spent", elapsed.Round(time.Millisecond), window)
 	}
 }
 
