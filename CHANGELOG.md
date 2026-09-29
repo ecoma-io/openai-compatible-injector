@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.4](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.3...v0.14.4) (2026-09-29)
+
+
+### Bug Fixes
+
+* **proxy:** read a closing content part's text before ignoring it ([#101](https://github.com/ecoma-io/openai-compatible-injector/issues/101)) ([#103](https://github.com/ecoma-io/openai-compatible-injector/issues/103)) ([14d5469](https://github.com/ecoma-io/openai-compatible-injector/commit/14d546969b012062295eaffb12dfefdf4598977b))
+
 ## [0.14.3](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.2...v0.14.3) (2026-09-29)
 
 
