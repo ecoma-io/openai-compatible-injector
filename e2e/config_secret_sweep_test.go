@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -14,6 +15,10 @@ import (
 // asserted absent from the process output.
 
 const (
+	// secretConfigPath is deliberately URL-shaped because OAICR_CONFIG_FILE is
+	// operator input, not necessarily a conventional filesystem-looking value.
+	// It must never become a service log field at boot or while polling.
+	secretConfigPath  = "SECRET_CONFIG_PATH_QUERY"
 	secretLevelURL    = "SECRET_LEVEL_URL"
 	secretTopKeyURL   = "SECRET_TOPKEY_URL"
 	secretModelKey    = "SECRET_MODELKEY_URL"
@@ -119,6 +124,69 @@ func TestBootRejectionNeverEchoesSecrets(t *testing.T) {
 				t.Errorf("case %d: boot failure output echoes %q — rejection-path leak", i, secret)
 			}
 		}
+	}
+}
+
+// TestConfigFilePathNeverEchoesSecrets covers the bootstrap setting itself.
+// OAICR_CONFIG_FILE is an environment value, therefore operator-controlled;
+// a path can carry URL-style userinfo or query material, and a secret marker
+// here is what a regression would echo. The service must not write it on a
+// boot read failure, a boot decode failure, a rejected reload, an unreadable
+// poll cycle, or either recovery path.
+func TestConfigFilePathNeverEchoesSecrets(t *testing.T) {
+	path := fmt.Sprintf("%s/config?%s=x.yaml", t.TempDir(), secretConfigPath)
+	valid := "api-key: k\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\nlog-level: info\n"
+
+	// A missing config reaches the bootstrap read error path. No file needs to
+	// exist for this case; the process exits before starting its poller.
+	code, stderr := startSubprocessExpectExit(t, startOpts{configPath: path})
+	if code != 1 || !strings.Contains(stderr, "config_file_read_failed") {
+		t.Fatalf("missing config: code/stderr = %d/%q, want config_file_read_failed", code, stderr)
+	}
+	if strings.Contains(stderr, secretConfigPath) {
+		t.Fatalf("boot read failure echoed config-file marker: %s", stderr)
+	}
+
+	// An unreadable YAML document reaches the second boot path after the file
+	// was successfully opened.
+	if err := os.WriteFile(path, []byte("models:\n"), 0o644); err != nil {
+		t.Fatalf("write invalid config: %v", err)
+	}
+	code, stderr = startSubprocessExpectExit(t, startOpts{configPath: path})
+	if code != 1 || !strings.Contains(stderr, "config_load_failed") {
+		t.Fatalf("invalid config: code/stderr = %d/%q, want config_load_failed", code, stderr)
+	}
+	if strings.Contains(stderr, secretConfigPath) {
+		t.Fatalf("boot load failure echoed config-file marker: %s", stderr)
+	}
+
+	if err := os.WriteFile(path, []byte(valid), 0o644); err != nil {
+		t.Fatalf("write valid config: %v", err)
+	}
+	p := startSubprocess(t, startOpts{configPath: path, logLevel: ""})
+	if err := os.WriteFile(path, []byte("models:\n"), 0o644); err != nil {
+		t.Fatalf("write invalid reload config: %v", err)
+	}
+	waitForEventCount(t, p, "config_reload_rejected", 1)
+	// Returning to the boot bytes heals the file but correctly does not publish
+	// a duplicate snapshot: the observable transition is recovery, not reload.
+	if err := os.WriteFile(path, []byte(valid), 0o644); err != nil {
+		t.Fatalf("restore rejected config: %v", err)
+	}
+	waitForEventCount(t, p, "config_file_recovered", 1)
+
+	// os.PathError includes its input path. Exercise the poller's unreadable
+	// path specifically, then return to the same last-known-good bytes.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove live config: %v", err)
+	}
+	waitForEventCount(t, p, "config_file_unreadable", 1)
+	if err := os.WriteFile(path, []byte(valid), 0o644); err != nil {
+		t.Fatalf("restore unreadable config: %v", err)
+	}
+	waitForEventCount(t, p, "config_file_recovered", 2)
+	if got := p.stderr.String(); strings.Contains(got, secretConfigPath) {
+		t.Fatalf("config-file lifecycle echoed marker: %s", got)
 	}
 }
 
