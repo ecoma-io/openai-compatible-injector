@@ -53,6 +53,18 @@ services:
       OAICR_LISTEN: :8080
       OAICR_CONFIG_FILE: /app/config.yaml
       OAICR_CONFIG_POLL_INTERVAL: 1s
+      # Go's GC, told where the process's real ceiling is. Without it the
+      # default GOGC=100 lets the heap goal track the live set, and a run
+      # with the 256 MiB buffering budget FULLY enforced (measured: five clean
+      # 503 capacity_exceeded refusals, no misconfiguration anywhere) still
+      # reached 914 MiB of RSS — over the mem_limit below. This clamps that
+      # goal instead of letting it float.
+      #
+      # It is a SOFT limit: the GC works harder to stay under it, but memory
+      # in use at the moment of measurement is not taken back, so a run that
+      # genuinely needs more still exceeds it. mem_limit must stay above this,
+      # with the gap absorbing that overshoot.
+      GOMEMLIMIT: 768MiB
       # The whole post-signal budget for serving: readiness head start plus
       # in-flight drain. It is not the whole shutdown, though — after it, the
       # defers run: the metering drain (a 10s window plus a 5s join grace
@@ -84,16 +96,20 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # A ceiling the process's own admission limits must stay below. The
-    # process-wide buffering budget the proxy admits request bodies and
-    # upstream answers against is 256 MiB and hard-coded, but 256 MiB is not
-    # the process's peak: an admitted buffer has a same-size DERIVED copy
-    # beside it (the transform re-marshals the request body, the response
-    # rewriter rebuilds the answer), and those copies are bounded by their
-    # sources rather than admitted themselves. So the number to size this
-    # against is about twice the budget — 512 MiB — with the rest left for
+    # A ceiling the process's own admission limits must stay below, and it
+    # must be sized against RESIDENT SET SIZE — not against the buffering
+    # budget. Those are different numbers: an admitted buffer has a same-size
+    # DERIVED copy beside it (the transform re-marshals the request body, the
+    # response rewriter rebuilds the answer), those copies are bounded by
+    # their sources rather than admitted themselves, and the GC holds on to
+    # memory it has not returned. 256 MiB of admitted buffers is ~512 MiB of
+    # live bytes, and GOMEMLIMIT above is what keeps RSS near that rather
+    # than letting the GC goal float.
+    #
+    # 1g leaves room above GOMEMLIMIT (768MiB) for the soft-limit overshoot,
     # TLS state, connection buffers, slice-growth rounding, and the response
-    # bytes of in-flight requests.
+    # bytes of in-flight requests. Lowering it below what a run can actually
+    # reach turns the budget's clean 503 capacity_exceeded into an OOM kill.
     mem_limit: 1g
     cpus: 2.0
     logging:

@@ -30,6 +30,20 @@ services:
       # stop_grace_period, with room left for the usage flush.
       # OAICR_SHUTDOWN_GRACE: 45s
       # OAICR_CONFIG_POLL_INTERVAL: 1s
+      # Go's GC, told where the ceiling is. Set here for the same reason
+      # compose.production.yaml sets it: the buffering budget bounds live
+      # bytes, and the GC goal otherwise floats with the live set, so a run
+      # can reach a resident set far past what the budget admitted. A soft
+      # limit — the GC works harder to stay under it but cannot take memory
+      # back mid-run. See README "Buffering" for the measurements.
+      GOMEMLIMIT: 768MiB
+    # The homelab file carries no cgroup memory ceiling on purpose: it is the
+    # development shape, and a limit here would turn a heavy local test into
+    # an OOM kill the operator cannot read as the proxy's own refusal. Set
+    # mem_limit here when you want the production coupling exercised locally —
+    # it must stay above GOMEMLIMIT, and compose.production.yaml states the
+    # derivation.
+    mem_limit: 1g
     # docker stop sends SIGTERM and waits this long before SIGKILL. The whole
     # post-signal budget is the drain grace (default 55s) PLUS the defers that
     # follow it: the usage drain's 10s window and its 5s join grace, and the

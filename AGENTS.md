@@ -113,8 +113,9 @@ Boundaries a helpful-looking refactor will cross:
   the deadline as soon as the read returns; never use server `ReadTimeout` or
   `WriteTimeout` (which would break keep-alive or SSE). Reserve as a buffer grows,
   refuse immediately as 503 `capacity_exceeded`, and never send that refusal to
-  recovery. Size the container for derived copies (~2× the budget); see README
-  "Buffering".
+  recovery. The budget bounds LIVE bytes; `mem_limit` must be sized against RSS,
+  which `GOMEMLIMIT` is what holds to the budget's arithmetic — do not restate
+  a bare "2×" without it; see README "Buffering".
 - **Every transform is byte-preserving and API-scoped; nothing is ever
   re-serialized.** `RewriteChatModel` replaces only the top-level `"model"` string
   value; `RewriteResponsesModel` additionally replaces the `"model"` directly

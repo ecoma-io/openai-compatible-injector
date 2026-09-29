@@ -1884,15 +1884,43 @@ for that.** The transform that injects the prompt decodes the request body and
 marshals it into a second buffer of the same size, live for the attempt beside
 the body the replay needs; the composed response rewriter builds a same-size
 copy of the answer before it is written. Neither copy is admitted separately —
-each is bounded by its admitted source — so the process peak is roughly
-**twice the budget** plus a few MiB per in-flight stream, and `mem_limit` has
-to be sized against that number rather than against the budget.
+each is bounded by its admitted source.
 
-The budget is a package constant (256 MiB), not runtime configuration, and
-`compose.production.yaml` pairs it with `mem_limit: 1g`: twice the budget for
-the derived copies, with the rest as headroom for TLS state and the response
-bytes of in-flight requests. Raising the limit alone buys nothing; lowering it
-towards the budget is the way to turn a clean refusal into an OOM kill.
+**The live bytes are the smaller half of the problem; the garbage collector is
+the larger one.** These copies are _live_, and the budget is a live-bytes
+bound. What reaches the cgroup is resident set size, which also counts memory
+the GC has not returned to the OS. Go's default `GOGC=100` lets the heap
+roughly double between collections, so a 256 MiB live set arrives as a
+~512 MiB heap goal and an RSS peak near it, with a floor of free-but-unreleased
+pages underneath.
+
+Measured on this repository at 16 MiB request bodies against a local upstream
+(64-bit linux, Go 1.26), peak RSS:
+
+| Concurrency       | Budget in use            | `GOGC` default | `GOMEMLIMIT=700MiB` |
+| ----------------- | ------------------------ | -------------- | ------------------- |
+| 8                 | 128 MiB                  | 586 MiB        | 580 MiB             |
+| 16                | 256 MiB                  | 990 MiB        | 703 MiB             |
+| 32                | 512 MiB                  | —              | 703 MiB             |
+| 20 + 3 s upstream | budget exhausted, 5× 503 | 914 MiB        | 714 MiB             |
+
+The last row is the shape that matters: the budget _is_ enforced (five
+`buffer_capacity_exceeded` refusals), and the peak still sat at 914 MiB — over
+the `mem_limit: 1g` this repository's compose file set — with no
+misconfiguration anywhere. `GOMEMLIMIT` moved the same workload to 714 MiB and
+held it flat as concurrency rose, because it clamps the GC goal instead of
+letting it float with the live set.
+
+**So `mem_limit` must be sized against RSS, not against the budget, and
+`GOMEMLIMIT` is what makes RSS track the budget's own arithmetic.** The budget
+is a package constant (256 MiB), not runtime configuration. `GOMEMLIMIT` is a
+_soft_ limit: the GC works harder to stay under it, but memory in use at the
+moment of the measurement is not taken back, so a run that genuinely needs
+more than its limit still exceeds it. Size `mem_limit` above `GOMEMLIMIT` with
+headroom for the overshoot, TLS state, connection buffers, and in-flight
+response bytes — lowering `mem_limit` below what a run can actually reach is
+how a clean 503 turns into an OOM kill. Raising `mem_limit` without a
+`GOMEMLIMIT` buys nothing: the GC goal still floats with the live set.
 
 ## Errors
 
@@ -2536,12 +2564,18 @@ docker run --rm -p 8080:8080 \
 mistake to avoid:
 
 - `mem_limit: 1g` is sized against the process's 256 MiB buffering budget
-  (see [Buffering](#buffering)): twice the budget, because an admitted buffer
-  has a same-size derived copy beside it, plus headroom for TLS state and the
-  response bytes of in-flight requests. The budget is a constant in the
-  binary, so raising `mem_limit` alone buys nothing, and lowering it towards
-  the budget converts a clean `503 capacity_exceeded` refusal into an OOM
-  kill.
+  (see [Buffering](#buffering)): twice the budget for the derived copies an
+  admitted buffer leaves behind, plus the `GOMEMLIMIT` the same service sets to
+  stop the GC goal floating with the live set, plus headroom for TLS state and
+  the response bytes of in-flight requests. The budget is a constant in the
+  binary, so raising `mem_limit` alone buys nothing; lowering it below what a
+  run can actually reach converts a clean `503 capacity_exceeded` refusal into
+  an OOM kill.
+- `GOMEMLIMIT: 768MiB` is set on the service, and is what makes `mem_limit`
+  meaningful: without it the GC goal tracks the live set and the process
+  reached 914 MiB of RSS with the budget fully enforced and no
+  misconfiguration — past the 1g ceiling this file sets. It is a soft limit, so
+  `mem_limit` must stay above it.
 - The `healthcheck` reads `/readyz` and never `/healthz` — see
   [Healthcheck](#healthcheck).
 - `read_only: true`, `cap_drop: ALL`, `no-new-privileges` and a `tmpfs` for
