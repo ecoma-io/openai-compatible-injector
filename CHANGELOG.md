@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.3](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.2...v0.14.3) (2026-09-29)
+
+
+### Bug Fixes
+
+* **proxy:** adversarial hardening pass for stream recovery and lifecycle ([#91](https://github.com/ecoma-io/openai-compatible-injector/issues/91)) ([8370465](https://github.com/ecoma-io/openai-compatible-injector/commit/83704658acc1d933961e1e3edc44c8c37672fff4))
+
+
+### Documentation
+
+* bring AGENTS.md under the 40k budget after formatter padding ([#97](https://github.com/ecoma-io/openai-compatible-injector/issues/97)) ([9a7eb13](https://github.com/ecoma-io/openai-compatible-injector/commit/9a7eb1365de09870a95a6b7c5cffc9c57d828596))
+* compress AGENTS.md below 40k chars, drop stale migration narrative and README-restating prose ([#90](https://github.com/ecoma-io/openai-compatible-injector/issues/90)) ([c79462b](https://github.com/ecoma-io/openai-compatible-injector/commit/c79462b98d977206d99a025ad64d8583ac3d001b))
+
 ## [0.14.2](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.1...v0.14.2) (2026-09-28)
 
 
