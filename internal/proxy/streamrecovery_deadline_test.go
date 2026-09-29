@@ -70,153 +70,128 @@ func (c *closeRecorder) Close() error {
 	return nil
 }
 
-// TestRecoveryWindowBindsEveryLeverToOneDeadline is the unit-level proof that
-// the four mechanisms a recovery session has share one instant, and that
-// re-arming a lever mid-window extends nothing.
-//
-// It is deliberately about the window type rather than about a request: the
-// defects this replaces were structural — a deadline read from one clock and a
-// gate from another, a dial bounded by neither — and a request-level test can
-// only observe the ones that happen to fire first.
+// TestRecoveryWindowBindsEveryLeverToOneDeadline proves the exact idle-time
+// boundary, including the clock/timer pairing that production uses through the
+// recoveryClock seam. Every assertion advances logical time and watchdog time
+// together; no test can accidentally accept a policy deadline whose real timer
+// is still running on another clock.
 func TestRecoveryWindowBindsEveryLeverToOneDeadline(t *testing.T) {
-	const window = 150 * time.Millisecond
-	start := time.Now()
-	w := newRecoveryWindow(start, window)
+	start := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+	const idle = time.Second
 
-	if w.expired(start) {
-		t.Error("the window was already expired at the instant it opened")
-	}
-	if w.expired(w.deadline) {
-		t.Error("the deadline itself counts as expired; the bound moved one tick inward")
-	}
-	if !w.expired(w.deadline.Add(time.Nanosecond)) {
-		t.Error("the window does not expire one tick past its deadline")
-	}
-	if w.shut() {
-		t.Error("the window reported itself shut before anything reached it")
-	}
+	t.Run("exact deadline closes the body", func(t *testing.T) {
+		clock := newManualRecoveryClock(start)
+		w := newRecoveryWindow(clock, idle)
+		body := &closeRecorder{}
+		stop := w.armBody(body)
+		defer stop()
 
-	// A gate that finds the instant already past marks the window shut as well
-	// as refusing: the refusal and the record are one fact.
-	if w.dialable(w.deadline.Add(time.Nanosecond)) {
-		t.Error("a hop was told it may dial past the window's deadline")
-	}
-	if !w.shut() {
-		t.Error("a refusal past the deadline did not record the window as shut")
-	}
-
-	// bind: the lever for a dial waiting on response headers. It cancels at
-	// the deadline, and its release cancels without claiming the window was
-	// reached — the release fires on a hop that SUCCEEDED.
-	fresh := newRecoveryWindow(time.Now(), window)
-	b := fresh.bind(context.Background(), time.Now())
-	if err := b.ctx.Err(); err != nil {
-		t.Fatalf("a hop was refused a context while the window was open: %v", err)
-	}
-	select {
-	case <-b.ctx.Done():
-		t.Fatal("the dial's context was canceled before the window was reached")
-	case <-time.After(window / 3):
-	}
-	select {
-	case <-b.ctx.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("the dial's context outlived the window: a header wait is unbounded")
-	}
-	if !fresh.shut() {
-		t.Error("the dial watchdog canceled without recording the window as shut")
-	}
-	b.release()
-
-	// The two levers end different waits, and that separation is load-bearing:
-	// net/http aborts an unread response body when the request's context is
-	// canceled, so a hop releases its header watchdog when the dial returns
-	// while the CONTEXT lives until the body is closed. stop() is the first
-	// half — and it must leave the context alone.
-	open := newRecoveryWindow(time.Now(), 10*time.Second)
-	live := open.bind(context.Background(), time.Now())
-	live.stop()
-	if err := live.ctx.Err(); err != nil {
-		t.Errorf("releasing a hop's header watchdog canceled the context its body is read under: %v", err)
-	}
-	if open.shut() {
-		t.Error("stopping a hop's header watchdog recorded the window as reached")
-	}
-	live.release()
-	if err := live.ctx.Err(); err == nil {
-		t.Error("releasing a hop's context left it live")
-	}
-	if open.shut() {
-		t.Error("releasing a hop's context recorded the window as reached")
-	}
-
-	// boundBody is the second half: the release rides the hop's own Close, so
-	// the context cannot be released while a relay is still reading.
-	null := io.NopCloser(strings.NewReader(""))
-	bounds := newRecoveryWindow(time.Now(), 10*time.Second).bind(context.Background(), time.Now())
-	wrapped := &boundBody{ReadCloser: null, release: bounds.release}
-	if err := bounds.ctx.Err(); err != nil {
-		t.Fatalf("a fresh hop context was already done: %v", err)
-	}
-	if err := wrapped.Close(); err != nil {
-		t.Fatalf("closing a hop body: %v", err)
-	}
-	if err := bounds.ctx.Err(); err == nil {
-		t.Error("closing a hop's body left its context live: a hop would leak one context per attempt")
-	}
-
-	// armBody: the lever for a stalled body. It closes at the deadline and not
-	// before.
-	body := &closeRecorder{}
-	armed := newRecoveryWindow(time.Now(), window)
-	stop := armed.armBody(time.Now(), body)
-	defer stop()
-	time.Sleep(window / 3)
-	if body.closed.Load() {
-		t.Error("a healthy body was closed before the window was reached")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !body.closed.Load() {
-		if time.Now().After(deadline) {
-			t.Fatal("the body watchdog never closed a body past the window")
+		clock.Advance(idle - time.Nanosecond)
+		if body.closed.Load() || w.expired() {
+			t.Fatal("window expired before its half-open boundary")
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !armed.shut() {
-		t.Error("the body watchdog closed a body without recording the window as shut")
-	}
+		clock.Advance(time.Nanosecond)
+		if !body.closed.Load() || !w.shut() || !w.expired() {
+			t.Fatal("window remained live at its exact deadline")
+		}
+		if w.progress() {
+			t.Fatal("a byte at the deadline revived an expired window")
+		}
+	})
 
-	// One window across separate passes: a body watchdog is inherently owned
-	// by the ONE response body it can close, so it is stopped as that pass ends
-	// before a later pass arms its own. The later lever gets only what was left
-	// of the same window; a per-hop reset would let it outlive the first timer
-	// by most of a window, which is exactly the property `max-elapsed` must not
-	// have.
-	shared := newRecoveryWindow(time.Now(), window)
-	first := &closeRecorder{}
-	stopFirst := shared.armBody(time.Now(), first)
-	time.Sleep(window * 2 / 3)
-	stopFirst()
-	if first.closed.Load() {
-		t.Error("stopping a healthy first pass closed its body")
-	}
-	second := &closeRecorder{}
-	stopSecond := shared.armBody(time.Now(), second)
-	defer stopSecond()
-	time.Sleep(window * 2 / 3)
-	if !second.closed.Load() {
-		t.Error("a lever armed for the later pass restarted the bound instead of sharing it")
-	}
+	t.Run("pre-deadline progress resets the active watchdog", func(t *testing.T) {
+		clock := newManualRecoveryClock(start)
+		w := newRecoveryWindow(clock, idle)
+		body := &closeRecorder{}
+		stop := w.armBody(body)
+		defer stop()
 
-	// The already-expired arm is the commit that itself outlived the window:
-	// nothing is relayed past it.
-	late := newRecoveryWindow(time.Now(), time.Millisecond)
-	time.Sleep(5 * time.Millisecond)
-	expiredBody := &closeRecorder{}
-	late.armBody(time.Now(), expiredBody)()
-	if !expiredBody.closed.Load() || !late.shut() {
-		t.Error("a pass armed against an already-shut window was allowed to read it")
-	}
+		clock.Advance(idle / 2)
+		if !w.progress() {
+			t.Fatal("pre-deadline source progress was rejected")
+		}
+		// The original callback is due now, but its identity was replaced by
+		// progress and must not close the body.
+		clock.Advance(idle / 2)
+		if body.closed.Load() || w.shut() {
+			t.Fatal("stale watchdog cut a stream after source progress")
+		}
+		clock.Advance(idle / 2)
+		if !body.closed.Load() || !w.shut() {
+			t.Fatal("replacement watchdog did not enforce the extended idle window")
+		}
+	})
+
+	t.Run("header handoff moves the window and guards the body", func(t *testing.T) {
+		clock := newManualRecoveryClock(start)
+		w := newRecoveryWindow(clock, idle)
+		bounds, ok := w.bind(context.Background())
+		if !ok {
+			t.Fatal("open window refused continuation header context")
+		}
+		defer bounds.release()
+
+		clock.Advance(idle / 2)
+		body := &closeRecorder{}
+		if !bounds.promote(body) {
+			t.Fatal("timely response headers were not accepted as upstream progress")
+		}
+		clock.Advance(idle / 2)
+		if body.closed.Load() || w.shut() {
+			t.Fatal("stale header timer canceled a successful response body")
+		}
+		clock.Advance(idle / 2)
+		if !body.closed.Load() || !w.shut() {
+			t.Fatal("promoted body was not protected by the renewed idle deadline")
+		}
+	})
+
+	t.Run("header wait cancels at the exact deadline", func(t *testing.T) {
+		clock := newManualRecoveryClock(start)
+		w := newRecoveryWindow(clock, idle)
+		bounds, ok := w.bind(context.Background())
+		if !ok {
+			t.Fatal("open window refused continuation header context")
+		}
+		defer bounds.release()
+		clock.Advance(idle)
+		select {
+		case <-bounds.ctx.Done():
+		default:
+			t.Fatal("header wait remained live at the exact idle deadline")
+		}
+		if !w.shut() {
+			t.Fatal("header timeout did not latch the window")
+		}
+	})
+
+	t.Run("completion disarms the current reset guard", func(t *testing.T) {
+		clock := newManualRecoveryClock(start)
+		w := newRecoveryWindow(clock, idle)
+		body := &closeRecorder{}
+		stop := w.armBody(body)
+		clock.Advance(idle / 2)
+		if !w.progress() {
+			t.Fatal("pre-deadline source progress was rejected")
+		}
+		stop()
+		clock.Advance(idle)
+		if body.closed.Load() || w.shut() {
+			t.Fatal("relay cleanup left its replacement watchdog armed")
+		}
+	})
+
+	t.Run("late reader returns a terminating error", func(t *testing.T) {
+		clock := newManualRecoveryClock(start)
+		w := newRecoveryWindow(clock, idle)
+		clock.Advance(idle)
+		r := upstreamProgressReader{Reader: strings.NewReader("late"), progress: w.progress}
+		buf := make([]byte, 8)
+		n, err := r.Read(buf)
+		if n != 0 || !errors.Is(err, errStreamWindowExpired) {
+			t.Fatalf("late Read = (%d, %v), want (0, errStreamWindowExpired)", n, err)
+		}
+	})
 }
 
 // TestStreamRecoveryHopHeaderWaitIsBounded is the response-header blind spot:

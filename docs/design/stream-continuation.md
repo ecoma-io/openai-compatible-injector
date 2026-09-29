@@ -311,20 +311,21 @@ window would make a dead peer immortal while the client remains connected.
 
 Two mechanisms enforce the same moving allowance:
 
-- **A stalled body.** A `time.AfterFunc` watchdog closes the upstream response
-  body when no source bytes arrive for the interval. `Body.Read` takes no
-  context, so a peer that sends a partial event and then holds the connection
-  open parks the relay inside a read; closing the body is the only lever that
-  unblocks it. Source reads reset that watchdog along with the deadline. When
-  it fires it records `windowClosed`, and the loop refuses every later gate
+- **A stalled body.** A watchdog closes the upstream response body when no
+  source bytes arrive for the interval. `Body.Read` takes no context, so a peer
+  that sends a partial event and then holds the connection open parks the relay
+  inside a read; closing the body is the only lever that unblocks it. Every
+  accepted source read resets the watchdog along with the deadline. When it
+  fires it records the window as shut, and the loop refuses every later gate
   with `max_elapsed` — no hop is dialed, and the pass's own close error is
   suppressed because that error is this proxy's own, not the upstream's.
 - **A stalled response header.** A continuation request that receives no
-  headers has no body to close. Its request context is cancelled after the
-  moving window's remaining silence allowance, so the dial returns rather than
-  parking the request until the client gives up. Once a hop has headers, the
-  header watchdog is released and the body watchdog owns the rest of that
-  response.
+  headers has no body to close. Its request context is cancelled once the moving
+  window's remaining silence allowance is spent, so the dial returns rather than
+  parking the request until the client gives up. Header arrival is upstream
+  wire activity, so a hop that answers in time moves the same window forward and
+  hands its watchdog to the new body atomically; a response that arrives after
+  the deadline is dropped rather than relayed, and the hop reports `max_elapsed`.
 
 Four properties make the watchdog safe, and each is deliberate:
 
@@ -332,14 +333,24 @@ Four properties make the watchdog safe, and each is deliberate:
    client disconnect must stay distinguishable from the operator's window, and
    a watchdog hung off the context could not tell them apart — the outcome
    would be `max_elapsed` for a reader that simply left.
-2. It creates no goroutine: `time.AfterFunc` runs on the runtime's timer
-   goroutine, and the relay's deferred `stop()` releases the timer on every
-   path, including the one where the pass ended long before the silence fell.
+2. It creates no goroutine of its own, and the relay's deferred release
+   disarms the timer on every path — including the one where source progress
+   replaced it with a freshly armed guard, which the same lease releases.
 3. It closes the UPSTREAM body, never the client's connection. The client's
    connection belongs to the request lifecycle and is closed by the server, not
    by a recovery bound.
 4. The window is one moving window, not a per-hop budget: source progress may
-   extend it, but taking another hop cannot reset it independently.
+   extend it, but taking another hop cannot reset it independently. Taking a hop
+   at all still requires live window, so a stream whose upstream went quiet is
+   never chased with fresh requests.
+
+The clock and the timer are one seam. Production reads `time.Now` and arms
+`time.AfterFunc`, whose monotonic readings make the arithmetic immune to
+wall-clock steps. A test replaces BOTH halves with one manual clock, so a
+fake policy clock can never disagree with a real watchdog — and the boundary
+itself is half-open: the window is live while `now < deadline` and spent at
+`now == deadline`, everywhere a gate reads it, so a timer that fires exactly on
+the instant latches the window and no later source byte can revive it.
 
 The distinction the record has to keep is the whole reason for the flag, and it
 is asserted at the wire level: `max_elapsed` must never be reported as

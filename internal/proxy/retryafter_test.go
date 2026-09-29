@@ -48,10 +48,10 @@ func TestParseRetryAfter(t *testing.T) {
 // overrides retryWait again after calling this.
 func stubRetryTiming(t *testing.T) {
 	t.Helper()
-	origNow, origDraw, origWait := retryNow, retryJitterDraw, retryWait
-	t.Cleanup(func() { retryNow, retryJitterDraw, retryWait = origNow, origDraw, origWait })
+	origClock, origDraw, origWait := retryClock, retryJitterDraw, retryWait
+	t.Cleanup(func() { retryClock, retryJitterDraw, retryWait = origClock, origDraw, origWait })
 	frozen := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
-	retryNow = func() time.Time { return frozen }
+	retryClock = fixedRecoveryClock{now: frozen}
 	retryJitterDraw = func() float64 { return 0 }
 	retryWait = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
 }

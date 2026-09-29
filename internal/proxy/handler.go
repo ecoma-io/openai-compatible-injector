@@ -811,7 +811,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// the body and model mapping, never the network), so the 400 is
 	// answered on the first attempt.
 	eng = recovery.NewEngine(r.Context(), m.Recovery,
-		recovery.WithClock(retryNow),
+		recovery.WithClock(retryClock.Now),
 		recovery.WithJitterSource(retryJitterDraw))
 
 	// answerKind is the committed result's shape, chosen by the post-walk
@@ -2207,23 +2207,16 @@ walk:
 			observe = partial.Observe
 		}
 
-		// The recovery window is ONE absolute instant, opened here — the
-		// instant before the committed stream begins relaying — and every
-		// bound this session has is measured against it: the loop's own gate,
-		// the body watchdog each pass is armed with, and the context each hop
-		// dials under. It is read on the engine's clock like every other
-		// window this request obeys, and read ONCE: `max-elapsed` is a bound
-		// since the commit, never a per-hop budget that a long stream could
-		// extend by making a hop.
+		// The recovery window opens here as one moving upstream-idle deadline for
+		// the entire logical stream. A source-body read moves it forward; a
+		// continuation header does too as it hands its header watchdog to the
+		// new body. Client writes, event dispatch, and proxy pings never do, so
+		// it is neither a total-runtime budget nor a fresh allowance per hop.
 		//
-		// It exists as a deadline rather than only as an elapsed check because
-		// a clock can only be consulted between operations. A peer that sends
-		// a partial event and then holds the connection open parks the relay
-		// inside Body.Read; a peer that accepts a connection and answers
-		// nothing at all parks the hop inside Do. Neither can be reached by
-		// re-checking the policy afterwards, so each is bound by a watchdog
-		// armed for the distance that REMAINS to this same instant
-		// (recoveryWindow): the body is closed, the dial's context canceled.
+		// A peer can park the relay in Body.Read after a partial event, or park
+		// a hop in Do before any response headers. The moving deadline closes the
+		// body in the first case and cancels the dial context in the second, so
+		// no upstream silence can outlive max-elapsed (recoveryWindow).
 		//
 		// Its `closed` flag is written only by those watchdogs, so it is the
 		// one authority on "this relay was cut by the operator's bound" as
@@ -2241,7 +2234,7 @@ walk:
 			return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
 		}
 		if contPolicy.Enabled {
-			window = newRecoveryWindow(eng.Now(), contPolicy.MaxElapsed)
+			window = newRecoveryWindow(retryClock, contPolicy.MaxElapsed)
 			// The source-read wrapper is where upstream progress is observed,
 			// so the window's silence restarts there and nowhere else. CopySSE's
 			// event hook happens AFTER it has parsed and written an event: a
@@ -2256,7 +2249,7 @@ walk:
 			// is upstream progress only: the keep-alive ping is written to the
 			// client, never read from the peer, so it cannot revive a window
 			// whose upstream has actually gone quiet.
-			relayProgress := func() { window.progress(eng.Now()) }
+			relayProgress := window.progress
 			relay = func(src io.ReadCloser) (StreamStats, error) {
 				// THE UPSTREAM-RESPONSE BOUNDARY. relay is invoked once per
 				// upstream HTTP response relayed into this one client stream:
@@ -2278,7 +2271,7 @@ walk:
 				if usageCapture != nil {
 					usageCapture.Seal()
 				}
-				stopWindow := window.armBody(eng.Now(), src)
+				stopWindow := window.armBody(src)
 				defer stopWindow()
 				return CopySSE(dst, upstreamProgressReader{Reader: src, progress: relayProgress}, relayRewrite, progress, stripKeys, observe)
 			}
@@ -2373,7 +2366,7 @@ walk:
 				unsafeReason, stopReason = verdict.Reason, recoveryUnsafeContent
 				break
 			}
-			if window.expired(eng.Now()) {
+			if window.expired() {
 				// The same instant the watchdogs are armed against, read on
 				// the same clock the policy was resolved with. A watchdog is
 				// what bounds an operation the proxy is parked inside; this

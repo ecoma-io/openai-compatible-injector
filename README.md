@@ -1319,7 +1319,11 @@ remain bounded:
   request's own context can unblock it — and for a client that is still
   reading, that context would live forever. The window carries its own cancel
   for exactly this case, so the dial returns after the remaining tolerated
-  silence rather than parking the request until the client gives up.
+  silence rather than parking the request until the client gives up. Header
+  arrival is itself upstream activity: a hop that answers in time moves the
+  same window forward and hands the watchdog to its new body, while one that
+  answers after the deadline is dropped and reported `max_elapsed` rather than
+  relayed.
 
 A later hop inherits the same moving window; it does not get a fresh interval
 just because the previous upstream response ended. In every case the hop's
