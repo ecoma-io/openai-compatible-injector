@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.5](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.4...v0.14.5) (2026-09-29)
+
+
+### Bug Fixes
+
+* **ci:** size the container against RSS, not the buffering budget ([#108](https://github.com/ecoma-io/openai-compatible-injector/issues/108)) ([e80fcb8](https://github.com/ecoma-io/openai-compatible-injector/commit/e80fcb86327d1eca61083160705cc2522a754528))
+* **config:** never let the config-file path reach a log event ([#105](https://github.com/ecoma-io/openai-compatible-injector/issues/105)) ([a717df4](https://github.com/ecoma-io/openai-compatible-injector/commit/a717df4ff30d5791ae08a6b781be53072227bbef))
+* **proxy:** make stream max-elapsed a maximum upstream idle timeout ([#110](https://github.com/ecoma-io/openai-compatible-injector/issues/110)) ([951ab43](https://github.com/ecoma-io/openai-compatible-injector/commit/951ab43850de91ceb7ae10e0ddd2184c581c26da))
+
 ## [0.14.4](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.3...v0.14.4) (2026-09-29)
 
 
