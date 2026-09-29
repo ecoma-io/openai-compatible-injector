@@ -1381,7 +1381,7 @@ walk:
 					}
 					break
 				}
-				resp, uerr = d.Do(req)
+				resp, uerr = transport.DialWithDeadline(eng.Budget(), r.Context(), d, req)
 				lastEgressAttempt = 1
 			}
 			// This attempt's own egress mode — the pool's last dialed

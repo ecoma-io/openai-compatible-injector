@@ -354,6 +354,57 @@ type Executor interface {
 	Execute(*AttemptRequest) (*http.Response, AttemptInfo, error)
 }
 
+// DialWithDeadline executes one outbound exchange through the Doer, bounded
+// by the exchange budget's remaining elapsed time. It is the enforcement of
+// `max-elapsed` on the dial itself — the gap the envelope's elapsed half was
+// never able to cover on its own, because a peer that accepts the connection
+// and sends no status line parks the caller in Do for as long as the client
+// gives it.
+//
+// The timeout is applied to a COPY of the request built on a DERIVED
+// context, never to the caller's own: a request's context is the caller's
+// cancellation and deadline channel, and folding the proxy's exchange bound
+// into it would make the walk read a proxy-owned timeout as the caller's own
+// (caller_deadline_exceeded, terminal) — the exact mis-classification an
+// exchange timeout must not produce. The caller's context stays the one
+// ClassifyAttempt sees, so a proxy deadline surfaces as the endpoint's
+// timeout: fallback-eligible, reviewable by the matrix.
+//
+// The timeout ends at the exchange: it is applied to the request used for
+// the dial, and the response's body, once returned, is the caller's live
+// stream — SSE bodies legitimately outlive any dial timeout. The
+// post-commitment stream window is the seam that bounds a stream's silence,
+// never this one.
+//
+// A budget that is nil leaves the dial exactly as it was: unbounded by any
+// envelope. A remaining elapsed that is zero or negative produces an
+// already-expired derived context, which fails fast exactly as a spent
+// envelope's ConsumeExchange would — and reports through the same error
+// path rather than inventing a new refusal shape.
+func DialWithDeadline(budget ExchangeBudget, ctx context.Context, doer Doer, req *http.Request) (*http.Response, error) {
+	if budget == nil {
+		return doer.Do(req)
+	}
+	derived, cancel := context.WithTimeout(ctx, budget.RemainingElapsed())
+	req2 := req.Clone(derived)
+	resp, err := doer.Do(req2)
+	if err != nil {
+		// The exchange is over — nothing will read a body, so the derived
+		// context has nothing left to own.
+		cancel()
+		return nil, err
+	}
+	// The exchange produced a response. Its BODY is the caller's live stream
+	// and legitimately outlives the exchange deadline (SSE); the derived
+	// context must stay alive until the body is done, exactly like the
+	// pool's permit — so the cancel is owned by the body's Close, not by
+	// this function's return. The same pattern as newReleaseBody: the cancel
+	// releases the per-exchange claim, and never fire before the stream the
+	// exchange produced is finished.
+	resp.Body = newReleaseBody(resp.Body, cancel)
+	return resp, nil
+}
+
 // ExchangeBudget is the per-request ceiling on real outbound exchanges,
 // claimed immediately before a dial. It is declared HERE, on the consumer
 // side: the transport layer performs the dials, so the transport layer
@@ -365,9 +416,31 @@ type Executor interface {
 // honest: a handler-side count would miss the exchanges a pool's fallback
 // adds to one candidate attempt. A claim that reports false means the
 // request has spent everything it may spend, and the caller MUST NOT dial.
+//
+// RemainingElapsed() is the companion seam: the same envelope's elapsed
+// ceiling, applied to the dial itself rather than only consulted between
+// exchanges. It is a remaining duration, not an idle bound — an exchange
+// that answers nothing is always bounded, while a stream that IS answering
+// is bounded by the stream recovery window instead, never by this
+// remaining-time budget.
 type ExchangeBudget interface {
 	// ConsumeExchange claims one unit for an exchange that is about to
 	// start, reporting false when the request's envelope is spent — in
 	// which case the caller MUST NOT dial.
 	ConsumeExchange() bool
+
+	// RemainingElapsed is how much time an exchange that starts now may
+	// still take, per the request's recovery envelopes. The transport
+	// anchors it on the machine's wall clock (context.WithTimeout), so
+	// `max-elapsed` bounds a blocked exchange — one that answered nothing —
+	// not only the gaps between exchanges. It is a remaining duration, never
+	// an idle bound: an "exchange in progress" always has a terminal
+	// instant, because the request's envelopes are validated to be finite.
+	//
+	// It must never be applied to the response BODY after headers arrive: a
+	// returned body is a live stream whose lifetime is the relay's own (SSE
+	// bodies legitimately outlive any dial timeout, and the stream-bound
+	// recovery window — not this seam — is what bounds their silence). The
+	// dial alone is what this caps.
+	RemainingElapsed() time.Duration
 }

@@ -207,3 +207,54 @@ func TestBudgetRequestRemainingFloorsAtZero(t *testing.T) {
 		t.Fatalf("request remaining = %d, want 0", got)
 	}
 }
+
+// TestBudgetRemainingElapsedIsTheTighterEnvelope pins the exchange-bound
+// seam: what an exchange that starts now is still allowed to take is the
+// smaller of the two envelopes' remaining time. The candidate's window is
+// the tighter one in the shipped defaults, so the candidate's remaining
+// governs until the request's own ceiling is closer.
+func TestBudgetRemainingElapsedIsTheTighterEnvelope(t *testing.T) {
+	clk := newTestClock()
+	b := NewBudget(Envelope{MaxExchanges: 100, MaxElapsed: 30 * time.Second}, clk.now)
+	b.BeginCandidate(Envelope{MaxExchanges: 100, MaxElapsed: 10 * time.Second})
+
+	// Nothing has elapsed: the candidate's shorter window governs.
+	if got := b.RemainingElapsed(); got != 10*time.Second {
+		t.Fatalf("remaining at start = %v, want the candidate's 10s", got)
+	}
+	clk.advance(6 * time.Second)
+	if got := b.RemainingElapsed(); got != 4*time.Second {
+		t.Fatalf("remaining at 6s = %v, want the candidate's 4s", got)
+	}
+
+	// The request clock outlives the candidate's 10s. A fresh candidate
+	// reopens its own 10s window, but the request's is now only 24s away —
+	// which is still looser, so the candidate's window governs again.
+	b.BeginCandidate(Envelope{MaxExchanges: 100, MaxElapsed: 10 * time.Second})
+	if got := b.RemainingElapsed(); got != 10*time.Second {
+		t.Fatalf("remaining after fresh candidate = %v, want 10s", got)
+	}
+	clk.advance(21 * time.Second) // 27s into the request, 21s into the candidate
+	// The candidate has overrun, so whatever the request still allows, the
+	// exchange must refuse: the seam reports the min of the two envelopes,
+	// and a spent candidate means zero usable time even while the request
+	// still has 3s.
+	if got := b.RemainingElapsed(); got > 0 {
+		t.Fatalf("remaining at candidate 21s = %v, want non-positive (candidate spent)", got)
+	}
+}
+
+// TestBudgetRemainingElapsedReportsASpentWindowAsNonPositive pins the
+// fail-fast direction: a remaining elapsed of zero or less must be returned
+// as-is, not clamped to a fresh window — clamping would turn a spent
+// envelope into one more dial. This is the read that makes a late exchange
+// refuse exactly where ConsumeExchange would.
+func TestBudgetRemainingElapsedReportsASpentWindowAsNonPositive(t *testing.T) {
+	clk := newTestClock()
+	b := NewBudget(Envelope{MaxExchanges: 100, MaxElapsed: 10 * time.Second}, clk.now)
+	b.BeginCandidate(Envelope{MaxExchanges: 100, MaxElapsed: 10 * time.Second})
+	clk.advance(12 * time.Second)
+	if got := b.RemainingElapsed(); got > 0 {
+		t.Fatalf("remaining after both windows overrun = %v, want non-positive", got)
+	}
+}

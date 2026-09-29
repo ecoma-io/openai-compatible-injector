@@ -529,6 +529,12 @@ func (b *stubBudget) grants() int {
 	return b.granted
 }
 
+// RemainingElapsed satisfies the exchange-budget seam for tests that only
+// exercise consumption. The stub always reports a window far longer than any
+// test runs, so no dial in these tests is ever bounded by it — consumption
+// counting stays the axis under test, and the elapsed-axis has its own tests.
+func (b *stubBudget) RemainingElapsed() time.Duration { return 365 * 24 * time.Hour }
+
 func withBudget(ar *AttemptRequest, b ExchangeBudget) *AttemptRequest {
 	ar.Budget = b
 	return ar
