@@ -506,14 +506,16 @@ func (p *partialText) bindChoiceIndex(choice map[string]json.RawMessage) bool {
 //	E. BOUND — events that name the text content part the prefix was read
 //	   from: response.content_part.added / .done and
 //	   response.output_text.annotation.added. They are held to the delta
-//	   identity contract and then ignored, and a refusal part is detected
-//	   rather than ignored. What makes the IGNORE sound is the shape of the
-//	   part, not the identity: the part's `type` is the same claim the deltas
-//	   make, and for an `output_text` part a payload whose `text` disagrees
-//	   with what this pass accumulated is a shape this build does not read —
-//	   see observeContentPart and issue #101. (response.output_text.done, by
-//	   contrast, is class A: its text IS read, because that event does state
-//	   the output text in full.)
+//	   identity contract, and a refusal part is detected rather than ignored.
+//	   What makes the IGNORE sound is the shape of the part, not the
+//	   identity: the part's `type` is the same claim the deltas make. For
+//	   `.added` that is the whole of it, because a part being opened states
+//	   no content of its own. For `.done` it is not — the event closes the
+//	   part and MAY state its text in full, so a `text` that disagrees with
+//	   what this pass accumulated is refused exactly as
+//	   observeResponsesTextDone refuses it. See verifyPartText.
+//	   (response.output_text.done, by contrast, is class A: its text IS
+//	   read, because that event does state the output text in full.)
 //	F. METADATA — response.created / .queued / .in_progress / .completed and
 //	   the reasoning channel (reasoning_text.*, reasoning_summary_*). The
 //	   reasoning channel is a SEPARATE output the client renders beside the
@@ -577,8 +579,10 @@ func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 		p.refuse(reasonUpstreamTerminal)
 
 	// E. BOUND
-	case "response.content_part.added", "response.content_part.done":
-		p.observeContentPart(obj)
+	case "response.content_part.added":
+		p.observeContentPart(obj, false)
+	case "response.content_part.done":
+		p.observeContentPart(obj, true)
 	case "response.output_text.annotation.added":
 		p.observeAnnotation(obj)
 
@@ -815,6 +819,7 @@ func responsesItem(obj map[string]json.RawMessage) (map[string]json.RawMessage, 
 // observeContentPart reads a content-part lifecycle event —
 // response.content_part.added or .done. The event announces or closes one
 // content part of one output item; the part's text arrives on the deltas.
+// done says which of the two it is, because their invariants differ.
 //
 // It is not ignored as a lifecycle detail, because it names the exact content
 // part a delta names and it names the part's CHANNEL: an event whose identity
@@ -825,19 +830,31 @@ func responsesItem(obj map[string]json.RawMessage) (map[string]json.RawMessage, 
 // part is the channel the prefix is made of, and any other part type is a
 // shape this accumulator does not know how to continue from.
 //
-// KNOWN GAP (issue #101): the part's own `text` member is not read for either
-// event name, so a `content_part.done` carrying a text that disagrees with what
-// this pass accumulated is ignored rather than refused. The ignore is sound for
-// `.added` — a part being opened has no content yet — and not established for
-// `.done`, which is why the two share one function and the stronger invariant
-// is left unenforced. `response.output_text.done` is the event that states the
-// output text in full, and it IS read (observeResponsesTextDone); the gap is
-// specific to this part-level event and is tracked rather than guessed at.
+// The two names are handled by one function because they share the identity
+// and the channel, but they do NOT share the text: `.added` states a part
+// being opened, which by the API's own shape carries no content yet, so
+// there is nothing of its own to disagree with the deltas. `.done` closes
+// the part and MAY state its text in full, and a text that disagrees with
+// what this pass accumulated means the client received text the prefix does
+// not hold — the same loss observeResponsesTextDone refuses, for the same
+// reason: continuing from a shorter prefix splices an answer around the
+// hole. So a `.done` whose part states a text member has it read and
+// compared, and only a `.done` that states none is closed on the identity
+// alone. The comparison is against the PASS region, exactly as
+// observeResponsesTextDone scopes its own: a continuation hop is a new
+// upstream response, and the text its part closes is the text that response
+// streamed, not the whole cross-hop prefix.
+//
+// A `.done` is NOT terminal, and the branch deliberately does not finish the
+// accumulator. `response.output_text.done` latches terminal because it states
+// the output text in full; this event closes one part of one output, which
+// the closing content_part and the enclosing output_item still follow. Only
+// the comparison is new here.
 //
 // A part object that is absent is not refused. The provider then states the
 // identity without stating the channel, and the identity is what the contract
 // is made of: there is nothing here that could have carried text.
-func (p *partialText) observeContentPart(obj map[string]json.RawMessage) {
+func (p *partialText) observeContentPart(obj map[string]json.RawMessage, done bool) {
 	if !p.bindTextStream("response.output_text.delta", obj) {
 		return
 	}
@@ -862,10 +879,50 @@ func (p *partialText) observeContentPart(obj map[string]json.RawMessage) {
 	}
 	switch kind {
 	case "output_text":
-		// The channel the committed prefix is made of.
+		if done {
+			p.verifyPartText(part)
+		}
 	case "refusal":
 		p.refuse(reasonRefusal)
 	default:
+		p.refuse(reasonUnknownShape)
+	}
+}
+
+// verifyPartText holds a closing content part to the text this upstream
+// response streamed. A `text` member that is absent or null states nothing
+// and closes on the identity alone, which is the ordinary shape: the part's
+// content was carried by the deltas the prefix already holds. A member that
+// IS stated is read, and anything but exact agreement with the pass's own
+// accumulation is unknown_shape — the same fact observeResponsesTextDone
+// reports on its own event, for the same reason, and the same token so an
+// operator reading a log line sees one failure rather than two spellings of
+// it.
+//
+// The comparison is a check and never a source. The text is NOT appended when
+// the pass accumulated nothing: a part closed with text where no delta was
+// observed is a cut generation, and observeResponsesTextDone handles that
+// case by adopting the stated text as the prefix, while the response's own
+// output_text.done — the event that says the output is complete — is what
+// decides whether it may be. Copying that branch here would make this event
+// a second, weaker path to putting unverified bytes into a continuation body.
+func (p *partialText) verifyPartText(part map[string]json.RawMessage) {
+	raw, ok := part["text"]
+	if !ok || jsonNull(raw) {
+		return
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		p.refuse(reasonUnknownShape)
+		return
+	}
+	if text == "" {
+		// An empty part closed textlessly agrees with any accumulation, and
+		// with none. There is nothing to compare and nothing that could have
+		// been lost, so it is the same shape as a part stating no text.
+		return
+	}
+	if string(p.passText()) != text {
 		p.refuse(reasonUnknownShape)
 	}
 }

@@ -1173,8 +1173,59 @@ func TestPartialTextResponsesBoundEvents(t *testing.T) {
 			recover: true,
 		},
 		{
-			name:    "content part done for the prefix's own stream",
+			// A closing part that states the text the deltas already
+			// accumulated agrees with the pass, so it changes nothing. This
+			// is the case the handler used to ignore for the same reason and
+			// still does — read now, not skipped.
+			name:    "content part done agreeing with the pass",
 			payload: `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Once"}}`,
+			recover: true,
+		},
+		{
+			// The gap issue #101 named: a closing part whose text is NOT
+			// what the deltas accumulated. The client received text the
+			// prefix does not hold, and continuing from the shorter prefix
+			// would splice an answer around the hole. Refused with the same
+			// token the sibling output_text.done path uses, so one failure
+			// has one spelling.
+			name:    "content part done disagreeing with the pass",
+			payload: `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Once upon a time, and then some more that never arrived"}}`,
+			want:    reasonUnknownShape,
+		},
+		{
+			// A closing part that states no text at all is the ordinary
+			// shape: its content was carried by deltas the prefix already
+			// holds, so there is nothing to compare and nothing lost.
+			name:    "content part done with no text member",
+			payload: `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[]}}`,
+			recover: true,
+		},
+		{
+			name:    "content part done with a null text",
+			payload: `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":null}}`,
+			recover: true,
+		},
+		{
+			// An empty part agrees with any accumulation, and with none.
+			name:    "content part done with empty text",
+			payload: `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`,
+			recover: true,
+		},
+		{
+			// A text this build cannot read as a string is a shape it must
+			// not wave through: the bytes are there and the meaning is not.
+			name:    "content part done with a non-string text",
+			payload: `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":42}}`,
+			want:    reasonUnknownShape,
+		},
+		{
+			// `.added` opens a part and states no content of its own, so a
+			// text on it is not compared — the event that may state the
+			// part's text in full is `.done`, and it is the one held to it.
+			// This is the asymmetry the two names have always had, now
+			// stated on the test that pins it rather than on a comment.
+			name:    "content part added carrying text is not compared",
+			payload: `{"type":"response.content_part.added","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"something the deltas never said"}}`,
 			recover: true,
 		},
 		{
@@ -1223,6 +1274,73 @@ func TestPartialTextResponsesBoundEvents(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPartialTextContentPartDoneIsPerUpstreamResponse pins the scope of the
+// closing-part comparison, which is the same scope observeResponsesTextDone's
+// is and for the same reason: a .done states the text of the response that
+// emitted it, so a continuation hop's closing part must be compared with that
+// hop's own deltas and never with the whole cross-hop prefix. Testing the
+// wrong region refuses a correct hop, which is the false "unsafe" the gate is
+// supposed to be allowed to pay only when the answer really is wrong.
+func TestPartialTextContentPartDoneIsPerUpstreamResponse(t *testing.T) {
+	const (
+		deltaM1 = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once"}`
+		deltaM2 = `{"type":"response.output_text.delta","item_id":"m2","output_index":0,"content_index":0,"delta":" upon a time"}`
+	)
+
+	t.Run("a hop closing its own part recovers", func(t *testing.T) {
+		// The hop's cross-hop prefix is "Once upon a time" while the part it
+		// closes states " upon a time" — the pass. Comparing against the
+		// whole prefix would refuse this correct hop.
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{deltaM1},
+			[]string{deltaM2, `{"type":"response.content_part.done","item_id":"m2","output_index":0,"content_index":0,"part":{"type":"output_text","text":" upon a time"}}`},
+		)
+		if got := recovered(t, v); got != "Once upon a time" {
+			t.Fatalf("prefix = %q, want %q", got, "Once upon a time")
+		}
+	})
+
+	t.Run("a hop closing a part that overstates its own deltas refuses", func(t *testing.T) {
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{deltaM1},
+			[]string{deltaM2, `{"type":"response.content_part.done","item_id":"m2","output_index":0,"content_index":0,"part":{"type":"output_text","text":" upon a time, and further"}}`},
+		)
+		if v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("a hop closing a part it never streamed refuses", func(t *testing.T) {
+		// A part closed with text where this pass streamed nothing is a cut
+		// generation. The text is not adopted — that is output_text.done's
+		// call, and the branch that would make it would be a second, weaker
+		// path to putting unverified bytes into a continuation body. Here the
+		// empty pass agrees with nothing, so the comparison refuses.
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{deltaM1},
+			[]string{`{"type":"response.content_part.done","item_id":"m2","output_index":0,"content_index":0,"part":{"type":"output_text","text":" text no delta stated"}}`},
+		)
+		if v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("a closing part does not latch the terminal", func(t *testing.T) {
+		// A content_part.done closes one part of one output; the enclosing
+		// output_item.done and the response envelope still follow, so the
+		// generation is not over and the stream stays continuable. Only
+		// response.output_text.done — the event that states the output is
+		// complete — latches terminal.
+		v := feedPasses(apiResponses, 1<<20,
+			[]string{deltaM1, `{"type":"response.content_part.done","item_id":"m1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Once"}}`},
+			[]string{deltaM2},
+		)
+		if got := recovered(t, v); got != "Once upon a time" {
+			t.Fatalf("prefix = %q, want %q", got, "Once upon a time")
+		}
+	})
 }
 
 // TestPartialTextResponsesItemCompletion: the closing event of an output item

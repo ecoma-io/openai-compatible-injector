@@ -556,11 +556,11 @@ capture outcome) a hop's answer never had, and emitting a thin one under the
 same slug would read as a walk event that lost its fields. The hop's status
 rides `upstream_status` on its own event instead.
 
-## Two gaps this pass found in its own safety gate
+## One gap this pass found in its own safety gate
 
-Neither is fixed here, and neither is a claim that a real upstream does the
-thing: both are readings of the code, filed so the next change to this area
-starts from them rather than from a comment that says the gate is sound.
+Not fixed here, and not a claim that a real upstream does the thing: it is a
+reading of the code, filed so the next change to this area starts from it
+rather than from a comment that says the gate is sound.
 
 1. **The event class comes from the data payload, and the SSE `event:` line is
    never compared with it** (issue #100). `observe` is handed the payload; the
@@ -573,15 +573,39 @@ starts from them rather than from a comment that says the gate is sound.
    place and as irrelevant in the other. Whether to refuse on a disagreement is
    a behavior change, which is why it is the issue's decision and not this
    note's.
-2. **`response.content_part.done` never reads its own `text`** (issue #101).
-   `content_part.added` and `.done` share one handler, and the part's `text`
-   member is not read for either, so a done event carrying text that disagrees
-   with the accumulated prefix is ignored rather than refused. The ignore is
-   sound for `.added` — a part being opened has no content yet — and is not
-   established for `.done`, which is why one function enforcing the weaker
-   invariant covers both. `response.output_text.done` is the event that states
-   the output text in full, and it IS read; the gap is specific to the
-   part-level event.
+
+## The second gap, since closed
+
+`response.content_part.done` never read its own `text` (issue #101).
+`content_part.added` and `.done` shared one handler, and the part's `text`
+member was not read for either, so a done event carrying text that disagreed
+with the accumulated prefix was ignored rather than refused. The ignore was
+sound for `.added` — a part being opened states no content yet — and was not
+established for `.done`, so one function enforcing the weaker invariant covered
+both. `response.output_text.done` is the event that states the output text in
+full, and it IS read; the gap was specific to the part-level event.
+
+The fix splits the two event names while keeping them in one function, because
+they share the identity and the channel and differ only in the text. A closing
+`output_text` part that states a `text` member has it read and compared with
+the pass's own accumulation, and a disagreement is `unknown_shape` — the same
+fact and the same token `observeResponsesTextDone` already reports, so one
+failure keeps one spelling. A closing part that states no text, states it null,
+or states it empty is closed on the identity alone, which is the ordinary
+shape. The comparison is a check and never a source: unlike
+`observeResponsesTextDone`'s empty-pass branch, this path does not adopt the
+stated text, because doing so would make a part-level event a second, weaker
+route for unverified bytes into a continuation body.
+
+The scope question was the one that needed pinning. A `.done` states the text
+of the response that emitted it, so a continuation hop's closing part is
+compared with that hop's own deltas (`passText`), never with the whole
+cross-hop prefix — the same seam `TestPartialTextResponsesDoneIsPerUpstreamResponse`
+pins for `output_text.done`, and the same failure mode if read the other way: a
+correct hop refused for being right. `verifyPartText` is deliberately a
+no-op for `.added` and does not latch terminal, because a content part is one
+part of one output and the enclosing `output_item.done` and the response
+envelope still follow.
 
 The class comment in `continuation.go` said of the two events that "the
 identity proves they cannot have introduced text", which is not what the
