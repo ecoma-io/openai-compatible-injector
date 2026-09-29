@@ -141,11 +141,20 @@ func run() int {
 
 	data, err := os.ReadFile(b.ConfigFile)
 	if err != nil {
-		log.Fatal().Err(err).Str("file", b.ConfigFile).Msg("config_file_read_failed")
+		// OAICR_CONFIG_FILE is operator input, and os.ReadFile's error is an
+		// os.PathError that embeds the path verbatim — so neither the field
+		// nor the error may reach the log. A path can carry URL-style
+		// userinfo or query material. The slug states the actionable fact
+		// without it; the error's own class is the only other thing an
+		// operator needs and it is not recoverable from here.
+		log.Fatal().Msg("config_file_read_failed")
 	}
 	snap, err := config.LoadRuntime(data)
 	if err != nil {
-		log.Fatal().Err(err).Str("file", b.ConfigFile).Msg("config_load_failed")
+		// LoadRuntime's rejection text quotes position, length or line and
+		// never the operator's input, so the error is safe here — unlike the
+		// read above, which cannot be logged at all.
+		log.Fatal().Err(err).Msg("config_load_failed")
 	}
 	zerolog.SetGlobalLevel(snap.LogLevel())
 
@@ -244,7 +253,10 @@ func run() int {
 	log.Info().
 		Str("version", version).
 		Str("listen", b.Listen).
-		Str("config_file", b.ConfigFile).
+		// The configured path is operator input and may carry sensitive
+		// URL-style components, so it is never a log field — not here, not
+		// in the poller's lifecycle events. What the process loaded is
+		// already stated by the counts and modes below.
 		Dur("poll_interval", b.PollInterval).
 		Dur("shutdown_grace", b.ShutdownGrace).
 		Int("model_count", snap.Len()).

@@ -78,7 +78,9 @@ func (p *Poller) Run(ctx context.Context) {
 			if failingKind != "" {
 				// The file is back — and byte-identical to the last-known-good
 				// content, so there is nothing to republish.
-				p.log.Info().Str("file", p.path).Msg("config_file_recovered")
+				// The configured path is operator input and may carry sensitive
+				// URL-style components, so the event names only the state change.
+				p.log.Info().Msg("config_file_recovered")
 			}
 			// A healthy unchanged tick is silent: the healthy state is the
 			// norm, and a per-tick heartbeat there would be the same
@@ -114,13 +116,27 @@ func (p *Poller) Run(ctx context.Context) {
 // the failure is new (healthy, or a different kind than the previous
 // cycle), a debug heartbeat when the same kind persists. The slugs carry
 // the kind so an operator can tell a vanished file from a rejected one.
+//
+// An unreadable file's error is an os.PathError, which embeds p.path — an
+// operator-controlled bootstrap value that can carry URL-style userinfo or
+// query material. That kind therefore names only the state change and logs no
+// error at all. A rejection keeps its error: LoadRuntime's text quotes
+// position, length or line, never the operator's input.
 func (p *Poller) enterFailure(kind *string, newKind string, err error) {
-	if *kind != newKind {
+	still := *kind == newKind
+	if !still {
 		*kind = newKind
-		p.log.Warn().Err(err).Str("file", p.path).Msg(p.failureSlug(newKind, false))
-		return
 	}
-	p.log.Debug().Err(err).Str("file", p.path).Msg(p.failureSlug(newKind, true))
+	// One place decides, so the two kinds cannot drift apart: the unreadable
+	// branch drops the error, everything else keeps it.
+	e := p.log.Debug()
+	if !still {
+		e = p.log.Warn()
+	}
+	if newKind != failingUnreadable {
+		e = e.Err(err)
+	}
+	e.Msg(p.failureSlug(newKind, still))
 }
 
 // failureSlug maps a failure kind and persistence onto its event slug.

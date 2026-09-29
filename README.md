@@ -2128,6 +2128,14 @@ in place: its historical rows are retained as the `auth` module before the
   log line or error text (a query-parameter API key survives even a dial
   failure). A quote of any of these is a security defect, not a typo
   (SECURITY.md).
+- **The config-file path is operator input and is never a log field.**
+  `OAICR_CONFIG_FILE` may carry URL-style userinfo or query material, so
+  `config_file_read_failed` and `config_load_failed` are the boot events and
+  `config_file_unreadable` / `config_file_recovered` are the poller's; none
+  names the path, and the read-failure event carries no error either, because
+  `os.ReadFile`'s is an `os.PathError` that embeds it. A rejected-reload event
+  does keep its error: that text quotes position, length or line, never the
+  operator's input.
 - `endpoint` URLs with userinfo are rejected at config load; fragments are
   rejected too (a fragment is never sent to a server, so accepting one would
   silently ignore part of the configured endpoint). An endpoint's query
@@ -2193,7 +2201,7 @@ What each level carries:
   level in effect at that moment — a reload mid-request can therefore
   change whether it appears. Also `config_reloaded` (`generation`,
   `model_count`, `log_level`), `config_file_recovered` (a file returned
-  byte-identical after a failure), `service_started` (boot config
+  byte-identical after a failure; no fields beyond the envelope), `service_started` (boot config
   accepted; the listener itself is announced by the DEBUG
   `listener_ready`), and `drain_started`. Post-commitment recovery, when the
   block is enabled, adds `stream_recovery_started` (one per continuation hop,
