@@ -41,49 +41,145 @@ Per-package test surface: 988 test functions, 200 subtests — `internal/proxy`
 
 ### 0.0 Performance baseline (S5)
 
-45 benchmarks at the same commit, median of 6 runs, spread `(max-min)/median`.
-**37 are usable; 2 are flagged `marginal` and must not be used as a
-regression signal** — `EngineObserve/http_429_retry` (42.6% spread) and
-`PipelineRecordParallel/par1` (32.6%). Several transform and SSE rows are
-likewise too noisy for a threshold: `Transform/chat/1MB` at 128% spread and
-`CopySSEFragmented/read256` at only 1 sample. **A regression verdict needs a
-clean before/after pair on the same machine, not a comparison against a number
-whose own spread is 128%.**
+The benchmarks are committed (`internal/*/hro_bench_test.go`), so every number
+below is re-derivable. `go test ./internal/... -bench=. -run='^$'` enumerates
+**256 `Hro` benchmarks**; this run recorded **241** of them. All 13 rows the run
+did not record are in one package — `internal/usage` (`PipelineRecord`,
+`PipelineRecordParallel/par1…32`, `UsageExtract/chat_small|chat_chunk|chat_64KB|
+responses_envelope`, `CaptureObserve`, `NewEventID`), and the run's own result
+files contain no `usage` entry, so that package was simply not benchmarked. The
+remaining two are `chat_no_messages/*`, added after this run (see the transform
+table). **Coverage gaps, stated rather than silent: none of them is a
+request-path surface** — they are the metering queue's enqueue and
+event-extraction paths, off the critical path by construction. Measured
+separately on this machine, `PipelineRecord` is ~1.0 µs / 3712 B and
+`PipelineRecordParallel` runs 45–150% spread across `par1…par32` — unusable for
+a threshold, consistent with the `Budget.Acquire` row below, so the gap costs
+the initiative nothing.
 
-The numbers that are stable enough to matter, and the only ones any
-optimization claim will be measured against:
+241 benchmarks at the same commit, median of 6 runs, spread `(max-min)/median`.
+**170 are usable, 34 `marginal`, 37 alloc-only; only the usable ones can be a
+regression signal.** The rows below that a number would be read off, taken
+verbatim from the same run, with the verdict each one carries:
 
-| Surface                     | ns/op | B/op  | allocs/op |
-| --------------------------- | ----- | ----- | --------- |
-| `Budget.Acquire`            | 13.2  | 0     | 0         |
-| `Budget.Acquire` refused    | 2.0   | 0     | 0         |
-| `Budget.Acquire` /par32     | 123.6 | 0     | 0         |
-| `Pipeline.Record`           | 45.2  | 0     | 0         |
-| `StaticAuth`                | 1907  | 0     | 0         |
-| `Policy.Validate`           | 8.3   | 0     | 0         |
-| `Engine.Observe` 503 retry  | 392   | 0     | 0         |
-| `Engine.New`                | 165.6 | 592   | 2         |
-| `Engine.Walk` (any variant) | ~32µs | 21896 | 52        |
-| `Policy.Hash`               | 14675 | 11168 | 7         |
+| Row                                         | ns/op    | B/op  | allocs/op | spread    | verdict               |
+| ------------------------------------------- | -------- | ----- | --------- | --------- | --------------------- |
+| `Engine.Walk` (4 of 5 variants)             | 28.0µs   | 21896 | 52        | 7.8–8.2%  | `usable`              |
+| `EngineWalk/fallback_3_candidates`          | 28.6µs   | 21896 | 52        | 28.2%     | `marginal`            |
+| `Budget.Parallel` /par1…par32               | 90–94    | 0     | 0         | 1.5–4.6%  | `usable`              |
+| `Budget.AcquireLarge`                       | 13.4     | 0     | 0         | 3.5%      | `usable`              |
+| `Budget.Refused`                            | 1.9      | 0     | 0         | 4.5%      | `usable`              |
+| `StaticAuthParallel` /par1…par32            | 248–272  | 0     | 0         | 5.0–13.4% | `usable`              |
+| `StaticAuthWrongKey`                        | 1789     | 0     | 0         | 7.4%      | `usable`              |
+| `Engine.New`                                | 149.5    | 592   | 2         | 14.9%     | `usable`              |
+| `Policy.Default`                            | 20.4µs   | 21304 | 50        | 13.0%     | `usable`              |
+| `StaticAuth` (single)                       | 1968     | 0     | 0         | 30.6%     | `marginal`            |
+| `Policy.Validate`                           | 17.2     | 0     | 0         | 21.0%     | `marginal`            |
+| `Engine.Observe` 503 retry                  | 1043     | 0     | 0         | 33.1%     | `marginal`            |
+| `Engine.Observe` 429 retry                  | 625      | 0     | 0         | 81.0%     | alloc-only            |
+| `Engine.Observe` transport / 400 / protocol | 705–1233 | 0–16  | 0–2       | 35–84%    | marginal / alloc-only |
+| `Budget.Acquire` (uncontended, small)       | 257      | 56    | 0.5       | 213%      | alloc-only            |
+| `Policy.Hash`                               | 52584    | 11168 | 7         | 82.8%     | alloc-only            |
 
-`Engine.Walk` costs 21896 B and 52 allocs per walk **regardless of whether
-the walk retries once, twice, or falls back across two or three candidates**
-— the same numbers to the byte across five variants. That is the single most
-useful measurement in the set: the walk's per-candidate cost is not in the
-policy evaluation, it is somewhere upstream of it, and optimizing
-`recovery.Engine` cannot move a request's cost. Full table, including the
-injection-transform and SSE-relay rows, is the artifact referenced by
+**A regression verdict needs a clean before/after pair on the same machine, not
+a comparison against a number whose own spread is 213%.** A row flagged
+`TOO_NOISY` is not evidence in either direction — not a green light and not a
+regression. Two whole families have no usable row at all: `EngineObserve` 0/5
+and `ServeSSE` 0/6, which are exactly island 4's and island 3's surfaces. Their
+regressions can only be caught by allocation counts and by the golden
+scenarios, so those islands must not treat "the benchmark got slower" as a
+signal they can trust; see `refactor-roadmap.md` §2 S5.
+
+The most useful number in the set is the byte-identical one. `Engine.Walk`
+costs 21896 B and 52 allocs per iteration **regardless of whether the walk
+retries once, twice, or falls back across two or three candidates** — the same
+numbers to the byte across all five variants. The benchmark's own body
+(`internal/recovery/hro_bench_test.go`) shows why, and it is worth reading
+before quoting the number:
+
+```go
+for i := 0; i < b.N; i++ {
+    p := Default()                    // 21304 B, 50 allocs
+    eng := NewEngine(context.Background(), p, ...)  // 592 B, 2 allocs
+    ...one walk...
+}
+```
+
+21304 + 592 = 21896, so **the walk's own per-candidate allocation is zero** —
+no variant adds a byte. In PRODUCTION the first call does not happen per
+request: `handler.go:859` passes `m.Recovery`, the policy already resolved at
+config load and carried on the snapshot, and only `NewEngine` runs per request.
+So a real request pays 592 B and 2 allocs for the walk, and the 21 KB figure
+belongs to config load, where `recovery.Default()` is genuinely called once
+(`config/runtime.go:440`) and amortized across every request the snapshot
+serves.
+
+The consequence for this initiative is the same either way and is the point:
+**no part of a walk's cost scales with the chain**, so optimizing
+`recovery.Engine` cannot move a request's cost, and no island should be
+justified by walk cost. What does scale per attempt is the handler's own
+per-attempt work — which is the transform table below. Full table, including
+the injection-transform and SSE-relay rows, is the artifact referenced by
 `refactor-roadmap.md` §2 S5.
 
 **Transform repetition, the number island 10 needs.** A same-candidate retry
-re-transforms the request body on every attempt: the body is rebuilt and
-re-injected per attempt, not once per candidate and reused. `Transform/chat`
-at 1 MB is 93 ms / 10.3 MB / 63 allocs, against `chat_noinject` at 68 ms /
-5.3 MB / 38 allocs. With a `max-retries: 8` policy and a large body, the
-transform is the dominant per-attempt cost and it is paid once per attempt.
+re-transforms the request body on every attempt: `transform(body, m)` sits
+INSIDE the attempt loop at `handler.go:1069`, so the body is rebuilt and
+re-injected per attempt, not once per candidate and reused. All five rows of
+this table are `usable` (8.8–19.8% spread), so unlike most of the set it can
+carry a threshold.
+
+| Body             | ns/op      | B/op      | allocs/op |
+| ---------------- | ---------- | --------- | --------- |
+| 1 KB             | 48051      | 9407      | 51        |
+| 64 KB            | 3061768    | 544778    | 52        |
+| 1 MB             | 49194331   | 10146977  | 62        |
+| 8 MB             | 383598295  | 92284634  | 69        |
+| 64 MiB (the cap) | 3164633475 | 738209944 | 74        |
+
+Those five are the INJECTION path, and the three chat paths separate cleanly.
+Measured together on one machine at 50 iterations (`HroTransform/chat*`):
+
+| Body             | `chat` (inject) | `chat_noinject` (empty prompt) | `chat_no_messages` (no member) |
+| ---------------- | --------------- | ------------------------------ | ------------------------------ |
+| 1 KB             | 35.4 µs / 51    | 19.3 µs / 32                   | 8.8 µs / 20                    |
+| 1 MB             | 39.8 ms / 61    | 19.3 ms / 35                   | 7.8 ms / 22                    |
+| 64 MiB (the cap) | 2.43 s / 61     | 1.21 s / 36                    | 0.49 s / 23                    |
+
+Three readings matter, and the third is the one an island must not skip:
+
+1. **Injection is the expensive path, by ~2× in time and ~1.7× in allocations.**
+   The bytes are roughly halved too, so the cost is not the prompt's size but
+   the prepend's own decode-and-marshal.
+2. **Allocation COUNT is nearly flat with body size** (51→61, 32→36, 20→23) while
+   BYTES grow linearly. Whatever scales with a large body is the copy, not a
+   per-element allocation, so an island that chases allocation counts will not
+   move the 64 MiB row at all.
+3. **The ~2× gap is a semantic difference, not slack.** `inject.Chat`
+   (`internal/inject/chat.go:33`) decodes the whole body into a
+   `map[string]json.RawMessage` and re-marshals it — that is what the
+   injection path pays, and it is the same second buffer
+   `handler.go:157-163` budgets for. The no-`messages` path skips the
+   `messages` re-marshal, not the outer one. So a real request is not "2× away
+   from a floor": it is already paying two full-size buffers, and **any reuse
+   proposal that keeps byte-preservation must keep paying one.** Reuse can
+   remove the per-ATTEMPT repetition; it cannot remove the per-REQUEST copy.
+   That is the correct ceiling, and it is why the number is a Phase 4
+   measurement rather than a Phase 1 defect.
+
+That last row is the one that matters: **a maximum-size body costs 3.16 s and
+738 MB of allocation for ONE attempt**, and a `max-retries: 8` policy pays it
+up to nine times — 28 s of CPU and 6.6 GB of churn to relay one request that
+the provider may have answered on the first try. End-to-end, the same 1 MB
+request through `ServeBuffered` is 40.2 ms / 12.3 MB / 304 allocs with
+injection and 27.8 ms / 10.3 MB / 289 allocs without, so the transform is the
+dominant per-attempt cost and it is a _multiplier_ on it.
+
 Whether reuse is legal is a _semantics_ question, not a speed one — the reuse
 must not cross a boundary that changes model, transport or strip semantics —
-so this is Phase 4 work, measured here and not acted on now.
+so this is Phase 4 work, measured here and not acted on now. It is the
+strongest measured candidate in the set, and the measurement is here so that
+"it feels faster" is never the reason it gets done.
 
 ### 0.1 What the baseline does and does not freeze
 
@@ -410,7 +506,7 @@ do not have access to it.", ...}}` with `<X>` exactly as sent.
 - **Observable**: Upstream-received body bytes.
 - **Regression tests**: `internal/inject` suite (62 test functions).
 
-### INV-INJ-02 — Transforms are byte-preserving and never re-serialized
+### INV-INJ-02 — Response rewriters are byte-preserving and never re-serialized
 
 - **Description**: `RewriteChatModel` replaces only the top-level `"model"`
   string value; `RewriteResponsesModel` additionally the `"model"` directly
@@ -426,6 +522,15 @@ do not have access to it.", ...}}` with `<X>` exactly as sent.
   rewrite tests. **GAP**: no property test asserts that a whole corpus of
   well-formed bodies round-trips byte-identically outside the rewritten
   member.
+- **Scope note (recorded, not a defect)**: this byte-preservation holds for the
+  RESPONSE rewriters. The REQUEST path is different and deliberately so —
+  `inject.Chat`/`inject.Responses` decode into a map and re-marshal, because
+  injecting means restructuring a member rather than replacing a value.
+  `handler.go:157-163` already budgets the resulting second full-size buffer.
+  The two must not be conflated: an island that "makes the transform
+  byte-preserving" on the request path would have to stop injecting, and an
+  island that assumes the request path is already a splice will propose reuse
+  that breaks the model rename.
 
 ### INV-INJ-03 — Field stripping is config data, byte-preserving, and last
 
