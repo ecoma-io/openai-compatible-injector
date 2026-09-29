@@ -260,7 +260,7 @@ func (p *partialText) passText() []byte { return p.text[p.passStart:] }
 // blocks and never writes.
 //
 // The payload is the relay's own buffer and is never retained.
-func (p *partialText) Observe(payload []byte) {
+func (p *partialText) Observe(name, payload []byte) {
 	if p.unsafe != "" || p.terminal {
 		// A latched verdict is permanent: a later shape cannot un-refuse a
 		// stream, and nothing after the generation's declared end belongs to
@@ -288,7 +288,28 @@ func (p *partialText) Observe(payload []byte) {
 		return
 	}
 	if p.api == apiChat {
+		// Chat carries no event: line — the whole surface is a `data:` stream
+		// ending in [DONE] — so there is no second half of a frame to compare
+		// this payload's shape against. The check below is a Responses-only
+		// obligation, and applying it here would refuse every Chat stream.
 		p.observeChatChunk(obj)
+		return
+	}
+	// A Responses frame names itself twice: the SSE `event:` line and the
+	// payload's own `type`. Both are in scope now, and a frame whose two
+	// halves disagree has no proven content shape — the gate would be
+	// classifying on the half that calls it safe while the other says
+	// something else. Refused, not reconciled: an absent name is LESS
+	// evidence than a present one, not equal evidence, and any rule picking
+	// between two disagreeing halves would be policy this build does not have.
+	//
+	// The relay's terminal predicate makes the opposite choice deliberately —
+	// it trusts `event: response.completed` and refuses a data payload naming
+	// it — because for a terminal marker the safe error is to send one more
+	// event. Here it is the safety gate, and the safe error is a truncated
+	// stream, which is what every deployment sees today.
+	if !p.frameNameAgrees(obj, name) {
+		p.refuse(reasonUnknownShape)
 		return
 	}
 	if raw, ok := obj["response"]; ok && !jsonNull(raw) {
@@ -528,16 +549,35 @@ func (p *partialText) bindChoiceIndex(choice map[string]json.RawMessage) bool {
 // ones a future upstream could use to stream text this proxy would then omit
 // from a continuation body.
 //
-// The event class comes from the DATA PAYLOAD alone, and that is the whole of
-// the evidence: the SSE `event:` line that precedes it is not passed to
-// `observe` at all, so the class is read from the payload's own `type` member
-// and the two are never compared. The relay's terminal predicate makes the
-// opposite choice deliberately — it trusts `event: response.completed` and
-// explicitly refuses a data payload naming it — because for a terminal marker
-// the safe error is to send one more event, while for the safety gate it is
-// not. That asymmetry is tracked as issue #100 rather than resolved here:
-// refusing on a mismatch is a behaviour change, not a fix, and it belongs to
-// the issue.
+// The event class is read from the DATA PAYLOAD's own `type` member, and the
+// frame's `event:` line is compared with it before this function is reached
+// (frameNameAgrees, in Observe) — a Responses frame names itself twice, and
+// the two names must agree before the gate will classify on either. The
+// relay's terminal predicate makes the opposite choice deliberately: it
+// trusts `event: response.completed` and explicitly refuses a data payload
+// naming it, because for a terminal marker the safe error is to send one more
+// event, while for the safety gate it is not.
+// frameNameAgrees reports whether a Responses frame's two names — the SSE
+// `event:` line and the payload's own `type` — are both present and equal.
+// A nil or empty name is not agreement: it is the absence of evidence, and
+// absence is refused rather than read as a match. A `type` that is not a
+// string, or an event name that is not text, is likewise a shape this build
+// cannot vouch for.
+func (p *partialText) frameNameAgrees(obj map[string]json.RawMessage, name []byte) bool {
+	if len(name) == 0 {
+		return false
+	}
+	raw, ok := obj["type"]
+	if !ok {
+		return false
+	}
+	var typ string
+	if err := json.Unmarshal(raw, &typ); err != nil {
+		return false
+	}
+	return string(name) == typ
+}
+
 func (p *partialText) observeResponsesEvent(obj map[string]json.RawMessage) {
 	raw, ok := obj["type"]
 	if !ok {

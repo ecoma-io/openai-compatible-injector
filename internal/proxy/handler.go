@@ -2197,7 +2197,7 @@ walk:
 		// unconfigured deployment has always produced.
 		contPolicy := answer.cand.Recovery.Stream
 		var partial *partialText
-		var observe func([]byte)
+		var observe func(name, payload []byte)
 		buildCont := inject.BuildContinuationChat
 		if api == apiResponses {
 			buildCont = inject.BuildContinuationResponses

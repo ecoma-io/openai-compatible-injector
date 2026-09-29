@@ -9,9 +9,10 @@ import (
 )
 
 var (
-	sseDataPrefix = []byte("data:")
-	sseModelKey   = []byte(`"model"`)
-	sseUsageKey   = []byte(`"usage"`)
+	sseDataPrefix  = []byte("data:")
+	sseEventPrefix = []byte("event:")
+	sseModelKey    = []byte(`"model"`)
+	sseUsageKey    = []byte(`"usage"`)
 )
 
 // Bounded SSE input. Without caps, a single upstream line without a
@@ -81,17 +82,26 @@ var (
 // Comments, event lines, blank lines, and terminators such as [DONE] pass
 // through byte-for-byte.
 //
-// observe, when non-nil, is called with the payload of EVERY data line —
-// before the acceptance gate above, and therefore before the rewrite — and
-// its return value is ignored. That is deliberately a different seam from
-// rewriter: the gate is an optimization keyed on the two keys the REWRITER
-// owns, and a payload that carries neither is exactly the case an observer
-// of, say, assistant text deltas must still see. (A Responses
-// `response.output_text.delta` event carries no `model` member at all, so
-// composing an observer into rewriter would silently miss every token of a
-// Responses stream.) A nil observe costs nothing: the unconfigured path does
-// not parse the line twice. observe must not write to dst and must not block
-// — it runs inline on the relay's goroutine.
+// observe, when non-nil, is called with the event NAME and the payload of
+// every data line — before the acceptance gate above, and therefore before
+// the rewrite — and its return value is ignored. That is deliberately a
+// different seam from rewriter: the gate is an optimization keyed on the two
+// keys the REWRITER owns, and a payload that carries neither is exactly the
+// case an observer of, say, assistant text deltas must still see. (A
+// Responses `response.output_text.delta` event carries no `model` member at
+// all, so composing an observer into rewriter would silently miss every token
+// of a Responses stream.) A nil observe costs nothing: the unconfigured path
+// does not parse the line twice. observe must not write to dst and must not
+// block — it runs inline on the relay's goroutine.
+//
+// The name is the frame's event: line — the bytes after "event:" — or nil
+// when the frame stated none. Nil and empty are different facts and both
+// occur: a Chat frame has no event: line at all, while a Responses frame
+// states one, and a safety gate refusing on a disagreement has to be able to
+// tell "no name was stated" from "a name was stated and it was empty". That
+// is why the parameter is a nil-able slice rather than a string, whose empty
+// value cannot express the first. The name is a copy, valid for the duration
+// of the call only.
 //
 // Limit breaches stop the relay: the offending (partial) line is never
 // written, no further reads happen, and the returned error wraps
@@ -100,7 +110,7 @@ var (
 // error is returned so the caller can truncate the stream. A failure
 // writing to dst is returned wrapped in *streamWriteError — the client side
 // went away — so the caller can log the two truncation causes apart.
-func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func(), stripKeys [][]byte, observe func(payload []byte)) (StreamStats, error) {
+func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, flush func(), stripKeys [][]byte, observe func(name, payload []byte)) (StreamStats, error) {
 	var stats StreamStats
 	br := bufio.NewReaderSize(src, sseReadBuffer)
 	// pending counts the bytes of the event in flight — every line since
@@ -116,6 +126,16 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 	// reach the observer and client immediately without inventing a boundary
 	// when it later proves to have been CRLF.
 	pendingCRLF := false
+	// eventName is the name the CURRENT frame's event: line stated, or nil
+	// when it stated none. An SSE frame's event: line precedes its data:
+	// lines, so the observer can be handed both halves of the same frame —
+	// which is the point: a payload and a name that disagree are a frame
+	// with no proven content shape, and the safety gate must be able to see
+	// the disagreement rather than only the half that agrees.
+	//
+	// Copied, never aliased: the line buffer is reused by the next read, and
+	// the observer may retain what it is given.
+	var eventName []byte
 	for {
 		line, rerr := readBoundedLine(br)
 		if errors.Is(rerr, ErrSSELineTooLong) {
@@ -140,16 +160,37 @@ func CopySSE(dst io.Writer, src io.Reader, rewrite func(payload []byte) []byte, 
 				pendingCRLF = false
 			} else {
 				boundary := isEventBoundary(line)
-				if !boundary {
+				if boundary {
+					// The frame is over: the next event: line belongs to the
+					// next frame, not to a late data line of this one.
+					eventName = nil
+				} else {
 					pending += int64(len(line))
 					if pending > MaxEventBytes {
 						return stats, fmt.Errorf("%w: event reached %d bytes, limit %d",
 							ErrSSEEventTooLarge, pending, MaxEventBytes)
 					}
+					if name, ok := sseEventName(line); ok {
+						// A second event: line in the same frame is the LAST one
+						// winning, which is what the EventSource specification
+						// says the field means. Copied, never aliased.
+						//
+						// The copy is into a non-nil empty slice, not
+						// append([]byte(nil), ...): a stated but EMPTY name and
+						// no name at all are different wire facts, and
+						// append(nil) of an empty slice yields nil, which would
+						// collapse them into one indistinguishable value at the
+						// assignment site — undoing what sseEventName took care
+						// to preserve. Today the gate refuses both under the
+						// same token, so nothing observable depends on it; the
+						// seam is what future callers read, and it should not
+						// promise a distinction it cannot deliver.
+						eventName = append([]byte{}, name...)
+					}
 				}
 				if observe != nil {
 					if payload, ok := sseDataPayload(line); ok {
-						observe(payload)
+						observe(eventName, payload)
 					}
 				}
 				out := rewriteSSELine(line, rewrite, stripKeys)
@@ -402,6 +443,27 @@ func sseDataPayload(line []byte) ([]byte, bool) {
 		payload = payload[1:]
 	}
 	return payload, true
+}
+
+// sseEventName returns the event name a raw "event:" line carries — the bytes
+// after "event:" and one optional separator space — and reports whether the
+// line is an event line at all. An event line with an empty name is reported
+// as an event line carrying an EMPTY name, not as no name at all: the two
+// mean different things to the safety gate, and a name that was stated and
+// came out empty is a disagreement rather than a silence.
+//
+// This is the ONE place the SSE event-line prefix is parsed, for the same
+// reason sseDataPayload is the one place the data prefix is.
+func sseEventName(line []byte) ([]byte, bool) {
+	content, _ := splitSSELineTerminator(line)
+	name, ok := bytes.CutPrefix(content, sseEventPrefix)
+	if !ok {
+		return nil, false
+	}
+	if len(name) > 0 && name[0] == ' ' {
+		name = name[1:]
+	}
+	return name, true
 }
 
 // mentionsAnyKey reports whether payload contains any of the strip

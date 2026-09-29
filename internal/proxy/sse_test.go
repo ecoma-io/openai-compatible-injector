@@ -606,3 +606,158 @@ func TestCopySSETerminalNeedsTheBytesToLand(t *testing.T) {
 		t.Fatal("a torn marker write set stats.Terminal")
 	}
 }
+
+// TestCopySSEObserveCarriesTheFrameName pins the seam the safety gate's
+// frame-name check depends on: a Responses frame states its class twice, and
+// only CopySSE can see both halves. These cases drive the real relay over a
+// real byte stream, so a seam that passed the payload and dropped or
+// misattributed the name would fail here rather than silently disabling the
+// check it feeds.
+func TestCopySSEObserveCarriesTheFrameName(t *testing.T) {
+	type frame struct {
+		name    string
+		payload string
+	}
+	collect := func(t *testing.T, stream string) []frame {
+		t.Helper()
+		var got []frame
+		_, err := CopySSE(io.Discard, strings.NewReader(stream), nil, nil, nil,
+			func(name, payload []byte) {
+				got = append(got, frame{string(name), string(payload)})
+			})
+		if err != nil {
+			t.Fatalf("CopySSE: %v", err)
+		}
+		return got
+	}
+	want := []frame{
+		{"response.output_text.delta", `{"type":"response.output_text.delta","delta":"a"}`},
+		{"response.output_text.done", `{"type":"response.output_text.done","text":"a"}`},
+	}
+
+	t.Run("each data line carries its own frame's name", func(t *testing.T) {
+		stream := "event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\n" +
+			"event: response.output_text.done\n" +
+			"data: {\"type\":\"response.output_text.done\",\"text\":\"a\"}\n\n"
+		got := collect(t, stream)
+		if len(got) != len(want) {
+			t.Fatalf("observed %d data lines, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("frame %d = (name %q, payload %s), want (name %q, payload %s)",
+					i, got[i].name, got[i].payload, want[i].name, want[i].payload)
+			}
+		}
+	})
+
+	t.Run("a chat stream reports no name", func(t *testing.T) {
+		// Chat carries no event: line, so the name is absent — which the
+		// accumulator treats as Chat's normal shape, exempting it from the
+		// agreement check. Pinning that here keeps the exemption honest: a
+		// relay that invented a name for Chat would break every Chat stream.
+		got := collect(t, "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n")
+		// [DONE] reaches the observer too — it is a data line — and is
+		// discarded by partialText.Observe itself, not by the relay.
+		if len(got) != 2 {
+			t.Fatalf("observed %d data lines, want 2", len(got))
+		}
+		for i, f := range got {
+			if f.name != "" {
+				t.Fatalf("chat frame %d name = %q, want empty", i, f.name)
+			}
+		}
+	})
+
+	t.Run("a name does not leak into the next frame", func(t *testing.T) {
+		// The failure this pins is a frame inheriting the PREVIOUS frame's
+		// name — which would make an unnamed frame agree with whatever
+		// preceded it, and turn the check into a rubber stamp exactly when
+		// the wire went wrong.
+		stream := "event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\n" +
+			"data: {\"type\":\"response.output_text.done\",\"text\":\"a\"}\n\n"
+		got := collect(t, stream)
+		if len(got) != 2 {
+			t.Fatalf("observed %d data lines, want 2", len(got))
+		}
+		if got[1].name != "" {
+			t.Fatalf("second frame name = %q, want empty (inherited from the first)", got[1].name)
+		}
+	})
+
+	t.Run("an empty event line is a stated empty name", func(t *testing.T) {
+		// "event:" with nothing after it is not the same wire fact as no
+		// event: line at all: the first STATES an empty name, the second
+		// states none. Both render as "" through a string conversion, so
+		// the assertion is on nil-ness — a seam that collapsed them would
+		// hand the observer a nil for both and fail here.
+		//
+		// The gate refuses both under the same token today, so nothing
+		// observable depends on the distinction; it is pinned because the
+		// seam's contract promises it, and a future caller may come to
+		// depend on it.
+		var nilness []bool
+		if _, err := CopySSE(io.Discard, strings.NewReader("event:\ndata: {\"type\":\"x\"}\n\n"),
+			nil, nil, nil, func(name, _ []byte) { nilness = append(nilness, name == nil) }); err != nil {
+			t.Fatalf("CopySSE: %v", err)
+		}
+		if len(nilness) != 1 {
+			t.Fatalf("observed %d data lines, want 1", len(nilness))
+		}
+		if nilness[0] {
+			t.Fatal("a stated empty event name arrived as nil — indistinguishable from no event line")
+		}
+	})
+
+	t.Run("a second event line in one frame is the last one", func(t *testing.T) {
+		// The EventSource specification says a repeated field takes its LAST
+		// value. Implementing the other reading would let a gateway prepend a
+		// benign name to a frame whose payload says otherwise and have the
+		// benign one win.
+		stream := "event: response.output_text.done\n" +
+			"event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\"}\n\n"
+		got := collect(t, stream)
+		if len(got) != 1 || got[0].name != "response.output_text.delta" {
+			t.Fatalf("observed %+v, want the last event: line to win", got)
+		}
+	})
+
+	t.Run("a data line before its event line is refused", func(t *testing.T) {
+		// The EventSource grammar applies an event name to the FRAME, not
+		// to the lines that precede it, so `data:` ahead of `event:` in one
+		// frame is legal wire — and this relay cannot see a name for that
+		// data line, because the name has not been read yet. The gate refuses
+		// it (unknown_shape) rather than deferring the observation to the
+		// end of the frame, which would mean buffering payloads the relay
+		// streams on arrival.
+		//
+		// This is the fail-closed cost of "refuse, do not reconcile" stated
+		// as a test rather than left as an implication: a well-formed stream
+		// in this field order is truncated. Real OpenAI Responses streams put
+		// `event:` first, so the exposure is nil in practice, but the
+		// behaviour is a decision, not an accident, and pinning it keeps a
+		// future "reconcile" attempt from changing it silently.
+		p := newPartialText(apiResponses, 1<<20)
+		stream := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n" +
+			"event: response.output_text.delta\n\n"
+		if _, err := CopySSE(io.Discard, strings.NewReader(stream), nil, nil, nil, p.Observe); err != nil {
+			t.Fatalf("CopySSE: %v", err)
+		}
+		if v := p.Verdict(); v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("comments and blank lines do not disturb the name", func(t *testing.T) {
+		stream := ": keep-alive\n\n" +
+			"event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\"}\n\n"
+		got := collect(t, stream)
+		if len(got) != 1 || got[0].name != "response.output_text.delta" {
+			t.Fatalf("observed %+v, want one named frame", got)
+		}
+	})
+}
