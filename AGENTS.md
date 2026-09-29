@@ -43,10 +43,8 @@ stripping.
   repository, the bounded asynchronous pipeline.
 - **`internal/transport`** — outbound paths: `Doer`/`Executor`/`Resolver` seams,
   direct/proxy/pool clients, failure classification, the exchange-budget seam.
-- **`internal/memlimit`** — the process-wide byte budget behind the proxy's
-  admission: an immediate CAS reservation, a clamped release, a `Peak`
-  diagnostic. It counts bytes and nothing else — no allocation, no lock, no I/O,
-  no knowledge of what the bytes are for.
+- **`internal/memlimit`** — the process-wide byte admission: immediate CAS
+  reservation, clamped release and `Peak` diagnostic; no allocation, lock or I/O.
 - **`internal/recovery`** — the recovery policy domain: `Failure`/`Match`/`Action`,
   the matrix, layer merge and `Resolve`, the policy hash, the `Engine`.
 - **`internal/proxy`** — HTTP wiring, client auth, `/v1/models`, error envelopes,
@@ -108,24 +106,15 @@ Boundaries a helpful-looking refactor will cross:
 - **Injection must never corrupt.** Chat prepends to `messages` only when it is a
   JSON array; Responses merges into `instructions` (string, array, or absent) and
   touches nothing else. An empty prompt means no injection.
-- **The request path is bounded in time and in aggregate, not only per
-  request.** `maxRequestBodyBytes` (64 MiB) caps how much a client may send; a
-  per-read deadline (`requestBodyReadTimeout`, via
-  `http.NewResponseController(w).SetReadDeadline`) caps how long it may take; one
-  process-wide `memlimit.Budget` (256 MiB) caps what every in-flight request is
-  buffering at once. Only the first is per-request. Clear the read deadline the
-  moment the read returns — the connection then carries a response, an SSE
-  stream included, and goes back into the keep-alive pool — and never reach for
-  `http.Server.ReadTimeout` (it arms the whole connection) or `WriteTimeout` (it
-  cuts legitimate SSE). Reserve the budget in blocks as a buffer GROWS, never a
-  cap up front, and refuse an unmet reservation IMMEDIATELY rather than queueing
-  it. The refusal is the 503 `capacity_exceeded` envelope and is NEVER fed to the
-  recovery matrix: a process-wide condition is one every candidate shares, so no
-  retry or fallback can clear it. Size it against the DERIVED copies, not the
-  budget: a transform re-marshals the request body and the rewriter rebuilds the
-  answer, each a same-size copy beside its admitted source, so the process peak is
-  about twice the budget — which is what `compose.production.yaml`'s
-  `mem_limit: 1g` is sized against. README "Buffering" has the rationale.
+- **The request path is bounded in time and aggregate.** `maxRequestBodyBytes`
+  (64 MiB) limits one client body; a per-read `requestBodyReadTimeout` (via
+  `http.NewResponseController(w).SetReadDeadline`) limits its read; the
+  process-wide `memlimit.Budget` (256 MiB) limits all request buffering. Clear
+  the deadline as soon as the read returns; never use server `ReadTimeout` or
+  `WriteTimeout` (which would break keep-alive or SSE). Reserve as a buffer grows,
+  refuse immediately as 503 `capacity_exceeded`, and never send that refusal to
+  recovery. Size the container for derived copies (~2× the budget); see README
+  "Buffering".
 - **Every transform is byte-preserving and API-scoped; nothing is ever
   re-serialized.** `RewriteChatModel` replaces only the top-level `"model"` string
   value; `RewriteResponsesModel` additionally replaces the `"model"` directly
@@ -376,16 +365,11 @@ Boundaries a helpful-looking refactor will cross:
   the request's `budget.request` envelope and counts as a provider-level attempt
   (`provider_attempts` and `upstream_exchanges` move; `candidates_entered` does
   not).
-- **Four bounds, all refusals rather than clamps:** the safety gate,
-  `max-recoveries`, `max-elapsed` (measured from the commit and checked BEFORE a
-  hop is scheduled), and the exchange envelope. The safety gate is fail-closed and
-  the shipped default outcome on agent traffic: `partialText` is fed every data
-  payload in hop order, and a tool call, a finish reason, a `data:` line that is
-  neither `[DONE]` nor recognizable JSON, or text past `max-partial-bytes` makes
-  the stream unrecoverable for good. An empty prefix is refused too — a hop with
-  no committed text is a blind replay wearing a continuation's shape — as is a
-  body the builders cannot express one for (`previous_response_id` especially,
-  whose response generation never finished).
+- **Four bounds are refusals, never clamps:** the safety gate, `max-recoveries`,
+  `max-elapsed` (from commit and checked BEFORE scheduling), and the exchange
+  envelope. The safety gate is fail-closed: every data payload feeds `partialText`;
+  tool/finish signals, non-JSON non-`[DONE]` data, text over `max-partial-bytes`,
+  an empty prefix, or an inexpressible continuation body make it unrecoverable.
 - **Hard boundaries for the continuation loop.** NO second header block and NO
   error body ever reaches a client already receiving a stream, and NO terminal
   marker is ever synthesized: a hop that truncates leaves the stream exactly as
@@ -394,19 +378,12 @@ Boundaries a helpful-looking refactor will cross:
   heartbeat runs ACROSS hops (`stopAndWait` fires after the loop), so the idle cut
   it exists to prevent cannot fire mid-recovery, and a reload mid-stream changes
   nothing.
-- **One owner per recovery stop, and one field name per vocabulary.** The five
-  recovery events form a matrix in README "Logging", pinned by
-  `streamrecovery_events_test.go`: `_started` announces an intent, `_succeeded`
-  means the upstream carried the stream to its marker, `_failed` means one hop
-  did not produce a continuable stream, `_exhausted` means this proxy stopped at
-  a bound, `stream_truncated` means the client's stream lost its marker. Three
-  field names, three closed sets: `phase` is the hop's, `reason` is the loop's,
-  `unsafe_reason` is the accumulator's — a builder refusal is `phase: build` with
-  `unsafe_reason` set, never the builder's token in `reason`. `phase: max_elapsed`
-  is always THIS proxy's own window, so it carries no `error` and no
-  `upstream_status`; `client_write` and `upstream_limit` are ours too. Never let
-  an operator read "recovery failed" and conclude "upstream failed" when the
-  owner was our own deadline.
+- **One owner per recovery stop, one field vocabulary.** README "Logging" and
+  `streamrecovery_events_test.go` pin the five events. `phase` is the hop's,
+  `reason` the loop's and `unsafe_reason` the accumulator's; builder refusal is
+  `phase: build` plus `unsafe_reason`, never a builder token in `reason`.
+  `max_elapsed`, `client_write` and `upstream_limit` are proxy-owned — never make
+  their error evidence say the upstream failed.
 - **A hop's body owns its dial's context, and the release rides the Close.**
   net/http aborts an UNREAD response body when the request's context is canceled,
   so the context a hop dialed under must outlive `dialContinuation`: the hop wraps
@@ -499,27 +476,18 @@ Boundaries a helpful-looking refactor will cross:
 
 ### Process lifecycle
 
-- **Liveness and readiness are two endpoints, and readiness goes false BEFORE
-  the listener stops accepting.** `/healthz` (proxy-owned, 200 for as long as
-  the listener exists, draining included) and `/readyz` (`server`-owned: 200
-  while ready, 503 + the state token otherwise, `no-store`). `Run` calls
-  `beginDraining()` FIRST, keeps serving for a head start
-  (`readinessPropagation` = 5s, capped at `grace/2`, DRAWN FROM the grace rather
-  than added to it, so `stop_grace_period` needs no adjustment), and only then
-  `Shutdown(grace - head)`. A probe that has not yet noticed cannot be told
-  anything by a closed port, so this ordering is not tradeable; a context
-  already cancelled at entry is never advertised ready at all. Readiness is
-  about THIS process alone — never the snapshot, a provider, or a database —
-  and the machine must stay one atomic integer with no lock and no callback, so
-  an outage cannot empty a load balancer's pool and no probe ever queues behind
-  a request. The container probe reads `/readyz`, never `/healthz`.
+- **Liveness and readiness are separate: readiness turns false BEFORE the
+  listener stops accepting.** `/healthz` stays 200 while the listener exists;
+  `/readyz` is server-owned, 200 only while ready, otherwise 503 + state and
+  `no-store`. `Run` calls `beginDraining()` first, serves the `readinessPropagation`
+  head start (5s, at most `grace/2`) inside grace, then `Shutdown(grace-head)`.
+  A cancelled entry context is never ready. Readiness names this process alone,
+  with one atomic state and no lock/callback; the container probes `/readyz`.
 - **Graceful shutdown, one signal channel.** The first SIGINT/SIGTERM runs
-  `Shutdown(grace)`, forces `Close()` on overflow, closes idle connections, and
-  drains the accepted usage-event queue within its bounded close window before
-  exiting 0. A second signal forces exit 1 — defers never run, so the usage
-  meter's final accounting is that path's deliberate casualty — and signals after
-  the drain are ignored, so a late duplicate cannot overwrite the exit code.
-  Compose `stop_grace_period` (60s) must exceed `OAICR_SHUTDOWN_GRACE` (55s).
+  `Shutdown(grace)`, forces `Close()` on overflow, closes idle connections and
+  drains accepted usage events before exit 0. A second signal exits 1; late signals
+  cannot overwrite the drain's exit code. Compose `stop_grace_period` (75s) covers
+  default 55s grace plus the bounded shutdown defers.
 - **Metering is optional, factual, and off the critical path.** Capture raw
   upstream usage BEFORE any response rewrite; absent usage stays SQL NULL. WITHIN
   one upstream call, streamed usage is last-readable-object wins, never a sum, and
