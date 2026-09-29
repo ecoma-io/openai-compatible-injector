@@ -56,6 +56,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	code := m.Run()
+	// The differential runner's baseline worktree is removed here rather than
+	// in a test cleanup: the runner is off by default, so on an ordinary run
+	// this is the ONLY place that knows a worktree was ever made, and a
+	// skipped differential suite must still leave the worktree list clean.
+	// The order is remove-then-exit-code because os.Exit skips deferred work.
+	diffCleanupWorktree()
 	_ = os.RemoveAll(tmp)
 	os.Exit(code)
 }
