@@ -716,7 +716,7 @@ func TestContinuationCredentialRefusalBlamesNoEndpoint(t *testing.T) {
 	}
 	dial := h.dialContinuation(continuationHop{
 		ctx:    context.Background(),
-		window: newRecoveryWindow(now, time.Minute),
+		window: newRecoveryWindow(wallRecoveryClock{}, time.Minute),
 		client: client,
 		cand: config.Candidate{
 			Endpoint: upstream,
@@ -775,7 +775,7 @@ func TestContinuationBuildFailureIsAPhaseNotAnError(t *testing.T) {
 	}
 	dial := h.dialContinuation(continuationHop{
 		ctx:    context.Background(),
-		window: newRecoveryWindow(now, time.Minute),
+		window: newRecoveryWindow(wallRecoveryClock{}, time.Minute),
 		client: client,
 		// No credential block: the build stage refuses before the credential
 		// seam is ever reached, which is the ordering this test also pins.
@@ -825,8 +825,12 @@ func TestContinuationWindowRefusalAtTheDialIsTheBound(t *testing.T) {
 		t.Fatalf("build client request: %v", err)
 	}
 	// The window opened a minute before the hop asks to dial it: the instant
-	// has passed, so no attempt may start past it.
-	window := newRecoveryWindow(now.Add(-time.Minute), 30*time.Second)
+	// has passed, so no attempt may start past it. The clock is advanced
+	// explicitly, so the refusal is caused by elapsed idle time and not by a
+	// construction-time reading.
+	clock := newManualRecoveryClock(now)
+	window := newRecoveryWindow(clock, 30*time.Second)
+	clock.Advance(time.Minute)
 	dial := h.dialContinuation(continuationHop{
 		ctx:       context.Background(),
 		window:    window,
@@ -966,7 +970,7 @@ func TestContinuationBodyOutlivesTheDial(t *testing.T) {
 
 	dial := h.dialContinuation(continuationHop{
 		ctx:       context.Background(),
-		window:    newRecoveryWindow(now, time.Minute),
+		window:    newRecoveryWindow(wallRecoveryClock{}, time.Minute),
 		client:    client,
 		cand:      config.Candidate{Endpoint: endpoint},
 		transform: func(body []byte, _ config.Model) ([]byte, error) { return body, nil },

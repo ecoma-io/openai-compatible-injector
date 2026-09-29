@@ -170,7 +170,7 @@ recovery:
   # stream:
   #   enabled: false # absent means streams are never continued
   #   max-recoveries: 1 # continuation REQUESTS per stream, 0..2
-  #   max-elapsed: 20s # hard window from the commit, >= 1ms, <= 2m
+  #   max-elapsed: 20s # maximum upstream silence, >= 1ms, <= 2m
   #   max-partial-bytes: 262144 # committed text held to build the hop, 1KiB..1MiB
 
 # Optional. Named upstream bases, each routed through a transport.
@@ -1191,7 +1191,7 @@ recovery:
   stream:
     enabled: false # default false; absent means streams are never continued
     max-recoveries: 1 # continuation hops per stream, 0..2
-    max-elapsed: 20s # window measured from the commit, >= 1ms, <= 2m
+    max-elapsed: 20s # maximum silence from the upstream, >= 1ms, <= 2m
     max-partial-bytes: 262144 # committed text held to build a hop, 1KiB..1MiB
 ```
 
@@ -1235,7 +1235,7 @@ records which gate fired:
 | usable prefix   | no text was committed at all, so a hop would be a blind replay                       | `unsafe_content` / `no_prefix`                   |
 | request body    | the client's body cannot express a continuation (see below)                          | `unsafe_content` / the builder's token           |
 | reach           | `max-recoveries` continuation requests were already made                             | `max_recoveries`                                 |
-| window          | `max-elapsed` passed since the stream committed                                      | `max_elapsed`                                    |
+| window          | the upstream has been silent for `max-elapsed`                                       | `max_elapsed`                                    |
 | envelope        | the request's `budget.request` envelope is spent                                     | `budget_spent`                                   |
 
 A non-null `finish_reason` is **not** an unsafe-content refusal and is never
@@ -1298,43 +1298,51 @@ failure that continues is a hop that streamed and truncated again — evidence o
 progress — and only while the reach, the window and the envelope still allow
 it.
 
-**`max-elapsed` is a hard runtime bound, not a check between reads.** It is one
-window measured from the moment the stream committed, shared by the committed
-relay and every hop, and **one instant** — the same deadline covers every wait
-a hop can be parked in, so no lever re-arms the clock and no later hop gets a
-fresh window. Both the waits a peer can leave this proxy in are bounded:
+**`max-elapsed` is a hard upstream-idle bound, not a check between reads.**
+It is one window shared by the committed relay and every hop, and the window
+moves only when the proxy receives upstream bytes: each byte restarts a full
+interval of tolerated silence. A healthy generation may therefore run for an
+hour without being cut, while a peer that stops talking still cannot leave the
+client waiting longer than one interval. The bound deliberately counts neither
+SSE event boundaries nor client writes — a fragmented event is still upstream
+progress, and a slow client or this proxy's own keep-alive ping says nothing
+about whether the upstream is alive. Both waits a peer can leave this proxy in
+remain bounded:
 
 - **A stalled body.** A peer that sends a partial event and then holds the TCP
-  connection open cannot outlive the window: at the deadline the proxy closes
-  the body the relay is blocked on, the read returns, no further hop is
+  connection open cannot outlive its silence window: when it expires the proxy
+  closes the body the relay is blocked on, the read returns, no further hop is
   dialed, and the stream is reported `stream_truncated` with
   `recovery_reason: max_elapsed`.
 - **A stalled response header.** A peer that accepts a continuation request
   and then answers nothing has produced no body to close, so nothing but the
   request's own context can unblock it — and for a client that is still
   reading, that context would live forever. The window carries its own cancel
-  for exactly this case, so the dial returns at the deadline rather than
-  parking the request until the client gives up.
+  for exactly this case, so the dial returns after the remaining tolerated
+  silence rather than parking the request until the client gives up. Header
+  arrival is itself upstream activity: a hop that answers in time moves the
+  same window forward and hands the watchdog to its new body, while one that
+  answers after the deadline is dropped and reported `max_elapsed` rather than
+  relayed.
 
-The window is also read off the frozen clock between hops, so an effort that
-ends cleanly just past the deadline stops too. In every case the hop's failure
-is reported as `phase: max_elapsed`, which is this proxy's own bound and never
-a peer's fault — see the event matrix in [Logging](#logging). A client that
-disconnects is a different thing altogether and is reported as
+A later hop inherits the same moving window; it does not get a fresh interval
+just because the previous upstream response ended. In every case the hop's
+failure is reported as `phase: max_elapsed`, which is this proxy's own bound
+and never a peer's fault — see the event matrix in [Logging](#logging). A
+client that disconnects is a different thing altogether and is reported as
 `client_disconnected`: the client's own context remains the higher hard stop,
 and it is never confused with the operator's window. A client disconnect also
 means **zero** further upstream requests — the proxy never spends an exchange
 on a stream nobody is reading.
 
-> **Size the window for your longest generation, not your shortest outage.**
-> The window is armed on the committed stream itself, so while the block is
-> enabled it also caps how long any single streamed answer may take. A
-> generation still running at `max-elapsed` is cut and reported
-> `stream_truncated` with `recovery_reason: max_elapsed` even if no upstream
-> ever failed — which is the point of a hard bound, but it means the default
-> `20s` is short for long reasoning models. The cap is `2m`; set the window
-> above the longest answer you expect to relay, or leave the block disabled and
-> keep the plain relay, which has no window at all.
+> **Size the window for the longest upstream pause you accept, not for the
+> longest generation.** The window is armed on the committed stream itself,
+> but a generation that keeps producing bytes keeps it alive. A peer silent for
+> `max-elapsed` is cut and reported `stream_truncated` with
+> `recovery_reason: max_elapsed`, even if no upstream error was observed. The
+> default is `20s` and the cap is `2m`; set it above the longest token gap you
+> accept from the provider. Leave the block disabled to preserve the plain
+> relay, which has no recovery window at all.
 
 **What is never done.** No ordinary retry and no fallback, before or after
 commitment; the pre-commitment walk is untouched and no decision here goes
@@ -1792,7 +1800,7 @@ live stream with correct per-chunk latency. Behavior:
   accepts the connection and then answers nothing therefore holds the request
   until the caller's own context ends (its deadline, its disconnect, or
   process shutdown). A continuation hop IS bounded: it runs under the
-  recovery window's deadline, so the same peer cannot park a hop either.
+  recovery window's remaining upstream-silence allowance, so the same peer cannot park a hop either.
   Why: Cloudflare silently cuts a client HTTP/2 stream after ~125s with
   zero bytes from origin (measured on 2026-09-22 — client
   `stream error … INTERNAL_ERROR` at 125.39s, origin-side close at

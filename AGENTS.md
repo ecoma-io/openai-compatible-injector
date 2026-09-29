@@ -367,10 +367,13 @@ Boundaries a helpful-looking refactor will cross:
   (`provider_attempts` and `upstream_exchanges` move; `candidates_entered` does
   not).
 - **Four bounds are refusals, never clamps:** the safety gate, `max-recoveries`,
-  `max-elapsed` (from commit and checked BEFORE scheduling), and the exchange
-  envelope. The safety gate is fail-closed: every data payload feeds `partialText`;
-  tool/finish signals, non-JSON non-`[DONE]` data, text over `max-partial-bytes`,
-  an empty prefix, or an inexpressible continuation body make it unrecoverable.
+  `max-elapsed` (maximum upstream silence, checked BEFORE scheduling), and the
+  exchange envelope. Only upstream activity moves the window: a source-body read
+  and a continuation response header that arrived in time. Client writes, SSE
+  event boundaries and this proxy's keep-alive ping never do. The safety gate is
+  fail-closed: every data payload feeds `partialText`; tool/finish signals, non-JSON
+  non-`[DONE]` data, text over `max-partial-bytes`, an empty prefix, or an
+  inexpressible continuation body make it unrecoverable.
 - **Hard boundaries for the continuation loop.** NO second header block and NO
   error body ever reaches a client already receiving a stream, and NO terminal
   marker is ever synthesized: a hop that truncates leaves the stream exactly as
@@ -388,14 +391,18 @@ Boundaries a helpful-looking refactor will cross:
 - **A hop's body owns its dial's context, and the release rides the Close.**
   net/http aborts an UNREAD response body when the request's context is canceled,
   so the context a hop dialed under must outlive `dialContinuation`: the hop wraps
-  it in `boundBody`, whose `Close` is the release, and `bind`'s `stop()` (the
-  header watchdog) must NOT cancel it. Releasing at the dial's return truncates
-  every successful hop.
+  it in `boundBody`, whose `Close` is the release, and the header watchdog's cancel
+  must not fire once the body is handed off. Releasing at the dial's return
+  truncates every successful hop.
   `bind` is called once per hop, but the window is created ONCE per logical
   session (at the commit), never per hop — a per-hop reset would let the last
-  lever outlive `max-elapsed` by most of a window. One instant covers both waits:
-  `armBody` closes a stalled body, `bind`'s own cancel unblocks a stalled response
-  HEADER.
+  lever outlive the moving `max-elapsed` silence allowance. One moving window
+  covers both waits: `armBody` closes a stalled body, `bind`'s own cancel
+  unblocks a stalled response HEADER, and `promote` hands that cancel to the
+  new body when the header arrives in time. Every lever is bound to the same
+  `recoveryClock` seam, and the live interval is half-open — `now < deadline` —
+  so a timer firing exactly on the instant latches the window and no later
+  upstream byte can revive it.
 - **The compatibility hinge is exact.** Feature off (or absent — the zero
   `StreamPolicy`) leaves the relay byte-identical, and an EOF with no marker still
   logs `stream_completed` / outcome `completed`. Feature ON reports a marker-less

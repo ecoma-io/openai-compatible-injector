@@ -61,13 +61,33 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 // crypto/rand would drag an error path into a pure policy function for no
 // gain.
 //
-// retryNow and retryJitterDraw are handed to the recovery engine as its clock
+// retryClock and retryJitterDraw are handed to the recovery engine as its clock
 // and jitter source, so the one request is measured and spread by one clock
-// and one draw, whichever layer asks.
+// and one draw, whichever layer asks. The stream-recovery idle watchdog shares
+// the same clock and timer scheduler, so a test clock cannot make policy time
+// and its watchdog disagree.
+
+type recoveryTimer interface {
+	Stop() bool
+}
+
+type recoveryClock interface {
+	Now() time.Time
+	AfterFunc(time.Duration, func()) recoveryTimer
+}
+
+type wallRecoveryClock struct{}
+
+func (wallRecoveryClock) Now() time.Time { return time.Now() }
+
+func (wallRecoveryClock) AfterFunc(d time.Duration, f func()) recoveryTimer {
+	return time.AfterFunc(d, f)
+}
 
 var (
-	// retryNow is the clock the walk reads.
-	retryNow = time.Now
+	// retryClock is the request clock and watchdog scheduler. Production uses
+	// time's monotonic clock; tests replace both halves together.
+	retryClock recoveryClock = wallRecoveryClock{}
 
 	// retryJitterDraw returns the uniform jitter factor in [-1, 1].
 	retryJitterDraw = func() float64 { return 2*rand.Float64() - 1 }

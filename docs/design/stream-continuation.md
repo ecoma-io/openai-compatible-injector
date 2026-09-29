@@ -113,7 +113,7 @@ permit.
 | caller                 | `r.Context().Err() != nil`                                                                                         | none (the client is gone; `client_disconnected` reports it)       |
 | logical terminal       | `verdict.Kind == verdictTerminal` — the upstream declared the answer finished, without forwarding the marker       | `logical_terminal`                                                |
 | safety                 | `verdict.Kind == verdictUnsafe`                                                                                    | `unsafe_content` + `unsafe_reason`                                |
-| window (clock)         | `now − streamStart > max-elapsed`                                                                                  | `max_elapsed`                                                     |
+| window (clock)         | the upstream has been silent for `max-elapsed`                                                                     | `max_elapsed`                                                     |
 | envelope               | `budget.Exhausted() != ExhaustionNone`                                                                             | `budget_spent`                                                    |
 | body                   | the builder refuses                                                                                                | `unsafe_content` + the refusal token                              |
 
@@ -291,26 +291,41 @@ a hop reports exactly what it always did.
 
 ## The two bounds, stated exactly
 
-### `max-elapsed` is a hard runtime bound
+### `max-elapsed` is a hard upstream-idle bound
 
-`max-elapsed` is not a check the loop makes between reads — it is a bound on
-the request's wall clock that a stalled peer cannot outlive. One instant is
-computed when the committed stream begins relaying (`windowEnd`), and every
-pass — the committed relay and each hop's relay — is armed against that SAME
-instant through `armRecoveryWindow`. Two mechanisms read it:
+`max-elapsed` is not a check the loop makes between reads, nor is it a cap on
+the request's wall-clock lifetime. It is the longest silence the proxy tolerates
+from the upstream response currently being relayed. The window opens when the
+committed stream begins, and every successful source-body read moves its
+deadline forward by a full interval. The committed relay and every continuation
+hop share that one moving window: a later hop does not get a fresh interval
+merely because the prior response ended.
 
-- a `time.AfterFunc` watchdog closes the upstream response body at the
-  deadline. `Body.Read` takes no context, so a peer that sends a partial event
-  and then holds the TCP connection open parks the relay inside a read; closing
-  the body is the only lever that unblocks it. When the watchdog fires it sets
-  `windowClosed`, and the loop refuses every later gate with
-  `max_elapsed` — no hop is dialed, and the pass's own error is suppressed,
-  because that error is this proxy's own close and not something the upstream
-  committed.
-- the frozen clock (`now − streamStart > max-elapsed`) is checked between
-  passes, so an effort that ends cleanly just past the deadline stops too, and
-  `windowClosed` stays false there: the pass ended by itself, so its error — if
-  any — is the upstream's and is reported as such.
+The source-read boundary is exact and deliberate. A peer can send a fragmented
+or large SSE event for longer than the interval before its blank-line boundary;
+those received bytes prove it is alive. The parser's event-dispatch hook runs
+after that evidence, and client writes can block behind a slow reader, so neither
+is a valid liveness signal. Likewise the SSE keep-alive is this proxy writing a
+comment to the client, never the upstream speaking; allowing it to move the
+window would make a dead peer immortal while the client remains connected.
+
+Two mechanisms enforce the same moving allowance:
+
+- **A stalled body.** A watchdog closes the upstream response body when no
+  source bytes arrive for the interval. `Body.Read` takes no context, so a peer
+  that sends a partial event and then holds the connection open parks the relay
+  inside a read; closing the body is the only lever that unblocks it. Every
+  accepted source read resets the watchdog along with the deadline. When it
+  fires it records the window as shut, and the loop refuses every later gate
+  with `max_elapsed` — no hop is dialed, and the pass's own close error is
+  suppressed because that error is this proxy's own, not the upstream's.
+- **A stalled response header.** A continuation request that receives no
+  headers has no body to close. Its request context is cancelled once the moving
+  window's remaining silence allowance is spent, so the dial returns rather than
+  parking the request until the client gives up. Header arrival is upstream
+  wire activity, so a hop that answers in time moves the same window forward and
+  hands its watchdog to the new body atomically; a response that arrives after
+  the deadline is dropped rather than relayed, and the hop reports `max_elapsed`.
 
 Four properties make the watchdog safe, and each is deliberate:
 
@@ -318,14 +333,24 @@ Four properties make the watchdog safe, and each is deliberate:
    client disconnect must stay distinguishable from the operator's window, and
    a watchdog hung off the context could not tell them apart — the outcome
    would be `max_elapsed` for a reader that simply left.
-2. It creates no goroutine: `time.AfterFunc` runs on the runtime's timer
-   goroutine, and the relay's deferred `stop()` releases the timer on every
-   path, including the one where the pass ended long before the deadline.
+2. It creates no goroutine of its own, and the relay's deferred release
+   disarms the timer on every path — including the one where source progress
+   replaced it with a freshly armed guard, which the same lease releases.
 3. It closes the UPSTREAM body, never the client's connection. The client's
    connection belongs to the request lifecycle and is closed by the server, not
    by a recovery bound.
-4. The window is one window, not a per-hop budget: the reach cannot extend the
-   wall-clock bound by taking another hop.
+4. The window is one moving window, not a per-hop budget: source progress may
+   extend it, but taking another hop cannot reset it independently. Taking a hop
+   at all still requires live window, so a stream whose upstream went quiet is
+   never chased with fresh requests.
+
+The clock and the timer are one seam. Production reads `time.Now` and arms
+`time.AfterFunc`, whose monotonic readings make the arithmetic immune to
+wall-clock steps. A test replaces BOTH halves with one manual clock, so a
+fake policy clock can never disagree with a real watchdog — and the boundary
+itself is half-open: the window is live while `now < deadline` and spent at
+`now == deadline`, everywhere a gate reads it, so a timer that fires exactly on
+the instant latches the window and no later source byte can revive it.
 
 The distinction the record has to keep is the whole reason for the flag, and it
 is asserted at the wire level: `max_elapsed` must never be reported as
@@ -337,28 +362,30 @@ window answers first when both are true at once.
 Two consequences follow from the window being armed on the committed relay and
 not only on hops, and both are deliberate:
 
-- While the block is enabled, `max-elapsed` also caps how long any single
-  streamed answer may take. A generation still running at the deadline is cut
-  and reported `max_elapsed` even though no upstream ever failed. The
-  alternative — a window that only the recovery effort observes — is a bound a
-  stalled peer outlives by never dying, which is the case the bound exists for.
+- While the block is enabled, a healthy generation may run indefinitely as long
+  as the upstream continues producing bytes. A generation that goes silent for
+  `max-elapsed` is cut and reported `max_elapsed` even though no upstream error
+  was observed. The alternative — a window that only the recovery effort
+  observes — is a bound a stalled peer outlives by never dying, which is the
+  case the bound exists for.
 - With the block DISABLED there is no window at all, which is the state the
   compatibility hinge requires. The resolved policy carries a nonzero
   `max-elapsed` even when `enabled: false` (it is the value an enabling layer
   inherits — see `defaults.go`), so the proxy may not decide to arm the
   watchdog from the window's value alone: the gate is `contPolicy.Enabled`, and
-  the disabled path keeps the plain relay with no timer, no deadline and no
-  window state. `TestStreamRecoveryWindowIsNotArmedWhenDisabled` pins that, and
+  the disabled path keeps the plain relay with no timer or window state.
+  `TestStreamRecoveryWindowIsNotArmedWhenDisabled` pins that, and
   `TestRecoveryStreamBlockParsesEveryFieldAndDefaultsOff` pins the data-side
   fact that makes it necessary.
 
 `TestStreamRecoveryMaxElapsedCutsABlockedRead` and
 `TestE2EStreamRecoveryMaxElapsedCutsAStalledUpstream` prove the hard half on a
-reader that ignores its context and on a real socket respectively;
-`TestE2EStreamRecoveryEnabledWindowBoundsTheCommittedRelay` proves the window
-bounds a healthy generation too; `TestStreamRecoveryClientCancelBeatsTheWindow`
-and `TestE2EStreamRecoverySpendsNothingForADepartedClient` prove the other
-direction.
+reader that ignores its context and on a real socket respectively.
+`TestRecoveryWindowIdleTimeIsExtendedByUpstreamProgress` proves the quiet half:
+a long healthy answer outlives the configured interval and keeps its terminal
+marker. `TestRecoveryWindowIsNotRevivedByThisProxysOwnKeepAlive` proves the
+proxy's client-side ping cannot conceal a dead upstream. The client-cancellation
+suites prove the other direction.
 
 ### `max-recoveries` counts continuation requests
 
@@ -826,7 +853,8 @@ On agent traffic `unsafe_content` should be the most common skip, and that is
 the feature working, not failing: a tool-call stream is one this proxy must not
 continuously re-enter.
 
-Before enabling it on a model, size `max-elapsed` above the longest generation
-that model produces. While the block is on, the window is armed on the committed
-stream itself, so a `20s` window on a long-reasoning model will cut healthy
-answers — reported, correctly, as `max_elapsed`.
+Before enabling it on a model, size `max-elapsed` above the longest upstream
+pause that model produces. The window is armed on the committed stream itself,
+but every upstream byte moves it, so a `20s` window does not cut a healthy
+long-reasoning answer that continues to stream. It cuts an upstream silent for
+20s, reported as `max_elapsed`.
