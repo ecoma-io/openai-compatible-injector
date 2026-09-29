@@ -102,7 +102,17 @@ Boundaries a helpful-looking refactor will cross:
   a valid RFC 6750 token. Authenticate before reading the body or doing any
   upstream I/O, and keep 405-before-401 ordering. `/healthz` and the 404 catch-all
   stay unauthenticated. Consume the client's Authorization header — never forward
-  or replace it.
+  or replace it. The client's `X-Request-Id` is consumed the same way: the proxy
+  mints its own, so neither a client's nor an upstream's value is ever adopted.
+- **The proxy OWNS the request id — one 16-hex id, four surfaces, minted once.**
+  It is code-owned (`requestIDHeader`), with no configuration key, stamped on
+  every `/v1` answer + the 405s + the catch-all 404, absent on `/healthz` and
+  `/readyz`, and identical across the log field, the response header, the
+  header forwarded upstream (every attempt and every recovery hop — never
+  re-minted) and the usage row. `setRequestID` runs AFTER `copyRelayHeaders`,
+  which `Set`s and would otherwise clobber the proxy's value silently; both id
+  names stay off `relayHeaderNames` AND off `evidenceRateLimitFields`. A client
+  value in a log line is CWE-117 plus attacker-controlled cardinality.
 - **Injection must never corrupt.** Chat prepends to `messages` only when it is a
   JSON array; Responses merges into `instructions` (string, array, or absent) and
   touches nothing else. An empty prompt means no injection.
@@ -467,6 +477,11 @@ Boundaries a helpful-looking refactor will cross:
   `attempt`, a legacy alias of `egress_attempt` — `egress_attempt` is
   authoritative. `request_completed` adds `retries_total` (an alias of
   `retry_attempts`), `final_candidate` (1-based) and `final_provider`.
+- **`request_id` is ONE value on four surfaces, unlike the countings above.**
+  Log field, `X-Request-Id` response header, the header forwarded upstream, and
+  `usage_events.request_id` are the same minted 16-hex id. A test that compares
+  the client's header against `request_completed.request_id` is what keeps them
+  from drifting into the two-names-one-quantity trap.
 - **`provider_attempt_failed` is transport failures ONLY**, and the received
   status (`upstream_status`) plus the `upstream_*` reason tokens belong to the
   unusable-answer and `upstream_http_error` events instead, because a transport

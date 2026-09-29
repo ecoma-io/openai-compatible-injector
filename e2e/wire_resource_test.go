@@ -5,11 +5,18 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// e2eRequestID is the shape of a proxy-minted request id: 16 lowercase hex
+// characters. The e2e suite asserts on the value the BUILT BINARY produced, so
+// it pins the format independently of internal/proxy's own pin — the two must
+// agree, and a divergence is exactly the defect a client ticket would hit.
+var e2eRequestID = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
 // Wire-fidelity and resource scenarios: header allow-lists in both
 // directions, redirects relayed verbatim (never followed), a long sequenced
@@ -82,9 +89,11 @@ func TestRedirectRelayedVerbatim(t *testing.T) {
 }
 
 // TestForwardHeaderAllowList: only Content-Type, Accept and OpenAI-Beta
-// travel upstream. Authorization authenticates the client TO the proxy and is
-// consumed there — never forwarded — and every other client header, including
-// credential-shaped ones, is dropped.
+// travel upstream as the CLIENT's headers. Authorization authenticates the
+// client TO the proxy and is consumed there — never forwarded — and every other
+// client header, including credential-shaped ones, is dropped. The proxy's own
+// X-Request-Id also travels, but it is not a client header: it is minted here,
+// which TestProxyRequestIDForwardedUpstream proves against this same binary.
 func TestForwardHeaderAllowList(t *testing.T) {
 	up := newFakeUpstream(t)
 	up.setHandler(jsonChatHandler(chatUpstream))
@@ -101,6 +110,7 @@ func TestForwardHeaderAllowList(t *testing.T) {
 		"Cookie":          "session=drop-me",
 		"Idempotency-Key": "drop-me",
 		"X-Custom":        "drop-me",
+		"X-Request-Id":    "client-chose-this", // dropped like any other client header
 	}
 	if status, _, _ := postJSON(t, p.addr, "/v1/chat/completions", chatBody, hdr); status != http.StatusOK {
 		t.Fatalf("status = %d, want 200", status)
@@ -122,11 +132,57 @@ func TestForwardHeaderAllowList(t *testing.T) {
 			t.Errorf("upstream received dropped header %s = %q", name, got)
 		}
 	}
+	if got := req.Headers.Get("X-Request-Id"); got == "client-chose-this" {
+		t.Error("the client's own X-Request-Id reached the upstream; the id must be the proxy's own")
+	}
+}
+
+// TestProxyRequestIDForwardedUpstream pins the feature against the BUILT
+// BINARY, which no unit test in internal/proxy can do: the value the upstream
+// saw and the value the client was handed are one 16-hex id this process
+// minted, and neither is the client's own. A client-supplied id is asserted
+// absent in both directions, because the ownership rule is the whole point —
+// an accepted client id would enter every log line and the metered request_id
+// column as an attacker-chosen string.
+func TestProxyRequestIDForwardedUpstream(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.setHandler(jsonChatHandler(chatUpstream))
+	p := startSubprocess(t, startOpts{
+		yaml:     runtimeYAML(chatPublic, up.url()+"/v1", chatUpstream, ""),
+		logLevel: "error",
+	})
+
+	const clientID = "rid-42"
+	status, hdr, _ := postJSON(t, p.addr, "/v1/chat/completions", chatBody,
+		map[string]string{"X-Request-Id": clientID})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	req, ok := up.last()
+	if !ok {
+		t.Fatal("upstream recorded no request")
+	}
+
+	stamped := hdr.Get("X-Request-Id")
+	if !e2eRequestID.MatchString(stamped) {
+		t.Errorf("client X-Request-Id = %q, want the proxy's own 16 lowercase hex chars", stamped)
+	}
+	if stamped == clientID {
+		t.Errorf("client X-Request-Id = %q, want the proxy's own id, not the client's", stamped)
+	}
+	if got := req.Headers.Get("X-Request-Id"); got != stamped {
+		t.Errorf("upstream saw X-Request-Id %q but the client was handed %q; the forwarded id "+
+			"and the answered id must be one value", got, stamped)
+	}
+	if got := hdr.Get("OpenAI-Request-Id"); got != "" {
+		t.Errorf("client received OpenAI-Request-Id = %q, want empty (not relayed on any name)", got)
+	}
 }
 
 // TestRelayHeaderAllowListAnd429: rate-limit and retry headers are
 // load-bearing and must survive; upstream set-cookies and fingerprint headers
-// must not.
+// must not. The upstream's own request-id headers must not survive either —
+// the proxy's id replaces them rather than competing with them.
 func TestRelayHeaderAllowListAnd429(t *testing.T) {
 	up := newFakeUpstream(t)
 	up.setHandler(func(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +191,7 @@ func TestRelayHeaderAllowListAnd429(t *testing.T) {
 		w.Header().Set("X-RateLimit-Limit", "100")
 		w.Header().Set("X-RateLimit-Remaining", "0")
 		w.Header().Set("X-Request-Id", "rid-42")
+		w.Header().Set("OpenAI-Request-Id", "req_upstream")
 		w.Header().Set("Set-Cookie", "sid=1; Path=/")
 		w.Header().Set("X-Powered-By", "sneaky")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -153,16 +210,18 @@ func TestRelayHeaderAllowListAnd429(t *testing.T) {
 		"Retry-After":           "7",
 		"X-RateLimit-Limit":     "100",
 		"X-RateLimit-Remaining": "0",
-		"X-Request-Id":          "rid-42",
 	} {
 		if got := hdr.Get(name); got != want {
 			t.Errorf("client %s = %q, want %q", name, got, want)
 		}
 	}
-	for _, name := range []string{"Set-Cookie", "X-Powered-By"} {
+	for _, name := range []string{"Set-Cookie", "X-Powered-By", "OpenAI-Request-Id"} {
 		if got := hdr.Get(name); got != "" {
 			t.Errorf("client received non-allow-listed header %s = %q", name, got)
 		}
+	}
+	if got := hdr.Get("X-Request-Id"); !e2eRequestID.MatchString(got) || got == "rid-42" {
+		t.Errorf("client X-Request-Id = %q, want the proxy's own 16-hex id, not the upstream's rid-42", got)
 	}
 	if want := `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}`; string(body) != want {
 		t.Errorf("429 body = %q, want the canonical envelope %q", body, want)

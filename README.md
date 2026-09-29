@@ -2028,11 +2028,60 @@ Consequences of the table:
   connection phase only.
 
 **Relayed response headers** (an allow-list, everything else is dropped):
-`Content-Type`, `Cache-Control`, `X-Request-Id`, `OpenAI-Request-Id`,
-`Retry-After`, `Location`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
-`X-RateLimit-Reset`, `X-RateLimit-Reset-Requests`, `X-RateLimit-Reset-Tokens`.
-Rate-limit and retry headers are load-bearing for client backoff; dropping
-them would make a 429 indistinguishable from any other upstream failure.
+`Content-Type`, `Cache-Control`, `Retry-After`, `Location`, `X-RateLimit-Limit`,
+`X-RateLimit-Remaining`, `X-RateLimit-Reset`, `X-RateLimit-Reset-Requests`,
+`X-RateLimit-Reset-Tokens`. Rate-limit and retry headers are load-bearing for
+client backoff; dropping them would make a 429 indistinguishable from any other
+upstream failure.
+
+The list carries **no request-id header**, on any spelling. `X-Request-Id` is
+the proxy's own — see [Request identity](#request-identity) — and
+`OpenAI-Request-Id` is dropped outright. An upstream's id is never relayed, so
+one hop presents one id and it is always the one this process minted.
+
+## Request identity
+
+Every request gets **one** id, minted by this process: 16 lowercase hex
+characters, cryptographically random, never derived from anything the client
+sent. The same value appears on all four surfaces of a request, so any one of
+them resolves to the others:
+
+- the `X-Request-Id` **response header** the client receives, on every answer —
+  success, normalized upstream error, local rejection, 405, 404;
+- the `request_id` field on every **log event** the request emits;
+- the `X-Request-Id` **request header forwarded upstream**, on every attempt and
+  every fallback candidate;
+- the `request_id` column of the **usage record**, in metering mode.
+
+So a support ticket quoting an `X-Request-Id` resolves to a log line, and an
+upstream's log for the same id resolves to this proxy's.
+
+**The client's own id is never adopted.** A request carrying `X-Request-Id` has
+that header dropped like any other unlisted client header; the upstream sees
+the proxy's value instead. The same is true of an upstream's id in the other
+direction — `X-Request-Id` and `OpenAI-Request-Id` are not on the relay
+allow-list, so a provider's value never reaches a client and never competes
+with the proxy's on one name. The id is not backoff input and never is, which
+is why overwriting the far end's value loses nothing load-bearing.
+
+**Where it is stamped:** every `/v1` route and the catch-all 404. `/healthz`
+and `/readyz` are exempt — they are container probes fired on an interval, they
+bind no request lifecycle and log nothing, so an id on them would be a header
+joining to no evidence. The catch-all 404 is the one path that carries an id
+with no log line: a stable handle the client can quote, not a join key.
+
+A stream-recovery hop forwards the **same** id as the attempt it continues; a
+continuation is the same client request re-asked, so the upstream sees one value
+across the original and every hop. A config reload mid-request cannot reshape
+any of this: the id is minted once, before the snapshot is even loaded, and
+lives exactly as long as the request.
+
+**There is no configuration key for any of it.** The header name is a
+documented internal constant (`requestIDHeader`), like the body and buffering
+caps. The feature is on for every deployment; there is no way to turn it off
+and no knob to rename the header. The rationale and the alternatives that were
+rejected are in
+[`docs/design/request-identity.md`](docs/design/request-identity.md).
 
 ## Partner API keys
 
@@ -2214,6 +2263,11 @@ level is hot-reloadable through `log-level` (see Hot reload).
 
 What each level carries:
 
+- Every event a request emits carries the same `request_id`: the value this
+  process minted, returned to the client as the `X-Request-Id` response header
+  and forwarded upstream on every attempt. See
+  [Request identity](#request-identity).
+
 - **DEBUG** — the full request lifecycle, every event bound to its
   `request_id`: `request_received` (method/path/remote address),
   `probe_completed` (model + stream flag), `model_resolved` (public model,
@@ -2245,7 +2299,8 @@ What each level carries:
   bodies, SSE `data:` payloads, and injection prompts do not exist at this
   level — or at any level.
 - **INFO** — one `request_completed` per proxied request with the wire
-  facts: `request_id` (16 hex chars, generated per request), `api`
+  facts: `request_id` (16 hex chars, generated per request — the same value
+  the client received and the upstream saw), `api`
   (`chat`/`responses`), `status`, `outcome` (including `unauthorized` for a
   rejected bearer), `public_model`, `stream`,
   `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the

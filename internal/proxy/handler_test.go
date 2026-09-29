@@ -458,8 +458,12 @@ func TestUpstreamHTTPErrorNormalized(t *testing.T) {
 			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 				t.Errorf("Cache-Control = %q, want no-store (relay allow-list still applies)", got)
 			}
-			if got := rec.Header().Get("X-Request-Id"); got != "req-1" {
-				t.Errorf("X-Request-Id = %q, want req-1", got)
+			// The proxy owns this header: the upstream's value is dropped
+			// and the client gets the id this proxy minted. The inequality
+			// half is the load-bearing one — it is what proves the
+			// overwrite, not just that some id is present.
+			if got := rec.Header().Get("X-Request-Id"); !isRequestID(got) || got == "req-1" {
+				t.Errorf("X-Request-Id = %q, want the proxy's own 16-hex id, not the upstream's req-1", got)
 			}
 			if got := rec.Header().Get("X-Secret"); got != "" {
 				t.Errorf("X-Secret = %q, want empty (not allow-listed)", got)
@@ -810,7 +814,6 @@ func TestUpstreamRateLimitHeadersRelayed(t *testing.T) {
 		w.Header().Set("X-RateLimit-Limit", "100")
 		w.Header().Set("X-RateLimit-Remaining", "0")
 		w.Header().Set("X-RateLimit-Reset-Tokens", "1.5s")
-		w.Header().Set("OpenAI-Request-Id", "req_abc")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
 	}))
@@ -827,7 +830,6 @@ func TestUpstreamRateLimitHeadersRelayed(t *testing.T) {
 		"X-RateLimit-Limit":        "100",
 		"X-RateLimit-Remaining":    "0",
 		"X-RateLimit-Reset-Tokens": "1.5s",
-		"OpenAI-Request-Id":        "req_abc",
 	} {
 		if got := rec.Header().Get(name); got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
@@ -835,6 +837,17 @@ func TestUpstreamRateLimitHeadersRelayed(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Secret"); got != "" {
 		t.Errorf("X-Secret = %q, want empty (allow-list still holds)", got)
+	}
+	// The upstream's own request-id headers are not relayed under any name:
+	// the proxy owns X-Request-Id, and a provider's value reaching the client
+	// beside it would be a second, unrelated id on the same response.
+	for _, name := range []string{"OpenAI-Request-Id"} {
+		if got := rec.Header().Get(name); got != "" {
+			t.Errorf("client received upstream request-id header %s = %q, want empty", name, got)
+		}
+	}
+	if got := rec.Header().Get("X-Request-Id"); !isRequestID(got) {
+		t.Errorf("X-Request-Id = %q, want the proxy's own 16-hex id", got)
 	}
 	want := `{"error":{"message":"upstream provider returned HTTP 429","type":"upstream_error","param":null,"code":"upstream_http_429"}}`
 	if body := rec.Body.String(); body != want {
@@ -1486,7 +1499,6 @@ func TestUpstreamHTTPErrorLogEvidence(t *testing.T) {
 		w.Header().Set("X-RateLimit-Limit", "100")
 		w.Header().Set("X-RateLimit-Remaining", "0")
 		w.Header().Set("X-RateLimit-Reset-Tokens", "1.5s")
-		w.Header().Set("OpenAI-Request-Id", "req_abc")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"message":"SECRET_ERROR_BODY rate limited","type":"rate_limit_error","code":"rate_limited"}}`)
 	}))

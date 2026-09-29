@@ -45,6 +45,13 @@ var upstreamErrorCaptureTimeout = 5 * time.Second
 // side sits on the relay allow-list (relayHeaderNames) too — this is the
 // evidence view of the same names. Allow-listed only: arbitrary upstream
 // headers never reach logs.
+//
+// The two lists are kept in step deliberately, and the request-id headers are
+// absent from BOTH on purpose: the proxy's own id is not evidence about the
+// upstream answer, it is this process's identity, and it reaches the operator
+// as request_id on every event plus the X-Request-Id response header. Adding a
+// name to one list and not the other is a defect — it is the one way a header
+// can become readable in a log without being an allow-listed relay name.
 var evidenceRateLimitFields = []struct{ header, field string }{
 	{"Retry-After", "retry_after"},
 	{"X-RateLimit-Limit", "x_ratelimit_limit"},
