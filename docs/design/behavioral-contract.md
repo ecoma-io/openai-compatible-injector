@@ -519,9 +519,21 @@ do not have access to it.", ...}}` with `<X>` exactly as sent.
   payload's nested `response.model` (that is client data).
 - **Observable**: Byte-exact response comparison.
 - **Regression tests**: `internal/inject` model-rewrite tests; `internal/proxy`
-  rewrite tests. **GAP**: no property test asserts that a whole corpus of
-  well-formed bodies round-trips byte-identically outside the rewritten
-  member.
+  rewrite tests; `internal/inject/rewrite_property_test.go` (corpus property,
+  GAP closed). The property test states the invariant by DELETION: it cuts
+  every in-scope `"model"` string value out of both the input and the output
+  and requires the remainders to be byte-identical. Checking the complement
+  rather than a recorded answer is what makes it a property over a corpus
+  instead of a longer list of examples, and it cannot be satisfied by a
+  rewriter that happens to match a hand-written expectation. Its oracle
+  reuses the production scanner, which is a real dependency and is why
+  `TestDeleteModelStringValuesPinsTheSpans` pins the spans separately — an
+  oracle that stopped finding values would silently pass everything.
+  Verified by mutation, not by green: re-serializing through a map (the
+  forbidden change) fails 19 cases; a no-op rewriter is caught by the
+  in-scope-value test alone, since byte-preservation alone would pass it; and
+  widening the chat scope into `response` is caught by both the corpus and
+  the scope tests.
 - **Scope note (recorded, not a defect)**: this byte-preservation holds for the
   RESPONSE rewriters. The REQUEST path is different and deliberately so —
   `inject.Chat`/`inject.Responses` decode into a map and re-marshal, because
