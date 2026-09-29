@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.6...v0.15.0) (2026-09-29)
+
+
+### Features
+
+* **proxy:** own and propagate a canonical request id ([#115](https://github.com/ecoma-io/openai-compatible-injector/issues/115)) ([4991f6e](https://github.com/ecoma-io/openai-compatible-injector/commit/4991f6e7287aebe51aaac19b1745d72e327329f9))
+
+
+### Bug Fixes
+
+* **proxy:** own the exchange envelope across the whole pre-commitment body ([#116](https://github.com/ecoma-io/openai-compatible-injector/issues/116)) ([3c9aeed](https://github.com/ecoma-io/openai-compatible-injector/commit/3c9aeed0f56aa44f67de8bdf7d756dea3d7c811f)), closes [#96](https://github.com/ecoma-io/openai-compatible-injector/issues/96)
+
 ## [0.14.6](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.5...v0.14.6) (2026-09-29)
 
 
