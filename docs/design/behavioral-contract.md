@@ -90,21 +90,54 @@ so this is Phase 4 work, measured here and not acted on now.
 The suite is strong on **scenario** coverage: commitment, send-state
 classification, the exchange envelope, credential and egress rotation, request
 identity, SSE framing, and usage accounting each have named tripwires (§4
-points at them). It is weak on three axes, which is why this initiative
-exists:
+points at them). It was weak on three axes, which is why this initiative
+exists. **Two are now closed; the third is not.**
 
-1. **No cross-cutting fingerprint.** Each test asserts one facet. Nothing runs
-   a whole request and records its observable shape — status, headers,
-   semantic body, candidate path, attempt/retry/fallback counts, credential
-   and egress choices, outcome, usage events, commit point, stream sequence —
-   as one comparable value. A refactor cannot be diffed against "before".
-2. **No fault script.** A fake upstream cannot, today, be scripted to fail in
-   a chosen way at a chosen point of a chosen attempt, so the recovery
-   matrix is exercised from the outside (configure a chain, point it at a
-   server, observe) rather than from a deterministic script.
-3. **No differential runner.** There is no way to execute a pre-refactor and a
-   post-refactor build over identical inputs and compare. Review therefore
-   argues equivalence from reading the diff.
+1. ~~**No cross-cutting fingerprint.**~~ **CLOSED by S2.**
+   `internal/proxy/hrofault_test.go` + `hrofingerprint_test.go` +
+   `hroharness_test.go` provide a scripted upstream and an
+   `ExecutionFingerprint`: status, reduced headers, exact-or-digested body,
+   the outbound body each attempt went out with, the candidate path, per-attempt
+   result and `send_state`, disposition and rule id, credential **key ids**,
+   usage facts, the commit point, and the SSE event sequence. A refactor is now
+   diffable against "before" rather than argued from a diff.
+2. ~~**No fault script.**~~ **CLOSED by S1.** The same harness scripts a
+   `Step` per attempt over the wire phases: `DialFail`, `DialTimeout`,
+   `BodyPartial`, `BodyTruncated`, `RSTAfterHeaders`, `SSEPartial`, and the
+   rest of the vocabulary, each as the error SHAPE the classifier actually
+   reads. `TestFaultVocabularyIsExpressible` walks the full list.
+3. **No differential runner.** **STILL OPEN (S3).** There is still no way to
+   execute a pre-refactor and a post-refactor build over identical inputs
+   within one `go test` invocation; a golden run on each side and a compare is
+   the manual substitute. This is the last structural gap in the net and it
+   must close before island 4.
+
+**What the fingerprint deliberately does not record**, because a field that
+can move without a behaviour change makes every comparison meaningless: no
+pointer or object identity, no goroutine identity or scheduling order, no
+`time.Time`, no measured duration, no map iteration order, no raw error text,
+no raw provider bytes above a 4 KiB ceiling, and **no credential values ever**
+— only the operator-chosen key `id` from `[A-Za-z0-9._:-]`. Volatile headers
+(`Date`, `X-Request-Id`, `CF-Ray`, `Content-Length`, …) are dropped by value
+but recorded by NAME, since their presence is observable while their value is
+a function of clock and randomness. `Canonical()` renders a fixed key order
+with sorted slices and `SHA` is its sha256, so two runs of one scenario agree
+and any reordering or re-timing cannot move it.
+
+**Where the harness had to live, and why it matters.** It is in-package
+(`package proxy`, `_test.go`) rather than beside it, so it can reach the
+unexported clock seams `retryClock`, `retryJitterDraw` and `retryWait`
+(`internal/proxy/retryafter.go`). A harness outside the package could not stub
+them, and a retry wait on a wall clock is a flaky test rather than a test.
+The trade is recorded rather than hidden: a first extraction that moved the
+walk out of `package proxy` would strand the harness's clock stubs, and the
+island that does it must relocate them with the code.
+
+**What the harness still cannot reach.** §0.1a. The fault vocabulary is
+expressible, but `WriteFailAfterPartialWrite` and `RSTAfterHeaders` are
+INERT against the real path, because `DialContext` is a hardcoded local in
+`direct.go` and `proxy.go` and there is no `net.Conn` seam. A test on those
+two asserts the fake, not the system.
 
 `GAP` in the Regression tests field means exactly that: the invariant is real
 and load-bearing, and nothing would fail if it broke. Every `GAP` is a
