@@ -378,6 +378,71 @@ func TestStreamRecoveryContinuesAChatStream(t *testing.T) {
 	}
 }
 
+// TestStreamRecoveryHopForwardsTheSameRequestID pins the identity a hop
+// carries. A continuation is the same client request re-asked, so an upstream
+// correlating on the forwarded header must see ONE value across the original
+// attempt and every hop — minting inside dialContinuation would split one
+// request's upstream-side evidence in two, and the join this feature exists to
+// provide would hold for the first dial and quietly break at the second.
+//
+// The triple equality is the whole contract: attempt 1, the hop, and the
+// header the client was handed. Any two agreeing and the third not is a
+// correlation that resolves to nothing.
+func TestStreamRecoveryHopForwardsTheSameRequestID(t *testing.T) {
+	h, logBuf, pa, pb := recoveryHandler(t, recoveryBlock(t, "    enabled: true\n"))
+
+	var mu sync.Mutex
+	var dialed []string
+	// record wraps a scripted answer so the id the upstream actually SAW is
+	// captured from the request it was handed, not from the response.
+	record := func(f dialFunc) dialFunc {
+		return func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			dialed = append(dialed, req.Header.Get(requestIDHeader))
+			mu.Unlock()
+			return f(req)
+		}
+	}
+	pa.script = []dialFunc{
+		record(sseCut(sseChat("Hello"))),
+		record(sseStream(sseChat(", world") + "data: [DONE]\n\n")),
+	}
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chatRequest, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", rec.Code)
+	}
+	if pa.dials() != 2 || pb.dials() != 0 {
+		t.Fatalf("dials = %d/%d, want the primary twice and the fallback never", pa.dials(), pb.dials())
+	}
+
+	stamped := rec.Header().Get(requestIDHeader)
+	if !isRequestID(stamped) {
+		t.Fatalf("%s = %q, want the proxy's own 16-hex id", requestIDHeader, stamped)
+	}
+	mu.Lock()
+	first, hop := dialed[0], dialed[1]
+	mu.Unlock()
+	if !isRequestID(first) {
+		t.Fatalf("attempt 1 forwarded %q, want the proxy's own 16-hex id", first)
+	}
+	if first != hop {
+		t.Errorf("the hop forwarded %q but attempt 1 forwarded %q; a continuation is the "+
+			"same client request re-asked and must carry one id", hop, first)
+	}
+	if first != stamped {
+		t.Errorf("attempt 1 forwarded %q but the client was stamped %q; the id upstream "+
+			"sees and the id the ticket quotes must be the same value", first, stamped)
+	}
+	// The hop's evidence joins the same log stream under that id, so a ticket
+	// naming the client's header reaches the recovery events too.
+	for _, ev := range logBuf.events(t, "stream_recovery_succeeded") {
+		if got, _ := ev["request_id"].(string); got != stamped {
+			t.Errorf("stream_recovery_succeeded carries request_id %q, want the stamped %q", got, stamped)
+		}
+	}
+}
+
 // TestStreamRecoveryContinuesAResponsesStream is the same guarantee on the
 // other surface: the continuation items are appended after the client's own
 // input, and the hop's own `response.completed` terminates the client's one

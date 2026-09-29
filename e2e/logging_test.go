@@ -400,6 +400,59 @@ func TestDebugLifecycleCheckpoints(t *testing.T) {
 	}
 }
 
+// TestProxyRequestIDMatchesTheLoggedID closes the loop this feature exists to
+// close, against the built binary: the id a client can quote in a support
+// ticket and the id every log line carries are ONE value. Before this change
+// the client's id was whatever the far end said, so a ticket quoted a string
+// that resolved to no log line at all. The client's own header is sent here
+// deliberately — it must change nothing on either side.
+func TestProxyRequestIDMatchesTheLoggedID(t *testing.T) {
+	const clientID = "rid-42"
+	upstream := newFakeUpstream(t)
+	upstream.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// The upstream answers with its own id under both spellings. Neither
+		// may reach the client, and the proxy's must replace the first.
+		w.Header().Set("X-Request-Id", "upstream-rid")
+		w.Header().Set("OpenAI-Request-Id", "upstream-req")
+		_, _ = w.Write([]byte(`{"id":"c1","model":"up-live"}`))
+	})
+
+	p := startSubprocess(t, startOpts{
+		yaml:     loggingYAML(upstream.url(), upstream.url(), "info"),
+		logLevel: "",
+	})
+
+	status, hdr, _ := postJSON(t, p.addr, "/v1/chat/completions", secretBody,
+		map[string]string{"X-Request-Id": clientID})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+
+	stamped := hdr.Get("X-Request-Id")
+	if !e2eRequestID.MatchString(stamped) {
+		t.Fatalf("client X-Request-Id = %q, want the proxy's own 16 lowercase hex chars", stamped)
+	}
+	if stamped == clientID || stamped == "upstream-rid" {
+		t.Fatalf("client X-Request-Id = %q, want the proxy's own id, not a client's or the upstream's", stamped)
+	}
+	if got := hdr.Get("OpenAI-Request-Id"); got != "" {
+		t.Errorf("client received OpenAI-Request-Id = %q, want empty (not relayed on any name)", got)
+	}
+
+	completed := waitForEventCount(t, p, "request_completed", 1)
+	logged, _ := completed[0]["request_id"].(string)
+	if logged != stamped {
+		t.Errorf("client was handed %q but request_completed carries request_id %q; a ticket "+
+			"quoting the client's id must resolve to a log line", stamped, logged)
+	}
+	// The client's value is nowhere in the log stream: an accepted client id
+	// would put an attacker-chosen string into every line of this process.
+	if strings.Contains(p.stderr.String(), clientID) {
+		t.Errorf("the client's request id reached the log stream:\n%s", p.stderr.String())
+	}
+}
+
 // TestLoggingNeverLeaksSecrets drives every log-producing path at maximum
 // verbosity with planted markers in the credentials, the payload, the
 // injection prompt, and the upstream endpoint query — none may surface in

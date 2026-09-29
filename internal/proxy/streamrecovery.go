@@ -78,6 +78,14 @@ type continuationHop struct {
 	// client is the original client request: its headers are forwarded onto
 	// the hop exactly as the walk forwards them, and it is never mutated.
 	client *http.Request
+	// requestID is the LOGICAL request's own id, forwarded by the hop under
+	// the same name and the same value the walk used. It is carried, never
+	// re-minted: a hop is not a new client request but a re-ask of the same
+	// one, so an upstream correlating its own logs on this header must see
+	// one value across the original attempt and every continuation. A hop
+	// that minted a fresh id would split a single client request's evidence
+	// in two on the far side — the one thing an id exists to prevent.
+	requestID string
 	// cand is the committed candidate.
 	cand config.Candidate
 	// pool and credKey are the committed candidate's rotation pool and the
@@ -215,6 +223,7 @@ func (h *injectorHandler) dialContinuation(hop continuationHop) continuationDial
 		return dial
 	}
 	copyForwardHeaders(req.Header, hop.client.Header)
+	setRequestID(req.Header, hop.requestID)
 
 	// THE CREDENTIAL SEAM, for the hop. The header is composed here and only
 	// here; the value never reaches a log, an error, or the transport layer.

@@ -66,17 +66,25 @@ const (
 // deliberately, Authorization included: the client's credential
 // authenticates it to this proxy only — it is consumed by the auth gate and
 // never forwarded, and nothing is injected in its place (upstreams are
-// trusted/internal).
+// trusted/internal). A client-supplied X-Request-Id is dropped by that same
+// rule and never becomes an internal identity: the id on this hop is the one
+// this proxy mints, not one a client chose.
 var forwardHeaderNames = []string{"Content-Type", "Accept", "OpenAI-Beta"}
 
 // response headers relayed back to the client from upstream. Rate-limit and
 // retry headers are load-bearing for well-behaved client SDK backoff; a 429
 // without Retry-After is indistinguishable from any other upstream error.
+//
+// The upstream's own request-id headers are deliberately ABSENT. The proxy owns
+// requestIDHeader — it mints the id, stamps it on the response, and forwards it
+// upstream — so relaying a provider's X-Request-Id or OpenAI-Request-Id would
+// either put two unrelated values in front of the client on one name, or (if
+// the name matched) silently win the race against the proxy's own. One hop, one
+// id: the value on the wire is the one this process minted, and it is the same
+// value every log line and the usage record carry.
 var relayHeaderNames = []string{
 	"Content-Type",
 	"Cache-Control",
-	"X-Request-Id",
-	"OpenAI-Request-Id",
 	"Retry-After",
 	"Location",
 	"X-RateLimit-Limit",
@@ -264,6 +272,15 @@ func (h *injectorHandler) notFound(w http.ResponseWriter, r *http.Request) {
 		Type:    "invalid_request_error",
 	}}
 	body, err := marshalEnvelopeJSON(env)
+	// The one id minted for a request that has no lifecycle to join: there is
+	// no snapshot, no auth and no log line here, so this value is a stable
+	// handle the client can quote — NOT a join key into this process's logs.
+	// It is stamped anyway, because "the 404 you saw" is precisely the thing
+	// an operator is asked to reproduce. Nothing is logged: a scanner probing
+	// unknown paths is unbounded noise, and the body already names the method
+	// and path. (The 405s are the opposite case — they log, so their id IS a
+	// join key.)
+	setRequestID(w.Header(), newRequestID())
 	// Outside the request lifecycle: no outcome to keep honest on a failed
 	// write.
 	_ = writeEnvelopeErr(w, http.StatusNotFound, body, err)
@@ -350,15 +367,23 @@ func (h *injectorHandler) commitBody(resp *http.Response) {
 
 func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, synthesize synthesizeFunc, strip stripFunc, suffix string) {
 	start := time.Now()
+	// The id and its logger are built BEFORE the method check, so a 405 is
+	// correlatable too: it is the first thing a client can be told is wrong
+	// about itself, and a client told something is exactly the client that
+	// quotes a ticket. Both are inert for a request that returns here — no
+	// snapshot is loaded, no goroutine starts, nothing is dialed.
+	requestID := newRequestID()
+	log := h.log.With().Str("request_id", requestID).Str("api", api).Logger()
 	if r.Method != http.MethodPost {
 		// Outside the request lifecycle: no snapshot is loaded and no
 		// generation exists to bind, and a wrong method is a client bug
 		// rather than proxy traffic — debug is the honest level.
-		h.log.Debug().Str("api", api).Str("method", r.Method).
-			Str("path", r.URL.Path).Str("remote_addr", r.RemoteAddr).
+		log.Debug().Str("method", r.Method).Str("path", r.URL.Path).
+			Str("remote_addr", r.RemoteAddr).
 			Msg("request_method_not_allowed")
 		// Outside the request lifecycle — nothing below can observe or
 		// report a failed write, so the error has nowhere to land.
+		setRequestID(w.Header(), requestID)
 		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
 		return
 	}
@@ -367,8 +392,6 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	defer func() { _ = r.Body.Close() }()
 
 	sw := &statusWriter{ResponseWriter: w}
-	requestID := newRequestID()
-	log := h.log.With().Str("request_id", requestID).Str("api", api).Logger()
 	log.Debug().Str("method", r.Method).Str("path", r.URL.Path).
 		Str("remote_addr", r.RemoteAddr).Msg("request_received")
 
@@ -603,6 +626,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// decision was. The envelope's own cause still shows in the status and,
 	// on the failure, in the WARN.
 	reject := func(status int, b []byte, err error) {
+		setRequestID(sw.Header(), requestID)
 		if werr := writeEnvelopeErr(sw, status, b, err); werr != nil {
 			outcome = "client_disconnected"
 			log.Warn().Err(werr).Str("public_model", publicModel).
@@ -1072,6 +1096,13 @@ walk:
 				return
 			}
 			copyForwardHeaders(req.Header, r.Header)
+			// The request's own id rides upstream so the provider can join
+			// this hop to its own logs. Written here, on the OUTBOUND request,
+			// not on the client's — which is what makes one edit cover every
+			// retry and every fallback candidate, since req is rebuilt each
+			// iteration. It is the proxy's value, never the client's: the
+			// allow-list above already dropped whatever the client sent.
+			setRequestID(req.Header, requestID)
 			// COUNTER AXIS 1 OF 2 — LOGICAL PROVIDER ATTEMPTS. One candidate
 			// attempt begins here: the candidate is entered, the request is
 			// built, and the transport is about to be asked. Counted here
@@ -2160,6 +2191,7 @@ walk:
 		}
 		copyRelayHeaders(sw.Header(), answer.header)
 		sw.Header().Set(contentTypeHeader, envelopeJSONType)
+		setRequestID(sw.Header(), requestID)
 		sw.WriteHeader(answer.status)
 		if _, werr := sw.Write(body); werr != nil {
 			// The status committed and the envelope is canonical; a failed
@@ -2187,6 +2219,7 @@ walk:
 		// which no spec defines but a broken peer can emit, stays here: it
 		// is not ours to reshape either.)
 		copyRelayHeaders(sw.Header(), answer.resp.Header)
+		setRequestID(sw.Header(), requestID)
 		sw.WriteHeader(answer.resp.StatusCode)
 		if _, err := copyVerbatim(sw, answer.resp.Body); err != nil {
 			// The relay did not finish — the outcome says so. A failure on
@@ -2220,8 +2253,11 @@ walk:
 		// Incremental SSE passthrough. The candidate was committed in-walk
 		// (headers selected, no retry follows); the 2xx status is written
 		// here, and any subsequent failure only truncates the stream,
-		// never switches the response to an error body.
+		// never switches the response to an error body. This is the ONLY site
+		// the stream's id can be stamped: headers commit once, here, and
+		// CopySSE is a pure body relay with no header access after it.
 		copyRelayHeaders(sw.Header(), answer.resp.Header)
+		setRequestID(sw.Header(), requestID)
 		sw.WriteHeader(answer.resp.StatusCode)
 		streamed = true
 		log.Debug().Str("public_model", model).Msg("stream_started")
@@ -2535,6 +2571,7 @@ walk:
 				ctx:       r.Context(),
 				window:    window,
 				client:    r,
+				requestID: requestID,
 				cand:      answer.cand,
 				pool:      answer.pool,
 				credKey:   credKey,
@@ -2899,6 +2936,7 @@ walk:
 	rewritten := rewriteOut(answer.body)
 	log.Debug().Int64("bytes_out", int64(len(rewritten))).Msg("response_transform_completed")
 	copyRelayHeaders(sw.Header(), answer.header)
+	setRequestID(sw.Header(), requestID)
 	sw.WriteHeader(answer.status)
 	if _, err := sw.Write(rewritten); err != nil {
 		// The status committed and the rewrite is done; the client went
@@ -3278,6 +3316,17 @@ func copyRelayHeaders(dst, src http.Header) {
 	}
 }
 
+// setRequestID stamps the request's own id onto a header map. It MUST be called
+// AFTER copyRelayHeaders, which uses Set and would otherwise overwrite the
+// proxy's value with the upstream's — silently, and with the header still
+// present, so the client gets the provider's id while every log line and the
+// usage record carry a different one. A missing stamp is just as quiet: the
+// header is simply absent, and the client is back to whatever the far end
+// said. Both directions are pinned per commit path in requestid_test.go.
+func setRequestID(h http.Header, id string) {
+	h.Set(requestIDHeader, id)
+}
+
 // flusher returns a flushing closure for streaming responses when the
 // ResponseWriter supports it, else a no-op.
 func flusher(w http.ResponseWriter) func() {
@@ -3382,6 +3431,22 @@ func (w *statusWriter) Flush() {
 // the id only needs to be unique within this process's log stream.
 const requestIDSource = 8
 
+// requestIDHeader is the one name this proxy's own request id travels under:
+// the response header it stamps, and the request header it forwards upstream.
+// A client's inbound X-Request-Id is dropped by the forward allow-list and an
+// upstream's is not relayed on any name, so this header carries exactly one
+// meaning per hop — the id this process minted, the same value every log line
+// and the usage record carry, and the value a client quotes in a support
+// ticket. It is the join key between the two, not backoff input, which is why
+// overwriting the far end's value loses nothing load-bearing.
+//
+// Documented internal constant, no configuration key — the same treatment the
+// body and buffering caps above get. A deployment in front of an upstream that
+// expects a differently-named correlation header cannot rename it; an id an
+// operator can grep from a client ticket is worth more than one satisfying
+// every upstream dialect. See docs/design/request-identity.md.
+const requestIDHeader = "X-Request-Id"
+
 func newRequestID() string {
 	var b [requestIDSource]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -3397,12 +3462,18 @@ func newRequestID() string {
 // only id and created (0).
 func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	// Hoisted above the method check for the same reason as the POST routes:
+	// a 405 is correlatable, and the id has to be a local before the catalog
+	// is built, since this handler answers locally and never relays.
+	requestID := newRequestID()
+	log := h.log.With().Str("request_id", requestID).Str("api", "models").Logger()
 	if r.Method != http.MethodGet {
 		// Keep the 405-before-401 ordering and outside-lifecycle semantics of
 		// the model-serving POST routes.
-		h.log.Debug().Str("api", "models").Str("method", r.Method).
-			Str("path", r.URL.Path).Str("remote_addr", r.RemoteAddr).
+		log.Debug().Str("method", r.Method).Str("path", r.URL.Path).
+			Str("remote_addr", r.RemoteAddr).
 			Msg("request_method_not_allowed")
+		setRequestID(w.Header(), requestID)
 		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
 		return
 	}
@@ -3410,7 +3481,6 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 	snap := h.store.Load()
 	defer func() { _ = r.Body.Close() }()
 	sw := &statusWriter{ResponseWriter: w}
-	log := h.log.With().Str("request_id", newRequestID()).Str("api", "models").Logger()
 	log.Debug().Str("method", r.Method).Str("path", r.URL.Path).
 		Str("remote_addr", r.RemoteAddr).Msg("request_received")
 
@@ -3422,6 +3492,7 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 			Uint64("config_generation", snap.Gen()).Msg("request_completed")
 	}
 	reject := func(status int, body string) {
+		setRequestID(sw.Header(), requestID)
 		if err := writeEnvelope(sw, status, body); err != nil {
 			outcome = "client_disconnected"
 			log.Warn().Err(err).Int64("bytes_out", sw.bytes).Msg("client_write_failed")
@@ -3475,6 +3546,7 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 	// possible after a successful write — a failed write is client-owned.
 	body, _ := json.Marshal(modelsList{Object: "list", Data: data})
 	sw.Header().Set(contentTypeHeader, envelopeJSONType)
+	setRequestID(sw.Header(), requestID)
 	sw.WriteHeader(http.StatusOK)
 	if _, err := sw.Write(body); err != nil {
 		outcome = "client_disconnected"
