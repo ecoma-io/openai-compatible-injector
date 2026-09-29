@@ -1,10 +1,33 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 )
+
+// observe feeds one payload to the accumulator under the frame name its own
+// `type` names — which, for these cases, is the name a real relay would have
+// seen, so the two halves of the frame agree by construction. The agreement
+// check is exercised for real by the refusal tests further down, which hand
+// the accumulator a name that deliberately disagrees. Chat frames carry no
+// `event:` line at all, so their name is nil, exactly as CopySSE reports it.
+func observe(p *partialText, payload string) {
+	raw := []byte(payload)
+	if p.api == apiChat {
+		p.Observe(nil, raw)
+		return
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		p.Observe(nil, raw)
+		return
+	}
+	p.Observe([]byte(probe.Type), raw)
+}
 
 // feed pushes a sequence of payloads through a fresh accumulator and returns
 // its verdict. Each payload is one admitted data line, exactly as CopySSE
@@ -12,7 +35,7 @@ import (
 func feed(api string, limit int, payloads ...string) continuationVerdict {
 	p := newPartialText(api, limit)
 	for _, s := range payloads {
-		p.Observe([]byte(s))
+		observe(p, s)
 	}
 	return p.Verdict()
 }
@@ -26,7 +49,7 @@ func feedPasses(api string, limit int, passes ...[]string) continuationVerdict {
 	for _, pass := range passes {
 		p.beginUpstreamStream()
 		for _, s := range pass {
-			p.Observe([]byte(s))
+			observe(p, s)
 		}
 	}
 	return p.Verdict()
@@ -79,21 +102,21 @@ func TestPartialTextAccumulatesResponsesContent(t *testing.T) {
 // even if response.completed never arrived.
 func TestPartialTextResponsesOutputTextDoneIsLogicalTerminal(t *testing.T) {
 	p := newPartialText(apiResponses, 1<<20)
-	p.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a "}`))
-	p.Observe([]byte(`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`))
+	observe(p, `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a "}`)
+	observe(p, `{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`)
 	if v := p.Verdict(); v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
 		t.Fatalf("mismatched output_text.done = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
 	}
 
 	p = newPartialText(apiResponses, 1<<20)
-	p.Observe([]byte(`{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a time"}`))
-	p.Observe([]byte(`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`))
+	observe(p, `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a time"}`)
+	observe(p, `{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"Once upon a time"}`)
 	if v := p.Verdict(); v.Kind != verdictTerminal {
 		t.Fatalf("matching output_text.done = %v/%q, want terminal", v.Kind, v.Reason)
 	}
 
 	p = newPartialText(apiResponses, 1<<20)
-	p.Observe([]byte(`{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"final delta"}`))
+	observe(p, `{"type":"response.output_text.done","item_id":"m1","output_index":0,"content_index":0,"text":"final delta"}`)
 	if v := p.Verdict(); v.Kind != verdictTerminal {
 		t.Fatalf("text-only output_text.done = %v/%q, want terminal", v.Kind, v.Reason)
 	}
@@ -348,7 +371,7 @@ func TestPartialTextTerminalChunkIsStillRead(t *testing.T) {
 	} {
 		t.Run(chunk, func(t *testing.T) {
 			p := newPartialText(apiChat, 1<<20)
-			p.Observe([]byte(chunk))
+			observe(p, chunk)
 			if v := p.Verdict(); v.Kind != verdictTerminal {
 				t.Fatalf("verdict = %v/%q, want terminal", v.Kind, v.Reason)
 			}
@@ -366,7 +389,7 @@ func TestPartialTextTerminalChunkIsStillRead(t *testing.T) {
 	// clean finish. This is the proof the content is really being read, not
 	// merely skipped.
 	p := newPartialText(apiChat, 8)
-	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"0123456789"},"finish_reason":"stop"}]}`))
+	observe(p, `{"choices":[{"index":0,"delta":{"content":"0123456789"},"finish_reason":"stop"}]}`)
 	v := p.Verdict()
 	if v.Kind != verdictUnsafe || v.Reason != reasonOversize {
 		t.Fatalf("verdict = %v/%q, want unsafe/%s — an over-limit terminal chunk was read as a clean finish",
@@ -386,8 +409,8 @@ func TestPartialTextFinishReasonIsLatched(t *testing.T) {
 	} {
 		t.Run(after, func(t *testing.T) {
 			p := newPartialText(apiChat, 1<<20)
-			p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}`))
-			p.Observe([]byte(after))
+			observe(p, `{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}`)
+			observe(p, after)
 			if v := p.Verdict(); v.Kind != verdictTerminal {
 				t.Fatalf("verdict = %v/%q, want the latched terminal", v.Kind, v.Reason)
 			}
@@ -403,9 +426,9 @@ func TestPartialTextFinishReasonIsLatched(t *testing.T) {
 // is what makes the gate a gate rather than a running opinion.
 func TestPartialTextFirstRefusalWins(t *testing.T) {
 	p := newPartialText(apiChat, 1<<20)
-	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"before"}}]}`))
-	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0}]}}]}`))
-	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":" after"}}]}`))
+	observe(p, `{"choices":[{"index":0,"delta":{"content":"before"}}]}`)
+	observe(p, `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0}]}}]}`)
+	observe(p, `{"choices":[{"index":0,"delta":{"content":" after"}}]}`)
 
 	v := p.Verdict()
 	if v.Kind != verdictUnsafe || v.Reason != reasonToolCalls {
@@ -416,7 +439,7 @@ func TestPartialTextFirstRefusalWins(t *testing.T) {
 	}
 	// The latched reason survives further calls and further observations, and
 	// an unsafe latch outranks a later terminal: first verdict wins.
-	p.Observe([]byte(`{"choices":[{"index":0,"delta":{"content":"more"},"finish_reason":"stop"}]}`))
+	observe(p, `{"choices":[{"index":0,"delta":{"content":"more"},"finish_reason":"stop"}]}`)
 	if again := p.Verdict(); again.Kind != verdictUnsafe || again.Reason != reasonToolCalls {
 		t.Fatalf("second verdict = %v/%q, want the latched unsafe/%q", again.Kind, again.Reason, reasonToolCalls)
 	}
@@ -536,7 +559,7 @@ func TestPartialTextOversizeFreesTheBuffer(t *testing.T) {
 	p := newPartialText(apiChat, 1<<10)
 	chunk := `{"choices":[{"index":0,"delta":{"content":"` + strings.Repeat("x", 256) + `"}}]}`
 	for i := 0; i < 8; i++ {
-		p.Observe([]byte(chunk))
+		observe(p, chunk)
 	}
 	v := p.Verdict()
 	if v.Kind != verdictUnsafe || v.Reason != reasonOversize {
@@ -935,7 +958,7 @@ func TestPartialTextRefusalDeltaIsNeverContinuationText(t *testing.T) {
 
 	t.Run("as the stream's first event", func(t *testing.T) {
 		p := newPartialText(apiResponses, 1<<20)
-		p.Observe([]byte(`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"I can't help with that."}`))
+		observe(p, `{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"I can't help with that."}`)
 		v := p.Verdict()
 		if v.Kind != verdictUnsafe || v.Reason != reasonRefusal {
 			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonRefusal)
@@ -947,8 +970,8 @@ func TestPartialTextRefusalDeltaIsNeverContinuationText(t *testing.T) {
 
 	t.Run("after committed text", func(t *testing.T) {
 		p := newPartialText(apiResponses, 1<<20)
-		p.Observe([]byte(text))
-		p.Observe([]byte(`{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"No, I won't."}`))
+		observe(p, text)
+		observe(p, `{"type":"response.refusal.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"No, I won't."}`)
 		v := p.Verdict()
 		if v.Kind != verdictUnsafe || v.Reason != reasonRefusal {
 			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonRefusal)
@@ -1536,4 +1559,106 @@ func TestPartialTextHopItemIdentityRegression(t *testing.T) {
 			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
 		}
 	})
+}
+
+// TestPartialTextFrameNameMustAgreeWithType is the Responses half of the
+// frame's two names. A Responses frame states its class twice — the SSE
+// `event:` line and the payload's own `type` — and the safety gate may not
+// classify on one half while the other says something else. Every case here
+// hands the accumulator a frame that a real relay could deliver and that the
+// gate must refuse.
+func TestPartialTextFrameNameMustAgreeWithType(t *testing.T) {
+	const (
+		deltaM1 = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Once upon a "}`
+		deltaM2 = `{"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"time"}`
+	)
+
+	// named drives the accumulator directly so the frame name and the
+	// payload's own `type` can be set independently, which is the whole
+	// subject here: no real upstream produces the pairs below, and a helper
+	// that derived the name from `type` could not express them.
+	named := func(name string, payloads ...string) continuationVerdict {
+		p := newPartialText(apiResponses, 1<<20)
+		var frame []byte
+		if name != "" {
+			frame = []byte(name)
+		}
+		for _, s := range payloads {
+			p.Observe(frame, []byte(s))
+		}
+		return p.Verdict()
+	}
+
+	t.Run("agreeing halves recover", func(t *testing.T) {
+		// The control: the check must not refuse a well-formed stream, or the
+		// fix would be a silent off switch rather than a gate.
+		if got := recovered(t, named("response.output_text.delta", deltaM1, deltaM2)); got != "Once upon a time" {
+			t.Fatalf("prefix = %q, want %q", got, "Once upon a time")
+		}
+	})
+
+	t.Run("a frame with no event line refuses", func(t *testing.T) {
+		// A Responses stream that stopped naming its frames names none of
+		// them here, and the payload's `type` alone is not proof of a shape
+		// this build can vouch for. An absent name is LESS evidence than a
+		// present one, so it is refused rather than treated as agreement.
+		if v := named("", deltaM1, deltaM2); v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("a name that disagrees with the type refuses", func(t *testing.T) {
+		// The exact shape this issue is about: the payload classifies as a
+		// text delta, so the accumulator would admit its text into a
+		// continuation body, while the frame says the event is something the
+		// gate never learned to handle.
+		if v := named("response.output_text.done", deltaM1, deltaM2); v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("an unreadable event name refuses", func(t *testing.T) {
+		// A name that is not text at all — the relay hands the raw event
+		// value over, and a gateway writing `event: {"a":1}` produces this.
+		// It cannot equal any `type`, so it refuses under the same token.
+		p := newPartialText(apiResponses, 1<<20)
+		p.Observe([]byte(`{"a":1}`), []byte(deltaM1))
+		if v := p.Verdict(); v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("the refusal is permanent and latches before terminal", func(t *testing.T) {
+		// A refusal that a later well-formed frame could clear would make the
+		// gate's verdict depend on what follows the cut, which is exactly
+		// what a caller cannot see when it decides whether to continue.
+		p := newPartialText(apiResponses, 1<<20)
+		p.Observe([]byte("response.output_text.done"), []byte(deltaM1))
+		p.Observe([]byte("response.output_text.delta"), []byte(deltaM2))
+		if v := p.Verdict(); v.Kind != verdictUnsafe || v.Reason != reasonUnknownShape {
+			t.Fatalf("verdict = %v/%q, want unsafe/%q", v.Kind, v.Reason, reasonUnknownShape)
+		}
+	})
+
+	t.Run("a disagreement before any text refuses with no prefix", func(t *testing.T) {
+		// The refusal must not come with a continuation body: the bytes
+		// accumulated before the bad frame are not a proven prefix once one
+		// frame of the stream has lied about its own shape.
+		if v := named("response.output_text.done", deltaM1); v.Text != "" {
+			t.Fatalf("refused verdict carried prefix %q", v.Text)
+		}
+	})
+}
+
+// TestPartialTextChatIsExemptFromFrameName pins the scope of the check. Chat
+// carries no `event:` line at all, so a nil name is Chat's NORMAL wire shape
+// and not a missing one. Applying the agreement check there would refuse
+// every Chat stream, which is why the obligation is Responses-only.
+func TestPartialTextChatIsExemptFromFrameName(t *testing.T) {
+	p := newPartialText(apiChat, 1<<20)
+	p.Observe(nil, []byte(`{"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}`))
+	p.Observe(nil, []byte(`{"choices":[{"index":0,"delta":{"content":", world"},"finish_reason":null}]}`))
+	if got := recovered(t, p.Verdict()); got != "Hello, world" {
+		t.Fatalf("prefix = %q, want %q", got, "Hello, world")
+	}
 }

@@ -556,23 +556,53 @@ capture outcome) a hop's answer never had, and emitting a thin one under the
 same slug would read as a walk event that lost its fields. The hop's status
 rides `upstream_status` on its own event instead.
 
-## One gap this pass found in its own safety gate
+## The first gap this pass found in its own safety gate, since closed
 
-Not fixed here, and not a claim that a real upstream does the thing: it is a
-reading of the code, filed so the next change to this area starts from it
-rather than from a comment that says the gate is sound.
+A Responses frame states its class twice — the SSE `event:` line and the
+payload's own `type` — and only one of the two was ever read (issue #100).
+`observe` was handed the payload alone, `observeResponsesEvent` dispatched on
+the payload's `type`, and a frame whose halves disagree had no proven content
+shape while the gate classified it from the half that calls it safe. The
+relay's terminal predicate already treats both halves as evidence, in the
+opposite direction: it trusts `event: response.completed` and refuses a data
+payload naming it.
 
-1. **The event class comes from the data payload, and the SSE `event:` line is
-   never compared with it** (issue #100). `observe` is handed the payload; the
-   event name is not in scope, and `observeResponsesEvent` dispatches on the
-   payload's `type`. A frame whose two halves disagree therefore has no proven
-   content shape, and the gate reads only the half that says it does. The
-   relay's terminal predicate makes the opposite choice on purpose — trusting
-   the `event:` line and refusing a data payload naming `response.completed` —
-   so the two surfaces of one frame are already treated as evidence in one
-   place and as irrelevant in the other. Whether to refuse on a disagreement is
-   a behavior change, which is why it is the issue's decision and not this
-   note's.
+The fix widens the seam rather than reconciling the two names. `CopySSE`
+already parses one line kind per function, so `sseEventName` is the `event:`
+counterpart to `sseDataPayload` and the relay hands the observer both halves
+of the same frame: the name is carried as loop state, reset at every event
+boundary, overwritten by a later `event:` line in the same frame (the
+EventSource specification's own reading of a repeated field), and copied
+rather than aliased because the line buffer is reused. `partialText.Observe`
+compares the two through `frameNameAgrees` before the class is dispatched.
+
+**Refused, not reconciled.** An absent name is less evidence than a present
+one, not equal evidence, and any rule picking between two disagreeing halves
+would be policy this build does not have. So a missing `event:` line, a
+missing or non-string `type`, a name that is not text, and a name that
+disagrees are all `unknown_shape` — one token, because they are one fact: this
+frame's shape is not established. The check is fail-closed in the direction
+the gate already is, and the cost of being wrong is a truncated stream, which
+is what every deployment sees today.
+
+That choice has one consequence worth stating rather than leaving implied. The
+EventSource grammar applies an event name to the FRAME, not to the lines that
+precede it, so `data:` ahead of `event:` within one frame is legal wire — and
+the relay cannot see a name for that data line, because the name has not been
+read yet. Such a frame is refused. Reconciling it would mean deferring the
+observation to the end of the frame, which would mean buffering payloads the
+relay otherwise streams on arrival. Real Responses streams put `event:` first,
+so the exposure is nil in practice;
+`TestCopySSEObserveCarriesTheFrameName` pins the behaviour so a later attempt
+to relax it has to be a deliberate change.
+
+The scope is Responses-only, and that boundary is load-bearing rather than
+incidental. Chat carries no `event:` line at all, so a nil name is Chat's
+normal wire shape and not a missing one; applying the check there would refuse
+every Chat stream, which is why `frameNameAgrees` is reached only past the
+surface split. The relay's opposite choice stays deliberate and is not an
+inconsistency to be reconciled: for a terminal marker the safe error is to
+send one more event, while for the safety gate it is to stop.
 
 ## The second gap, since closed
 
