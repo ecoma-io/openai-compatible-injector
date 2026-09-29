@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.6](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.5...v0.14.6) (2026-09-29)
+
+
+### Bug Fixes
+
+* **proxy:** bound each exchange dial by the envelope max-elapsed ([#96](https://github.com/ecoma-io/openai-compatible-injector/issues/96)) ([#111](https://github.com/ecoma-io/openai-compatible-injector/issues/111)) ([2437c7b](https://github.com/ecoma-io/openai-compatible-injector/commit/2437c7b9b1ce83288ede27341ca1792513bbb2b5))
+
 ## [0.14.5](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.4...v0.14.5) (2026-09-29)
 
 
