@@ -108,6 +108,26 @@ func Classify(err error) Class {
 	if err == nil {
 		return ClassNone
 	}
+	// The two dial outcomes the envelope's own machinery produces, checked
+	// before the sentinels below because the caller's own case carries
+	// context.Canceled as its cause while meaning something quite different:
+	// a context error here does not say whose context it was, and this proxy
+	// has just made a point of knowing that.
+	//
+	// The order is the order of the ownership question, not of specificity:
+	// the envelope's window is this proxy's own bound and reads as the
+	// endpoint's timeout (fallback-eligible, send-unknown — the peer answered
+	// nothing on an established connection), while the caller's end is the
+	// client's own event and reads as a cancellation, which is terminal at
+	// every fallback layer and never a strike.
+	var ede *ExchangeDeadlineError
+	if errors.As(err, &ede) {
+		return ClassCanceled
+	}
+	var ete *ExchangeTimeoutError
+	if errors.As(err, &ete) {
+		return ClassTimeout
+	}
 	if errors.Is(err, context.Canceled) {
 		return ClassCanceled
 	}
@@ -328,6 +348,18 @@ func isTimeoutErr(err error) bool {
 
 // causeOfConnection narrows the connection class to its code-owned cause:
 // refused, TLS verification, or the generic dial/transport bucket.
+//
+// The function's recursion into *url.Error is the case that must stay narrow
+// once ExchangeDeadlineError exists. *url.Error wraps every error net/http
+// returns from a client Do, and an exchange the CALLER's context ended arrives
+// wrapped in one — so unwrapping to find a refused syscall would keep the
+// recursion out of the caller's own case (it is classified before this is ever
+// reached) and, more importantly, out of the envelope's: neither owns a
+// connection failure, and the envelope's is already classified as a timeout
+// above. What remains unwrapping reaches is this package's own ProxyConnectError
+// and the transport's own TLS and syscall shapes — net/http's own wraps. The
+// generic dial bucket is the honest answer for anything else, and no value
+// read here comes from a message.
 func causeOfConnection(err error) string {
 	var oe *net.OpError
 	if errors.As(err, &oe) && errors.Is(oe.Err, syscall.ECONNREFUSED) {

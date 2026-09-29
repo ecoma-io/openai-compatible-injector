@@ -181,7 +181,7 @@ func TestEngineExchangeEnvelopeStopsRetryingButNotTheWalk(t *testing.T) {
 	pol.Budget.Candidate.MaxExchanges = 2
 	e, _ := newTestEngine(t, context.Background(), pol)
 	e.EnterCandidate(pol)
-	mustConsume(t, e.Budget(), 2)
+	mustGrant(t, e.Budget(), 2)
 	d := e.Observe(httpObs(429, 1))
 	if d.Action != ActionFallback {
 		t.Fatalf("a spent candidate envelope got %+v, want a fallback", d)
@@ -197,7 +197,7 @@ func TestEngineExchangeEnvelopeStopsRetryingButNotTheWalk(t *testing.T) {
 	if got := e.Budget().Exhausted(); got != ExhaustionNone {
 		t.Fatalf("a fresh candidate started spent: %v", got)
 	}
-	if !e.Budget().ConsumeExchange() {
+	if !e.Budget().AcquireExchange().Granted {
 		t.Fatal("the second candidate's first exchange was refused")
 	}
 }
@@ -211,7 +211,7 @@ func TestEngineSpentCandidateUnderTerminalRetryEndsTheWalk(t *testing.T) {
 	pol.Budget.Candidate.MaxExchanges = 2
 	e, _ := newTestEngine(t, context.Background(), pol)
 	e.EnterCandidate(pol)
-	mustConsume(t, e.Budget(), 2)
+	mustGrant(t, e.Budget(), 2)
 	if d := e.Observe(httpObs(429, 1)); d.Action != ActionTerminal {
 		t.Fatalf("a spent candidate envelope under a terminal retry policy got %+v", d)
 	}
@@ -229,7 +229,7 @@ func TestEngineRequestEnvelopeStopsTheWalk(t *testing.T) {
 		if !e.EnterCandidate(pol) {
 			t.Fatalf("candidate %d was refused", i+1)
 		}
-		if !e.Budget().ConsumeExchange() {
+		if !e.Budget().AcquireExchange().Granted {
 			t.Fatalf("exchange %d refused", i+1)
 		}
 		d := e.Observe(httpObs(429, 1))
@@ -514,7 +514,7 @@ func TestEngineCandidateSpentFollowsThePolicy(t *testing.T) {
 	pol.Budget.Candidate.MaxExchanges = 1
 	e, _ := newTestEngine(t, context.Background(), pol)
 	e.EnterCandidate(pol)
-	if !e.Budget().ConsumeExchange() {
+	if !e.Budget().AcquireExchange().Granted {
 		t.Fatal("the candidate's first exchange was refused")
 	}
 	if e.Budget().Exhausted() != ExhaustionCandidate {
@@ -531,7 +531,7 @@ func TestEngineCandidateSpentFollowsThePolicy(t *testing.T) {
 	// The chain's reach is the fallback policy's, not the envelope's.
 	e2, _ := newTestEngine(t, context.Background(), pol)
 	e2.EnterCandidate(pol)
-	e2.Budget().ConsumeExchange()
+	e2.Budget().AcquireExchange()
 	if !e2.EnterCandidate(pol) {
 		t.Fatal("the second candidate was not enterable")
 	}
@@ -552,7 +552,7 @@ func TestEngineCandidateSpentTerminalSpelling(t *testing.T) {
 	pol.Retry.OnExhausted = ActionTerminal
 	e, _ := newTestEngine(t, context.Background(), pol)
 	e.EnterCandidate(pol)
-	e.Budget().ConsumeExchange()
+	e.Budget().AcquireExchange()
 	if d := e.CandidateSpent(CauseExchangeBudget); d.Action != ActionTerminal || d.RuleID != RuleIDBudgetCandidate {
 		t.Fatalf("spent candidate envelope under a terminal policy: %+v", d)
 	}
@@ -569,7 +569,7 @@ func TestEngineCandidateSpentRequestEnvelopeIsAlwaysTerminal(t *testing.T) {
 	pol.Retry.OnExhausted = ActionFallback
 	e, _ := newTestEngine(t, context.Background(), pol)
 	e.EnterCandidate(pol)
-	if !e.Budget().ConsumeExchange() {
+	if !e.Budget().AcquireExchange().Granted {
 		t.Fatal("the request's single exchange was refused")
 	}
 	if e.Budget().Exhausted() != ExhaustionRequest {

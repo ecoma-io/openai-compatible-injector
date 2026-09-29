@@ -301,7 +301,7 @@ type statusExecutor struct {
 }
 
 func (e *statusExecutor) Execute(ar *transport.AttemptRequest) (*http.Response, transport.AttemptInfo, error) {
-	if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
+	if ar.Budget != nil && !ar.Budget.AcquireExchange().Granted {
 		return nil, transport.AttemptInfo{BudgetExhausted: true}, errors.New("exchange budget exhausted")
 	}
 	return &http.Response{

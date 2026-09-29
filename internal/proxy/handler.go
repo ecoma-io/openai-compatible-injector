@@ -326,6 +326,28 @@ func thinkingModeName(mode config.ThinkingMode) string {
 // outcome, duration, byte counts, snapshot generation), and WARN-level
 // failures split by phase. Metadata only — bodies, prompts, payloads, and
 // Authorization never enter any log event at any level.
+// commitBody releases the candidate's pre-commitment exchange envelope on an
+// answer whose commitment is now decided, and records when it could not be
+// released because none was found.
+//
+// A false answer is the ordinary, expected one on a response that never went
+// through the transport's DialWithin at all — an injected test Doer, say — so
+// this never treats it as a failure. It is worth one DEBUG line because the
+// alternative is invisible: a committed stream still carrying a pre-commitment
+// window truncates at the candidate's max-elapsed, and nothing in any log
+// distinguishes that from a stream the upstream simply ended. The transport's
+// own search for that window is depth-bounded, so a body wrapped deeper than
+// the bound fails the lookup the same way an unwrapped body does — which makes
+// this line the only trace of it.
+func (h *injectorHandler) commitBody(resp *http.Response) {
+	if transport.HandoffStream(resp) {
+		return
+	}
+	if event := h.log.Debug(); event.Enabled() {
+		event.Msg("stream_envelope_unreleased")
+	}
+}
+
 func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api string, transform transformFunc, rewrite rewriteFunc, synthesize synthesizeFunc, strip stripFunc, suffix string) {
 	start := time.Now()
 	if r.Method != http.MethodPost {
@@ -951,7 +973,11 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		if cerr == captureOK {
 			return &walkAnswer{kind: answerHTTPError, ev: ev, header: resp.Header, status: status, cand: cand, candIndex: i + 1, egressKind: egressKind, credKey: credKey}
 		}
-		if cerr == captureDeadline {
+		if cerr == captureDeadline || cerr == captureEnvelopeElapsed {
+			// The answer did not finish inside its bound — the capture's
+			// own, or this proxy's exchange envelope — so it is the same
+			// invalid flavor either way, and the 502 retains the timeout
+			// cause, never a read failure.
 			return &walkAnswer{kind: answerInvalid, invalid: invalidBodyTimeout, cand: cand, candIndex: i + 1, egressKind: egressKind, credKey: credKey}
 		}
 		return &walkAnswer{kind: answerInvalid, invalid: invalidReadFailed, cand: cand, candIndex: i + 1, egressKind: egressKind, credKey: credKey}
@@ -1374,14 +1400,27 @@ walk:
 				// dialed, no endpoint is to blame — so no observation is built:
 				// the walk stops with the envelope named, exactly as it does for
 				// a pool that refused a dial.
-				if !eng.Budget().ConsumeExchange() {
+				//
+				// The claim and the dial's own time bound come back together, in
+				// one atomic acquisition: a granted claim has already been
+				// checked against both envelopes AND carries the window this
+				// exchange is allowed, so the dial below can never be started
+				// against a reading of the budget that no longer vouches for it.
+				grant := eng.Budget().AcquireExchange()
+				if !grant.Granted {
 					if !fallBackOnSpentCandidate() {
 						budgetStopped = true
 						break walk
 					}
 					break
 				}
-				resp, uerr = transport.DialWithDeadline(eng.Budget(), r.Context(), d, req)
+				// The window stays armed across the response body: whether this
+				// answer will be committed is not knowable until its content
+				// type is read, below. Only transport.HandoffStream, called at
+				// that point, releases it — a streaming request answered with
+				// buffered JSON is still a pre-commitment body inside its
+				// candidate's envelope.
+				resp, uerr = transport.DialWithin(grant.Window, r.Context(), d, req)
 				lastEgressAttempt = 1
 			}
 			// This attempt's own egress mode — the pool's last dialed
@@ -1654,7 +1693,11 @@ walk:
 					obs.StatusClass = recovery.StatusClassOf(status)
 					obs.ProviderErrorType = ev.providerType
 					obs.ProviderErrorCode = ev.providerCode
-				case captureDeadline:
+				case captureDeadline, captureEnvelopeElapsed:
+					// Both are this proxy's bounds on a body that did not
+					// finish: the capture's own internal deadline, and the
+					// exchange envelope the candidate was granted. Neither is
+					// the peer's fault, and neither is a read failure.
 					obs.Class = recovery.FailureProtocol
 					obs.ProtocolCause = recovery.ProtocolBodyTimeout
 				default:
@@ -1704,11 +1747,22 @@ walk:
 					withCredentialFields(event, credKey).Msg("upstream_http_error")
 				} else {
 					w := log.Warn().Str("public_model", model)
-					if cerr == captureDeadline {
+					// The two bounded causes are named by their own
+					// sentinel rather than by the error's type, and they
+					// are NOT the same owner: the capture deadline is this
+					// proxy's fixed internal read timer, while the envelope
+					// is the candidate's exchange window. The first is a
+					// protocol bound, the second belongs to the budget.
+					switch cerr {
+					case captureDeadline:
 						w = w.Str("error_class", "upstream_error_body_timeout").
 							Str("error_cause", "capture_deadline_exceeded").
 							Str("failure_origin", "protocol")
-					} else {
+					case captureEnvelopeElapsed:
+						w = w.Str("error_class", "upstream_error_body_timeout").
+							Str("error_cause", "exchange_elapsed").
+							Str("failure_origin", "envelope")
+					default:
 						w = w.Str("error_class", "upstream_error").
 							Str("error_cause", "body_read_failed").
 							Str("failure_origin", "protocol")
@@ -1744,6 +1798,13 @@ walk:
 			if status >= http.StatusMultipleChoices || status == http.StatusNoContent || status == http.StatusNotModified {
 				// Verbatim answer: redirects (3xx, never followed) and the
 				// two body-less statuses. Committed as-is, body untouched.
+				//
+				// Committed means the client's answer is decided, so the
+				// candidate's pre-commitment envelope stops here: the body is
+				// relayed after the walk, and a pre-commitment bound must not
+				// reach a body a client already holds. What still bounds it is
+				// the caller's context, which is a client's own event.
+				h.commitBody(resp)
 				answer = &walkAnswer{kind: answerVerbatim, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey}
 				break walk
 			}
@@ -1752,6 +1813,14 @@ walk:
 				// SSE answer: the headers are the commitment. The body is
 				// not read here — it streams after the walk, and anything
 				// that kills it later truncates the committed stream.
+				//
+				// This is the only place in the walk where a body is
+				// committed as an event stream, and it is decided by the
+				// RESPONSE's own content type, never by the request's
+				// `stream` flag: a streaming request answered with buffered
+				// JSON is a pre-commitment body and stays inside its
+				// candidate's envelope, where the read below happens.
+				h.commitBody(resp)
 				answer = &walkAnswer{kind: answerSSE, resp: resp, header: resp.Header, status: status, cand: cand, candIndex: i + 1, credKey: credKey, pool: pool}
 				break walk
 			}
@@ -1794,6 +1863,14 @@ walk:
 			}
 			if rerr != nil {
 				respAdm.release()
+				// The exchange envelope elapsed while this buffered 2xx was
+				// being read inside the walk — a pre-commitment answer, so the
+				// candidate's absolute attempt window still owns it. The
+				// transport's typed bound is named HERE, before the caller's
+				// context check: a caller that is ALSO gone is still ranked by
+				// its own context first (the next line), which is why the typed
+				// error alone never decides the caller-ownership question.
+				exchangeElapsed := errors.As(rerr, new(*transport.ExchangeTimeoutError))
 				// Ownership is the request context's, never the error chain's:
 				// a canceled OR expired caller surfaces through the upstream
 				// read as its own sentinel, and neither may be reported as an
@@ -1811,9 +1888,21 @@ walk:
 					return
 				}
 				elapsed := eng.Now().Sub(attemptStart)
+				// A body the exchange envelope cut is this proxy's bound: it
+				// observes as the protocol body timeout — never as a read
+				// failure of the peer's — and the evidence says the envelope
+				// did it. Every other failed read stays a read failure.
+				protocolCause := recovery.ProtocolBodyReadFailed
+				errorCause := "body_read_failed"
+				failureOrigin := "protocol"
+				if exchangeElapsed {
+					protocolCause = recovery.ProtocolBodyTimeout
+					errorCause = "exchange_elapsed"
+					failureOrigin = "envelope"
+				}
 				dec := eng.Observe(recovery.Observation{
 					Class:            recovery.FailureProtocol,
-					ProtocolCause:    recovery.ProtocolBodyReadFailed,
+					ProtocolCause:    protocolCause,
 					Streaming:        stream,
 					Committed:        answer != nil,
 					CandidateIndex:   i + 1,
@@ -1827,8 +1916,8 @@ walk:
 					Str("upstream", origin(&upstream)).
 					Int("upstream_status", status).
 					Str("error_class", "upstream_error").
-					Str("error_cause", "body_read_failed").
-					Str("failure_origin", "protocol"),
+					Str("error_cause", errorCause).
+					Str("failure_origin", failureOrigin),
 					providerAttempts, i+1, attempt, elapsed),
 					dec.RuleID, lastPolicyHash, snap.Gen(), exchangeBefore+lastEgressAttempt, eng.Budget().RequestRemaining()).
 					Str("disposition", act.String()).
@@ -2040,9 +2129,14 @@ walk:
 		// an error body whose capture stalled. Its evidence event already
 		// fired in-walk with the terminal disposition; the client answer
 		// is the canonical 502, never half a provider body.
-		if answer.invalid == invalidBody {
+		switch answer.invalid {
+		case invalidBody, invalidBodyTimeout:
+			// A body that did not finish inside its bound — the capture's own
+			// deadline or the exchange envelope — keeps the timeout cause the
+			// observation carried. The 502 names the invalid response, and the
+			// event's reason token says which bound it was.
 			outcome = "upstream_invalid_response"
-		} else {
+		default:
 			outcome = "upstream_read_failed"
 		}
 		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
@@ -2602,11 +2696,19 @@ walk:
 			if !strings.Contains(strings.ToLower(dial.resp.Header.Get(contentTypeHeader)), eventStreamType) {
 				// A 2xx that is not a stream: the provider answered with
 				// JSON where an event stream was asked for. Splicing it in
-				// would be a non-SSE frame inside an SSE response.
+				// would be a non-SSE frame inside an SSE response. The body is
+				// not relayed, so the exchange keeps its envelope and the read
+				// above stops at the hop's own recovery bound.
 				recoveryFailed("upstream_status", nil, dial.resp.StatusCode)
 				_ = dial.resp.Body.Close()
 				break
 			}
+			// Confirmed event stream: this hop's body is spliced into a stream
+			// the client already holds, so it is committed the moment the
+			// content type says so — and never before, on the strength of a
+			// request flag. Its silence from here is the recovery window's
+			// business, not the candidate envelope's.
+			h.commitBody(dial.resp)
 			hopStats, hopErr := relay(dial.resp.Body)
 			_ = dial.resp.Body.Close()
 			bytesOut += hopStats.Bytes

@@ -348,34 +348,55 @@ func (p *poolDoer) Execute(ar *AttemptRequest) (*http.Response, AttemptInfo, err
 			st.end()
 			return nil, info, &RequestBuildError{cause: buildErr}
 		}
-		if ar.Budget != nil && !ar.Budget.ConsumeExchange() {
-			// The request's exchange envelope will not fund this dial. This
-			// is not an endpoint failure: nothing was dialed, no member is
-			// struck, and this member is left untouched.
-			//
-			// The member's permit is handed back first: it was taken for a
-			// dial that never happens, so a refused exchange must not read
-			// as an in-flight request and shrink a capped member's capacity.
-			ms.lim.release()
-			info.BudgetExhausted = true
-			// A refusal on the FIRST dial of this Execute is not an endpoint
-			// failure, so the zero-dial exhaustion sentinel must not be
-			// raised for it: Exhausted means "every member was ineligible,
-			// unhealthy, or saturated", and an endpoint never dialed for
-			// want of budget is not one the pool could not use. A refusal
-			// AFTER a real dial keeps its last endpoint error in force,
-			// which is exactly the case the zero-dial sentinel is for.
-			if attempts == 0 {
-				// The lease taken at entry is released on EVERY return: a
-				// state that never drops back to zero can never satisfy the
-				// registry's retire condition, so its teardown would be
-				// deferred forever and the evicted generation would linger.
-				st.end()
-				return nil, info, nil
+		// The envelope is claimed HERE, immediately before the dial, and the
+		// claim and the window this dial may take come back together in one
+		// atomic acquisition. A dial that starts is therefore always a dial
+		// the envelope vouched for AND a dial whose bound was read at the
+		// instant of that authorisation — never a claim made under a reading
+		// the budget has since moved past. A caller that never metered passes
+		// no budget, and its dial is bounded by the caller's own context
+		// alone.
+		window := unboundedWindow
+		if ar.Budget != nil {
+			grant := ar.Budget.AcquireExchange()
+			if !grant.Granted {
+				// The request's exchange envelope will not fund this dial.
+				// This is not an endpoint failure: nothing was dialed, no
+				// member is struck, and this member is left untouched.
+				//
+				// The member's permit is handed back first: it was taken for
+				// a dial that never happens, so a refused exchange must not
+				// read as an in-flight request and shrink a capped member's
+				// capacity.
+				ms.lim.release()
+				info.BudgetExhausted = true
+				// A refusal on the FIRST dial of this Execute is not an
+				// endpoint failure, so the zero-dial exhaustion sentinel must
+				// not be raised for it: Exhausted means "every member was
+				// ineligible, unhealthy, or saturated", and an endpoint never
+				// dialed for want of budget is not one the pool could not
+				// use. A refusal AFTER a real dial keeps its last endpoint
+				// error in force, which is exactly the case the zero-dial
+				// sentinel is for.
+				if attempts == 0 {
+					// The lease taken at entry is released on EVERY return: a
+					// state that never drops back to zero can never satisfy
+					// the registry's retire condition, so its teardown would
+					// be deferred forever and the evicted generation would
+					// linger.
+					st.end()
+					return nil, info, nil
+				}
+				break
 			}
-			break
+			window = grant.Window
 		}
-		resp, err := DialWithDeadline(ar.Budget, ar.Ctx, ms.client, req)
+		// The window is not disarmed here: an answer of any status may yet
+		// turn out to be one the caller will relay after the walk, and only
+		// the caller — which sees the content type — can decide that. The
+		// window stays armed through the body until HandoffStream says
+		// otherwise or the body is closed.
+		resp, err := DialWithin(window, ar.Ctx, ms.client, req)
 		attempts++
 		info.Attempts = attempts
 		info.Kind = p.pool.Members[idx].Endpoint.kindName()
@@ -518,3 +539,11 @@ func (b *releaseBody) Close() error {
 	b.once.Do(b.fn)
 	return err
 }
+
+// Unwrap exposes the body this wrapper was placed on — the exchange window's
+// wrapper, when there is one. HandoffStream uses it to disarm that window on a
+// pooled answer exactly as it would on a direct one; a direct answer has no
+// wrapper here and is unaffected. The exposure is one layer and it never
+// changes what Read or Close do, so the permit and the lease stay exactly as
+// owned as before.
+func (b *releaseBody) Unwrap() io.ReadCloser { return b.ReadCloser }

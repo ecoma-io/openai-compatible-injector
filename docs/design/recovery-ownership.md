@@ -56,7 +56,37 @@ loops.
 - **Budgets are code-owned and claimed at the dial** (`ExchangeBudget` seam;
   budget.go:88; pool.go:333 claims immediately before the dial, after every
   gate). `budget.request` is request-scoped and only legal at the global
-  layer.
+  layer. The claim and the time window that exchange may take come back
+  together from ONE atomic `AcquireExchange`, so a granted claim is never a
+  count observed before a later reading moved the budget under it — every
+  increment of `RequestExchanges()` is an exchange the caller was authorized
+  to start, and the `Window` that came with it was valid at that instant.
+  A refusal moves no counter at all.
+- **The exchange window's reach depends on the RESPONSE's shape, and the
+  window is disarmed on every path that ends the exchange.** A pre-commitment
+  exchange is bounded end to end — a stalled header AND a stalled buffered
+  body are the same window — because whether an answer will be committed is
+  unknowable until its content type is read. Only the caller can decide that,
+  so `DialWithin` returns the body still windowed and `HandoffStream` is called
+  at the two points where commitment is confirmed: a `text/event-stream`
+  response and the verbatim 3xx/204/304 relays. Guessing the phase from the
+  request's `stream` flag re-opens the unbounded-pre-body hole; a `stream:true`
+  answered with `200 application/json` is a pre-commitment body. A body the
+  window cuts is THIS PROXY's bound, so its evidence is
+  `error_cause: exchange_elapsed` over `failure_origin: envelope` — never a
+  peer read fault — and the walk finalizes on it as
+  `upstream_invalid_response`.
+- **The handoff UNWRAPS through the wrappers, because the committed body
+  carries three of them.** A pooled continuation hop stacks its context
+  binder over the pool's permit holder over the window itself, and a lookup
+  that stopped at a fixed depth would find the hop's wrapper, see no window,
+  and return — leaving the window to fire at the candidate's `max-elapsed` and
+  close a body spliced into a stream the client is already reading. That is
+  the same class of defect the handoff exists to prevent, reintroduced one
+  layer up, and it is silent: nothing panics and no test fails unless a test
+  asserts the body SURVIVES the window through the full stack. The search is
+  therefore a bounded unwrap, and every decorator on the path exposes
+  `Unwrap` for exactly that reason.
 
 ## Defects fixed (smallest coherent change)
 
@@ -290,11 +320,21 @@ Both surfaced in the branch's own review, against code this branch added.
   `transport-cause-*` tokens including `proxy_auth`/`proxy_connect`, and
   `no_eligible_endpoint`. That is a closed vocabulary of typed failure
   conditions the transport maps its own errors onto, not a coupling to the
-  transport's implementation — `internal/recovery` imports no package of this
-  service at all, and the tokens do not depend on how a dial is made. It is
-  the one place the two layers share a vocabulary, and the sharing is
-  deliberate: a policy an operator writes has to be able to say "retry when
-  the proxy rejected us".)
+  transport's implementation, and the tokens do not depend on how a dial is
+  made. It is the one place the two layers share a vocabulary, and the sharing
+  is deliberate: a policy an operator writes has to be able to say "retry
+  when the proxy rejected us".) The one import of another package of this
+  service that `internal/recovery` does have is `recovery → transport`, and it
+  is for a TYPE ALIAS alone: `Budget` satisfies the transport's
+  `ExchangeBudget` seam by aliasing the `transport.Exchange` value that seam
+  returns (`type Exchange = transport.Exchange`, budget.go), so the consumer
+  declares the shape and the packages meet on a name and nothing else. A
+  producer-local struct would satisfy the method while returning a value the
+  transport cannot read — the same method, an unusable seam — so the alias is
+  the honest form, not the coupled one. It adds a compile-time edge and no
+  runtime capability: the alias names a struct, and
+  `internal/credential/guards_test.go` still parses `internal/recovery` and
+  fails it on any waiting primitive or network capability.
 - `ActionRetry`/`ActionFallback`/`ActionTerminal` unchanged (action.go).
 - No new retry loop anywhere; no HTTP retry logic moved into transport; the
   transport still owns only paths and bytes.
@@ -315,15 +355,33 @@ Both surfaced in the branch's own review, against code this branch added.
   an earlier one published a state; a local build failure is reported under
   `upstream_request_build_failed`, stops the walk, and names no endpoint; an
   expired caller deadline on a post-commitment relay is a client disconnect,
-  not an upstream read failure.
+  not an upstream read failure; `exchange_envelope_test.go` pins the two
+  reproductions a `stream: true` request answered with a stalled BUFFERED body
+  makes possible — the walk stays inside the candidate envelope instead of
+  hanging past it, and the timeout it surfaces names the envelope
+  (`exchange_elapsed` over `failure_origin: envelope`, finalizing as
+  `upstream_invalid_response`) rather than the peer, on both the buffered-2xx
+  and the error-body-capture paths.
 - `internal/transport` — `ClassifyAttempt` send-state pinned per real wire
   shape (`sendstate_test.go`, against the real HTTP stack) and per synthetic
   cause token; a `send_unknown` failure dials exactly one member and strikes
   no health, while a refused dial and a dial timeout both fall back; the
   zero-dial budget refusal releases its lease; an unbuildable request is a
   typed local failure that claims no exchange, holds no permit and prints no
-  URL.
-- `internal/recovery` — unchanged (no engine semantics changed).
+  URL; `exchange_deadline_test.go` pins the two-phase window — a committed
+  body outlives the window, a window that wins the commit closes the body, a
+  synchronous failure and a buffered close both disarm the timer, and
+  `HandoffStream` is idempotent, inert against a racing `Close`, and a no-op on
+  a body that never went through `DialWithin` (including one stacked under the
+  pool's `releaseBody`), and that the window is REACHED through the
+  three-decorator stack a pooled continuation hop actually builds
+  (`boundBody → releaseBody → windowedBody`) — asserted by the body surviving
+  the window, not by the call returning.
+- `internal/recovery` — `exchange_test.go` pins the atomic acquisition at its
+  boundaries: exact expiry, acquire before and after expiry, request vs
+  candidate envelope, both exchange limits, the one final exchange,
+  concurrent contention for the last unit, and that a refusal moves no counter
+  at all.
 - e2e — `logging_test.go` lifecycle checks cover the new slug; the pool
   lifecycle tests exercise the fallback boundary through a tunnel-phase
   failure rather than an HTTP member that dies after the request was written

@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"openai-compatible-injector/internal/transport"
 )
 
 // Upstream HTTP errors (any 4xx/5xx) are normalized, not relayed: the
@@ -115,8 +117,8 @@ type upstreamErrorEvidence struct {
 }
 
 // captureError is the typed outcome of an error-body capture — a closed set,
-// decided from the capture context and stdlib sentinels, never from error
-// text:
+// decided from the capture context, the transport's typed deadline, and stdlib
+// sentinels, never from error text:
 //
 //	captureOK              the prefix was captured; the evidence is complete
 //	                       (truncation is a field, not a failure);
@@ -126,6 +128,12 @@ type upstreamErrorEvidence struct {
 //	captureDeadline        the capture's own deadline fired on a body that
 //	                       never finished: the answer stays the canonical
 //	                       502 invalid-response;
+//	captureEnvelopeElapsed the exchange envelope elapsed while the body was
+//	                       being read: this proxy's own bound cut the read.
+//	                       The answer DID arrive with a status — only the
+//	                       evidence read was cut — so the observation is the
+//	                       protocol body timeout, with failure_origin
+//	                       "envelope", never a peer fault;
 //	captureReadFailed      the upstream died mid-body: the same 502, and the
 //	                       raw error never reaches a log (its text can quote
 //	                       upstream bytes).
@@ -135,6 +143,7 @@ const (
 	captureOK captureError = iota
 	captureCallerEnded
 	captureDeadline
+	captureEnvelopeElapsed
 	captureReadFailed
 )
 
@@ -174,6 +183,13 @@ func captureUpstreamErrorEvidence(ctx context.Context, resp *http.Response) (ups
 			// The caller left mid-capture: ownership stays with the caller,
 			// whatever the read's own error text says.
 			return upstreamErrorEvidence{}, captureCallerEnded
+		// The exchange envelope elapsed before this proxy could read the
+		// evidence: the transport's typed bound is this proxy's own, so it is
+		// named before the capture's internal deadline can claim a stall the
+		// peer did not cause. It never misreads the caller — the direct
+		// context check above already decided that.
+		case errors.As(err, new(*transport.ExchangeTimeoutError)):
+			return upstreamErrorEvidence{}, captureEnvelopeElapsed
 		case errors.Is(cctx.Err(), context.DeadlineExceeded):
 			return upstreamErrorEvidence{}, captureDeadline
 		default:

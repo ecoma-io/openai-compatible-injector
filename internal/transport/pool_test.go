@@ -513,14 +513,16 @@ type stubBudget struct {
 	granted   int
 }
 
-func (b *stubBudget) ConsumeExchange() bool {
+// AcquireExchange grants a fixed window alongside the claim, mirroring the
+// production seam: one call, one decision, and the window that came with it.
+func (b *stubBudget) AcquireExchange() Exchange {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.granted >= b.allowance {
-		return false
+		return Exchange{}
 	}
 	b.granted++
-	return true
+	return Exchange{Granted: true, Window: stubWindow}
 }
 
 func (b *stubBudget) grants() int {
@@ -529,11 +531,11 @@ func (b *stubBudget) grants() int {
 	return b.granted
 }
 
-// RemainingElapsed satisfies the exchange-budget seam for tests that only
-// exercise consumption. The stub always reports a window far longer than any
-// test runs, so no dial in these tests is ever bounded by it — consumption
-// counting stays the axis under test, and the elapsed-axis has its own tests.
-func (b *stubBudget) RemainingElapsed() time.Duration { return 365 * 24 * time.Hour }
+// stubWindow is the allowance the stub grants: a window far longer than any
+// test runs, so no dial in the tests that use it is ever bounded by it — the
+// claim COUNT is the axis under test here, and the window's own behaviour has
+// its own tests.
+const stubWindow = 365 * 24 * time.Hour
 
 func withBudget(ar *AttemptRequest, b ExchangeBudget) *AttemptRequest {
 	ar.Budget = b

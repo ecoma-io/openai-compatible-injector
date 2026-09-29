@@ -647,6 +647,12 @@ referenced by name from `providers`:
     **Any response — 429 and 5xx included — ends the attempt loop**: an
     HTTP status is the upstream's answer, never a fallback trigger and
     never a health strike.
+    **An exchange the envelope ended before a response is `send_unknown`,
+    so a pool stops there too.** Its members buy redundancy against a
+    connection that provably never carried the request, not against this
+    proxy's own `max-elapsed`: provider-level fallback (the next candidate)
+    still applies, but member-level fallback does not, because the request
+    may already have reached the member that went quiet.
   - **Passive health.** `failure-threshold` consecutive
     `definitely_not_sent` failures open a `cooldown` during which the
     member is skipped — a `send_unknown` failure proves nothing about the
@@ -1098,6 +1104,22 @@ candidate attempt. A refusal stops that dial; nothing is dialed and no endpoint
 is blamed — an endpoint that was never reached is never struck, and a pool that
 refused the claim hands its concurrency permit back. `max-elapsed` bounds each
 scope in wall-clock time.
+
+**The envelope's elapsed bound reaches a buffered body through EOF, and stops
+at the commitment.** A pre-commitment exchange — a dial whose response has not
+been committed to the client — is bounded end to end: acquiring a stalled
+header and reading a stalled **buffered** body are both inside the same window,
+so a peer that answers `200` and then goes quiet cannot hold the walk open past
+its envelope. Only a response that has actually committed hands the body off
+that bound: a confirmed `text/event-stream` (decided by the **response's**
+content type, never by the request's `stream` flag — a streaming request
+answered with buffered JSON is still a pre-commitment body) and the verbatim
+3xx/204/304 relays, both of which the client holds and which are bounded by the
+caller's own context instead. A body cut by the envelope this way is this
+proxy's own bound, never a peer fault: it is reported as the protocol body
+timeout with `error_cause: exchange_elapsed` and `failure_origin: envelope`, and
+a walk that finalizes on it answers `upstream_invalid_response` with reason
+`upstream_body_timeout`.
 
 The two envelopes stop different things. A spent **request** envelope ends the
 walk: no candidate may start another exchange, so the request is over. A spent
@@ -2210,7 +2232,14 @@ What each level carries:
   256 dispatched events — a stuck stream shows up as a heartbeat that
   stops advancing), and `stream_completed` (carrying `stream_recoveries`,
   and emitted only for a stream that either reached its terminal marker or
-  ran with post-commitment recovery off). Plus the poller's per-tick
+  ran with post-commitment recovery off).
+  `stream_envelope_unreleased` is the one lifecycle event that reports a
+  bookkeeping miss: it fires at a commitment point when the answer carried no
+  releasable pre-commitment envelope — the expected case for an answer that
+  never went through the transport's windowed dial, so it is DEBUG and never
+  an error — and its absence would leave a committed stream that still
+  truncates at the candidate's `max-elapsed` unexplained.
+  Plus the poller's per-tick
   debug heartbeat while a config failure persists (the healthy unchanged
   state logs nothing at all). Detailed but never payload-bearing: request
   bodies, SSE `data:` payloads, and injection prompts do not exist at this
@@ -2261,7 +2290,11 @@ What each level carries:
   (`client_write_failed`, outcome `client_disconnected`, superseding the
   envelope's own classification), an upstream that
   died mid-body before the answer could be parsed
-  (`upstream_body_read_failed`, outcome `upstream_read_failed`), a client
+  (`upstream_body_read_failed`, outcome `upstream_read_failed` — except when
+  this proxy's own exchange envelope cut the read, which is
+  `error_cause: exchange_elapsed` over `failure_origin: envelope` and
+  finalizes as `upstream_invalid_response`, because a bound this proxy set
+  is not a peer fault), a client
   that goes away mid-request — a disconnect or an expired deadline,
   including while the upstream request is in flight
   (`upstream_request_failed` with `error_class` `canceled` and
@@ -2410,7 +2443,13 @@ below 500 — fallback-only and terminal rows alike — the transport cause
 tokens, and `upstream_invalid_response` /
 `upstream_body_timeout` / `upstream_body_read_failed` for unusable
 answers, which ride the unusable-answer events rather than
-`provider_attempt_failed`), `failure_origin` (`upstream_http` | `transport` |
+`provider_attempt_failed`), `error_cause` (on the unusable-answer events, a
+closed set: `body_read_failed` (the upstream died mid-body),
+`capture_deadline_exceeded` (this proxy's own 5 s error-capture timer fired on
+a body that never finished) and `exchange_elapsed` (the exchange envelope cut
+the read) — the last two are proxy-owned bounds, never peer faults, and both
+ride `failure_origin: protocol`/`envelope` respectively), `failure_origin`
+(`upstream_http` | `transport` |
 `protocol` | `caller` | `credential` | `envelope` — the layer the failure
 belongs to; `credential` is a candidate whose rotation pool had no usable key,
 which is a local refusal rather than a wire failure) and

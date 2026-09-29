@@ -14,15 +14,38 @@ func newTestClock() *testClock {
 func (c *testClock) now() time.Time          { return c.t }
 func (c *testClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
-// mustConsume asserts that the envelope funds n more exchanges. It exists so
-// multi-consume expectations read as one statement rather than an operator
+// grants asserts that the envelope funds one more exchange, and returns the
+// window it was granted with. Every claim in this file goes through the
+// ATOMIC acquisition rather than a bare predicate: the window is part of the
+// grant, and a test that ignored it would not be exercising the seam the
+// transport actually dials through.
+func grant(t *testing.T, b *Budget) Exchange {
+	t.Helper()
+	e := b.AcquireExchange()
+	if !e.Granted {
+		t.Fatal("exchange refused with room to spare")
+	}
+	if e.Window <= 0 {
+		t.Fatalf("granted exchange carries window %v, want a positive one", e.Window)
+	}
+	return e
+}
+
+// refuses asserts that the envelope will not fund another exchange.
+func refuses(t *testing.T, b *Budget) {
+	t.Helper()
+	if b.AcquireExchange().Granted {
+		t.Fatal("envelope granted an exchange it had no room for")
+	}
+}
+
+// mustGrant asserts that the envelope funds n more exchanges. It exists so
+// multi-exchange expectations read as one statement rather than an operator
 // chain.
-func mustConsume(t *testing.T, b *Budget, n int) {
+func mustGrant(t *testing.T, b *Budget, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
-		if !b.ConsumeExchange() {
-			t.Fatalf("exchange %d of %d was refused with room to spare", i+1, n)
-		}
+		grant(t, b)
 	}
 }
 
@@ -31,13 +54,9 @@ func TestBudgetConsumesPerExchange(t *testing.T) {
 	b := NewBudget(Envelope{MaxExchanges: 3, MaxElapsed: time.Minute}, clk.now)
 	b.BeginCandidate(Envelope{MaxExchanges: 3, MaxElapsed: time.Minute})
 	for i := 1; i <= 3; i++ {
-		if !b.ConsumeExchange() {
-			t.Fatalf("exchange %d was refused with room to spare", i)
-		}
+		grant(t, b)
 	}
-	if b.ConsumeExchange() {
-		t.Fatal("the request envelope allowed an exchange past its ceiling")
-	}
+	refuses(t, b)
 	if got := b.RequestExchanges(); got != 3 {
 		t.Fatalf("request exchanges = %d, want 3", got)
 	}
@@ -59,10 +78,8 @@ func TestBudgetNestsCandidateInsideRequest(t *testing.T) {
 	cand := Envelope{MaxExchanges: 2, MaxElapsed: time.Minute}
 
 	b.BeginCandidate(cand)
-	mustConsume(t, b, 2)
-	if b.ConsumeExchange() {
-		t.Fatal("the candidate envelope allowed a third exchange")
-	}
+	mustGrant(t, b, 2)
+	refuses(t, b)
 	if got := b.Exhausted(); got != ExhaustionCandidate {
 		t.Fatalf("exhaustion = %v, want candidate", got)
 	}
@@ -75,20 +92,18 @@ func TestBudgetNestsCandidateInsideRequest(t *testing.T) {
 	if got := b.RequestExchanges(); got != 2 {
 		t.Fatalf("entering a candidate refilled the request envelope: %d", got)
 	}
-	mustConsume(t, b, 2)
+	mustGrant(t, b, 2)
 	if got := b.Exhausted(); got != ExhaustionCandidate {
 		t.Fatalf("a spent candidate envelope should report the candidate: %v", got)
 	}
 
 	// A third candidate has its own room left, but the request does not.
 	b.BeginCandidate(cand)
-	mustConsume(t, b, 2)
+	mustGrant(t, b, 2)
 	if got := b.Exhausted(); got != ExhaustionRequest {
 		t.Fatalf("the request ceiling should now bind: %v", got)
 	}
-	if b.ConsumeExchange() {
-		t.Fatal("the request ceiling was crossed")
-	}
+	refuses(t, b)
 	if got := b.RequestExchanges(); got != 6 {
 		t.Fatalf("request exchanges = %d, want 6", got)
 	}
@@ -100,16 +115,12 @@ func TestBudgetElapsedEnvelopes(t *testing.T) {
 	b.BeginCandidate(Envelope{MaxExchanges: 100, MaxElapsed: 10 * time.Second})
 
 	clk.advance(9 * time.Second)
-	if !b.ConsumeExchange() {
-		t.Fatal("the candidate envelope expired early")
-	}
+	grant(t, b)
 	clk.advance(2 * time.Second)
 	if got := b.Exhausted(); got != ExhaustionCandidate {
 		t.Fatalf("exhaustion = %v, want candidate", got)
 	}
-	if b.ConsumeExchange() {
-		t.Fatal("an exchange was allowed past the candidate's wall-clock ceiling")
-	}
+	refuses(t, b)
 
 	// The candidate envelope resets with the candidate; the request's clock
 	// keeps running from the request's start.
@@ -131,9 +142,7 @@ func TestBudgetElapsedBoundaryIsSpentAtTheCeiling(t *testing.T) {
 	if got := b.Exhausted(); got != ExhaustionRequest {
 		t.Fatalf("exactly at the ceiling the envelope is %v, want spent", got)
 	}
-	if b.ConsumeExchange() {
-		t.Fatal("an exchange was allowed exactly at the ceiling")
-	}
+	refuses(t, b)
 }
 
 // TestBudgetIsTheExchangeTruth documents that the budget, consumed where the
@@ -143,11 +152,7 @@ func TestBudgetIsTheExchangeTruth(t *testing.T) {
 	clk := newTestClock()
 	b := NewBudget(Envelope{MaxExchanges: 32, MaxElapsed: time.Minute}, clk.now)
 	b.BeginCandidate(Envelope{MaxExchanges: 16, MaxElapsed: time.Minute})
-	for i := 0; i < 5; i++ {
-		if !b.ConsumeExchange() {
-			t.Fatalf("exchange %d refused", i+1)
-		}
-	}
+	mustGrant(t, b, 5)
 	if got := b.RequestExchanges(); got != 5 {
 		t.Fatalf("request exchanges = %d, want 5", got)
 	}
@@ -169,7 +174,7 @@ func TestBudgetRequestRemainingIgnoresTheCandidateEnvelope(t *testing.T) {
 	clk := newTestClock()
 	b := NewBudget(Envelope{MaxExchanges: 32, MaxElapsed: time.Minute}, clk.now)
 	b.BeginCandidate(Envelope{MaxExchanges: 2, MaxElapsed: time.Minute})
-	mustConsume(t, b, 2)
+	mustGrant(t, b, 2)
 	if got := b.Remaining(); got != 0 {
 		t.Fatalf("remaining = %d, want the spent candidate envelope to bind it", got)
 	}
@@ -197,12 +202,10 @@ func TestBudgetRequestRemainingFloorsAtZero(t *testing.T) {
 	clk := newTestClock()
 	b := NewBudget(Envelope{MaxExchanges: 1, MaxElapsed: time.Minute}, clk.now)
 	b.BeginCandidate(Envelope{MaxExchanges: 4, MaxElapsed: time.Minute})
-	mustConsume(t, b, 1)
+	mustGrant(t, b, 1)
 	// The request envelope is checked first, so the candidate's spare units
 	// are unreachable here: the seat is refused, never overspent.
-	if b.ConsumeExchange() {
-		t.Fatal("a candidate envelope bought an exchange the request envelope refused")
-	}
+	refuses(t, b)
 	if got := b.RequestRemaining(); got != 0 {
 		t.Fatalf("request remaining = %d, want 0", got)
 	}
@@ -247,8 +250,8 @@ func TestBudgetRemainingElapsedIsTheTighterEnvelope(t *testing.T) {
 // TestBudgetRemainingElapsedReportsASpentWindowAsNonPositive pins the
 // fail-fast direction: a remaining elapsed of zero or less must be returned
 // as-is, not clamped to a fresh window — clamping would turn a spent
-// envelope into one more dial. This is the read that makes a late exchange
-// refuse exactly where ConsumeExchange would.
+// envelope into one more dial. A late exchange refuses at the claim itself,
+// where AcquireExchange reports it.
 func TestBudgetRemainingElapsedReportsASpentWindowAsNonPositive(t *testing.T) {
 	clk := newTestClock()
 	b := NewBudget(Envelope{MaxExchanges: 100, MaxElapsed: 10 * time.Second}, clk.now)
