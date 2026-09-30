@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.1](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.15.0...v0.15.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* **proxy:** end an SSE line at the earliest terminator, not a buffered LF ([#124](https://github.com/ecoma-io/openai-compatible-injector/issues/124)) ([666c54b](https://github.com/ecoma-io/openai-compatible-injector/commit/666c54b47d0ebdeb5f7e771850858345881f0024))
+
+
+### Documentation
+
+* bring the agent guide back under its byte budget ([#119](https://github.com/ecoma-io/openai-compatible-injector/issues/119)) ([efb199b](https://github.com/ecoma-io/openai-compatible-injector/commit/efb199b534637eecb5202b421ff1cf1b9189dcc2))
+
 ## [0.15.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.14.6...v0.15.0) (2026-09-29)
 
 
