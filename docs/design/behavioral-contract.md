@@ -557,7 +557,17 @@ do not have access to it.", ...}}` with `<X>` exactly as sent.
   of the unparseable input rather than the same slice (the SSE pointer
   fast-path depends on identity).
 - **Observable**: Relayed body bytes; the fake upstream's untouched body.
-- **Regression tests**: `internal/proxy/strip_test.go`, `e2e/strip_fields_test.go`.
+- **Regression tests**: `internal/proxy/strip_test.go`, `e2e/strip_fields_test.go`;
+  `internal/inject/strip_property_test.go` (characterization, landed as Island 1
+  safety commit). Excision has a property value replacement does not: a strip
+  can only ever DELETE, so the output must be a byte subsequence of the input
+  (re-serializing reorders and reformats, and the subsequence check rules the
+  whole forbidden class out at once), and stripping an already-stripped body
+  must be a byte-for-byte no-op. Identity is pinned across the corpus, not
+  only at the hand-written no-op cases: equal bytes must be the same backing
+  slice for the SSE fast path. Verified by mutation: re-serializing the
+  stripped result, returning an equal copy on the mention-gate path, and
+  dropping the sole-member removal each fail at least one property.
 
 ### INV-INJ-04 — Thinking usage is opt-in, response-side, and fail-open
 
