@@ -341,6 +341,65 @@ skipped, including the three that exercise these transforms end to end
 (`TestDiffChatInjected`, `TestDiffResponsesBuffered`, `TestDiffStreamChat`,
 `TestDiffStreamResponses`).
 
+### Island 2 — config normalization: closed, no refactor
+
+The deliverable named in §3 is "separate representation → validation →
+normalization → snapshot". Those boundaries already exist, and the evidence
+that they do is structural rather than stylistic.
+
+`LoadRuntime` is the pipeline, and its phases run strictly in sequence, each
+consuming only the previous one's output: the top-level key allow-list and the
+strict `KnownFields` decode (representation), the second-document probe
+(document discipline), `buildTransports` → `buildProviders` →
+`buildGlobalRecovery` → `recovery.Resolve` (normalization), and the sorted,
+deduplicated model loop that assembles the `Snapshot`. Every `build*` function
+has a single caller and calls only deeper `build*`s — the call graph is a DAG
+with no mutual recursion and no shared mutable state between phases.
+
+That is the specific thing the refactor exists to fix, and this package does
+not have it. §0's problem statement for the initiative is concepts "entangled
+by parallel variables rather than by types"; here the phases are separated by
+function call direction, there are no parallel variables, and no phase writes
+anything another phase reads. Splitting a DAG into more files would add
+indirection and remove a boundary that is already unambiguous.
+
+The 882-line `recovery.go` is the one file large enough to look like a target.
+It is 18 single-purpose builders in one direction, each with one caller, and
+splitting it would move code without changing what decides it.
+
+**What was pinned.** One SAFETY commit, no production code touched.
+`sanitize_property_test.go` closes the INV-CFG-01 gap by stating the redaction
+property over the SHAPE of a document rather than a hand-picked list of
+positions: the marker is planted in 27 structural slots and no rejection may
+quote it. The positive half is pinned too, since a sanitizer returning a fixed
+string satisfies the negative half while leaving an operator unable to find the
+line they broke.
+
+**A finding, recorded rather than papered over.** Mutation verification showed
+that deleting the `yaml: invalid map key` entry from `inputEchoingPrefixes` is
+a SILENT no-op — every test in the package stays green. The entry is
+unreachable from `LoadRuntime`: a malformed map key surfaces as a
+`yaml.TypeError`, which the other mechanism redacts by extracting line numbers
+before the prefix table is consulted. The natural coverage case for that entry
+therefore passed for the wrong reason. The entry is kept as defence against a
+yaml.v3 that does emit it, and `TestInputEchoingPrefixesAreReachable` names it
+as unreachable so a future reader does not mistake it for coverage. This is
+also the clearest illustration of why the corpus property is the primary
+defense: a whitelist cannot detect an entry it is missing, only one it has.
+
+Three mutations were each caught by the test written for them: dropping a
+reachable table entry (corpus case fails by name), bypassing the TypeError
+redaction (three positions fail), and keeping the redaction while discarding the
+line numbers (only the positioning test fails — which is exactly why it
+exists).
+
+**Verification.** `go test ./...` and `go test -race ./internal/config/` green;
+`go vet` and `golangci-lint run ./internal/config/` clean; `FuzzLoadRuntime`
+passes 20s (247k executions, no crash); the differential runner against
+`d247969` passes all 12 scenarios. Config is not on the per-chunk hot path —
+it is loaded once per reload — so no benchmark baseline was required by §4
+step 3, which scopes that to hot-path islands.
+
 ## 11. Done
 
 The initiative is complete when the correctness, architecture, security,
