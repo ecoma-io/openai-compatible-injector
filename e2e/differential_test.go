@@ -737,28 +737,6 @@ models:
 %s`, e2eAPIKey, public, upstreamModel, injectionPrompt, extraModelBlock)
 }
 
-// diffChainYAML renders a chain model over two candidates, the first pointing
-// at the run's upstream and the second at a CLOSED PORT. A closed port is the
-// suite's standing choice for a dial that cannot succeed: connection refused
-// is a transport failure with no status, which is the observation the walk's
-// fallback rule is stated in terms of.
-func diffChainYAML(public, recoveryBlock string) string {
-	return fmt.Sprintf(`api-key: %s
-providers:
-  diff-primary:
-    base-url: {{UPSTREAM}}/v1
-  diff-secondary:
-    base-url: http://127.0.0.1:1/v1
-models:
-  %s:
-    providers:
-      - provider: diff-primary
-        upstream-model: diff-up-1
-      - provider: diff-secondary
-        upstream-model: diff-up-2
-%s`, e2eAPIKey, public, recoveryBlock)
-}
-
 // diffChatOK is a 200 chat completion the upstream answers every time. It
 // names a stable upstream model so the rewrite has something to rename.
 func diffChatOK() http.HandlerFunc {
