@@ -774,10 +774,46 @@ behavior.
   candidate's transform fails all, so it answers 400 immediately.
 - **Observable**: The fake upstream's recorded request bodies, one per
   attempt.
-- **Regression tests**: `internal/proxy/provider_fallback_test.go`.
-  **GAP**: the "transform once, reuse across same-candidate retries"
-  optimization is _not_ currently in place; any future change to it must
-  prove the upstream-received bytes are identical per attempt.
+- **Regression tests**: `internal/proxy/provider_fallback_test.go`
+  (`TestProviderChainRetryReplaysIdenticalBody` for the same-candidate retry,
+  `TestProviderChainFallsBackOnTransportFailure` for the fallback hop).
+  **CLOSED** — the suite pins both hops, and the pin was verified by mutation
+  rather than by reading the assertions. The "transform once, reuse across
+  attempts" optimization stays out of place, and the measurements below say
+  precisely which invariant a future one has to satisfy.
+
+  **What a memo may key on.** `inject.Chat` and `inject.Responses` read
+  exactly two fields of `config.Model`: `UpstreamModel` and
+  `InjectionPrompt`. `TestRequestTransformsReadOnlyTheRenameAndPromptFields`
+  in `internal/inject` parses both functions and asserts that set is exactly
+  those two — and, via reflection over the struct, that no field has been added
+  without being classified. A memo keyed on `body + UpstreamModel +
+InjectionPrompt` is therefore sound by construction. Everything else on
+  `m` — `Provider`, `Endpoint`, `Public`, `Transport`, `Strip`,
+  `ThinkingUsage`, `ContinuationRule`, `Chain`, `Recovery` — is not an input
+  to the transform at all.
+
+  The forbidden shape is a key that does not distinguish candidates, and the
+  suite catches it in one test.
+
+  **Mutation evidence.**
+
+  | Mutation                                                                                    | Result                                                                                                                         |
+  | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+  | M1 — memo keyed on body + `UpstreamModel` + `Provider` + `Public`                           | **survives**, correctly. Those are the only fields `Chat`/`Responses` read, so the memo is behaviour-preserving.               |
+  | M2 — process-global memo keyed on the client body alone                                     | caught by 3 tests                                                                                                              |
+  | M3 — **per-request** memo keyed on the body alone, calling the injected transform on a miss | caught by exactly 1 test: `TestProviderChainFallsBackOnTransportFailure`                                                       |
+  | M4 — `inject.Chat` reads `m.Public` instead of `m.UpstreamModel`                            | caught by 5 tests, including the field-set test, which names the drifted field rather than only reporting a wrong model string |
+
+  M3 is the sharp one. Stripping the memo of cross-request state removes both
+  other M2 failures, so the two extra M2 failures are a _different_ property — a
+  process-global memo replays one client's transformed body under another
+  client's request, which also defeats the local-validation boundary
+  (`TestProviderChainTransformErrorNeverFallsBack`,
+  `TestUsageTransformFailureNotMetered` both stop seeing their own transform
+  error and answer 200/502). That is a cross-request defect, not a
+  cross-candidate one, and it is why the tripwire is a prohibition rather than
+  a key: no key makes an unguarded process-global memo safe here.
 
 ### INV-REC-10 — The matrix is deterministic and re-validates at every layer
 

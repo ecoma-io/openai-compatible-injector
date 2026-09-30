@@ -478,6 +478,64 @@ line and therefore dispatches nothing.
 ./internal/proxy/` green; `go vet` and `golangci-lint run ./internal/proxy/`
 clean; `gofmt` clean.
 
+### Island 4 — `AttemptResult`: characterization, first contract gap closed
+
+Step 2 of the protocol (characterize) ran against the first open GAP in the
+walk, `INV-REC-09`, and the GAP was a **prohibition without a measurement**:
+"the transform-once optimization is not in place; any future change to it must
+prove the upstream-received bytes are identical per attempt." It named the
+obligation but not the invariant, so it could not tell an implementer which
+memo key would be safe and which would not.
+
+**The measurement.** Four mutations of the request transform, each reverted
+afterwards; `internal/proxy/handler.go` carries a zero-diff at the end of this
+step.
+
+| Mutation                                                          | Result                   |
+| ----------------------------------------------------------------- | ------------------------ |
+| M1 — memo keyed on body + `UpstreamModel` + `Provider` + `Public` | survives, and _should_   |
+| M2 — process-global memo keyed on the body alone                  | caught by 3 tests        |
+| M3 — per-request memo keyed on the body alone                     | caught by exactly 1 test |
+| M4 — `inject.Chat` reads `m.Public`                               | caught by 5 tests        |
+
+M3 is the load-bearing result. M2 catches three tests, and the two extra
+failures turned out to be a different property entirely: a process-global memo
+replays one client's transformed bytes under _another_ client's request, so
+`TestProviderChainTransformErrorNeverFallsBack` and
+`TestUsageTransformFailureNotMetered` stop seeing their own transform error and
+answer 200/502. Removing cross-request state leaves precisely one failure —
+`TestProviderChainFallsBackOnTransportFailure`, asserting the fallback hop
+received `"model":"up-a"` — which is the cross-candidate property the contract
+entry is about.
+
+**Two corrections I had to make to my own first attempt.** The initial M2
+helper called `inject.Chat` directly, bypassing the injected `transform`
+parameter; the two transform-error tests then failed for a seam-bypass reason
+that had nothing to do with memoization, which is why their verdict matched
+M3's. And the first M3 allocated the memo _inside_ the attempt loop, so it could
+never span a candidate boundary — a mutation that cannot express the defect it
+claims to test. Both were rebuilt to call the injected `transform` on a miss and
+to allocate the memo once per request. A mutation that fails for the wrong
+reason is worse than no mutation, because it looks like a result.
+
+**What the measurement buys.** `Chat` and `Responses` read exactly two fields of
+`config.Model` — `UpstreamModel` and `InjectionPrompt`.
+`TestRequestTransformsReadOnlyTheRenameAndPromptFields` parses both and asserts
+that set, and reflects over the struct to fail on any field that has been added
+without being classified. It was written from the measurement, and its first run
+immediately earned its keep by naming three unclassified fields
+(`Chain`, `Recovery`, `RecoveryHash`). Under M4 it is the only failure that
+names _which_ field drifted; the behavioural tests report the same mutation as
+a wrong model string.
+
+So the contract entry no longer states a prohibition. It states the invariant:
+a memo keyed on `body + UpstreamModel + InjectionPrompt` is sound, and any
+other key that fails to distinguish candidates is caught by one test.
+
+**Verification.** `go test ./internal/inject/ ./internal/proxy/
+./internal/config/` green; `go vet ./internal/...` clean; `gofmt` clean; the
+production tree carries no diff from this step.
+
 ## 11. Done
 
 The initiative is complete when the correctness, architecture, security,
