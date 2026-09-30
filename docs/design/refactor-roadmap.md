@@ -277,7 +277,71 @@ Any one of these reverts the island:
 mismatch appears in a path no test covers, that is a coverage gap to close
 first — the mismatch is still a mismatch.
 
-## 10. Done
+## 10. Island log
+
+One entry per island, written when the island closes. An island whose
+deliverable turned out to be characterization rather than a code change says
+so, and records the evidence that decided it — otherwise a later reader cannot
+tell "nothing to do here" from "never looked".
+
+### Island 1 — `inject` transforms: closed, no refactor
+
+Steps 1–3 and 5–6 ran; step 4 has no work to do, and the reason is the
+allocation evidence rather than a preference for leaving code alone.
+
+**What was pinned.** Two SAFETY-only commits, no production code touched.
+`rewrite_property_test.go` closes the INV-INJ-02 GAP with a corpus of
+well-formed bodies asserted by DELETION — every in-scope `"model"` value is cut
+from input and output and the remainders must be byte-identical, so the
+invariant is stated directly instead of against a recorded answer.
+`strip_property_test.go` closes INV-INJ-03 with four properties over a ~35-case
+corpus: the output is a SUBSEQUENCE of the input (which rules out
+re-serialization in one check), a second pass is a byte-for-byte no-op, equal
+bytes are the SAME SLICE, and a valid body stays valid. Both were
+mutation-verified before landing — re-serializing, returning an equal copy,
+widening the strip scope into `response`, and dropping a removal each failed a
+named test, with the sources reverted pristine afterwards.
+
+**The measured baseline** (`-benchtime 200ms -count 3`, 16-core):
+
+| Body       | `rename_only` | allocs | `rename_strip` |
+| ---------- | ------------- | ------ | -------------- |
+| 1 KB       | 4.4 µs        | 4      | 9.1 µs         |
+| 64 KB      | 245 µs        | 4      | 490 µs         |
+| 1 MB       | 3.8 ms        | 6      | 7.9 ms         |
+| 8 MB       | 29 ms         | 8      | 59 ms          |
+| 64 MiB cap | 245 ms        | 16     | 457 ms         |
+
+Allocation is flat in body size — 4 allocs at 1 KB and 8 at 8 MB, a 16× body
+for two more allocations, and the only size-proportional term is the single
+output copy the transform must produce. `rename_only` runs at 266–306 MB/s;
+the strip roughly halves throughput, which is the cost of the second
+byte-level pass, and the no-match strip gate allocates zero times. There is no
+quadratic term, no per-member allocation, and no redundant copy to reclaim, so
+"any optimization needs allocation evidence" resolves to: the evidence shows
+none available. The 17–20 allocs on the `rename_think_strip` row belong to the
+thinking synthesizer's own `encoding/json` work, not to the byte-preserving
+transforms.
+
+**Why no extraction.** The two rewriters are already the shape step 4 asks for:
+`RewriteChatModel` and `RewriteResponsesModel` are one-line wrappers over a
+single `rewriteModel(body, public, nestedResponse)`, sharing one scanner with
+the scope as a parameter. There is no duplicated logic to separate and no
+boundary to move. `StripChatFields`/`StripResponsesFields` are the same pair of
+wrappers. A rewrite here would be churn against the §1 ground rules, and the
+island-ordering rule in §3 — a refactor is only as safe as the invariants it
+preserves — has nothing to preserve here that is not already structural.
+
+**Verification.** `go test ./...`, `go test -race ./...`, `go vet ./...` and
+`golangci-lint run ./...` (0 issues) all green; the four inject fuzz targets
+(`FuzzProbe`, `FuzzRewriteModel`, `FuzzStripFields`,
+`FuzzSynthesizeThinkingUsage`) pass a 10s run each; and the differential runner
+against the pre-refactor build `d247969` passes all 12 scenarios with none
+skipped, including the three that exercise these transforms end to end
+(`TestDiffChatInjected`, `TestDiffResponsesBuffered`, `TestDiffStreamChat`,
+`TestDiffStreamResponses`).
+
+## 11. Done
 
 The initiative is complete when the correctness, architecture, security,
 performance and operations conditions in the initiative brief are all met —
