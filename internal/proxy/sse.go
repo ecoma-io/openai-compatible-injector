@@ -262,27 +262,48 @@ func readToLineEnd(br *bufio.Reader) ([]byte, error) {
 	if err != nil && len(b) == 0 {
 		return nil, err
 	}
-	// An LF anywhere in the buffered window ends the line: every byte
-	// before it is line data whatever terminators precede it, so the whole
-	// line is one ReadSlice and a CRLF needs no special case.
-	if bytes.IndexByte(b, '\n') >= 0 {
+	// The EARLIEST terminator in the window ends the line, whichever kind it
+	// is — a position comparison, not a style preference. Every byte before it
+	// is line data whatever terminator follows, so the choice is made on
+	// offsets alone and the same bytes frame the same way no matter where the
+	// transport split its reads. Testing for an LF first and only then asking
+	// where the CR was would make the framing a function of the read boundary
+	// instead: a stream mixing terminators would fold a CR into its data
+	// whenever a later LF happened to be buffered, and the event count, the
+	// flush count and the observed payloads would all shift with TCP timing.
+	//
+	// The CR scan stops at the LF, which bounds it to this line's own bytes
+	// rather than the whole buffer — the extra IndexByte is over the region
+	// the LF path was going to read anyway.
+	lf := bytes.IndexByte(b, '\n')
+	scan := b
+	if lf >= 0 {
+		scan = b[:lf]
+	}
+	cr := bytes.IndexByte(scan, '\r')
+	if cr >= 0 {
+		// A CR is itself a complete line ending, and CopySSE remembers the
+		// ambiguity so a lone CR reaches the observer and client immediately
+		// without inventing a boundary when its LF later proves to have been
+		// adjacent — the CRLF pair is the one case where the CR does not end
+		// the line, and it is settled by the same comparison: the LF sits one
+		// position later, so the CR wins the cut and the following LF is read
+		// as this line's own. Do not wait for the next byte to learn whether
+		// the CR grows into CRLF: a peer may legally pause forever after a
+		// lone CR, and holding that complete line would leave its
+		// client-visible event unflushed.
+		chunk := append([]byte(nil), b[:cr+1]...)
+		if _, err := br.Discard(cr + 1); err != nil {
+			return chunk, err
+		}
+		return chunk, nil
+	}
+	if lf >= 0 {
 		chunk, rerr := br.ReadSlice('\n')
 		// ErrBufferFull is impossible here — the window held an LF, and
 		// the window is the whole buffer — so any error is the reader's
 		// own and propagates.
 		return chunk, rerr
-	}
-	// No LF buffered. A CR is itself a complete line ending. Do not wait for
-	// the next byte to learn whether it grows into CRLF: a peer may legally
-	// pause forever after a lone CR, and holding that complete line would leave
-	// its client-visible event unflushed. CopySSE remembers the ambiguity and
-	// treats one later LF as part of this line rather than a new blank line.
-	if i := bytes.IndexByte(b, '\r'); i >= 0 {
-		chunk := append([]byte(nil), b[:i+1]...)
-		if _, err := br.Discard(i + 1); err != nil {
-			return chunk, err
-		}
-		return chunk, nil
 	}
 	// No terminator in the window: it is all line data. Read it out
 	// (bufio returns the error only once its buffer is drained) and let
