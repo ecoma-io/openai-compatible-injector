@@ -405,7 +405,7 @@ step 3, which scopes that to hot-path islands.
 This island is the first whose deliverable was not "no refactor warranted".
 The gap named in the contract under INV-SSE-03 was that the arbitrary
 chunk-boundary property was not asserted as a chunking-invariance property
-test, and writing that test found a real bug in the parser.
+test, and writing that test found a real bug in the parser (#123).
 
 **The defect.** `readToLineEnd` tested for a buffered LF before asking where
 the first CR was, so the answer depended on whether a terminator of the OTHER

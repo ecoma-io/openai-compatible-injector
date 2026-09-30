@@ -1063,7 +1063,7 @@ InjectionPrompt` is therefore sound by construction. Everything else on
   `TestCopySSELineEndsAtTheEarliestTerminator`,
   `TestCopySSETrailingLFAfterLoneCRIsGrammarNotChunking`).
 
-  The GAP above is closed, and closing it found a real defect. The property
+  The GAP above is closed, and closing it found a real defect (#123). The property
   test states the invariant over the split rather than over any one split, and
   the first corpus entry that mixed terminator styles within one buffer failed
   it. `readToLineEnd` had tested for a buffered LF before asking where the

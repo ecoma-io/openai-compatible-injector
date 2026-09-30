@@ -1847,9 +1847,13 @@ live stream with correct per-chunk latency. Behavior:
   too.
 - Malformed lines are forwarded verbatim. We are a passthrough, not an SSE
   validator.
-- Known limitation: lines are terminated by `\n` (with `\r\n` accepted) —
-  the SSE standard and everything real providers emit. Bare-CR line endings
-  (no `\n`) would not be treated as line boundaries.
+- All three line endings the SSE grammar admits are honored: `\n`, `\r\n`, and
+  a bare `\r`. A CR is a complete line ending in its own right, so an LF that
+  immediately follows one is that line's own terminator rather than a line of
+  its own — the relay writes a CR-terminated line as soon as it sees the CR
+  and never holds it back waiting to learn whether it will grow. Framing is a
+  function of the byte stream alone: the same upstream bytes parse to the same
+  events no matter where the transport split its reads.
 - A request with `"stream": true` against an upstream that answers with a
   normal JSON body is handled as a plain 200 (the body is model-rewritten,
   not wrapped, not streamed).
