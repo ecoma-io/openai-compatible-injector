@@ -400,6 +400,84 @@ passes 20s (247k executions, no crash); the differential runner against
 it is loaded once per reload — so no benchmark baseline was required by §4
 step 3, which scopes that to hot-path islands.
 
+### Island 3 — SSE framing: closed, one production defect fixed
+
+This island is the first whose deliverable was not "no refactor warranted".
+The gap named in the contract under INV-SSE-03 was that the arbitrary
+chunk-boundary property was not asserted as a chunking-invariance property
+test, and writing that test found a real bug in the parser.
+
+**The defect.** `readToLineEnd` tested for a buffered LF before asking where
+the first CR was, so the answer depended on whether a terminator of the OTHER
+kind happened to be in the same window. A CR followed later by an LF in one
+buffer was folded into the line's data. The relayed bytes were always
+identical, so the byte-preserving guarantee never noticed — but the FRAME
+boundaries moved, and with them `stats.Events`, the flush cadence the client
+observes, and the payload the continuation accumulator reconstructs a
+truncated stream from. The framing therefore depended on where the transport
+split its reads, which makes one upstream byte sequence parse two different
+ways on two different connections.
+
+    "data: one\rdata: two\n\n"  read whole  -> one data line
+    "data: one\rdata: two\n\n"  read short  -> two data lines
+
+**Why it survived the existing suite.** Every pre-existing CR test used a
+stream with no LF in it, or an all-CRLF one where the LF branch was correct.
+`bufio` fills a whole `strings.NewReader` source in a single `Read`, so both
+of those cases never put a CR in front of a buffered LF. No test in the
+package — unit or e2e — contained a stream mixing both terminator styles.
+
+**The fix.** One position comparison, replacing the ordering of two tests: the
+EARLIEST terminator in the window ends the line, whichever kind it is. A CR is
+never a frame boundary on its own, so `data: a\r\n` is one line and dispatches
+nothing — the LF is that line's own terminator, and `pendingCRLF` is what
+absorbs it when it arrives in a later read.
+
+**A claim withdrawn.** An earlier reading of this defect claimed it could let a
+truncated stream report itself terminated, since a swallowed boundary would
+change the event count. That was not measured and it is false: `isTerminalSSELine`
+compares the line's content with the terminator stripped, so a terminal marker
+that is on the wire is found at every chunking. The continuation loop's gate is
+unaffected. The real consequence is confined to framing.
+
+**The property test that found it** states the invariant over the split rather
+than over any one split: for a fixed stream, run `CopySSE` under nine chunk
+sizes and require identical output bytes, byte count, event count, terminal
+flag, flush count, error identity and observation sequence. A second test
+exhausts every two-chunk split offset of one adversarial stream, and a third
+pins the earliest-terminator rule at every split offset for streams that mix
+terminator styles.
+
+**Mutation verification, including two survivors.** Restoring the original
+defect exactly fails five tests across seven subtests. Disabling
+`pendingCRLF` fails seven tests. Two mutations SURVIVE, and that is the useful
+result: never pairing a CRLF at all, and never pairing it unless the LF is
+adjacent, both leave every test green. The pending flag makes the two ways of
+cutting a CRLF equivalent, so the only load-bearing part of the new code is
+the position comparison. A mutation that cannot fail is a measurement about
+which line of the fix matters, not a gap in the test.
+
+**Three test-helper defects were found and fixed in the same pass**, each
+visible only because the corpus grew. `splitReader` re-copied the same tail on
+every call after the first, which spun `CopySSE` forever; it then dropped the
+head of the stream, because it served the tail from offset 0 on the first call;
+and both readers answered `io.EOF` for a zero-length destination, which
+`io.Reader` forbids and which made `bufio` believe the source was closed. The
+first version of `splitReader` passed its only test because that test's stream
+was all-CRLF, where the parser's own bug absorbed the duplicate.
+
+**Two expectations of mine were wrong and were corrected against the grammar
+rather than the implementation**, per the rule that a test is not fixed to
+match the code. Two data lines inside one frame are one event, not two; and
+there is no such stream as a "lone CR followed by an LF of its own", because a
+line ending in CR with LF as the very next byte is the CRLF case. An earlier
+draft asserted two events for `data: x\r\n`, which has one line and no blank
+line and therefore dispatches nothing.
+
+**Verification.** `go test ./...` green including e2e; `go test -race
+./internal/proxy/` green; `go vet` and `golangci-lint run ./internal/proxy/`
+clean; `gofmt` clean.
+
 ## 11. Done
 
 The initiative is complete when the correctness, architecture, security,

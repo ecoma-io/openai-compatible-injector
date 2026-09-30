@@ -1020,9 +1020,33 @@ behavior.
 - **Observable**: The client's received bytes.
 - **Regression tests**: `internal/proxy/sse_test.go` (763 lines),
   `TestCopySSELoneCRReachesTheClientBeforeTheNextByte`,
-  `TestCopySSEEventOverLimitTruncatesBeforeOffendingLine`.
-  **GAP**: `internal/proxy/fuzz_test.go` exists; the arbitrary-chunk-boundary
-  property is not yet asserted as a chunking-invariance property test.
+  `TestCopySSEEventOverLimitTruncatesBeforeOffendingLine`,
+  `internal/proxy/sse_chunking_property_test.go`
+  (`TestCopySSEIsInvariantUnderChunking`,
+  `TestCopySSEChunkInvarianceCoversEverySplitOffset`,
+  `TestCopySSELineEndsAtTheEarliestTerminator`,
+  `TestCopySSETrailingLFAfterLoneCRIsGrammarNotChunking`).
+
+  The GAP above is closed, and closing it found a real defect. The property
+  test states the invariant over the split rather than over any one split, and
+  the first corpus entry that mixed terminator styles within one buffer failed
+  it. `readToLineEnd` had tested for a buffered LF before asking where the
+  first CR was, so a CR was folded into the line's data whenever any LF
+  existed later in the same window. The relayed BYTES were always identical
+  — the byte-preserving guarantee never noticed — but the frame boundaries
+  moved with them, so `stats.Events`, the flush cadence the client observes,
+  and the payload the continuation accumulator reconstructs a truncated
+  stream from all changed, and changed according to where the transport split
+  its reads. The rule is now a single position comparison: the EARLIEST
+  terminator in the window ends the line, whichever kind it is.
+
+  Two properties of the fix are worth recording because they are counter-intuitive
+  and were measured, not assumed. Disabling `pendingCRLF` breaks seven tests,
+  while never pairing a CRLF at all breaks none — the pending flag makes both
+  ways of cutting a CRLF equivalent, so what matters is only the position
+  comparison. And a CR is never a frame boundary on its own: `data: a\r\n` is
+  one line and dispatches nothing, because the LF is that line's own
+  terminator.
 
 ### INV-SSE-04 — Size limits stop the relay before the client sees the line
 
