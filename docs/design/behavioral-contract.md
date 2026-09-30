@@ -1362,7 +1362,17 @@ behavior.
 - **Forbidden**: A `---`-separated document; an unprefixed variable; a
   reload that clears a snapshot instead of keeping it.
 - **Observable**: Exit code; the reload event; `config_generation`.
-- **Regression tests**: `internal/config` suite (113 test functions).
+- **Regression tests**: `internal/config` suite (112 test functions).
+  `sanitize_property_test.go` closes the gap that rejection text is checked
+  only at hand-picked positions. The property is stated over the SHAPE of a
+  document — the marker is planted in 27 structural positions and no rejection
+  may quote it — plus the positive half, that redaction kept the line numbers
+  (a sanitizer returning a fixed string would pass the negative half while
+  leaving an operator unable to find the broken line), plus
+  `TestInputEchoingPrefixesAreReachable`, which records that the
+  `yaml: invalid map key` table entry is currently unreachable: mutation
+  verification showed deleting it is a silent no-op, so the entry is retained
+  deliberately and named as such rather than looking load-bearing.
 
 ### INV-CFG-02 — A database URL is infrastructure, and never logged
 
