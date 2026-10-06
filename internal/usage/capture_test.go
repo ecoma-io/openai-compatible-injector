@@ -226,6 +226,30 @@ func TestCaptureAPIScope(t *testing.T) {
 	assertTokens(t, tokens, Tokens{PromptTokens: i64(5), CompletionTokens: i64(6), TotalTokens: i64(11)})
 }
 
+// The Anthropic "messages" surface meters the SAME bytes a chat request
+// would: Observe reads pre-rewrite upstream payloads, and a Messages
+// request's upstream traffic is Chat Completions. Giving it its own
+// extractor — or worse, defaulting the unknown surface to the Responses
+// one — would silently NULL every messages row's token columns, which is the
+// quiet direction: nothing fails, the numbers just stop being there.
+func TestCaptureMessagesUsesChatExtractor(t *testing.T) {
+	c := NewCapture("messages")
+	c.Observe([]byte(`{"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`))
+	tokens, ok := c.Tokens()
+	if !ok {
+		t.Fatal("messages capture read no usage from a chat-shaped object")
+	}
+	assertTokens(t, tokens, Tokens{PromptTokens: i64(11), CompletionTokens: i64(22), TotalTokens: i64(33)})
+
+	// ...and it still does not descend into a Responses envelope, which is
+	// not the shape any messages upstream sends.
+	other := NewCapture("messages")
+	other.Observe([]byte(`{"response":{"usage":{"input_tokens":999}}}`))
+	if _, ok := other.Tokens(); ok {
+		t.Fatal("messages capture read the responses envelope")
+	}
+}
+
 // Seal: the boundary between two upstream calls answering one request. The
 // two token counts are deliberately NOT combined the same way — a hop re-asks
 // with the same conversation, so its prompt is the context seen again and the

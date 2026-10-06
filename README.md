@@ -40,6 +40,12 @@ Common shapes:
 One model name, one upstream, one prompt. Mapping is per public model name;
 there are no routes, weights, or per-request overrides.
 
+Two client dialects share that one config. The same entry answers OpenAI Chat
+Completions and Responses **and** Anthropic Messages, so Claude Code can point
+at this proxy — `x-api-key`, `[1m]` model markers and all — with no change to
+`providers:` or `models:`; see
+[Anthropic Messages](#anthropic-messages-v1messages).
+
 ## Quick start
 
 ```sh
@@ -442,7 +448,9 @@ Semantics that hold:
 What "inject a system prompt" means, per API. **The request is never
 corrupted to inject**: if the target shape is absent or of an unexpected
 type, the request passes through untouched (and the empty prompt injects
-nothing).
+nothing). The Anthropic Messages route is the exception to the first half
+only: it translates to the Chat shape first and then rides the Chat rule,
+so a body it cannot translate is a local 400 rather than a pass-through.
 
 ### Chat Completions (`/v1/chat/completions`)
 
@@ -481,10 +489,95 @@ several shapes:
 | array                  | a developer message item is prepended: `{"type":"message","role":"developer","content":[{"type":"input_text","text":"<prompt>"}]}` |
 | anything else          | untouched                                                                                                                          |
 
+### Anthropic Messages (`/v1/messages`)
+
+Claude Code and the Anthropic SDKs speak the Messages dialect. This route
+translates it onto the **Chat Completions upstream**, so the `providers:` /
+`models:` YAML needs no change: one configured model serves both dialects at
+once, and an Anthropic client and an OpenAI client reading the same entry
+reach the same provider.
+
+**Authentication** additionally accepts `x-api-key: <key>` — Anthropic clients
+send only that header when `ANTHROPIC_API_KEY` is set, and real Claude Code
+sends no `Authorization` header at all. `Authorization: Bearer` still wins when
+both appear. Both are consumed and neither is forwarded; the scheme remains
+case-insensitive and the key must be a valid RFC 6750 token, exactly as on
+every other `/v1` route. (The `x-api-key` spelling works on the Chat and
+Responses routes too — the header is route-independent.)
+
+**Model name.** A trailing `[1m]` — the 1M-context marker clients append —
+is stripped before lookup, so `claude-sonnet-4-5[1m]` and `claude-sonnet-4-5`
+resolve the same configured entry. The 404 quotes the post-strip name,
+byte-exact as always.
+
+**Request translation** is an allow-list; everything not named is dropped, so
+no Anthropic-only field reaches a strict OpenAI upstream:
+
+| Anthropic Messages                                                    | Chat Completions upstream                                           |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `system` (string, or an array of `text` blocks)                       | the first `system` message; `cache_control` dropped                 |
+| text / image blocks                                                   | text / an `image_url` data URI                                      |
+| `tool_result` block                                                   | a `role: "tool"` message, in source order                           |
+| `tool_use` block                                                      | a `tool_calls` entry                                                |
+| `thinking`, `redacted_thinking`, unknown blocks                       | dropped                                                             |
+| `tools[].input_schema`                                                | `tools[].function.parameters` — OpenAI's `{type, function}` nesting |
+| `tool_choice`                                                         | `auto`→`"auto"`, `any`→`"required"`, named tool→`function`          |
+| `stop_sequences`                                                      | `stop`                                                              |
+| `metadata.user_id`                                                    | `user`                                                              |
+| `max_tokens`, `temperature`, `top_p`, `stream`, `parallel_tool_calls` | passed through                                                      |
+
+The injection prompt then rides the Chat rule unchanged: it lands at
+`messages[0]`, before the client's own system message. Because this route
+translates rather than splices, a body the translator cannot read is a **local
+400** (`transform_error`) — the candidate walk never starts and no provider is
+asked, which is the point: a body failing one candidate's transform fails all
+of them.
+
+`stream: true` additionally injects `stream_options: {"include_usage": true}`
+upstream, so the usage a client reports comes from the provider's own finish
+chunk rather than from this proxy guessing. The field exists only in the
+translation: metering still observes the pre-rewrite bytes, and
+[Usage metering](#usage-metering) is untouched. A strict upstream that rejects
+`stream_options` fails only this route, surfacing as the ordinary upstream 400
+the recovery walk already knows how to answer.
+
+**Response translation.** A buffered answer becomes a `type: "message"` object
+with a `content` block array (`text`, `tool_use` with its arguments parsed),
+`stop_reason` mapped from `finish_reason`, and `usage` as
+`input_tokens`/`output_tokens`. A streamed answer is re-emitted as
+`message_start` → `content_block_start`/`content_block_delta`/
+`content_block_stop` → `message_delta` (carrying the usage) → `message_stop`;
+the upstream's `data: [DONE]` never crosses the boundary. Ids pass through
+opaquely — `chatcmpl-*` becomes the `message.id`, `call_*` the
+`tool_use.id` — because both APIs document ids as opaque and the client stores
+exactly what this proxy emitted.
+
+Thinking blocks are dropped in **both** directions: an Anthropic `thinking`
+block is not forwarded upstream, and an upstream `reasoning_content` is not
+surfaced. Simulated [thinking usage](#simulated-thinking-usage) still
+activates, because it reads the request-level `thinking` object.
+
+Post-commitment [stream recovery](#stream-recovery) is **refused** on this
+surface: a committed stream that truncates ends exactly as truncated, with
+`stream_recovery_failed` and `unsafe_reason: unsupported_shape`, and no hop is
+dialed. That is a documented deferral, not a silent degradation — see
+[`docs/design/anthropic-messages.md`](docs/design/anthropic-messages.md).
+
+**Error dialect.** Every failure `/v1/messages` itself answers uses the
+Anthropic envelope — see [Errors](#errors). Statuses, ordering (405 still
+precedes 401) and the byte-exact message text are the same contract as the
+Chat route; only the envelope's shape differs.
+
+**Known limitation.** `GET /v1/models` still answers the OpenAI list shape
+for Anthropic clients. Real Anthropic clients do not call it — a Claude Code
+2.1.291 capture made zero `/v1/models` requests — so this is a documented
+asymmetry rather than a gap a client will hit.
+
 ## Model discovery
 
-`GET /v1/models` authenticates with the same bearer credential as the two
-model-serving routes and answers from the current request's runtime config
+`GET /v1/models` authenticates with the same client credential as the three
+model-serving routes (`/v1/chat/completions`, `/v1/responses`,
+`/v1/messages`) and answers from the current request's runtime config
 snapshot. It **never calls an upstream provider**: the public mapping is the
 catalog, while an upstream list could advertise unusable names or disclose an
 alias target. Model IDs are sorted lexicographically for deterministic output;
@@ -1805,9 +1898,10 @@ live stream with correct per-chunk latency. Behavior:
   ignored by every spec-compliant SSE parser, so the heartbeat is
   client-compatible and invisible to application events. The heartbeat
   stops at upstream EOF/error, on client disconnect, and as soon as the
-  Chat `[DONE]` or Responses `response.completed` terminal marker is
-  forwarded — it never injects inside a partial `data:` line, never splits
-  an event, and never appends after the terminal event. One exception: with
+  Chat `[DONE]`, Responses `response.completed`, or Anthropic
+  `message_stop` terminal marker is forwarded — it never injects inside a
+  partial `data:` line, never splits an event, and never appends after the
+  terminal event. One exception: with
   post-commitment [stream recovery](#stream-recovery) enabled, a relay pass
   that ends without its terminal marker may be followed by another hop on
   the same connection, so the heartbeat is not stopped at that EOF — it
@@ -1837,14 +1931,25 @@ live stream with correct per-chunk latency. Behavior:
   - Chat Completions: `data:` lines, terminated by `data: [DONE]`.
   - Responses API: `event:`/`data:` pairs. **No `[DONE]`** — Responses
     termination events are part of the protocol and pass through untouched.
-- Only `data:` lines whose JSON carries an in-scope `model` string value are
-  rewritten — the top-level key (and, for responses, the envelope's
-  `response.model`). Model text appearing anywhere else in the payload — a
-  substring of a message, another field's value — never matches.
-  `event:`, comments, and other `data:` lines pass through verbatim. When
-  [thinking-usage](#simulated-thinking-usage) synthesis is active for the
-  model, a `data:` line carrying a `usage` object is a rewrite candidate
-  too.
+  - Anthropic Messages: `event:`/`data:` pairs terminated by
+    `event: message_stop`, which **no `[DONE]`** crosses. This route is not
+    a passthrough: `CopyMessagesSSE` re-emits the upstream Chat stream as
+    Anthropic events — `message_start` → content blocks → `message_delta` →
+    `message_stop` — under the same 1 MiB line and 2 MiB event caps, the
+    same per-event flush, and the same `StreamStats`. The terminal is the
+    one this proxy emits, which is exactly what latches the keep-alive off
+    and what makes a truncated stream visible as truncated.
+- On the Chat and Responses routes, only `data:` lines whose JSON carries an
+  in-scope `model` string value are rewritten — the top-level key (and, for
+  responses, the envelope's `response.model`). Model text appearing anywhere
+  else in the payload — a substring of a message, another field's value —
+  never matches. `event:`, comments, and other `data:` lines pass through
+  verbatim. When [thinking-usage](#simulated-thinking-usage) synthesis is
+  active for the model, a `data:` line carrying a `usage` object is a
+  rewrite candidate too. The Anthropic Messages route admits **every**
+  `data:` line, because the whole payload is translated rather than a key
+  rewritten inside it — that is a widening of the input, not of the OpenAI
+  routes' gate, which stays byte-identical.
 - Malformed lines are forwarded verbatim. We are a passthrough, not an SSE
   validator.
 - Lines end at the earliest of `\n`, `\r\n` or `\r` — all three terminators
@@ -1958,7 +2063,11 @@ how a clean 503 turns into an OOM kill. Raising `mem_limit` without a
 
 ## Errors
 
-Upstream and client failures are classified, never fogged:
+Upstream and client failures are classified, never fogged. **The table below
+is the OpenAI dialect** — the bodies every Chat Completions and Responses
+client pins byte-exact. `/v1/messages` answers the same conditions, in the
+same order and with the same message text, in the Anthropic envelope; see
+[Error dialect](#error-dialect) for its exact bodies.
 
 | Condition                                                                                                                             | Status                 | `error.type` / `code`                                                                                                                                                                           |
 | ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2042,6 +2151,53 @@ The list carries **no request-id header**, on any spelling. `X-Request-Id` is
 the proxy's own — see [Request identity](#request-identity) — and
 `OpenAI-Request-Id` is dropped outright. An upstream's id is never relayed, so
 one hop presents one id and it is always the one this process minted.
+
+### Error dialect
+
+`POST /v1/messages` wraps every condition above — and only its own — in the
+Anthropic envelope `{"type":"error","error":{"type":"message"}}`. An Anthropic
+error object carries a type and a message and nothing else, so there is no
+`param` and no `code` member; the diagnosis an operator needs lives in the log
+event, whose vocabulary is closed-set anyway. The status, the ordering (405
+still precedes 401) and the message text are unchanged, and no body carries a
+request id — that reaches the client in `X-Request-Id` like everywhere else.
+
+The local refusals, byte-exact:
+
+| Condition                    | Body                                                                                                                                                                  |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Missing/malformed credential | `{"type":"error","error":{"type":"authentication_error","message":"you must provide an API key in the Authorization header (Bearer <key>) or the x-api-key header"}}` |
+| Wrong key                    | `{"type":"error","error":{"type":"authentication_error","message":"invalid API key"}}`                                                                                |
+| Non-POST `/v1/messages`      | `{"type":"error","error":{"type":"invalid_request_error","message":"method not allowed"}}`                                                                            |
+| Body is not JSON             | `{"type":"error","error":{"type":"invalid_request_error","message":"invalid JSON in request body"}}`                                                                  |
+| Missing `model`              | `{"type":"error","error":{"type":"invalid_request_error","message":"you must provide a model parameter"}}`                                                            |
+| Body over the 64 MiB cap     | `{"type":"error","error":{"type":"request_too_large","message":"request body too large"}}`                                                                            |
+| Buffering budget exhausted   | `{"type":"error","error":{"type":"api_error","message":"server is out of buffering capacity"}}`                                                                       |
+| Unmapped model               | `{"type":"error","error":{"type":"not_found_error","message":"The model '<X>' does not exist or you do not have access to it."}}` — `<X>` byte-exact, unescaped       |
+| Upstream unreachable         | `{"type":"error","error":{"type":"api_error","message":"upstream request failed"}}`                                                                                   |
+| Unusable upstream answer     | `{"type":"error","error":{"type":"api_error","message":"upstream returned an invalid response"}}`                                                                     |
+
+An upstream that answers 4xx/5xx keeps its status and gets the provider's own
+status translated into Anthropic's vocabulary — `401 → authentication_error`,
+`403 → permission_error`, `404 → not_found_error`, `413 → request_too_large`,
+`429 → rate_limit_error`, `≥500 → api_error`, any other 4xx →
+`invalid_request_error` — with the message
+`"upstream provider returned HTTP <n>"`:
+
+```json
+{
+  "type": "error",
+  "error": { "type": "rate_limit_error", "message": "upstream provider returned HTTP 429" }
+}
+```
+
+The type set is Anthropic's own, not a renaming of the OpenAI `upstream_error`
+family, because a Messages client dispatches on these names. Provider text is
+still never carried: only the status crosses.
+
+The dialect stops at this route. The catch-all 404 (an unknown path is not a
+Messages request), `/healthz`'s 405 and `GET /v1/models` keep the OpenAI
+envelope above, and so do Chat and Responses for every condition.
 
 ## Request identity
 
@@ -2168,7 +2324,10 @@ never logged, including its length.
 Each request that reaches the provider path produces at most one durable event
 asynchronously, with an event ID, request time and request ID, partner/key
 identity (when partner auth is enabled), bound config generation, public model,
-provider and upstream model, API surface, the relayed stream mode (what the
+provider and upstream model, API surface (`chat`, `responses`, or `messages` —
+the Anthropic route, which records the Chat-shaped usage its upstream actually
+reported, because metering always reads the pre-rewrite bytes; no migration
+was needed, the column never had a value constraint), the relayed stream mode (what the
 response actually was — a `stream: true` request whose upstream answered
 non-SSE is recorded buffered), final client status and outcome,
 upstream-reported token counts, client wire byte counts, cumulative provider
@@ -2305,7 +2464,7 @@ What each level carries:
 - **INFO** — one `request_completed` per proxied request with the wire
   facts: `request_id` (16 hex chars, generated per request — the same value
   the client received and the upstream saw), `api`
-  (`chat`/`responses`), `status`, `outcome` (including `unauthorized` for a
+  (`chat`/`responses`/`messages`), `status`, `outcome` (including `unauthorized` for a
   rejected bearer), `public_model`, `stream`,
   `bytes_in`, `bytes_out`, `duration_ms`, and `config_generation` (the
   snapshot generation the request bound to — correlating reloads with
@@ -2724,6 +2883,26 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/openai-compatible-injector 
   go test ./e2e/ -count=1 -timeout 25m   # or -short for unit-only
   ```
 
+- **Real Claude Code** (`e2e/claude_code_test.go`, inside the e2e suite) drives
+  an actual `claude` process against the built binary and asserts what a
+  synthetic body cannot: the headers a real install puts on the wire, the tool
+  schemas after translation, and whether Claude Code's own usage totals came
+  out non-zero across the dialect change. It runs from an isolated temp-dir
+  `HOME` / `CLAUDE_CONFIG_DIR` / `XDG_*` tree, so the machine's real
+  `~/.claude` is never read or written, and its settings arrive only through
+  `--settings`. **It skips when no binary is present** — that is the default,
+  and it is what keeps CI hermetic:
+
+  ```sh
+  go test ./e2e/ -count=1 -timeout 25m -run TestClaudeCode   # claude on PATH
+  OAICR_E2E_CLAUDE_BIN=/path/to/claude go test ./e2e/ -run TestClaudeCode   # explicit
+  OAICR_E2E_CLAUDE_INSTALL=1 go test ./e2e/ -run TestClaudeCode             # npm i into a temp dir
+  ```
+
+  None of the three installs anything globally or touches your settings; the
+  `INSTALL=1` path fetches `@anthropic-ai/claude-code` into a test temp dir and
+  runs it from there.
+
 - CI (`ci-gate`): gofmt, `go vet`, `golangci-lint` (checksum-pinned), race
   tests, build with `-X main.version`, pull-request title commitlint.
 - CI (`analysis-gate`): CodeQL (Go + Actions), Semgrep (own rules with
@@ -2798,7 +2977,7 @@ internal/config/                 bootstrap, runtime YAML (models, providers, tra
 internal/auth/                   client identity: static + partner key store, decision cache, SQL migrations
 internal/migrate/                shared module-scoped SQL migration runner
 internal/usage/                  factual upstream usage capture, async pipeline, PostgreSQL repository
-internal/inject/                 pure request/response transforms (probe, chat, responses, rewrite, thinking usage)
+internal/inject/                 pure request/response transforms (probe, chat, responses, Anthropic Messages ↔ chat, rewrite, thinking usage)
 internal/recovery/               recovery policy domain: typed failure matrix, layered resolution, retry/fallback mechanics, exchange budget
 internal/transport/              outbound paths: Doer seam, direct client, proxy (http/https/socks5/socks5h), pool registry, exchange-budget seam
 internal/proxy/                  handler, client auth gate, SSE copy, error envelopes, candidate walk driven by the recovery engine

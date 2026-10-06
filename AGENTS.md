@@ -15,11 +15,13 @@ looks as it does belongs in `docs/design/`.
 
 An OpenAI-compatible injector proxy: clients talk to it as if it were an
 OpenAI endpoint, and it forwards to configured upstream providers, renaming the
-model and injecting a per-model system prompt. Two model-serving surfaces —
-Chat Completions and Responses, both with SSE passthrough — plus authenticated
-`GET /v1/models`, answered from the configured public mapping and never from an
-upstream. Three per-model response transforms run in a fixed order: model rename
-→ thinking-usage synthesis → field stripping. README "What it is for".
+model and injecting a per-model system prompt. Three model-serving surfaces —
+Chat Completions, Responses, and Anthropic Messages (translated to Chat
+Completions upstream), all with SSE — plus authenticated `GET /v1/models`,
+answered from the configured public mapping and never from an upstream. Three
+per-model response transforms run in a fixed order: model rename →
+thinking-usage synthesis → field stripping. README "What it is for";
+`docs/design/anthropic-messages.md`.
 
 ## Layout and boundaries
 
@@ -30,8 +32,9 @@ One line per package; the full map is README "Repository layout".
   `Store`, content-hash `Poller`.
 - **`internal/credential`** — per-provider credential `Spec`, rotation `Pool`,
   `Registry`. Inert by construction: no I/O, no goroutines, no timers.
-- **`internal/inject`** — pure transforms: `Probe`, `Chat`/`Responses`, model
-  rewriters, thinking/usage synthesizers, field stripping, continuation builders.
+- **`internal/inject`** — pure transforms: `Probe`, `Chat`/`Responses`,
+  Messages↔Chat translation, model rewriters, thinking/usage synthesizers, field
+  stripping, continuation builders.
 - **`internal/auth`** — client identity: `Principal`, the `Provider` seam, static
   and partner providers, token minting and at-rest hashing, the key store.
 - **`internal/migrate`** — the shared SQL-first, module-scoped migration runner;
@@ -44,9 +47,10 @@ One line per package; the full map is README "Repository layout".
   reservation, clamped release and `Peak`; no allocation, lock or I/O.
 - **`internal/recovery`** — the recovery policy domain: `Failure`/`Match`/`Action`,
   the matrix, layer merge and `Resolve`, the policy hash, the `Engine`.
-- **`internal/proxy`** — HTTP wiring, client auth, `/v1/models`, error envelopes,
-  the candidate walk, `CopySSE`, `rewriteOut`, the continuation loop, and the two
-  buffer admissions that draw on `internal/memlimit`.
+- **`internal/proxy`** — HTTP wiring, client auth, `/v1/models`, `/v1/messages`,
+  error envelopes, the candidate walk, `CopySSE`/`CopyMessagesSSE`, `rewriteOut`,
+  the continuation loop, and the two buffer admissions that draw on
+  `internal/memlimit`.
 - **`internal/server`, `cmd/…`, `e2e`** — listener lifecycle and shutdown;
   entrypoint and subcommands; black-box tests over the built binary.
 
@@ -92,12 +96,13 @@ Boundaries a helpful-looking refactor will cross:
 ### The request path
 
 - **Client authentication is mandatory, terminal, and never forwarded.** Every
-  `/v1` request — Chat, Responses, and the local `GET /v1/models` — presents
-  `Authorization: Bearer <key>`; the scheme is case-insensitive and the key must
-  be a valid RFC 6750 token. Authenticate before reading the body or doing any
-  upstream I/O, and keep 405-before-401 ordering. `/healthz` and the 404 catch-all
-  stay unauthenticated. Consume the client's Authorization header — never forward
-  or replace it. The client's `X-Request-Id` is consumed the same way. A client
+  `/v1` request — Chat, Responses, Messages, and the local `GET /v1/models` —
+  presents `Authorization: Bearer <key>` or `x-api-key` (Bearer wins when both
+  appear); the scheme is case-insensitive and the key must be a valid RFC 6750
+  token. Authenticate before reading the body or doing any upstream I/O, and keep
+  405-before-401 ordering. `/healthz` and the 404 catch-all stay unauthenticated.
+  Consume the client's Authorization and `x-api-key` headers — never forward or
+  replace either. The client's `X-Request-Id` is consumed the same way. A client
   id in a log line is CWE-117 plus attacker-controlled cardinality.
 - **The proxy OWNS the request id — one 16-hex id, minted once, no config key.**
   `requestIDHeader` is code-owned. Stamped on every `/v1` answer + the 405s + the
@@ -109,7 +114,9 @@ Boundaries a helpful-looking refactor will cross:
   silently. README "Request identity"; `docs/design/request-identity.md`.
 - **Injection must never corrupt.** Chat prepends to `messages` only when it is a
   JSON array; Responses merges into `instructions` (string, array, or absent) and
-  touches nothing else. An empty prompt means no injection.
+  touches nothing else. An empty prompt means no injection. Messages translates
+  to the Chat shape first and then rides the Chat rule; a body it cannot
+  translate is a local 400, never a walk.
 - **The request path is bounded in time and aggregate.** `maxRequestBodyBytes`
   (64 MiB) limits one client body; a per-read `requestBodyReadTimeout` limits its
   read; the process-wide `memlimit.Budget` (256 MiB) limits all request
@@ -348,6 +355,13 @@ Boundaries a helpful-looking refactor will cross:
   offending line is never forwarded. It rewrites only the `data:` lines its gate
   admits — `"model"`, `"usage"`, or a configured strip key — under the same
   acceptance rule as the buffered path.
+- **`/v1/messages` is not a passthrough.** `CopyMessagesSSE` re-emits the
+  upstream Chat stream as Anthropic events — `message_start` … `message_stop` —
+  under the same caps, the same per-boundary flush, and the same one-line-per-
+  `Write` contract; the upstream's `data: [DONE]` never crosses. Its terminal is
+  `event: message_stop`, the third arm of the one `isTerminalSSELine` predicate,
+  so `StreamStats.Terminal`, the keep-alive latch and the continuation gate all
+  agree on it for free. README "Streaming"; `docs/design/anthropic-messages.md`.
 - **The SSE keep-alive is request-owned and never pings inside or after a terminal
   event.** One ticker writes the ignorable comment `: ping\n\n` only after an
   event-boundary silence interval; any forwarded byte resets it. It starts after
@@ -435,6 +449,12 @@ Boundaries a helpful-looking refactor will cross:
   deadline during either is `client_disconnected`, with no envelope.
 - **Dial failure is 502 `upstream_unreachable`; an unmapped model is 404
   `model_not_found` and is NEVER forwarded.**
+- **`/v1/messages` answers in the Anthropic error dialect; every other surface —
+  including the catch-all 404 and `GET /v1/models` — keeps the OpenAI envelope.**
+  Same statuses, same ordering, same message text; the envelope is
+  `{"type":"error","error":{"type","message"}}` under Anthropic's own `type`
+  vocabulary, with no `param`, no `code` and no request id. README "Error
+  dialect".
 
 ### Observability and secrets
 

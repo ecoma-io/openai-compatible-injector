@@ -226,6 +226,10 @@ func NewHandler(store *config.Store, doers transport.Resolver, creds CredentialR
 	// plain-text default.
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 	mux.HandleFunc("/v1/responses", h.responses)
+	// The Anthropic Messages surface. Same service, same upstream config,
+	// same provider walk — the route differs only in what it translates to
+	// and from.
+	mux.HandleFunc("/v1/messages", h.messages)
 	mux.HandleFunc("/v1/models", h.models)
 	// The catch-all keeps the same promise for unknown paths — trailing
 	// slashes, wrong case, anything unmatched: an OpenAI SDK client always
@@ -261,6 +265,37 @@ func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
 	h.serve(w, r, apiResponses, inject.Responses, inject.RewriteResponsesModel, inject.SynthesizeResponsesThinkingUsage, inject.StripResponsesFields, "/responses")
+}
+
+// messages serves the Anthropic Messages surface. It rides the Chat
+// pipeline end to end — Chat rewrite, Chat thinking synthesis, Chat strip,
+// and a "/chat/completions" suffix on the outbound URL — because its
+// upstream traffic IS Chat Completions. Only the request transform differs:
+// the body arrives in Anthropic shape and must leave in Chat shape before
+// the rename and injection that transform's second stage performs.
+func (h *injectorHandler) messages(w http.ResponseWriter, r *http.Request) {
+	h.serve(w, r, apiMessages, messagesToChat, inject.RewriteChatModel,
+		inject.SynthesizeChatThinkingUsage, inject.StripChatFields, "/chat/completions")
+}
+
+// messagesToChat is the Messages route's transform: translate the Anthropic
+// body into the Chat shape, then hand that translation to the ordinary Chat
+// transform so the upstream alias rename and the injection prompt at
+// messages[0] apply exactly as they do for a native chat request. Two
+// stages in one function because serve takes one transform per route — and
+// because a translation failure must fail the request here, on the same
+// 400-never-falls-back path a local transform failure already owns: a body
+// this translation cannot read fails every candidate equally.
+//
+// Each attempt replays the ORIGINAL client body through this again, so
+// nothing observed on an earlier attempt feeds the next — the translation
+// is a pure function of the client's bytes and the request's model.
+func messagesToChat(body []byte, m config.Model) ([]byte, error) {
+	chat, err := inject.MessagesToChat(body)
+	if err != nil {
+		return nil, err
+	}
+	return inject.Chat(chat, m)
 }
 
 // notFound is the catch-all for paths no route matched. The interpolated
@@ -374,6 +409,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// snapshot is loaded, no goroutine starts, nothing is dialed.
 	requestID := newRequestID()
 	log := h.log.With().Str("request_id", requestID).Str("api", api).Logger()
+	// The error dialect is a property of the surface, not of the failure, so
+	// it is resolved once here — BEFORE the method check below. That ordering
+	// is what keeps 405-before-401 honest for every route: a wrong method is
+	// answered in the client's own dialect without ever reaching the auth
+	// gate, and the 401 that follows a right method is answered the same way.
+	env := dialectFor(api)
 	if r.Method != http.MethodPost {
 		// Outside the request lifecycle: no snapshot is loaded and no
 		// generation exists to bind, and a wrong method is a client bug
@@ -384,7 +425,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// Outside the request lifecycle — nothing below can observe or
 		// report a failed write, so the error has nowhere to land.
 		setRequestID(w.Header(), requestID)
-		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
+		_ = writeEnvelope(w, http.StatusMethodNotAllowed, env.badMethod)
 		return
 	}
 
@@ -625,7 +666,15 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// disconnect rather than the classification, however certain the local
 	// decision was. The envelope's own cause still shows in the status and,
 	// on the failure, in the WARN.
+	//
+	// The marshaling failure below is unreachable for the all-string bodies
+	// this closure is handed, but the fallback must still answer in THIS
+	// route's dialect — a fixed OpenAI body on a Messages request would be
+	// the one envelope on the surface that lied about its shape.
 	reject := func(status int, b []byte, err error) {
+		if err != nil {
+			b, err = []byte(env.invalidReq), nil
+		}
 		setRequestID(sw.Header(), requestID)
 		if werr := writeEnvelopeErr(sw, status, b, err); werr != nil {
 			outcome = "client_disconnected"
@@ -635,19 +684,19 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 	}
 
-	// Client authentication, before any body is read. The presented bearer
-	// token is resolved through the request's authenticator — the snapshot
-	// in static mode, the partner key store in partner mode. A missing or
-	// malformed Authorization header, a wrong key, an unknown or revoked
-	// partner key, and even an unreachable credential store all share the
-	// static-envelope discipline: the same two 401 bodies as ever, no
-	// fragment of the presented credential ever echoed, and — the
-	// fail-closed shape — a store outage denies the request instead of
-	// letting it through, with no upstream I/O either way.
-	token, ok := bearerToken(r.Header.Get("Authorization"))
+	// Client authentication, before any body is read. The presented
+	// credential — an Authorization bearer or an x-api-key — is resolved
+	// through the request's authenticator — the snapshot in static mode, the
+	// partner key store in partner mode. A missing or malformed header, a
+	// wrong key, an unknown or revoked partner key, and even an unreachable
+	// credential store all share the static-envelope discipline: the same two
+	// 401 bodies as ever, no fragment of the presented credential ever
+	// echoed, and — the fail-closed shape — a store outage denies the request
+	// instead of letting it through, with no upstream I/O either way.
+	token, ok := clientToken(r.Header)
 	if !ok {
 		outcome = "unauthorized"
-		reject(http.StatusUnauthorized, []byte(envelopeAuthMissing), nil)
+		reject(http.StatusUnauthorized, []byte(env.authMissing), nil)
 		return
 	}
 	principal, reason, aerr := h.auth.For(snap).Authenticate(r.Context(), token)
@@ -660,7 +709,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 	if reason != auth.ReasonOK {
 		outcome = "unauthorized"
-		reject(http.StatusUnauthorized, []byte(envelopeAuthInvalid), nil)
+		reject(http.StatusUnauthorized, []byte(env.authInvalid), nil)
 		return
 	}
 	if principal.PartnerID != "" || principal.KeyID != "" {
@@ -709,14 +758,14 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		switch {
 		case errors.As(err, &tooLarge):
 			outcome = "body_too_large"
-			reject(http.StatusRequestEntityTooLarge, []byte(envelopeTooLarge), nil)
+			reject(http.StatusRequestEntityTooLarge, []byte(env.tooLarge), nil)
 		case errors.Is(err, errBufferRefused):
 			outcome = "capacity_exceeded"
 			log.Warn().Str("public_model", publicModel).
 				Str("phase", "request_body").
 				Str("error_class", "capacity_exceeded").
 				Msg("buffer_capacity_exceeded")
-			reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+			reject(http.StatusServiceUnavailable, []byte(env.atCapacity), nil)
 		default:
 			// A body that stalled past the read deadline lands here beside a
 			// connection that died mid-body and a body net/http could not
@@ -725,7 +774,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			// failure's outcome rather than an outcome of its own. Nothing
 			// about the client's bytes is logged or echoed on any of them.
 			outcome = "body_read_error"
-			reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+			reject(http.StatusBadRequest, []byte(env.invalidReq), nil)
 		}
 		return
 	}
@@ -734,13 +783,25 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	model, stream, err := inject.Probe(body)
 	if err != nil {
 		outcome = "invalid_json"
-		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+		reject(http.StatusBadRequest, []byte(env.invalidReq), nil)
 		return
+	}
+	// A Claude client appends a "[1m]" context-window capability suffix to
+	// the model name. The capability travels on the Anthropic wire as a beta
+	// header, not as part of the id, so the name that reaches the model
+	// lookup must not carry it. Only the Messages surface ever presents such
+	// a name and only that surface strips: a chat client that literally
+	// configured a model named "…[1m]" still resolves it. The strip runs
+	// BEFORE publicModel is bound, so the lookup, the logs, the usage row,
+	// the 404 and the model echoed back to the client all agree on the name
+	// that resolved.
+	if api == apiMessages {
+		model, _ = inject.StripContextMarker(model)
 	}
 	publicModel = model
 	if model == "" {
 		outcome = "missing_model"
-		reject(http.StatusBadRequest, []byte(envelopeMissingMod), nil)
+		reject(http.StatusBadRequest, []byte(env.missingMod), nil)
 		return
 	}
 	log.Debug().Str("public_model", model).Bool("stream", stream).Msg("probe_completed")
@@ -748,7 +809,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	m, ok := snap.Model(model)
 	if !ok {
 		outcome = "model_not_found"
-		body, merr := modelNotFoundEnvelope(model)
+		body, merr := env.modelNotFound(model)
 		reject(http.StatusNotFound, body, merr)
 		return
 	}
@@ -1069,7 +1130,7 @@ walk:
 			out, terr := transform(body, m)
 			if terr != nil {
 				outcome = "transform_error"
-				reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+				reject(http.StatusBadRequest, []byte(env.invalidReq), nil)
 				return
 			}
 			log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
@@ -1092,7 +1153,7 @@ walk:
 					Str("error_class", "request_build").
 					Msg("upstream_request_build_failed")
 				outcome = "upstream_unreachable"
-				reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+				reject(http.StatusBadGateway, []byte(env.upUnreach), nil)
 				return
 			}
 			copyForwardHeaders(req.Header, r.Header)
@@ -1493,7 +1554,7 @@ walk:
 						Int("candidate_index", i+1).
 						Msg("upstream_request_build_failed")
 					outcome = "upstream_unreachable"
-					reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+					reject(http.StatusBadGateway, []byte(env.upUnreach), nil)
 					return
 				}
 				lastUerr = uerr
@@ -1889,7 +1950,7 @@ walk:
 					Int("candidate_index", i+1).
 					Int("upstream_status", status).
 					Msg("buffer_capacity_exceeded")
-				reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+				reject(http.StatusServiceUnavailable, []byte(env.atCapacity), nil)
 				return
 			}
 			if rerr != nil {
@@ -2147,7 +2208,7 @@ walk:
 			return
 		}
 		outcome = "upstream_unreachable"
-		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+		reject(http.StatusBadGateway, []byte(env.upUnreach), nil)
 		return
 	}
 	if answer.resp != nil {
@@ -2170,7 +2231,7 @@ walk:
 		default:
 			outcome = "upstream_read_failed"
 		}
-		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
+		reject(http.StatusBadGateway, []byte(env.upInvalid), nil)
 		return
 	}
 
@@ -2183,11 +2244,11 @@ walk:
 		// client answer: the upstream's own status, the operational
 		// headers from the relay allow-list, and a Content-Type that
 		// describes the body the client actually receives.
-		body, berr := answer.ev.envelopeBytes()
+		body, berr := env.upstreamErr(answer.ev)
 		if berr != nil {
 			// Unreachable for an all-string envelope, but the fallback must
 			// still be a canonical body — never raw upstream bytes.
-			body = []byte(envelopeUpInvalid)
+			body = []byte(env.upInvalid)
 		}
 		copyRelayHeaders(sw.Header(), answer.header)
 		sw.Header().Set(contentTypeHeader, envelopeJSONType)
@@ -2329,11 +2390,24 @@ walk:
 		var partial *partialText
 		var observe func(name, payload []byte)
 		buildCont := inject.BuildContinuationChat
-		if api == apiResponses {
+		switch api {
+		case apiResponses:
 			buildCont = inject.BuildContinuationResponses
+		case apiMessages:
+			buildCont = inject.BuildContinuationMessages
 		}
 		if contPolicy.Enabled {
-			partial = newPartialText(api, contPolicy.MaxPartialBytes)
+			// The accumulator observes PRE-translation upstream bytes, so a
+			// Messages request is accumulated as the chat stream it is —
+			// the client holds Anthropic events, but the prefix a
+			// continuation would be built from is the upstream's own
+			// dialect, and reading it as anything else would refuse an
+			// honest prefix as unparseable.
+			accumulatorAPI := api
+			if api == apiMessages {
+				accumulatorAPI = apiChat
+			}
+			partial = newPartialText(accumulatorAPI, contPolicy.MaxPartialBytes)
 			observe = partial.Observe
 		}
 
@@ -2359,9 +2433,29 @@ walk:
 		// twenty seconds in, on deployments that never asked for any of this.
 		// The disabled path therefore keeps the plain relay it has always had:
 		// no timer, no deadline, no window state.
+		// ONE selection point for the whole request, made where the relay is
+		// built rather than at each call site. The Messages surface is the
+		// only route that is not a passthrough: it re-emits an upstream Chat
+		// stream as Anthropic events, which the one-payload-in/one-payload-
+		// out seam cannot express. Both branches share the line caps, the
+		// boundary accounting and the terminal predicate, so what differs is
+		// only whose frames reach the client — and the OpenAI routes take
+		// byte-identical CopySSE.
+		//
+		// The translator is fresh per pass: a hop is a new upstream response
+		// announcing its own output, so it must start at message_start. Today
+		// there is exactly one pass — BuildContinuationMessages refuses — but
+		// constructing it here rather than outside keeps that invariant
+		// attached to the boundary it describes.
+		copyStream := func(w io.Writer, rd io.Reader) (StreamStats, error) {
+			if api == apiMessages {
+				return CopyMessagesSSE(w, rd, relayRewrite, inject.NewChatToMessagesStream(publicModel), progress, observe)
+			}
+			return CopySSE(w, rd, relayRewrite, progress, stripKeys, observe)
+		}
 		var window *recoveryWindow
 		relay := func(src io.ReadCloser) (StreamStats, error) {
-			return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
+			return copyStream(dst, src)
 		}
 		if contPolicy.Enabled {
 			window = newRecoveryWindow(retryClock, contPolicy.MaxElapsed)
@@ -2403,7 +2497,7 @@ walk:
 				}
 				stopWindow := window.armBody(src)
 				defer stopWindow()
-				return CopySSE(dst, upstreamProgressReader{Reader: src, progress: relayProgress}, relayRewrite, progress, stripKeys, observe)
+				return copyStream(dst, upstreamProgressReader{Reader: src, progress: relayProgress})
 			}
 		}
 		stats, err := relay(answer.resp.Body)
@@ -2934,6 +3028,25 @@ walk:
 		usageCapture.Observe(answer.body)
 	}
 	rewritten := rewriteOut(answer.body)
+	// The Messages surface holds an Anthropic client, so the Chat-shaped
+	// bytes the pipeline just produced are translated one last time before
+	// anything reaches the wire. This happens BEFORE any header write: a
+	// body this translation cannot read is the same unusable-upstream 502
+	// the walk answers an unparseable 200 with, and answering it early keeps
+	// the client from ever seeing a partial Chat-shaped reply under an
+	// Anthropic status line.
+	if api == apiMessages {
+		translated, ok := inject.ChatToMessages(rewritten, publicModel)
+		if !ok {
+			outcome = "upstream_invalid_response"
+			log.Warn().Str("public_model", model).
+				Str("error_class", "upstream_invalid_response").
+				Msg("upstream_invalid_response")
+			reject(http.StatusBadGateway, []byte(env.upInvalid), nil)
+			return
+		}
+		rewritten = translated
+	}
 	log.Debug().Int64("bytes_out", int64(len(rewritten))).Msg("response_transform_completed")
 	copyRelayHeaders(sw.Header(), answer.header)
 	setRequestID(sw.Header(), requestID)
@@ -3270,6 +3383,31 @@ func bearerToken(header string) (string, bool) {
 	return token, true
 }
 
+// clientToken resolves the credential a request presents, accepting either
+// of the two spellings the served dialects use: Authorization: Bearer (Chat
+// Completions, Responses) or x-api-key (Anthropic Messages). The bearer wins
+// when both appear, so a client that sends both authenticates with its
+// bearer credential and a client that sends only x-api-key — the way an
+// Anthropic client with ANTHROPIC_API_KEY does — authenticates with that. A
+// malformed bearer falls through to the x-api-key rather than short-circuiting
+// the request: either header alone is sufficient to authenticate.
+//
+// Both candidates go through the same validBearerToken gate — the same 4 KiB
+// cap, the same character class, no new validation vocabulary — so nothing
+// that could not legally ride in an Authorization header can ride here
+// either. Neither header's text is echoed or logged, and neither is on the
+// forward allow-list, so neither ever reaches an upstream.
+func clientToken(h http.Header) (string, bool) {
+	if token, ok := bearerToken(h.Get("Authorization")); ok {
+		return token, true
+	}
+	token := strings.Trim(h.Get("X-API-Key"), " ")
+	if !validBearerToken(token) {
+		return "", false
+	}
+	return token, true
+}
+
 // maxBearerTokenBytes bounds the credential material held per request. The
 // same cap on the config plane makes constant-time comparison practical.
 const maxBearerTokenBytes = 4 << 10
@@ -3500,7 +3638,7 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 		complete()
 	}
 
-	token, ok := bearerToken(r.Header.Get("Authorization"))
+	token, ok := clientToken(r.Header)
 	if !ok {
 		outcome = "unauthorized"
 		reject(http.StatusUnauthorized, envelopeAuthMissing)

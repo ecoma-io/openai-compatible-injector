@@ -268,3 +268,100 @@ func TestCopySSETerminalIsForwardedOnceAndLaterBytesStillRelay(t *testing.T) {
 		t.Fatalf("the marker was duplicated or lost: %d occurrences in %q", n, out)
 	}
 }
+
+// TestCopySSEMessagesTerminalIsTheMessageStopEvent pins the third marker:
+// the Anthropic surface's `event: message_stop`, which CopyMessagesSSE
+// synthesizes. It is recognized at the EVENT line, like the Responses
+// marker, because that is the line the frame builder writes first and the
+// line the keep-alive latches on.
+func TestCopySSEMessagesTerminalIsTheMessageStopEvent(t *testing.T) {
+	stats, out, err := copySSEStatsFor(t, sseRewriter("public"), "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	if err != nil {
+		t.Fatalf("CopySSE: %v", err)
+	}
+	if !stats.Terminal {
+		t.Fatal("a message_stop event did not set Terminal")
+	}
+	if out != "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n" {
+		t.Fatalf("relayed bytes changed: %q", out)
+	}
+
+	// The data payload naming the type — a shape a client string or a
+	// provider decoration could carry — is not the event.
+	stats, _, err = copySSEStatsFor(t, sseRewriter("public"), "data: {\"type\":\"message_stop\"}\n\n")
+	if err != nil {
+		t.Fatalf("CopySSE: %v", err)
+	}
+	if stats.Terminal {
+		t.Fatal("a data payload naming message_stop was accepted as the terminal event")
+	}
+}
+
+// TestCopySSEMessagesTerminalNearMissesDoNotTerminate pins message_stop's
+// exact-match rule from the near side: everything below is one byte — or one
+// field — away from the marker, and none of them is it. Note that
+// `event:message_stop` without the separator space is a VALID event name to
+// the SSE parser and is still not a terminal: the predicate matches the
+// exact bytes the frame builder writes, and the parser's tolerance is a
+// separate question.
+func TestCopySSEMessagesTerminalNearMissesDoNotTerminate(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"trailing space", "event: message_stop \n\n"},
+		{"trailing tab", "event: message_stop\t\n\n"},
+		{"no separator space", "event:message_stop\n\n"},
+		{"two separator spaces", "event:  message_stop\n\n"},
+		{"lower case", "event: Message_Stop\n\n"},
+		{"prefixed", "event: xmessage_stop\n\n"},
+		{"suffixed", "event: message_stop_suffix\n\n"},
+		{"hyphenated", "event: message-stop\n\n"},
+		{"in a comment", ": event: message_stop\n\n"},
+		{"in a data payload", "data: event: message_stop\n\n"},
+		{"as an id line", "id: message_stop\n\n"},
+		{"torn final event line", "event: message_sto"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stats, out, err := copySSEStatsFor(t, sseRewriter("public"), tc.input)
+			if err != nil {
+				t.Fatalf("CopySSE: %v", err)
+			}
+			if out != tc.input {
+				t.Fatalf("relayed bytes changed: %q", out)
+			}
+			if stats.Terminal {
+				t.Fatalf("near-miss %q was accepted as a terminal marker", tc.input)
+			}
+		})
+	}
+}
+
+// TestCopySSEMessagesTerminalWithEveryLineEnding pins the positive controls
+// the near-miss table must not be confused with: a complete message_stop
+// terminates under LF, CR, CRLF, and with no terminator at all.
+func TestCopySSEMessagesTerminalWithEveryLineEnding(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{"LF", "event: message_stop\n"},
+		{"CR", "event: message_stop\r"},
+		{"CRLF", "event: message_stop\r\n"},
+		{"unterminated EOF", "event: message_stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stats, out, err := copySSEStatsFor(t, sseRewriter("public"), tc.input)
+			if err != nil {
+				t.Fatalf("CopySSE: %v", err)
+			}
+			if !stats.Terminal {
+				t.Fatalf("a complete marker under this ending was missed: %q", tc.input)
+			}
+			if out != tc.input {
+				t.Fatalf("marker bytes were rewritten: got %q want %q", out, tc.input)
+			}
+		})
+	}
+}

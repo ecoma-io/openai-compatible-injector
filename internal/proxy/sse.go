@@ -365,14 +365,14 @@ func readBoundedLine(br *bufio.Reader) ([]byte, error) {
 type StreamStats struct {
 	Bytes  int64
 	Events int
-	// Terminal reports that one of the two terminal markers reached the
-	// client: chat's `data: [DONE]`, responses' `event: response.completed`.
-	// It is the fact that separates a stream that ENDED from a stream that
-	// was CUT — CopySSE maps io.EOF to a nil error in both cases (an
-	// upstream that closes a finished stream and one that closes a dying
-	// generation look identical on the wire), so the caller cannot tell them
-	// apart from the error alone. Once set it stays set: a stream cannot
-	// un-terminate.
+	// Terminal reports that one of the terminal markers reached the client:
+	// chat's `data: [DONE]`, responses' `event: response.completed`, or the
+	// Anthropic surface's `event: message_stop`. It is the fact that
+	// separates a stream that ENDED from a stream that was CUT — the relay
+	// maps io.EOF to a nil error in both cases (an upstream that closes a
+	// finished stream and one that closes a dying generation look identical
+	// on the wire), so the caller cannot tell them apart from the error
+	// alone. Once set it stays set: a stream cannot un-terminate.
 	Terminal bool
 }
 
@@ -385,21 +385,29 @@ type streamWriteError struct{ err error }
 func (e *streamWriteError) Error() string { return "writing SSE stream to client: " + e.err.Error() }
 func (e *streamWriteError) Unwrap() error { return e.err }
 
-// isTerminalSSELine reports the two terminal markers this proxy serves.
-// Chat's terminal payload is literally [DONE]. Responses identifies the
-// terminal envelope with its event name; recognizing it at the event line
-// (rather than waiting for its data line or EOF) makes the guarantee
-// stronger: no comment can appear in the middle of, or after, the terminal
-// event, and the relay can report a terminated stream without waiting for
-// the read that follows it.
+// isTerminalSSELine reports the three terminal markers this proxy serves.
+// Chat's terminal payload is literally [DONE]. Responses identifies its
+// terminal envelope with an event name, and the Anthropic Messages surface
+// identifies its own — `event: message_stop`, which CopyMessagesSSE
+// synthesizes rather than forwards; recognizing it at the event line (rather
+// than waiting for its data line or EOF) makes the guarantee stronger: no
+// comment can appear in the middle of, or after, the terminal event, and the
+// relay can report a terminated stream without waiting for the read that
+// follows it.
 //
-// It lives beside CopySSE rather than beside the heartbeat that first needed
-// it, because the relay is where the fact is RECORDED (StreamStats.Terminal)
-// and the heartbeat is only where it was first USED — the predicate is a
-// property of the wire, not of keep-alive. The bytes are never touched.
+// Three consumers read it off the SAME bytes, so adding a marker here is all
+// it takes for them to agree: StreamStats.Terminal in the relay, the
+// keep-alive's pingWriter.Write latching `finished` so no ping follows the
+// terminal, and the continuation gate that decides whether a marker-less
+// stream is a truncation. It lives beside CopySSE rather than beside the
+// heartbeat that first needed it because the relay is where the fact is
+// RECORDED and the heartbeat is only where it was first USED — the predicate
+// is a property of the wire, not of keep-alive. The bytes are never touched.
 func isTerminalSSELine(b []byte) bool {
 	content, _ := splitSSELineTerminator(b)
-	return bytes.Equal(content, []byte("data: [DONE]")) || bytes.Equal(content, []byte("event: response.completed"))
+	return bytes.Equal(content, []byte("data: [DONE]")) ||
+		bytes.Equal(content, []byte("event: response.completed")) ||
+		bytes.Equal(content, []byte("event: message_stop"))
 }
 
 // isEventBoundary reports whether the raw line (terminator included) is a
