@@ -2433,9 +2433,29 @@ walk:
 		// twenty seconds in, on deployments that never asked for any of this.
 		// The disabled path therefore keeps the plain relay it has always had:
 		// no timer, no deadline, no window state.
+		// ONE selection point for the whole request, made where the relay is
+		// built rather than at each call site. The Messages surface is the
+		// only route that is not a passthrough: it re-emits an upstream Chat
+		// stream as Anthropic events, which the one-payload-in/one-payload-
+		// out seam cannot express. Both branches share the line caps, the
+		// boundary accounting and the terminal predicate, so what differs is
+		// only whose frames reach the client — and the OpenAI routes take
+		// byte-identical CopySSE.
+		//
+		// The translator is fresh per pass: a hop is a new upstream response
+		// announcing its own output, so it must start at message_start. Today
+		// there is exactly one pass — BuildContinuationMessages refuses — but
+		// constructing it here rather than outside keeps that invariant
+		// attached to the boundary it describes.
+		copyStream := func(w io.Writer, rd io.Reader) (StreamStats, error) {
+			if api == apiMessages {
+				return CopyMessagesSSE(w, rd, relayRewrite, inject.NewChatToMessagesStream(publicModel), progress, observe)
+			}
+			return CopySSE(w, rd, relayRewrite, progress, stripKeys, observe)
+		}
 		var window *recoveryWindow
 		relay := func(src io.ReadCloser) (StreamStats, error) {
-			return CopySSE(dst, src, relayRewrite, progress, stripKeys, observe)
+			return copyStream(dst, src)
 		}
 		if contPolicy.Enabled {
 			window = newRecoveryWindow(retryClock, contPolicy.MaxElapsed)
@@ -2477,7 +2497,7 @@ walk:
 				}
 				stopWindow := window.armBody(src)
 				defer stopWindow()
-				return CopySSE(dst, upstreamProgressReader{Reader: src, progress: relayProgress}, relayRewrite, progress, stripKeys, observe)
+				return copyStream(dst, upstreamProgressReader{Reader: src, progress: relayProgress})
 			}
 		}
 		stats, err := relay(answer.resp.Body)

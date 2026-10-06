@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"openai-compatible-injector/internal/config"
+	"openai-compatible-injector/internal/inject"
 )
 
 // newKeepAliveStore builds a store for the "test-model" mapping plus a
@@ -432,4 +433,62 @@ func TestSSEKeepAliveResponsesPath(t *testing.T) {
 	if got := strings.ReplaceAll(body, string(ssePing), ""); got != want {
 		t.Fatalf("responses body with pings stripped =\n%q\nwant\n%q", got, want)
 	}
+}
+
+// TestPingWriterStopsOnMessageStop drives the WHOLE chain the "no ping after
+// message_stop" rule rests on: CopyMessagesSSE writes its synthesized frames
+// into the pingWriter, one line per Write, and the `event: message_stop` line
+// — written BEFORE the blank line that dispatches it — must latch `finished`
+// on its own. A ticker that acquires the mutex in the window between that
+// write and the relay's return must find eligibility already closed.
+//
+// The negative control is the same relay over a truncated stream: no terminal
+// was earned, so the heartbeat still fires. Without it, a writer broken in a
+// way that suppresses every ping would pass the positive assertion too.
+func TestPingWriterStopsOnMessageStop(t *testing.T) {
+	const interval = 10 * time.Millisecond
+	base := time.Now()
+
+	relay := func(t *testing.T, stream string) (*pingWriter, *syncBuffer) {
+		t.Helper()
+		var buf syncBuffer
+		p := newPingWriter(&buf, func() {}, interval, base)
+		if _, err := CopyMessagesSSE(p, strings.NewReader(stream), sseRewriter("test-model"),
+			inject.NewChatToMessagesStream("test-model"), p.Flush, nil); err != nil {
+			t.Fatalf("CopyMessagesSSE: %v", err)
+		}
+		return p, &buf
+	}
+
+	truncated := "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n"
+
+	t.Run("terminal suppresses the ping", func(t *testing.T) {
+		p, buf := relay(t, upstreamChatStream)
+		if countPings(buf.String()) != 0 {
+			t.Fatalf("the relay itself wrote a ping: %q", buf.String())
+		}
+		if !p.maybePing(base.Add(time.Hour)) {
+			t.Fatal("maybePing reported the client gone on a healthy writer")
+		}
+		if got := countPings(buf.String()); got != 0 {
+			t.Fatalf("a ping followed message_stop: %d (body %q)", got, buf.String())
+		}
+		// A fresh, much later clock cannot revive eligibility.
+		if !p.maybePing(base.Add(24 * time.Hour)) {
+			t.Fatal("maybePing reported the client gone on a healthy writer")
+		}
+		if got := countPings(buf.String()); got != 0 {
+			t.Fatalf("a second ping followed message_stop: %d", got)
+		}
+	})
+
+	t.Run("an unearned terminal still allows the ping", func(t *testing.T) {
+		p, buf := relay(t, truncated)
+		if !p.maybePing(base.Add(time.Hour)) {
+			t.Fatal("maybePing reported the client gone on a healthy writer")
+		}
+		if got := countPings(buf.String()); got != 1 {
+			t.Fatalf("pings = %d, want 1 (the truncated stream never reached message_stop)", got)
+		}
+	})
 }
