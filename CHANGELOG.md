@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.15.1...v0.16.0) (2026-10-06)
+
+
+### Features
+
+* **config:** support multiple client api keys (backward compatible) ([#128](https://github.com/ecoma-io/openai-compatible-injector/issues/128)) ([44c4bb1](https://github.com/ecoma-io/openai-compatible-injector/commit/44c4bb1ab8c38cbecee1269f142930b731a6d5c7))
+* **proxy:** support anthropic messages surface (/v1/messages) ([#130](https://github.com/ecoma-io/openai-compatible-injector/issues/130)) ([31b6533](https://github.com/ecoma-io/openai-compatible-injector/commit/31b6533539ee25aa5ba9a7de109e4b8be9fbb80f))
+
 ## [0.15.1](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.15.0...v0.15.1) (2026-09-30)
 
 
