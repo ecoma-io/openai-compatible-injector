@@ -31,7 +31,7 @@ func FuzzLoadRuntime(f *testing.F) {
 		"bananas: true\n" + validRuntime(),  // unknown top-level key
 		// keyless variant of the baseline: the required-key reject
 		strings.Replace(validRuntime(), "api-key: unit-test-key\n", "", 1),
-		"api-key: [not, a, string]\n" + strings.TrimPrefix(validRuntime(), "\n"),                                           // wrong type in the key position
+		"api-key: [{a: b}]\n" + strings.TrimPrefix(validRuntime(), "\n"),                                                   // wrong type in the key position
 		"api-key: \"  \"\n" + strings.TrimPrefix(strings.Replace(validRuntime(), "api-key: unit-test-key\n", "", 1), "\n"), // whitespace-only key
 		`api-key: k
 models:
@@ -200,7 +200,7 @@ models:
 		if s == nil {
 			t.Fatal("LoadRuntime returned a nil snapshot with a nil error")
 		}
-		if s.APIKey() == "" {
+		if len(s.APIKeys()) == 0 {
 			t.Fatal("accepted a snapshot without a client api-key")
 		}
 		_ = s.Gen()

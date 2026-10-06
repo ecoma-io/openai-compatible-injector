@@ -107,13 +107,16 @@ func decodeConfigError(err error) error {
 
 type runtimeFile struct {
 	Models map[string]runtimeModel `yaml:"models"`
-	// APIKey mirrors the required top-level api-key — the bearer credential
-	// clients must present on both /v1 routes. Absent, null, or
+	// APIKeys mirrors the required top-level api-key — the bearer credential
+	// (or credentials) clients must present on both /v1 routes. It accepts
+	// either one scalar or a list, so a deployment that issued a second key
+	// does not have to invent a second file: the single-key spelling every
+	// existing file uses keeps working unchanged. Absent, null, or
 	// whitespace-only rejects the whole file, so the front door is closed by
-	// default and a bad rewrite cannot silently reopen it on reload. The
-	// value is credential material: it never reaches any log event or error
+	// default and a bad rewrite cannot silently reopen it on reload. Every
+	// value is credential material: none ever reaches any log event or error
 	// text.
-	APIKey string `yaml:"api-key"`
+	APIKeys runtimeAPIKeys `yaml:"api-key"`
 	// LogLevel mirrors the optional top-level log-level key — the same
 	// flat spelling the org's other Go services use, with no nested
 	// section. Absent or null selects the default; the value itself is
@@ -208,6 +211,35 @@ var poolMemberFields = map[string]struct{}{
 	"max-concurrency": {},
 	"streaming":       {},
 	"weight":          {},
+}
+
+// runtimeAPIKeys is the top-level api-key in its allowed shapes (scalar or
+// sequence). Both spellings decode through the same type to preserve
+// backward compatibility without forcing a schema migration.
+type runtimeAPIKeys []string
+
+// UnmarshalYAML accepts the scalar spelling or the sequence spelling. Value-type
+// failures return *yaml.TypeError so they are redacted to line numbers; structural
+// rejections return fixed text literals.
+func (ks *runtimeAPIKeys) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		var v string
+		if err := value.Decode(&v); err != nil {
+			return err
+		}
+		k := strings.Trim(v, " ")
+		*ks = runtimeAPIKeys{k}
+		return nil
+	}
+	if value.Kind != yaml.SequenceNode {
+		return errors.New("api-key: must be a string or a list of strings")
+	}
+	var keys []string
+	if err := value.Decode(&keys); err != nil {
+		return err
+	}
+	*ks = runtimeAPIKeys(keys)
+	return nil
 }
 
 // UnmarshalYAML accepts the bare-reference scalar or the strict mapping.
@@ -486,16 +518,27 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 	// The client API key is required — fail-closed. A file without one never
 	// becomes a snapshot: first boot refuses to start and a keyless rewrite
 	// lands on the last-known-good path instead of reopening the front door.
-	// A space-only value is the same as absent. Outer spaces are normalized, but
-	// every other character must form an RFC 6750 bearer token, or clients could
-	// not present it legally. The value is never named in the error: error text
-	// reaches logs verbatim.
-	key := strings.Trim(rf.APIKey, " ")
-	if key == "" {
+	// A space-only value is the same as absent; empty elements in a list are
+	// treated the same. Outer spaces are normalized per element, but every
+	// element must form an RFC 6750 bearer token, or clients could not present
+	// it legally. The values are never named in the error: error text reaches
+	// logs verbatim.
+	keys := rf.APIKeys
+	if len(keys) == 0 {
 		return nil, errors.New("api-key is required")
 	}
-	if !validBearerToken(key) {
-		return nil, errors.New("api-key must be a valid bearer token")
+	seenKey := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		if k == "" {
+			return nil, errors.New("api-key is required")
+		}
+		if !validBearerToken(k) {
+			return nil, errors.New("api-key must be a valid bearer token")
+		}
+		if _, dup := seenKey[k]; dup {
+			return nil, errors.New("api-key must not contain duplicate values")
+		}
+		seenKey[k] = struct{}{}
 	}
 
 	level, err := ParseLogLevel(rf.LogLevel)
@@ -568,7 +611,7 @@ func LoadRuntime(data []byte) (*Snapshot, error) {
 
 	return &Snapshot{
 		models:      models,
-		apiKey:      key,
+		apiKeys:     append([]string(nil), keys...),
 		logLevel:    level,
 		keepAlive:   keepAlive,
 		transports:  transportSet,

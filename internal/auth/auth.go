@@ -94,14 +94,14 @@ type StaticProvider struct{}
 
 // For returns the snapshot-bound authenticator.
 func (StaticProvider) For(snap *config.Snapshot) Authenticator {
-	return staticAuthenticator{configured: snap.APIKey()}
+	return staticAuthenticator{configured: snap.APIKeys()}
 }
 
-// staticAuthenticator compares the presented token against one configured
+// staticAuthenticator compares the presented token against any configured
 // key. The comparison is constant-time: both byte slices are padded to the
 // same fixed cap so the comparison exposes neither a mismatch position nor
 // the configured key's length.
-type staticAuthenticator struct{ configured string }
+type staticAuthenticator struct{ configured []string }
 
 // maxTokenBytes bounds the credential material held per comparison. The
 // permitted b64token syntax bounds real tokens far below this; the cap
@@ -112,7 +112,13 @@ const maxTokenBytes = 4 << 10
 // Authenticate implements Authenticator. The context is accepted for seam
 // parity; the static comparison does no I/O and cannot be cancelled.
 func (a staticAuthenticator) Authenticate(_ context.Context, token string) (Principal, Reason, error) {
-	if tokenMatches(token, a.configured) {
+	matched := byte(0)
+	for _, k := range a.configured {
+		if tokenMatches(token, k) {
+			matched |= 1
+		}
+	}
+	if matched == 1 {
 		// The zero Principal is the shared identity: static mode has no
 		// per-caller attribution to report.
 		return Principal{}, ReasonOK, nil
