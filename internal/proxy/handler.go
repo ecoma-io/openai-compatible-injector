@@ -374,6 +374,12 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// snapshot is loaded, no goroutine starts, nothing is dialed.
 	requestID := newRequestID()
 	log := h.log.With().Str("request_id", requestID).Str("api", api).Logger()
+	// The error dialect is a property of the surface, not of the failure, so
+	// it is resolved once here — BEFORE the method check below. That ordering
+	// is what keeps 405-before-401 honest for every route: a wrong method is
+	// answered in the client's own dialect without ever reaching the auth
+	// gate, and the 401 that follows a right method is answered the same way.
+	env := dialectFor(api)
 	if r.Method != http.MethodPost {
 		// Outside the request lifecycle: no snapshot is loaded and no
 		// generation exists to bind, and a wrong method is a client bug
@@ -384,7 +390,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		// Outside the request lifecycle — nothing below can observe or
 		// report a failed write, so the error has nowhere to land.
 		setRequestID(w.Header(), requestID)
-		_ = writeEnvelope(w, http.StatusMethodNotAllowed, envelopeBadMethod)
+		_ = writeEnvelope(w, http.StatusMethodNotAllowed, env.badMethod)
 		return
 	}
 
@@ -625,7 +631,15 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	// disconnect rather than the classification, however certain the local
 	// decision was. The envelope's own cause still shows in the status and,
 	// on the failure, in the WARN.
+	//
+	// The marshaling failure below is unreachable for the all-string bodies
+	// this closure is handed, but the fallback must still answer in THIS
+	// route's dialect — a fixed OpenAI body on a Messages request would be
+	// the one envelope on the surface that lied about its shape.
 	reject := func(status int, b []byte, err error) {
+		if err != nil {
+			b, err = []byte(env.invalidReq), nil
+		}
 		setRequestID(sw.Header(), requestID)
 		if werr := writeEnvelopeErr(sw, status, b, err); werr != nil {
 			outcome = "client_disconnected"
@@ -647,7 +661,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	token, ok := clientToken(r.Header)
 	if !ok {
 		outcome = "unauthorized"
-		reject(http.StatusUnauthorized, []byte(envelopeAuthMissing), nil)
+		reject(http.StatusUnauthorized, []byte(env.authMissing), nil)
 		return
 	}
 	principal, reason, aerr := h.auth.For(snap).Authenticate(r.Context(), token)
@@ -660,7 +674,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	}
 	if reason != auth.ReasonOK {
 		outcome = "unauthorized"
-		reject(http.StatusUnauthorized, []byte(envelopeAuthInvalid), nil)
+		reject(http.StatusUnauthorized, []byte(env.authInvalid), nil)
 		return
 	}
 	if principal.PartnerID != "" || principal.KeyID != "" {
@@ -709,14 +723,14 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		switch {
 		case errors.As(err, &tooLarge):
 			outcome = "body_too_large"
-			reject(http.StatusRequestEntityTooLarge, []byte(envelopeTooLarge), nil)
+			reject(http.StatusRequestEntityTooLarge, []byte(env.tooLarge), nil)
 		case errors.Is(err, errBufferRefused):
 			outcome = "capacity_exceeded"
 			log.Warn().Str("public_model", publicModel).
 				Str("phase", "request_body").
 				Str("error_class", "capacity_exceeded").
 				Msg("buffer_capacity_exceeded")
-			reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+			reject(http.StatusServiceUnavailable, []byte(env.atCapacity), nil)
 		default:
 			// A body that stalled past the read deadline lands here beside a
 			// connection that died mid-body and a body net/http could not
@@ -725,7 +739,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 			// failure's outcome rather than an outcome of its own. Nothing
 			// about the client's bytes is logged or echoed on any of them.
 			outcome = "body_read_error"
-			reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+			reject(http.StatusBadRequest, []byte(env.invalidReq), nil)
 		}
 		return
 	}
@@ -734,13 +748,13 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	model, stream, err := inject.Probe(body)
 	if err != nil {
 		outcome = "invalid_json"
-		reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+		reject(http.StatusBadRequest, []byte(env.invalidReq), nil)
 		return
 	}
 	publicModel = model
 	if model == "" {
 		outcome = "missing_model"
-		reject(http.StatusBadRequest, []byte(envelopeMissingMod), nil)
+		reject(http.StatusBadRequest, []byte(env.missingMod), nil)
 		return
 	}
 	log.Debug().Str("public_model", model).Bool("stream", stream).Msg("probe_completed")
@@ -748,7 +762,7 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 	m, ok := snap.Model(model)
 	if !ok {
 		outcome = "model_not_found"
-		body, merr := modelNotFoundEnvelope(model)
+		body, merr := env.modelNotFound(model)
 		reject(http.StatusNotFound, body, merr)
 		return
 	}
@@ -1069,7 +1083,7 @@ walk:
 			out, terr := transform(body, m)
 			if terr != nil {
 				outcome = "transform_error"
-				reject(http.StatusBadRequest, []byte(envelopeInvalidReq), nil)
+				reject(http.StatusBadRequest, []byte(env.invalidReq), nil)
 				return
 			}
 			log.Debug().Int64("bytes_out", int64(len(out))).Msg("request_transform_completed")
@@ -1092,7 +1106,7 @@ walk:
 					Str("error_class", "request_build").
 					Msg("upstream_request_build_failed")
 				outcome = "upstream_unreachable"
-				reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+				reject(http.StatusBadGateway, []byte(env.upUnreach), nil)
 				return
 			}
 			copyForwardHeaders(req.Header, r.Header)
@@ -1493,7 +1507,7 @@ walk:
 						Int("candidate_index", i+1).
 						Msg("upstream_request_build_failed")
 					outcome = "upstream_unreachable"
-					reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+					reject(http.StatusBadGateway, []byte(env.upUnreach), nil)
 					return
 				}
 				lastUerr = uerr
@@ -1889,7 +1903,7 @@ walk:
 					Int("candidate_index", i+1).
 					Int("upstream_status", status).
 					Msg("buffer_capacity_exceeded")
-				reject(http.StatusServiceUnavailable, []byte(envelopeAtCapacity), nil)
+				reject(http.StatusServiceUnavailable, []byte(env.atCapacity), nil)
 				return
 			}
 			if rerr != nil {
@@ -2147,7 +2161,7 @@ walk:
 			return
 		}
 		outcome = "upstream_unreachable"
-		reject(http.StatusBadGateway, []byte(envelopeUpUnreach), nil)
+		reject(http.StatusBadGateway, []byte(env.upUnreach), nil)
 		return
 	}
 	if answer.resp != nil {
@@ -2170,7 +2184,7 @@ walk:
 		default:
 			outcome = "upstream_read_failed"
 		}
-		reject(http.StatusBadGateway, []byte(envelopeUpInvalid), nil)
+		reject(http.StatusBadGateway, []byte(env.upInvalid), nil)
 		return
 	}
 
@@ -2183,11 +2197,11 @@ walk:
 		// client answer: the upstream's own status, the operational
 		// headers from the relay allow-list, and a Content-Type that
 		// describes the body the client actually receives.
-		body, berr := answer.ev.envelopeBytes()
+		body, berr := env.upstreamErr(answer.ev)
 		if berr != nil {
 			// Unreachable for an all-string envelope, but the fallback must
 			// still be a canonical body — never raw upstream bytes.
-			body = []byte(envelopeUpInvalid)
+			body = []byte(env.upInvalid)
 		}
 		copyRelayHeaders(sw.Header(), answer.header)
 		sw.Header().Set(contentTypeHeader, envelopeJSONType)

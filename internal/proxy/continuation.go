@@ -5,13 +5,19 @@ import (
 	"encoding/json"
 )
 
-// The two API surfaces, spelled exactly as serve binds them to the request
+// The API surfaces, spelled exactly as serve binds them to the request
 // logger and to usage.NewCapture. A continuation is API-scoped the same way
-// the response rewrites are: the two surfaces stream different envelopes, and
-// one accumulator cannot read both.
+// the response rewrites are: the surfaces stream different envelopes, and one
+// accumulator cannot read all of them.
+//
+// apiMessages is the Anthropic Messages surface. Its upstream traffic is
+// Chat Completions — it translates on the way in and on the way out — so the
+// accumulator that observes its stream reads the chat dialect and the
+// continuation builder it selects refuses rather than re-asking.
 const (
 	apiChat      = "chat"
 	apiResponses = "responses"
+	apiMessages  = "messages"
 )
 
 // The closed set of reasons a committed stream cannot be continued, plus the
