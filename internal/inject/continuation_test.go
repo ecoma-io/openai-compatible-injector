@@ -416,10 +416,11 @@ func TestContinuationInstructionIsFixed(t *testing.T) {
 	}
 }
 
-// TestBuildContinuationIsIdempotentInItsInputs: neither builder mutates the
-// body it was handed. The original bytes are replayed through the candidate's
+// TestBuildContinuationIsIdempotentInItsInputs: no builder mutates the body
+// it was handed. The original bytes are replayed through the candidate's
 // transform on every attempt, and a builder that edited them in place would
-// corrupt the retry path it is not part of.
+// corrupt the retry path it is not part of. The Messages builder refuses,
+// so it is covered by never looking at its input at all.
 func TestBuildContinuationIsIdempotentInItsInputs(t *testing.T) {
 	chat := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 	chatCopy := append([]byte(nil), chat...)
@@ -437,5 +438,57 @@ func TestBuildContinuationIsIdempotentInItsInputs(t *testing.T) {
 	}
 	if !bytes.Equal(responses, responsesCopy) {
 		t.Fatalf("the responses builder mutated its input: %s", responses)
+	}
+
+	messages := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	messagesCopy := append([]byte(nil), messages...)
+	_, err := BuildContinuationMessages(messages, "prefix")
+	if err == nil {
+		t.Fatal("the messages builder accepted a body it must refuse")
+	}
+	if !bytes.Equal(messages, messagesCopy) {
+		t.Fatalf("the messages builder mutated its input: %s", messages)
+	}
+}
+
+// TestBuildContinuationMessagesAlwaysRefuses: post-commitment recovery is
+// deferred on the Messages surface, and the deferral is this builder — a
+// typed refusal rather than a missing branch at the call site. Whatever the
+// body and whatever the prefix, the answer is the same closed-set token, so
+// the caller can log it and dial nothing.
+//
+// The token is unsupported_shape rather than no_op: nothing is refused for
+// being a duplicate of the last attempt, the surface's continuation simply
+// cannot be expressed without guessing across two dialects.
+func TestBuildContinuationMessagesAlwaysRefuses(t *testing.T) {
+	bodies := []string{
+		`{"messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"partial"}]}]}`,
+		`not json`,
+		`[]`,
+		``,
+	}
+	for _, body := range bodies {
+		for _, prefix := range []string{"", "partial text", "x"} {
+			_, err := BuildContinuationMessages([]byte(body), prefix)
+			if got := refusalReason(t, err); got != refusalUnsupportedShape {
+				t.Errorf("body %q prefix %q: reason = %q, want %q", body, prefix, got, refusalUnsupportedShape)
+			}
+		}
+	}
+}
+
+// TestBuildContinuationMessagesRefusalEchoesNothing: the token is the whole
+// message. The builder is handed the client body AND the observed prefix —
+// the two things that must never reach a log line — and returns neither.
+func TestBuildContinuationMessagesRefusalEchoesNothing(t *testing.T) {
+	const secret = "SECRET-CLIENT-BODY-CONTENT"
+	body := `{"messages":[{"role":"assistant","content":[{"type":"text","text":"` + secret + `"}]}]}`
+	_, err := BuildContinuationMessages([]byte(body), secret)
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	if bytes.Contains([]byte(err.Error()), []byte(secret)) {
+		t.Fatalf("the refusal error quotes request content: %v", err)
 	}
 }
