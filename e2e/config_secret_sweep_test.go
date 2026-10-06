@@ -77,9 +77,9 @@ func rejectedYAML(i int) string {
 		return "models:\n  m:\n    endpoint: \"" + secretSchemePaste + ":x\"\n    upstream-model: up\n"
 	case 11: // secret model name where a model entry value belongs (type error)
 		return "models:\n  m: " + secretModelName + "\n"
-	case 12: // secret-valued api-key as a list (type error; the yaml type
-		// message names the type, never the value)
-		return "api-key: [" + secretAPIKey + ", x]\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\n"
+	case 12: // api-key sequence element wrong type (mapping) — still type error
+		// message names the type, never the value
+		return "api-key: [{a: b}]\nmodels:\n  m:\n    endpoint: http://127.0.0.1:1/v1\n    upstream-model: up\n"
 	case 13: // real secret-valued api-key on a file rejected for another
 		// reason (bad endpoint scheme): the rejection names the model ordinal,
 		// never the key

@@ -184,8 +184,8 @@ type Snapshot struct {
 	// apiKey is the client bearer credential this snapshot requires. It is
 	// credential material: compared per request, never logged, never echoed
 	// in error text.
-	apiKey string
-	models map[string]Model
+	apiKeys []string
+	models  map[string]Model
 	// transports is the distinct set of outbound transport configs the
 	// models reference — the retain set the transport registry reconciles
 	// to on publish. Every chain candidate's transport is part of the set,
@@ -210,11 +210,12 @@ func (s *Snapshot) Gen() uint64 { return s.gen }
 // hot-reloadable through the same content-hash poll as everything else.
 func (s *Snapshot) LogLevel() zerolog.Level { return s.logLevel }
 
-// APIKey returns the client bearer key this snapshot requires. It is read
-// per request, so a reload rotates the key for subsequent requests only —
-// an in-flight request stays bound to the snapshot it authenticated
-// against. It is never logged.
-func (s *Snapshot) APIKey() string { return s.apiKey }
+// APIKeys returns the client bearer keys this snapshot requires. It is
+// read per request, so a reload rotates the keys for subsequent requests
+// only — an in-flight request stays bound to the snapshot it authenticated
+// against. It must not be retained or mutated by callers. It is never
+// logged.
+func (s *Snapshot) APIKeys() []string { return s.apiKeys }
 
 // SSEKeepAlive returns the SSE keep-alive settings this snapshot carries.
 // They bind to the request like everything else on the snapshot, so an

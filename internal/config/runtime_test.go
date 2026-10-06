@@ -220,8 +220,8 @@ func TestLoadRuntimeRequiresAPIKey(t *testing.T) {
 	}
 
 	s := mustSnapshot(t, "api-key: \"  unit-test-key  \"\nmodels:\n  a:\n    endpoint: https://h/v1\n    upstream-model: m\n")
-	if got := s.APIKey(); got != "unit-test-key" {
-		t.Fatalf("APIKey() = %q, want the trimmed value", got)
+	if keys := s.APIKeys(); len(keys) != 1 || keys[0] != "unit-test-key" {
+		t.Fatalf("APIKeys() = %q, want [\"unit-test-key\"]", keys)
 	}
 	// The key is a legal top-level citizen: alongside models and log-level
 	// it loads fine.
