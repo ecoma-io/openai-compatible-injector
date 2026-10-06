@@ -635,16 +635,16 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		complete()
 	}
 
-	// Client authentication, before any body is read. The presented bearer
-	// token is resolved through the request's authenticator — the snapshot
-	// in static mode, the partner key store in partner mode. A missing or
-	// malformed Authorization header, a wrong key, an unknown or revoked
-	// partner key, and even an unreachable credential store all share the
-	// static-envelope discipline: the same two 401 bodies as ever, no
-	// fragment of the presented credential ever echoed, and — the
-	// fail-closed shape — a store outage denies the request instead of
-	// letting it through, with no upstream I/O either way.
-	token, ok := bearerToken(r.Header.Get("Authorization"))
+	// Client authentication, before any body is read. The presented
+	// credential — an Authorization bearer or an x-api-key — is resolved
+	// through the request's authenticator — the snapshot in static mode, the
+	// partner key store in partner mode. A missing or malformed header, a
+	// wrong key, an unknown or revoked partner key, and even an unreachable
+	// credential store all share the static-envelope discipline: the same two
+	// 401 bodies as ever, no fragment of the presented credential ever
+	// echoed, and — the fail-closed shape — a store outage denies the request
+	// instead of letting it through, with no upstream I/O either way.
+	token, ok := clientToken(r.Header)
 	if !ok {
 		outcome = "unauthorized"
 		reject(http.StatusUnauthorized, []byte(envelopeAuthMissing), nil)
@@ -3270,6 +3270,31 @@ func bearerToken(header string) (string, bool) {
 	return token, true
 }
 
+// clientToken resolves the credential a request presents, accepting either
+// of the two spellings the served dialects use: Authorization: Bearer (Chat
+// Completions, Responses) or x-api-key (Anthropic Messages). The bearer wins
+// when both appear, so a client that sends both authenticates with its
+// bearer credential and a client that sends only x-api-key — the way an
+// Anthropic client with ANTHROPIC_API_KEY does — authenticates with that. A
+// malformed bearer falls through to the x-api-key rather than short-circuiting
+// the request: either header alone is sufficient to authenticate.
+//
+// Both candidates go through the same validBearerToken gate — the same 4 KiB
+// cap, the same character class, no new validation vocabulary — so nothing
+// that could not legally ride in an Authorization header can ride here
+// either. Neither header's text is echoed or logged, and neither is on the
+// forward allow-list, so neither ever reaches an upstream.
+func clientToken(h http.Header) (string, bool) {
+	if token, ok := bearerToken(h.Get("Authorization")); ok {
+		return token, true
+	}
+	token := strings.Trim(h.Get("X-API-Key"), " ")
+	if !validBearerToken(token) {
+		return "", false
+	}
+	return token, true
+}
+
 // maxBearerTokenBytes bounds the credential material held per request. The
 // same cap on the config plane makes constant-time comparison practical.
 const maxBearerTokenBytes = 4 << 10
@@ -3500,7 +3525,7 @@ func (h *injectorHandler) models(w http.ResponseWriter, r *http.Request) {
 		complete()
 	}
 
-	token, ok := bearerToken(r.Header.Get("Authorization"))
+	token, ok := clientToken(r.Header)
 	if !ok {
 		outcome = "unauthorized"
 		reject(http.StatusUnauthorized, envelopeAuthMissing)
