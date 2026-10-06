@@ -42,7 +42,8 @@ type Event struct {
 	// last one attempted. UpstreamModel is that candidate's mapped name.
 	Provider      string
 	UpstreamModel string
-	// API is "chat" or "responses".
+	// API is "chat", "responses", or "messages" (the Anthropic surface,
+	// which meters the chat-shaped pre-rewrite bytes it translates from).
 	API    string
 	Stream bool
 	// HTTPStatus is the status the client received (the upstream's own on

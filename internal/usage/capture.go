@@ -44,15 +44,19 @@ type Capture struct {
 }
 
 // NewCapture builds the request's usage capture for one API surface:
-// "chat" reads the top-level usage object (prompt/completion/total);
 // "responses" reads the top-level usage of a buffered Response object, or
 // the usage inside a top-level "response" envelope (the streaming events) —
-// input/output/total. It descends no further: a nested "usage" inside
-// client or provider payload data is not the API's usage.
+// input/output/total; everything else — "chat" and the Anthropic
+// "messages" surface — reads the top-level usage object
+// (prompt/completion/total). Messages rides the chat extractor because the
+// bytes Observe reads are ALWAYS pre-rewrite upstream bytes, and a
+// Messages request's upstream traffic is Chat Completions. It descends no
+// further: a nested "usage" inside client or provider payload data is not
+// the API's usage.
 func NewCapture(api string) *Capture {
-	extract := ExtractResponsesUsage
-	if api == "chat" {
-		extract = ExtractChatUsage
+	extract := ExtractChatUsage
+	if api == "responses" {
+		extract = ExtractResponsesUsage
 	}
 	return &Capture{extract: extract}
 }

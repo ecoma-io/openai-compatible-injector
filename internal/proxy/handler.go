@@ -226,6 +226,10 @@ func NewHandler(store *config.Store, doers transport.Resolver, creds CredentialR
 	// plain-text default.
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 	mux.HandleFunc("/v1/responses", h.responses)
+	// The Anthropic Messages surface. Same service, same upstream config,
+	// same provider walk — the route differs only in what it translates to
+	// and from.
+	mux.HandleFunc("/v1/messages", h.messages)
 	mux.HandleFunc("/v1/models", h.models)
 	// The catch-all keeps the same promise for unknown paths — trailing
 	// slashes, wrong case, anything unmatched: an OpenAI SDK client always
@@ -261,6 +265,37 @@ func (h *injectorHandler) chatCompletions(w http.ResponseWriter, r *http.Request
 
 func (h *injectorHandler) responses(w http.ResponseWriter, r *http.Request) {
 	h.serve(w, r, apiResponses, inject.Responses, inject.RewriteResponsesModel, inject.SynthesizeResponsesThinkingUsage, inject.StripResponsesFields, "/responses")
+}
+
+// messages serves the Anthropic Messages surface. It rides the Chat
+// pipeline end to end — Chat rewrite, Chat thinking synthesis, Chat strip,
+// and a "/chat/completions" suffix on the outbound URL — because its
+// upstream traffic IS Chat Completions. Only the request transform differs:
+// the body arrives in Anthropic shape and must leave in Chat shape before
+// the rename and injection that transform's second stage performs.
+func (h *injectorHandler) messages(w http.ResponseWriter, r *http.Request) {
+	h.serve(w, r, apiMessages, messagesToChat, inject.RewriteChatModel,
+		inject.SynthesizeChatThinkingUsage, inject.StripChatFields, "/chat/completions")
+}
+
+// messagesToChat is the Messages route's transform: translate the Anthropic
+// body into the Chat shape, then hand that translation to the ordinary Chat
+// transform so the upstream alias rename and the injection prompt at
+// messages[0] apply exactly as they do for a native chat request. Two
+// stages in one function because serve takes one transform per route — and
+// because a translation failure must fail the request here, on the same
+// 400-never-falls-back path a local transform failure already owns: a body
+// this translation cannot read fails every candidate equally.
+//
+// Each attempt replays the ORIGINAL client body through this again, so
+// nothing observed on an earlier attempt feeds the next — the translation
+// is a pure function of the client's bytes and the request's model.
+func messagesToChat(body []byte, m config.Model) ([]byte, error) {
+	chat, err := inject.MessagesToChat(body)
+	if err != nil {
+		return nil, err
+	}
+	return inject.Chat(chat, m)
 }
 
 // notFound is the catch-all for paths no route matched. The interpolated
@@ -750,6 +785,18 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		outcome = "invalid_json"
 		reject(http.StatusBadRequest, []byte(env.invalidReq), nil)
 		return
+	}
+	// A Claude client appends a "[1m]" context-window capability suffix to
+	// the model name. The capability travels on the Anthropic wire as a beta
+	// header, not as part of the id, so the name that reaches the model
+	// lookup must not carry it. Only the Messages surface ever presents such
+	// a name and only that surface strips: a chat client that literally
+	// configured a model named "…[1m]" still resolves it. The strip runs
+	// BEFORE publicModel is bound, so the lookup, the logs, the usage row,
+	// the 404 and the model echoed back to the client all agree on the name
+	// that resolved.
+	if api == apiMessages {
+		model, _ = inject.StripContextMarker(model)
 	}
 	publicModel = model
 	if model == "" {
@@ -2343,11 +2390,24 @@ walk:
 		var partial *partialText
 		var observe func(name, payload []byte)
 		buildCont := inject.BuildContinuationChat
-		if api == apiResponses {
+		switch api {
+		case apiResponses:
 			buildCont = inject.BuildContinuationResponses
+		case apiMessages:
+			buildCont = inject.BuildContinuationMessages
 		}
 		if contPolicy.Enabled {
-			partial = newPartialText(api, contPolicy.MaxPartialBytes)
+			// The accumulator observes PRE-translation upstream bytes, so a
+			// Messages request is accumulated as the chat stream it is —
+			// the client holds Anthropic events, but the prefix a
+			// continuation would be built from is the upstream's own
+			// dialect, and reading it as anything else would refuse an
+			// honest prefix as unparseable.
+			accumulatorAPI := api
+			if api == apiMessages {
+				accumulatorAPI = apiChat
+			}
+			partial = newPartialText(accumulatorAPI, contPolicy.MaxPartialBytes)
 			observe = partial.Observe
 		}
 
@@ -2948,6 +3008,25 @@ walk:
 		usageCapture.Observe(answer.body)
 	}
 	rewritten := rewriteOut(answer.body)
+	// The Messages surface holds an Anthropic client, so the Chat-shaped
+	// bytes the pipeline just produced are translated one last time before
+	// anything reaches the wire. This happens BEFORE any header write: a
+	// body this translation cannot read is the same unusable-upstream 502
+	// the walk answers an unparseable 200 with, and answering it early keeps
+	// the client from ever seeing a partial Chat-shaped reply under an
+	// Anthropic status line.
+	if api == apiMessages {
+		translated, ok := inject.ChatToMessages(rewritten, publicModel)
+		if !ok {
+			outcome = "upstream_invalid_response"
+			log.Warn().Str("public_model", model).
+				Str("error_class", "upstream_invalid_response").
+				Msg("upstream_invalid_response")
+			reject(http.StatusBadGateway, []byte(env.upInvalid), nil)
+			return
+		}
+		rewritten = translated
+	}
 	log.Debug().Int64("bytes_out", int64(len(rewritten))).Msg("response_transform_completed")
 	copyRelayHeaders(sw.Header(), answer.header)
 	setRequestID(sw.Header(), requestID)
