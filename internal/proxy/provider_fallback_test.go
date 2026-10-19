@@ -1911,3 +1911,84 @@ models:
 		t.Errorf("completion = %v, want entries 2 attempts 3 retries 1 exchanges 7", done)
 	}
 }
+
+// TestProviderChainRepeatedProviderWalks pins the chain schema's tolerance
+// for one providers-table entry appearing more than once: the walk treats
+// each entry as its own candidate, so a gateway serving several models is a
+// whole route. The repeated provider is dialed again under ITS OWN
+// upstream-model — the hop is not a re-ask of the same model, and the
+// evidence keeps the two apart by candidate_index.
+//
+// The quiet direction is the point: the second hop's body must carry the
+// second hop's model name, and the completion record must name the
+// answering hop's position.
+func TestProviderChainRepeatedProviderWalks(t *testing.T) {
+	snap, err := config.LoadRuntime([]byte("api-key: " + testAPIKey + `
+providers:
+  pa:
+    base-url: https://a.example/v1
+models:
+  chain-model:
+    injection-prompt: "CHAIN-PROMPT-MARKER"
+    recovery:
+      fallback:
+        max-candidates: 3
+    providers:
+      - provider: pa
+        upstream-model: up-a
+      - provider: pa
+        upstream-model: up-a2
+`))
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	// The primary's transport fails; the repeated provider's second entry
+	// answers. Both hops run through the same transport, so one Doer
+	// serves them — the difference is the hop, not the path.
+	script := newScript(
+		scriptStep{err: dialError("a.example")},
+		scriptStep{status: http.StatusOK, body: `{"model":"up-a2","choices":[]}`},
+	)
+	logBuf, log := captureLog(zerolog.InfoLevel)
+	h := NewHandler(config.NewStore(snap), kindResolver{direct: script}, nil, nil, nil, log)
+
+	rec := doRequest(t, h, http.MethodPost, "/v1/chat/completions", chainChatBody, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"model":"chain-model"`) {
+		t.Errorf("response model not rewritten to the public name: %s", rec.Body.String())
+	}
+	// The second hop carried ITS OWN upstream-model: the repeated provider
+	// is a second candidate, not a re-ask of the first one.
+	bodies := script.allBodies()
+	if len(bodies) != 2 {
+		t.Fatalf("upstream calls = %d, want 2", len(bodies))
+	}
+	if !strings.Contains(bodies[0], `"model":"up-a"`) {
+		t.Errorf("first hop body = %s, want the first hop's upstream model", bodies[0])
+	}
+	if !strings.Contains(bodies[1], `"model":"up-a2"`) {
+		t.Errorf("second hop body = %s, want the second hop's upstream model", bodies[1])
+	}
+	// The injection prompt is a property of the PUBLIC model: every hop
+	// receives it.
+	for i, b := range bodies {
+		if !strings.Contains(b, "CHAIN-PROMPT-MARKER") {
+			t.Errorf("hop %d body lost the injection prompt: %s", i+1, b)
+		}
+	}
+	done := logBuf.events(t, "request_completed")
+	if len(done) != 1 {
+		t.Fatalf("request_completed events = %d, want 1", len(done))
+	}
+	// Two candidates ENTERED, two provider attempts, and the answering hop
+	// is the second one — the same provider name, a different chain
+	// position, which the candidate_index keeps distinguishable.
+	if done[0]["candidates_entered"] != float64(2) || done[0]["provider_attempts"] != float64(2) {
+		t.Errorf("completion counters = %v, want 2 entries and 2 attempts", done[0])
+	}
+	if done[0]["final_provider"] != "pa" || done[0]["final_candidate"] != float64(2) {
+		t.Errorf("completion identity = %v/%v, want pa/2", done[0]["final_provider"], done[0]["final_candidate"])
+	}
+}

@@ -1301,10 +1301,12 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 // because silently rerouting egress is the quiet direction this schema
 // exists to prevent. Candidates are validated in list order so the
 // rejection's ordinal is deterministic; the names themselves are never
-// echoed (error text reaches logs verbatim). A provider may appear only
-// once: retrying the same endpoint under a different upstream-model name
-// is an ambiguity about what a "provider attempt" is, not a fallback
-// route.
+// echoed (error text reaches logs verbatim). A provider may appear more
+// than once in a chain: each entry is an independent candidate carrying its
+// own upstream-model and its own recovery override, so one gateway entry
+// serving several models can be a whole route — primary first, fallbacks
+// after — without the operator having to clone the provider under a second
+// name.
 func buildChain(cands []runtimeModelCandidate, providers map[string]providerEntry) ([]Candidate, error) {
 	if len(cands) == 0 {
 		// Only reachable through an explicit empty list (`providers: []`);
@@ -1312,17 +1314,12 @@ func buildChain(cands []runtimeModelCandidate, providers map[string]providerEntr
 		return nil, errors.New("the providers list requires at least one candidate")
 	}
 	chain := make([]Candidate, 0, len(cands))
-	seen := make(map[string]struct{}, len(cands))
 	for i, c := range cands {
 		ordinal := i + 1
 		ref := strings.TrimSpace(c.Provider)
 		if ref == "" {
 			return nil, fmt.Errorf("providers candidate %d: provider is required", ordinal)
 		}
-		if _, dup := seen[ref]; dup {
-			return nil, fmt.Errorf("providers candidate %d: provider reference is a duplicate of an earlier candidate", ordinal)
-		}
-		seen[ref] = struct{}{}
 		p, ok := providers[ref]
 		if !ok {
 			return nil, fmt.Errorf("providers candidate %d: provider reference is unknown", ordinal)
