@@ -289,6 +289,17 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   that states a list replaces its provider's list; a model without one
   inherits each candidate's provider list per hop.
   See [Response field stripping](#response-field-stripping).
+- `vision` — optional boolean declaring this model's upstream accepts
+  image-bearing requests (chat `image_url` parts, Responses `input_image`
+  items, Anthropic image blocks, data URIs in string content, Ollama message
+  `images` arrays). Absent or null means text-only. On a chain, declare it on
+  a `providers` candidate entry instead — one provider may serve both
+  modalities. A model carrying no vision-capable candidate never has a
+  request body scanned for images; on a model that does, an image request's
+  effective candidate chain is filtered to the vision-capable candidates in
+  written order, so a vision hop that fails moves to the next vision hop
+  rather than churning through text-only candidates that would reject the
+  image. See [Vision capability and auto-switch](#vision-capability-and-auto-switch).
 - `recovery` — optional block carrying the model recovery policy: the
   `matrix` (which failure retries, falls back, or terminates), `retries`,
   `fallback`, `budget`, and `retry-after`. The same block is accepted at the
@@ -361,7 +372,7 @@ The file is validated strictly, in two layers:
 - **Model entries** are decoded strictly (`yaml.v3`
   with known fields): any key outside `endpoint`, `provider`,
   `upstream-model`, `injection-prompt`, `thinking-usage`, `strip-fields`,
-  `retries`, `recovery` and
+  `vision`, `retries`, `recovery` and
   `providers` (and, inside the thinking-usage block, outside `mode`,
   `min-ratio`, `max-ratio`; inside `retries`, outside `max-retries`,
   `max-elapsed` and `backoff` — itself limited to `initial`, `max` and
@@ -371,7 +382,7 @@ The file is validated strictly, in two layers:
   warning. The
   same strictness holds inside `providers` entries (`base-url`,
   `transport`, `recovery`, `strip-fields`), model-chain candidate entries (`provider`,
-  `upstream-model`, `recovery`), `transports` entries
+  `upstream-model`, `recovery`, `vision`), `transports` entries
   (`type`, `proxy`, and the pool fields `members`, `strategy`, `fallback`,
   `health`, each with their own strict field sets), and pool `members`
   entries (`transport`, `max-body-bytes`, `max-concurrency`, `streaming`,
@@ -619,6 +630,61 @@ values are replaced inside a string-state-aware scan. Everything else — every
 whitespace byte, key order, unknown fields — is forwarded exactly as
 received. A response whose JSON cannot be parsed is forwarded byte-for-byte
 unchanged.
+
+## Vision capability and auto-switch
+
+A model — or a chain candidate — may declare whether its upstream
+serves **vision** (accepts image-bearing input):
+
+```yaml
+models:
+  gpt-5: # single-candidate form
+    endpoint: https://api.openai.com/v1
+    upstream-model: gpt-5
+    vision: true # absent or null = text-only
+
+  multimodal: # chain form — declared per candidate
+    providers:
+      - provider: openai
+        upstream-model: gpt-5
+        vision: true
+      - provider: other
+        upstream-model: gpt-5-mini # text-only candidate
+```
+
+The candidate's own declaration wins over the model-level one, matching
+`strip-fields`' model-overrides-candidates pattern. `vision` is capability
+data, not routing: a text-only candidate stays a valid route for every
+plain-text request.
+
+- **Hot path.** A model whose chain carries no vision-capable candidate
+  never has a request body scanned for images — the resolved `Model`
+  carries one load-time boolean (`HasVisionCandidate`, computed in the same
+  pass that resolves per-candidate recovery) and, when it is false, the
+  request path is byte-identical to a deployment before the key existed.
+- **Detection.** `inject.HasImage` scans the request body once, only for a
+  model with a vision candidate: chat `image_url` content parts at any
+  depth, Responses `input_image` items (top-level or nested in message
+  content), Anthropic-style `"type": "image"` blocks, Ollama/Hermes
+  message-level `images` arrays (a non-empty one), and a `data:image/…`
+  URI spelled inside a plain string content. The scan needs the body
+  contain the byte sequence `image` at all before decoding anything; the
+  structural walk reads real object members only, so a prompt that merely
+  _mentions_ images never flips the answer. A body that is invalid JSON or
+  not an object reports no image (fail-open: text-only candidates stay
+  eligible and the request behaves exactly as it always has).
+- **Auto-switch.** When the scan reports an image, the request's effective
+  candidate chain is **filtered** — not reordered — to the vision-capable
+  candidates in their written order. An image request only ever reaches an
+  upstream declared able to read images, so a vision hop that fails moves
+  to the next vision hop instead of churning through text-only candidates
+  that would 4xx. A plain-text request walks every candidate unchanged.
+  The filter binds to the request's own copy of the resolved model — the
+  snapshot is never mutated, and a reload mid-request cannot change it.
+- **No synthesis.** Vision is a routing decision only. The proxy transforms
+  nothing in the image path: no part is rewritten, no capability header
+  added, no usage synthesized. What the upstream rejects, it rejects
+  normally — through the recovery policy like any other status.
 
 ## Provider transports
 

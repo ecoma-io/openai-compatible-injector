@@ -112,6 +112,15 @@ type Candidate struct {
 	// registry keyed by Spec content. Nil keeps every request byte exactly
 	// as it was before credentials existed.
 	Cred *credential.Provider
+	// Vision declares whether this candidate's upstream model accepts
+	// image-bearing requests (chat image_url parts, Responses input_image
+	// items, Anthropic image blocks, data URIs in string content). It is
+	// load-time data, resolved from the candidate's own `vision` (or the
+	// model-level fallback) exactly as Recovery is — the request never
+	// re-derives it. False, the zero value, is the reading for every file
+	// that predates the key and for every candidate the file does not
+	// declare it on.
+	Vision bool
 }
 
 // Label is the candidate's observability identity: the providers-table
@@ -173,6 +182,16 @@ type Model struct {
 	// build a one-candidate chain, so the handler walks one uniform
 	// structure — there is no separate legacy code path to drift.
 	Chain []Candidate
+	// HasVisionCandidate reports whether ANY candidate of the chain
+	// declares Vision. It is a load-time aggregate, computed in the same
+	// pass that resolves per-candidate recovery, so the request path reads
+	// one array element out of the struct and never scans the chain per
+	// request. A model whose chain carries no vision-capable candidate
+	// never pays for the request's image scan: the flag IS the hot-path
+	// gate, and absent vision config on the model resolves to false — the
+	// request path is then byte-identical to every generation before the
+	// key existed.
+	HasVisionCandidate bool
 }
 
 // Snapshot is an immutable view of a validated runtime configuration. It is
