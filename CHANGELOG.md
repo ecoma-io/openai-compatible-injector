@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.16.0...v0.17.0) (2026-10-19)
+
+
+### Features
+
+* **config:** allow the same provider to appear more than once in a candidate chain ([#137](https://github.com/ecoma-io/openai-compatible-injector/issues/137)) ([09767a2](https://github.com/ecoma-io/openai-compatible-injector/commit/09767a2ab622cbb92c8a151ef97517e56849a9cc))
+
 ## [0.16.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.15.1...v0.16.0) (2026-10-06)
 
 
