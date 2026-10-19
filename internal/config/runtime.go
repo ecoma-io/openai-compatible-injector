@@ -357,6 +357,14 @@ type runtimeModel struct {
 	// that states one uses it instead of its providers' lists (override);
 	// a model without one inherits each candidate's provider list per hop.
 	StripFields []string `yaml:"strip-fields"`
+	// Vision declares the legacy single-candidate form's capability: the
+	// model accepts image-bearing requests. It applies to the one candidate
+	// the provider/endpoint form builds (via buildModel's candidate loop) —
+	// the chain form declares it per candidate instead, because one provider
+	// can serve both vision and text-only models. Absent or nil is false
+	// (text-only), the same reading every generation-before-the-key file
+	// keeps.
+	Vision *bool `yaml:"vision"`
 }
 
 // runtimeModelCandidate mirrors one entry of a model's providers chain:
@@ -367,6 +375,14 @@ type runtimeModelCandidate struct {
 	Provider      string           `yaml:"provider"`
 	UpstreamModel string           `yaml:"upstream-model"`
 	Recovery      *runtimeRecovery `yaml:"recovery"`
+	// Vision declares this candidate's capability: the upstream model at
+	// this hop accepts image-bearing input (chat image_url parts, Responses
+	// input_image items, Anthropic image blocks, data URIs in string
+	// content). Absent or nil means false — text-only — which is also the
+	// reading for every file that predates the key. The walk consults it
+	// only for a request that carries an image part, so a text-only
+	// candidate stays a valid route for plain-text traffic.
+	Vision *bool `yaml:"vision"`
 }
 
 // runtimeThinkingUsage mirrors the optional per-model thinking-usage block.
@@ -1226,7 +1242,21 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 	// The candidate overrides ride alongside the chain: the list entry and
 	// the chain entry are the same position, so they are indexed together.
 	// A non-chain model never reaches this loop — its single candidate has
-	// no list entry to carry an override.
+	// no list entry to carry an override. Vision resolves identically: the
+	// candidate's own declaration when the list entry states one, the
+	// model-level fallback otherwise (a chain form with no model-level
+	// vision reads every candidate's nil as false, the plain text-only past;
+	// the provider/endpoint form has no list entry, so the model-level
+	// spelling is its only one).
+	for i := range chain {
+		if i < len(rm.Providers) && rm.Providers[i].Vision != nil {
+			chain[i].Vision = *rm.Providers[i].Vision
+			continue
+		}
+		if rm.Vision != nil {
+			chain[i].Vision = *rm.Vision
+		}
+	}
 	candidateRecovery := make([]*recovery.Partial, len(chain))
 	for i := range chain {
 		if i >= len(rm.Providers) || rm.Providers[i].Recovery == nil {
@@ -1280,18 +1310,29 @@ func buildModel(name string, rm runtimeModel, providers map[string]providerEntry
 			chain[i].Strip = modelStrip
 		}
 	}
+	// The vision aggregate is computed in the same load pass that resolves
+	// each candidate's recovery, never on the request path: one bool read
+	// decides whether a request pays for the body's image scan.
+	hasVision := false
+	for i := range chain {
+		if chain[i].Vision {
+			hasVision = true
+			break
+		}
+	}
 	return Model{
-		Public:          name,
-		Provider:        chain[0].Provider,
-		Endpoint:        chain[0].Endpoint,
-		UpstreamModel:   chain[0].UpstreamModel,
-		InjectionPrompt: rm.InjectionPrompt,
-		ThinkingUsage:   tu,
-		Strip:           modelStrip,
-		Recovery:        chain[0].Recovery,
-		RecoveryHash:    chain[0].RecoveryHash,
-		Transport:       chain[0].Transport,
-		Chain:           chain,
+		Public:             name,
+		Provider:           chain[0].Provider,
+		Endpoint:           chain[0].Endpoint,
+		UpstreamModel:      chain[0].UpstreamModel,
+		InjectionPrompt:    rm.InjectionPrompt,
+		ThinkingUsage:      tu,
+		Strip:              modelStrip,
+		Recovery:           chain[0].Recovery,
+		RecoveryHash:       chain[0].RecoveryHash,
+		Transport:          chain[0].Transport,
+		Chain:              chain,
+		HasVisionCandidate: hasVision,
 	}, nil
 }
 

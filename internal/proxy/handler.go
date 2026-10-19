@@ -817,6 +817,30 @@ func (h *injectorHandler) serve(w http.ResponseWriter, r *http.Request, api stri
 		Str("upstream", origin(m.Endpoint)).
 		Int("provider_count", len(m.Chain)).Msg("model_resolved")
 
+	// Vision auto-switch. A model whose chain carries no vision-capable
+	// candidate never pays for the body scan — the hot path stays byte for
+	// byte what it was — and a body with no image goes out unchanged. When
+	// both are true the effective chain is FILTERED to the vision-capable
+	// candidates in their written order: an image request only ever reaches
+	// a model that can read images, so a vision hop that fails moves to the
+	// next vision hop instead of churning through text-only 400s (the same
+	// provider may serve both modalities — that is what the per-candidate
+	// declaration exists for). The filter is a fresh slice value bound to
+	// this request's copy of the model; the snapshot is untouched.
+	if m.HasVisionCandidate && inject.HasImage(body) {
+		visionChain := make([]config.Candidate, 0, len(m.Chain))
+		for _, cand := range m.Chain {
+			if cand.Vision {
+				visionChain = append(visionChain, cand)
+			}
+		}
+		log.Debug().
+			Int("chain_candidates", len(m.Chain)).
+			Int("vision_candidates", len(visionChain)).
+			Msg("vision_autoswitch")
+		m.Chain = visionChain
+	}
+
 	// Prepare the API-scoped capture before entering the provider walk. The
 	// event gate itself is set once a candidate has transformed and built its
 	// outbound request: a local transform or build failure BEFORE that first

@@ -414,6 +414,17 @@ models:
     strip-fields:
       - provider
       - service_tier
+    # Optional. Declares that this model's upstream accepts image-bearing
+    # requests (chat image_url parts, Responses input_image items, Anthropic
+    # image blocks, data URIs in string content). Absent or null means
+    # text-only. On a chain, declare it per candidate instead (see
+    # chained-model below) — a single provider may serve both modalities.
+    # For a text-only model the request body is never scanned and the
+    # request path stays byte-identical to every generation before the key
+    # existed; for a model with at least one vision-capable candidate, an
+    # image request is filtered to those candidates only, so a vision hop
+    # that fails never churns through text-only candidates that would 4xx.
+    # vision: true
 
   # A chain example: an ordered provider candidate list. The first entry
   # is the primary route; later entries are fallbacks reached when an
@@ -435,6 +446,12 @@ models:
     providers:
       - provider: opencode # primary: the providers-table entry above
         upstream-model: gpt-5-pro
+        # Optional per-candidate vision declaration: this candidate accepts
+        # image-bearing requests. An image request for the model is filtered
+        # to the vision-capable candidates only; a plain-text request walks
+        # every candidate in the written order. Absent or null (like the
+        # backup below) means text-only.
+        vision: true
         # Optional candidate-level override: this hop alone. Here the
         # primary is never re-asked — a failure moves straight on — while
         # the backup candidate below keeps the inherited retry mechanics.
