@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.17.0...v0.18.0) (2026-10-19)
+
+
+### Features
+
+* **inject:** vision capability declaration and image-request auto-switch ([#139](https://github.com/ecoma-io/openai-compatible-injector/issues/139)) ([9d1af4b](https://github.com/ecoma-io/openai-compatible-injector/commit/9d1af4b934fc8129a908295a2b4b24eabe2262f6))
+
 ## [0.17.0](https://github.com/ecoma-io/openai-compatible-injector/compare/v0.16.0...v0.17.0) (2026-10-19)
 
 
