@@ -444,6 +444,24 @@ models:
       - provider: opencode-backup # a second providers-table entry
         upstream-model: gpt-5-pro
 
+  # The same providers-table entry may appear more than once in a chain:
+  # each entry is an independent candidate with its own upstream-model and
+  # its own recovery override, so one gateway serving several models is a
+  # whole route without cloning the entry under a second name. The walk's
+  # reach is fallback.max-candidates (default 2), so a chain this long
+  # states its own.
+  multi-model-model:
+    recovery:
+      fallback:
+        max-candidates: 3
+    providers:
+      - provider: opencode
+        upstream-model: gpt-5-pro
+      - provider: opencode
+        upstream-model: gpt-5-mini # the same gateway, another model
+      - provider: opencode-backup
+        upstream-model: gpt-5-pro
+
 # Optional, and LEGACY: the candidate-walk bound under the pre-policy-engine
 # spelling. It normalizes into the SAME single policy engine (the GLOBAL
 # layer's fallback policy, where max-attempts becomes max-candidates), so a

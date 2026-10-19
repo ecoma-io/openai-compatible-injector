@@ -123,6 +123,56 @@ func TestLoadRuntimeProviderChainShape(t *testing.T) {
 	}
 }
 
+// TestLoadRuntimeProviderChainAllowsRepeatedProvider pins the chain schema's
+// tolerance for one providers-table entry appearing more than once: each
+// entry is an independent candidate carrying its own upstream-model, so a
+// gateway serving several models is a whole route rather than a name the
+// operator has to clone. The candidates stay distinct — the repeated
+// provider keeps its own model name, and the chain keeps the order the
+// operator wrote.
+func TestLoadRuntimeProviderChainAllowsRepeatedProvider(t *testing.T) {
+	snap, err := LoadRuntime([]byte(chainRuntime(
+		"    injection-prompt: stay honest\n"+
+			"    providers:\n"+
+			"      - provider: pa\n        upstream-model: up-a\n"+
+			"      - provider: pb\n        upstream-model: up-b\n"+
+			"      - provider: pa\n        upstream-model: up-a2\n",
+		"")))
+	if err != nil {
+		t.Fatalf("a chain repeating one provider was rejected: %v", err)
+	}
+	m, ok := snap.Model("m")
+	if !ok {
+		t.Fatal("model missing")
+	}
+	if len(m.Chain) != 3 {
+		t.Fatalf("chain length = %d, want 3", len(m.Chain))
+	}
+	// The repeated provider keeps its own upstream-model and its own
+	// position: the chain is a route, not a set.
+	wantModels := []string{"up-a", "up-b", "up-a2"}
+	wantProviders := []string{"pa", "pb", "pa"}
+	for i, c := range m.Chain {
+		if c.Provider != wantProviders[i] || c.UpstreamModel != wantModels[i] {
+			t.Errorf("chain[%d] = provider %q / model %q, want %q / %q",
+				i, c.Provider, c.UpstreamModel, wantProviders[i], wantModels[i])
+		}
+	}
+	// The repeated provider resolves to the same endpoint and transport —
+	// it is the same gateway — while the candidates stay separate hops.
+	if m.Chain[0].Endpoint.Host != m.Chain[2].Endpoint.Host {
+		t.Errorf("the repeated provider resolved to a different host: %q vs %q",
+			m.Chain[0].Endpoint.Host, m.Chain[2].Endpoint.Host)
+	}
+	if m.Chain[0].Transport.Key() != m.Chain[2].Transport.Key() {
+		t.Error("the repeated provider resolved to a different transport")
+	}
+	// The flattened primary still mirrors chain[0].
+	if m.Provider != "pa" || m.UpstreamModel != "up-a" {
+		t.Errorf("flattened primary = %+v, want pa/up-a", m)
+	}
+}
+
 // TestLoadRuntimeProviderChainRejections pins the whole-file rejections of
 // the chain schema, and the no-echo rule over them: the provider name (the
 // position a pasted credential lands in) never appears in the error.
@@ -135,7 +185,6 @@ func TestLoadRuntimeProviderChainRejections(t *testing.T) {
 		{"chain next to provider", "    provider: pa\n    upstream-model: x\n    providers:\n      - provider: pb\n        upstream-model: y\n", "mutually exclusive"},
 		{"chain next to endpoint", "    endpoint: https://x.example/v1\n    providers:\n      - provider: pb\n        upstream-model: y\n", "mutually exclusive"},
 		{"unknown provider ref", "    providers:\n      - provider: ghost\n        upstream-model: y\n", "provider reference is unknown"},
-		{"duplicate provider ref", "    providers:\n      - provider: pa\n        upstream-model: y\n      - provider: pa\n        upstream-model: z\n", "duplicate of an earlier candidate"},
 		{"candidate without provider", "    providers:\n      - upstream-model: y\n", "provider is required"},
 		{"candidate without upstream-model", "    providers:\n      - provider: pa\n", "upstream-model is required"},
 		{"empty chain", "    providers: []\n", "requires at least one candidate"},

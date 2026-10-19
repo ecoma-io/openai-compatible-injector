@@ -246,11 +246,17 @@ log-level: info # optional; debug | info | warn | error (absent = info)
   [recovery matrix](#provider-recovery-policy). A candidate entry may
   carry its own `recovery` override, which applies to that hop alone.
   Both forms at once — a `providers` list next to `provider` or
-  `endpoint` — is a rejection, as is the same provider referenced twice
-  in one chain. The `injection-prompt` and `thinking-usage` stay
-  model-level: every candidate receives the same prompt and the same
-  synthesis setting, because those are properties of the public model,
-  not of a hop. See [Provider recovery policy](#provider-recovery-policy).
+  `endpoint` — is a rejection. The same providers-table entry may appear
+  more than once in one chain: each entry is an independent candidate
+  carrying its own `upstream-model` and its own `recovery` override, so
+  one gateway serving several models is a whole route without the
+  operator having to clone the entry under a second name. The
+  `injection-prompt` and `thinking-usage` stay model-level: every
+  candidate receives the same prompt and the same synthesis setting,
+  because those are properties of the public model, not of a hop. The
+  walk's reach is `fallback.max-candidates` (default 2), so a longer
+  chain needs a stated reach. See
+  [Provider recovery policy](#provider-recovery-policy).
 - `upstream-model` — the `model` value actually forwarded upstream.
   Required on the single-provider and inline-endpoint forms (and per
   candidate inside a `providers` chain, where there is no model-level
